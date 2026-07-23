@@ -1,0 +1,97 @@
+name: rollerskate-dev
+
+services:
+  mysql:
+    image: mysql:8.4.10
+    environment:
+      MYSQL_DATABASE: rollerskate
+      MYSQL_PASSWORD: rollerskate
+      MYSQL_ROOT_PASSWORD: rollerskate-root
+      MYSQL_USER: rollerskate
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping --host=127.0.0.1 --user=root --password=$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - mysql-data:/var/lib/mysql
+
+  synapse:
+    image: ghcr.io/element-hq/synapse:v1.153.0
+    entrypoint: ["python", "/bootstrap/bootstrap.py"]
+    environment:
+      ROLLERSKATE_APPLICATION_SERVICE_URL: http://server:4100
+      ROLLERSKATE_MATRIX_AS_TOKEN_FILE: /run/secrets/matrix_as_token
+      ROLLERSKATE_MATRIX_HS_TOKEN_FILE: /run/secrets/matrix_hs_token
+      SYNAPSE_REPORT_STATS: "no"
+      SYNAPSE_SERVER_NAME: rollerskate.test
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8008/_matrix/client/versions', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+    ports:
+      - "127.0.0.1:${ROLLERSKATE_DEV_MATRIX_PORT:-8008}:8008"
+    secrets:
+      - matrix_as_token
+      - matrix_hs_token
+    volumes:
+      - ./synapse:/bootstrap:ro
+      - synapse-data:/data
+
+  migrate:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+    command: ["npm", "--prefix", "server", "run", "migrate"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      ROLLERSKATE_DATABASE_URL: mysql://rollerskate:rollerskate@mysql:3306/rollerskate
+    restart: "no"
+
+  server:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      synapse:
+        condition: service_healthy
+    environment:
+      ROLLERSKATE_ALLOW_INSECURE_MATRIX_HTTP: "true"
+      ROLLERSKATE_DATABASE_URL: mysql://rollerskate:rollerskate@mysql:3306/rollerskate
+      ROLLERSKATE_MATRIX_AS_TOKEN_FILE: /run/secrets/matrix_as_token
+      ROLLERSKATE_MATRIX_HOMESERVER_URL: http://synapse:8008
+      ROLLERSKATE_MATRIX_HS_TOKEN_FILE: /run/secrets/matrix_hs_token
+      ROLLERSKATE_MATRIX_SERVER_NAME: rollerskate.test
+      ROLLERSKATE_OIDC_AUTHORIZATION_REQUEST_METHOD: ${ROLLERSKATE_OIDC_AUTHORIZATION_REQUEST_METHOD:-get}
+      ROLLERSKATE_OIDC_CLIENT_ID: ${ROLLERSKATE_OIDC_CLIENT_ID:?set ROLLERSKATE_OIDC_CLIENT_ID in dev/.env}
+      ROLLERSKATE_OIDC_CLIENT_SECRET: ${ROLLERSKATE_OIDC_CLIENT_SECRET:-}
+      ROLLERSKATE_OIDC_DISCOVERY_URL: ${ROLLERSKATE_OIDC_DISCOVERY_URL:-}
+      ROLLERSKATE_OIDC_ISSUER: ${ROLLERSKATE_OIDC_ISSUER:-}
+      ROLLERSKATE_PUBLIC_URL: http://localhost:${ROLLERSKATE_DEV_SERVER_PORT:-4100}
+      ROLLERSKATE_SERVER_HOST: 0.0.0.0
+      ROLLERSKATE_SERVER_PORT: 4100
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4100/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "127.0.0.1:${ROLLERSKATE_DEV_SERVER_PORT:-4100}:4100"
+    secrets:
+      - matrix_as_token
+      - matrix_hs_token
+
+volumes:
+  mysql-data:
+  synapse-data:
+
+secrets:
+  matrix_as_token:
+    file: ./secrets/matrix_as_token
+  matrix_hs_token:
+    file: ./secrets/matrix_hs_token

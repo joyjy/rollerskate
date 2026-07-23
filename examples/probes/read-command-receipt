@@ -1,0 +1,27 @@
+#!/bin/sh
+set -u
+
+command_id=${1:-}
+case "$command_id" in
+  ""|*[!A-Za-z0-9._-]*)
+    printf '%s\n' "command ID must use 1-128 safe characters" >&2
+    exit 2
+    ;;
+esac
+if [ "${#command_id}" -gt 128 ]; then
+  printf '%s\n' "command ID must use 1-128 safe characters" >&2
+  exit 2
+fi
+
+receipt_path=".rollerskate-command-receipts/$command_id.json"
+if [ ! -e "$receipt_path" ]; then
+  printf '{"schemaVersion":1,"commandId":"%s","state":"running"}\n' "$command_id"
+  exit 0
+fi
+if [ -L "$receipt_path" ] || [ ! -f "$receipt_path" ]; then
+  printf '%s\n' "receipt must be a regular file" >&2
+  exit 2
+fi
+while IFS= read -r line || [ -n "$line" ]; do
+  printf '%s\n' "$line"
+done < "$receipt_path"

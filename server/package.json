@@ -1,0 +1,35 @@
+{
+  "name": "@rollerskate/server",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/src/bootstrap/main.js",
+  "bin": {
+    "rollerskate-server": "./dist/src/bootstrap/main.js",
+    "rollerskate-server-migrate": "./dist/src/adapter/persistence/mysql/migrate-cli.js"
+  },
+  "scripts": {
+    "prebuild": "npm --prefix ../packages/protocol run build",
+    "clean": "node ../scripts/clean-dist.mjs",
+    "build": "npm run clean && tsc -p tsconfig.json",
+    "start": "node dist/src/bootstrap/main.js",
+    "migrate": "node dist/src/adapter/persistence/mysql/migrate-cli.js",
+    "smoke:matrix-room": "node dist/src/smoke/matrix-room.js",
+    "smoke:terminal-server": "node dist/src/smoke/terminal-room-server.js",
+    "test": "node --test dist/test/*.test.js",
+    "verify": "npm run build && npm test"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "dependencies": {
+    "@rollerskate/protocol": "file:../packages/protocol",
+    "jose": "^6.2.3",
+    "mysql2": "3.16.0",
+    "zod": "^4.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "typescript": "7.0.2"
+  }
+}

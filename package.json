@@ -1,0 +1,23 @@
+{
+  "name": "rollerskate",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "local",
+    "server"
+  ],
+  "scripts": {
+    "build": "npm run build -w @rollerskate/protocol && npm run build -w @rollerskate/local && npm run build -w @rollerskate/server",
+    "dev:init": "node dev/init-secrets.mjs",
+    "dev:up": "npm run dev:init && docker compose --env-file dev/.env -f dev/compose.yaml up --build",
+    "dev:down": "docker compose --env-file dev/.env -f dev/compose.yaml down",
+    "test": "$HOME/.ai/scripts/node-test-kit run",
+    "test:coverage": "$HOME/.ai/scripts/node-test-kit coverage",
+    "verify": "npm test"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  }
+}

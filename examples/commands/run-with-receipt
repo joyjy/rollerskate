@@ -1,0 +1,30 @@
+#!/bin/sh
+set -u
+
+command_id=${1:-}
+if ! printf '%s' "$command_id" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'; then
+  printf '%s\n' "command ID must use 1-128 safe characters" >&2
+  exit 2
+fi
+shift
+if [ "$#" -eq 0 ]; then
+  printf '%s\n' "a command is required" >&2
+  exit 2
+fi
+
+receipt_directory="$PWD/.rollerskate-command-receipts"
+receipt_path="$receipt_directory/$command_id.json"
+temporary_path="$receipt_path.$$.tmp"
+mkdir -p "$receipt_directory"
+chmod 700 "$receipt_directory"
+started_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+"$@"
+exit_code=$?
+
+completed_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+umask 077
+printf '{"schemaVersion":1,"commandId":"%s","state":"completed","exitCode":%s,"startedAt":"%s","completedAt":"%s"}\n' \
+  "$command_id" "$exit_code" "$started_at" "$completed_at" > "$temporary_path"
+mv "$temporary_path" "$receipt_path"
+exit "$exit_code"

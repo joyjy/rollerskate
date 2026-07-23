@@ -1,0 +1,11 @@
+.git
+.gitignore
+.rollerskate
+coverage
+dev/.env
+node_modules
+**/dist
+**/node_modules
+*.db
+*.db-shm
+*.db-wal

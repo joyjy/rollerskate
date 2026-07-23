@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+.rollerskate/
+dev/.env
+dev/secrets/
+*.db
+*.db-shm
+*.db-wal
+.vite/
+/index.md

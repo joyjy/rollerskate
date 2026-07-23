@@ -1,0 +1,10 @@
+{
+  "transport": {
+    "kind": "command",
+    "executable": "/absolute/path/to/glab",
+    "project": "group/project",
+    "pipelineId": 123456,
+    "cwd": "/absolute/agent/workspace",
+    "environment": ["HOME", "PATH"]
+  }
+}

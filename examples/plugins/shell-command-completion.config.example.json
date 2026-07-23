@@ -1,0 +1,5 @@
+{
+  "commandId": "v0.3-shell-acceptance",
+  "probeExecutable": "/absolute/path/to/rollerskate/examples/probes/read-command-receipt",
+  "cwd": "/absolute/path/to/workspace"
+}
