@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
+import { formatDateTime } from "@/utils/format";
 import type { Subscription, SubscriptionStatus } from "@/types/subscription";
 import StatusBadge from "./StatusBadge.vue";
 
@@ -22,8 +23,7 @@ const hints: Record<SubscriptionStatus, Hint> = {
   failed: { title: "Failed", body: "Subscription 处理失败且已耗尽重试。", variant: "failed" },
   unknown: { title: "Unknown", body: "Provider 结果不明，UI 不提供可能重复 side effect 的 retry。", variant: "unknown" },
   cancelled: { title: "Cancelled", body: "Subscription 已被用户取消，不会再自动执行。", variant: "" },
-  expired: { title: "Expired", body: "Subscription 已超过 expiry 时间。", variant: "" },
-  revoked: { title: "Revoked", body: "关联 grant 已撤销，Subscription 不再有效。", variant: "failed" }
+  expired: { title: "Expired", body: "Subscription 已超过 expiry 时间。", variant: "" }
 };
 
 const hint = computed(() => hints[props.subscription.status]);
@@ -31,12 +31,10 @@ const hint = computed(() => hints[props.subscription.status]);
 const canPause = computed(() => props.subscription.status === "active");
 const canResume = computed(() => props.subscription.status === "paused");
 const canCancel = computed(() => ["active", "paused"].includes(props.subscription.status));
-const canRevoke = computed(() => ["active", "paused"].includes(props.subscription.status));
 const busy = ref(false);
 
-const formatTime = (iso: string) => new Date(iso).toLocaleString("zh-CN", { hour12: false });
 
-async function act(action: "pause" | "resume" | "cancel" | "revoke") {
+async function act(action: "pause" | "resume" | "cancel") {
   busy.value = true;
   try {
     const response = await fetch(`/api/subscriptions/${encodeURIComponent(props.subscription.id)}/${action}`, {
@@ -62,22 +60,25 @@ async function act(action: "pause" | "resume" | "cancel" | "revoke") {
     <dl class="mini-kv">
       <dt>Status</dt>
       <dd><StatusBadge :status="subscription.status" /></dd>
-      <dt>Session</dt>
-      <dd>{{ subscription.sessionId }}</dd>
+      <dt>Owner</dt>
+      <dd>@{{ subscription.owner.handle }} · {{ subscription.owner.client }}</dd>
+      <dt>Provider Session</dt>
+      <dd>{{ subscription.callback.providerSessionId }}</dd>
+      <dt>Local Session</dt>
+      <dd>{{ subscription.callback.localSessionId ?? "pending terminal fire" }}</dd>
       <dt>Plugin</dt>
       <dd>{{ subscription.plugin.id }}</dd>
       <dt>Fire Event</dt>
       <dd>{{ subscription.fireEventId ?? "pending" }}</dd>
       <dt>Updated</dt>
-      <dd>{{ formatTime(subscription.updatedAt) }}</dd>
+      <dd>{{ formatDateTime(subscription.updatedAt) }}</dd>
     </dl>
 
     <div class="section-title">Actions</div>
     <div class="actions">
-      <button class="primary" :disabled="busy || !canPause" @click="act('pause')">Pause</button>
-      <button :disabled="busy || !canResume" @click="act('resume')">Resume</button>
-      <button class="warning" :disabled="busy || !canCancel" @click="act('cancel')">Cancel</button>
-      <button class="danger" :disabled="busy || !canRevoke" @click="act('revoke')">Revoke</button>
+      <button class="primary-button action-button" :disabled="busy || !canPause" @click="act('pause')">Pause</button>
+      <button class="secondary-button action-button" :disabled="busy || !canResume" @click="act('resume')">Resume</button>
+      <button class="secondary-button warning action-button" :disabled="busy || !canCancel" @click="act('cancel')">Cancel</button>
     </div>
   </div>
 </template>
@@ -140,54 +141,7 @@ async function act(action: "pause" | "resume" | "cancel" | "revoke") {
   margin-top: 16px;
 }
 
-button {
-  appearance: none;
-  border: 1px solid var(--border);
-  background: var(--surface);
-  color: var(--text);
-  padding: 9px 14px;
-  border-radius: 6px;
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: background 0.15s, border-color 0.15s;
+.action-button {
   text-align: left;
-}
-
-button:hover {
-  background: var(--bg);
-}
-
-button.primary {
-  background: var(--primary);
-  border-color: var(--primary);
-  color: #fff;
-}
-
-button.primary:hover {
-  background: #1d4ed8;
-}
-
-button.danger {
-  color: var(--danger);
-  border-color: var(--danger);
-}
-
-button.danger:hover {
-  background: var(--danger-soft);
-}
-
-button.warning {
-  color: var(--warning);
-  border-color: var(--warning);
-}
-
-button.warning:hover {
-  background: var(--warning-soft);
-}
-
-button:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
 }
 </style>

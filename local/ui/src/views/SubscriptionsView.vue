@@ -46,10 +46,10 @@ function updateSubscription(updated: Subscription) {
 </script>
 
 <template>
-  <div v-if="loading" class="empty-state">Loading durable Subscriptions…</div>
-  <div v-else-if="error" class="empty-state error">Failed to load Subscriptions: {{ error }}</div>
-  <div v-else-if="!selected" class="empty-state">No Subscription is registered.</div>
-  <div v-else class="subscriptions-layout">
+  <div v-if="loading" class="state">Loading durable Subscriptions…</div>
+  <div v-else-if="error" class="state error">Failed to load Subscriptions: {{ error }}</div>
+  <div v-else-if="!selected" class="state">No Subscription is registered.</div>
+  <div v-else class="subscriptions-layout layout-base gap-lg layout-three-pane-wide">
     <div class="panel">
       <div class="panel-header">Subscriptions</div>
       <SubscriptionList
@@ -71,26 +71,7 @@ function updateSubscription(updated: Subscription) {
 </template>
 
 <style scoped>
-.subscriptions-layout {
-  display: grid;
-  grid-template-columns: 280px 1fr 300px;
-  gap: 20px;
-  max-width: 1500px;
-  margin: 0 auto;
-  align-items: start;
-}
-
-.empty-state {
-  max-width: 1500px;
-  margin: 0 auto;
-  padding: 32px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  color: var(--text-secondary);
-}
-
-.empty-state.error { color: var(--danger); }
+.subscriptions-layout { grid-template-columns: 280px 1fr 300px; }
 
 @media (max-width: 1100px) {
   .subscriptions-layout {

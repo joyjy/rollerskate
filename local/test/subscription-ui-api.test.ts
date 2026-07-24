@@ -5,6 +5,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import test from "node:test";
 
+import { LocalFoundationStore } from "../src/application/local-foundation.js";
 import type { CreatePollSubscription } from "../src/capabilities/subscription/model.js";
 import { PollSubscriptionStore } from "../src/capabilities/subscription/store.js";
 import { startUiServer } from "../src/entrypoints/console/launcher.js";
@@ -13,10 +14,15 @@ import { RuntimeStore } from "../src/core/runtime/store.js";
 test("loopback UI API reads durable Subscriptions and applies explicit control actions", async () => {
   const directory = mkdtempSync(join(tmpdir(), "rollerskate-subscription-ui-"));
   const database = join(directory, "runtime.db");
-  const sessionId = seedSession(database, directory);
+  const ownerAgentId = seedAgent(database);
+  const sessionId = seedSession(database, directory, ownerAgentId);
   const store = new PollSubscriptionStore(database);
+  let subscriptionId = "";
   try {
-    store.create(subscription(directory, sessionId), "2026-07-22T10:00:00.000Z");
+    subscriptionId = store.create(
+      subscription(directory, ownerAgentId, sessionId),
+      "2026-07-22T10:00:00.000Z"
+    ).subscriptionId;
   } finally {
     store.close();
   }
@@ -39,7 +45,7 @@ test("loopback UI API reads durable Subscriptions and applies explicit control a
       subscriptions: { active: number };
     };
     assert.equal(runtimeView.status, "degraded");
-    assert.equal(runtimeView.version, "0.3.0");
+    assert.equal(runtimeView.version, "0.3.1");
     assert.equal(runtimeView.subscriptions.active, 1);
     assert.ok(runtimeView.workload.queuedExecutions >= 0);
     const rejectedRuntimeControl = await fetch(`${origin}/api/runtime/pause`, { method: "POST" });
@@ -95,27 +101,71 @@ test("loopback UI API reads durable Subscriptions and applies explicit control a
 
     const list = await fetch(`${origin}/api/subscriptions`);
     assert.equal(list.status, 200);
-    const items = await list.json() as Array<{ id: string; status: string; plugin: { id: string } }>;
-    assert.deepEqual(items.map((item) => ({ id: item.id, status: item.status, plugin: item.plugin.id })), [
-      { id: "sub-ui-1", status: "active", plugin: "fixture" }
+    const items = await list.json() as Array<{
+      id: string;
+      status: string;
+      owner: { agentId: string; handle: string; client: string };
+      callback: {
+        providerSessionId: string;
+        adapterId: string;
+        workspace: string;
+        localSessionId: string | null;
+        prompt: string;
+      };
+      plugin: { id: string };
+    }>;
+    assert.deepEqual(items.map((item) => ({
+      id: item.id,
+      status: item.status,
+      owner: item.owner,
+      callback: item.callback,
+      plugin: item.plugin.id
+    })), [{
+      id: subscriptionId,
+      status: "active",
+      owner: { agentId: ownerAgentId, handle: "alice", client: "codex" },
+      callback: {
+        providerSessionId: "provider-session-ui",
+        adapterId: "fake-agent-v1",
+        workspace: directory,
+        localSessionId: sessionId,
+        prompt: "Report the result."
+      },
+      plugin: "fixture"
+    }
     ]);
-    const rejected = await fetch(`${origin}/api/subscriptions/sub-ui-1/pause`, { method: "POST" });
+    const rejected = await fetch(
+      `${origin}/api/subscriptions/${subscriptionId}/pause`,
+      { method: "POST" }
+    );
     assert.equal(rejected.status, 403);
-    const paused = await fetch(`${origin}/api/subscriptions/sub-ui-1/pause`, {
+    const paused = await fetch(`${origin}/api/subscriptions/${subscriptionId}/pause`, {
       method: "POST",
       headers: { "X-Rollerskate-Request": "console" }
     });
     assert.equal(paused.status, 200);
     assert.equal((await paused.json() as { status: string }).status, "paused");
+    const removedRevoke = await fetch(
+      `${origin}/api/subscriptions/${subscriptionId}/revoke`,
+      {
+        method: "POST",
+        headers: { "X-Rollerskate-Request": "console" }
+      }
+    );
+    assert.equal(removedRevoke.status, 405);
   } finally {
     controller.abort();
     await server.close();
   }
 });
 
-function subscription(workspaceRoot: string, sessionId: string): CreatePollSubscription {
+function subscription(
+  workspaceRoot: string,
+  ownerAgentId: string,
+  sessionId: string
+): CreatePollSubscription {
   return {
-    subscriptionId: "sub-ui-1",
+    ownerAgentId,
     pluginPath: join(workspaceRoot, "plugin.ts"),
     pluginId: "fixture",
     pluginSchemaVersion: 1,
@@ -131,23 +181,40 @@ function subscription(workspaceRoot: string, sessionId: string): CreatePollSubsc
     intervalMilliseconds: 1_000,
     maxWaitMilliseconds: 60_000,
     maxAttempts: 10,
-    callback: { sessionId, prompt: "Report the result." }
+    callback: {
+      providerSessionId: "provider-session-ui",
+      adapterId: "fake-agent-v1",
+      workspace: workspaceRoot,
+      localSessionId: sessionId,
+      prompt: "Report the result."
+    }
   };
 }
 
-function seedSession(database: string, workspace: string): string {
+function seedAgent(database: string): string {
+  const foundation = new LocalFoundationStore(database);
+  try {
+    return foundation.addAgent("alice", "codex").principalId;
+  } finally {
+    foundation.close();
+  }
+}
+
+function seedSession(database: string, workspace: string, ownerAgentId: string): string {
   const runtime = new RuntimeStore(database);
   try {
     runtime.appendEvent({
-      type: "agent.request", source: { kind: "cli" }, agentId: "agent-1", prompt: "seed"
+      type: "agent.request", source: { kind: "cli" }, agentId: ownerAgentId, prompt: "seed"
     });
     const execution = runtime.claimDueExecutions()[0]!;
-    return runtime.completeExecution(execution.executionId, {
+    const result = runtime.completeExecution(execution.executionId, {
       adapterId: "fake-agent-v1",
       workspace,
       providerSessionId: "provider-session-ui",
       output: "seeded"
-    }).sessionId!;
+    });
+    assert.equal(result?.type, "agent.result");
+    return result.sessionId!;
   } finally {
     runtime.close();
   }

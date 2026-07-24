@@ -5,7 +5,14 @@ export const mockSubscriptions: Subscription[] = [
   {
     id: "sub-2f8a9e1c",
     status: "active",
-    sessionId: "sess-1111-2222",
+    owner: { agentId: "prn-alice", handle: "alice", client: "codex" },
+    callback: {
+      providerSessionId: "provider-codex-1111",
+      adapterId: "codex-runtime-jsonl-v1",
+      workspace: "/workspace",
+      localSessionId: "ses_1111-2222",
+      prompt: "任务完成后，总结当前 Room 上下文并给出下一步建议。"
+    },
     plugin: { id: "ticktick-completed", path: "examples/plugins/ticktick.ts", schemaVersion: 1 },
     schedule: {
       intervalMilliseconds: 30000,
@@ -22,7 +29,6 @@ export const mockSubscriptions: Subscription[] = [
       timeoutMilliseconds: 5000,
       maxOutputBytes: 65536
     },
-    prompt: "任务完成后，总结当前 Room 上下文并给出下一步建议。",
     createdAt: "2026-07-21T09:12:00Z",
     updatedAt: "2026-07-21T09:12:00Z",
     fireEventId: null,
@@ -31,7 +37,14 @@ export const mockSubscriptions: Subscription[] = [
   {
     id: "sub-9b4d21f7",
     status: "paused",
-    sessionId: "sess-3333-4444",
+    owner: { agentId: "prn-bob", handle: "bob", client: "codex" },
+    callback: {
+      providerSessionId: "provider-codex-3333",
+      adapterId: "codex-runtime-jsonl-v1",
+      workspace: "/workspace",
+      localSessionId: "ses_3333-4444",
+      prompt: "Bug 修复后，在 Room 中更新进展。"
+    },
     plugin: { id: "ticktick-completed", path: "examples/plugins/ticktick.ts", schemaVersion: 1 },
     schedule: {
       intervalMilliseconds: 60000,
@@ -48,7 +61,6 @@ export const mockSubscriptions: Subscription[] = [
       timeoutMilliseconds: 5000,
       maxOutputBytes: 65536
     },
-    prompt: "Bug 修复后，在 Room 中更新进展。",
     createdAt: "2026-07-20T16:45:00Z",
     updatedAt: "2026-07-21T08:30:00Z",
     fireEventId: null,
@@ -57,7 +69,14 @@ export const mockSubscriptions: Subscription[] = [
   {
     id: "sub-77e3c5a0",
     status: "running",
-    sessionId: "sess-1111-2222",
+    owner: { agentId: "prn-alice", handle: "alice", client: "codex" },
+    callback: {
+      providerSessionId: "provider-codex-1111",
+      adapterId: "codex-runtime-jsonl-v1",
+      workspace: "/workspace",
+      localSessionId: "ses_1111-2222",
+      prompt: "任务完成后，总结当前 Room 上下文并给出下一步建议。"
+    },
     plugin: { id: "ticktick-completed", path: "examples/plugins/ticktick.ts", schemaVersion: 1 },
     schedule: {
       intervalMilliseconds: 30000,
@@ -74,7 +93,6 @@ export const mockSubscriptions: Subscription[] = [
       timeoutMilliseconds: 5000,
       maxOutputBytes: 65536
     },
-    prompt: "任务完成后，总结当前 Room 上下文并给出下一步建议。",
     createdAt: "2026-07-21T07:00:00Z",
     updatedAt: "2026-07-21T10:05:00Z",
     fireEventId: null,
@@ -83,7 +101,14 @@ export const mockSubscriptions: Subscription[] = [
   {
     id: "sub-11aa88dd",
     status: "completed",
-    sessionId: "sess-5555-6666",
+    owner: { agentId: "prn-carol", handle: "carol", client: "codex" },
+    callback: {
+      providerSessionId: "provider-codex-5555",
+      adapterId: "codex-runtime-jsonl-v1",
+      workspace: "/workspace",
+      localSessionId: "ses_5555-6666",
+      prompt: "部署任务完成后，输出部署摘要。"
+    },
     plugin: { id: "ticktick-completed", path: "examples/plugins/ticktick.ts", schemaVersion: 1 },
     schedule: {
       intervalMilliseconds: 60000,
@@ -100,7 +125,6 @@ export const mockSubscriptions: Subscription[] = [
       timeoutMilliseconds: 5000,
       maxOutputBytes: 65536
     },
-    prompt: "部署任务完成后，输出部署摘要。",
     createdAt: "2026-07-19T14:20:00Z",
     updatedAt: "2026-07-20T09:10:00Z",
     fireEventId: "evt-subscription-fire-3300",
@@ -109,7 +133,14 @@ export const mockSubscriptions: Subscription[] = [
   {
     id: "sub-cc4433aa",
     status: "unknown",
-    sessionId: "sess-1111-2222",
+    owner: { agentId: "prn-alice", handle: "alice", client: "codex" },
+    callback: {
+      providerSessionId: "provider-codex-1111",
+      adapterId: "codex-runtime-jsonl-v1",
+      workspace: "/workspace",
+      localSessionId: null,
+      prompt: "任务完成后，总结当前 Room 上下文并给出下一步建议。"
+    },
     plugin: { id: "ticktick-completed", path: "examples/plugins/ticktick.ts", schemaVersion: 1 },
     schedule: {
       intervalMilliseconds: 30000,
@@ -126,7 +157,6 @@ export const mockSubscriptions: Subscription[] = [
       timeoutMilliseconds: 5000,
       maxOutputBytes: 65536
     },
-    prompt: "任务完成后，总结当前 Room 上下文并给出下一步建议。",
     createdAt: "2026-07-21T06:00:00Z",
     updatedAt: "2026-07-21T09:50:00Z",
     fireEventId: null,
@@ -135,7 +165,14 @@ export const mockSubscriptions: Subscription[] = [
   {
     id: "sub-55ff1122",
     status: "cancelled",
-    sessionId: "sess-3333-4444",
+    owner: { agentId: "prn-bob", handle: "bob", client: "codex" },
+    callback: {
+      providerSessionId: "provider-codex-3333",
+      adapterId: "codex-runtime-jsonl-v1",
+      workspace: "/workspace",
+      localSessionId: "ses_3333-4444",
+      prompt: "任务取消后不再续接。"
+    },
     plugin: { id: "ticktick-completed", path: "examples/plugins/ticktick.ts", schemaVersion: 1 },
     schedule: {
       intervalMilliseconds: 60000,
@@ -152,7 +189,6 @@ export const mockSubscriptions: Subscription[] = [
       timeoutMilliseconds: 5000,
       maxOutputBytes: 65536
     },
-    prompt: "任务取消后不再续接。",
     createdAt: "2026-07-18T11:00:00Z",
     updatedAt: "2026-07-19T10:20:00Z",
     fireEventId: null,
@@ -310,12 +346,12 @@ export const mockEventAudits: RuntimeAudit[] = [
           createdAt: "2026-07-23T04:37:50Z",
           attemptedAt: "2026-07-23T04:37:50Z",
           deliveredAt: "2026-07-23T04:37:51Z",
-          receipt: "m.room.message/$xyz"
+          receipt: "m.chat.message/$xyz"
         },
         destination: {
           destinationId: "!room-planning:example.com",
           kind: "matrix",
-          address: { roomId: "!room-planning:example.com" }
+          address: { topicId: "!room-planning:example.com" }
         }
       }
     ],
@@ -395,7 +431,7 @@ export const mockEventAudits: RuntimeAudit[] = [
         destination: {
           destinationId: "!room-deploy:example.com",
           kind: "matrix",
-          address: { roomId: "!room-deploy:example.com" }
+          address: { topicId: "!room-deploy:example.com" }
         }
       }
     ],
@@ -599,12 +635,12 @@ export const mockEventAudits: RuntimeAudit[] = [
           createdAt: "2026-07-23T04:37:50Z",
           attemptedAt: "2026-07-23T04:37:50Z",
           deliveredAt: "2026-07-23T04:37:51Z",
-          receipt: "m.room.message/$xyz"
+          receipt: "m.chat.message/$xyz"
         },
         destination: {
           destinationId: "!room-planning:example.com",
           kind: "matrix",
-          address: { roomId: "!room-planning:example.com" }
+          address: { topicId: "!room-planning:example.com" }
         }
       }
     ],

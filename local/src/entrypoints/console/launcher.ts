@@ -15,6 +15,20 @@ import {
 } from "../../application/runtime-console.js";
 import { reconcileRuntime, setLoopPaused } from "../../application/loop-control.js";
 import { runtimeTrace, runtimeTraces } from "../../application/runtime-audit.js";
+import {
+  addLocalAgent,
+  agentConsoleList,
+  localRuntimeSnapshot,
+  renameLocalAgent,
+  resumeLocalAgent,
+  suspendLocalAgent
+} from "../../application/local-agent-control.js";
+import {
+  dispatchLocalChatMessage,
+  localChatView,
+  postLocalChatMessage,
+  rotateLocalAgentSession
+} from "../../application/local-chat-control.js";
 
 export interface UiServerOptions {
   readonly repoRoot: string;
@@ -87,6 +101,33 @@ function startStaticServer(options: StaticStartOptions): Promise<UiServerHandle>
         );
         return;
       }
+      if (url.pathname === "/api/local" || url.pathname === "/api/agents" ||
+        url.pathname.startsWith("/api/agents/")) {
+        void serveLocalAgentApi(
+          options.repoRoot,
+          options.runtimeDirectory,
+          request,
+          request.headers["x-rollerskate-request"],
+          url,
+          response
+        );
+        return;
+      }
+      if (url.pathname === "/api/chat" || url.pathname.startsWith("/api/chat/")) {
+        void serveLocalChatApi(
+          options.repoRoot,
+          options.runtimeDirectory,
+          request,
+          request.headers["x-rollerskate-request"],
+          url,
+          response
+        );
+        return;
+      }
+      if (url.pathname === "/api" || url.pathname.startsWith("/api/")) {
+        json(response, 404, { error: "not_found" });
+        return;
+      }
       let pathname = decodeURIComponent(url.pathname);
       if (pathname === "/") pathname = "/index.html";
       if (pathname === "/console/") pathname = "/console/index.html";
@@ -136,6 +177,160 @@ function startStaticServer(options: StaticStartOptions): Promise<UiServerHandle>
 
     server.once("error", (error) => rejectPromise(error));
   });
+}
+
+async function serveLocalChatApi(
+  repoRoot: string,
+  runtimeDirectory: string | undefined,
+  request: import("node:http").IncomingMessage,
+  requestMarker: string | readonly string[] | undefined,
+  url: URL,
+  response: import("node:http").ServerResponse
+): Promise<void> {
+  const method = request.method ?? "GET";
+  const options = runtimeDirectory === undefined ? {} : { runtimeDirectory };
+  try {
+    if (url.pathname === "/api/chat" && method === "GET") {
+      json(response, 200, localChatView(repoRoot, options));
+      return;
+    }
+    if (requestMarker !== "console") {
+      json(response, 403, { error: "console_request_marker_required" });
+      return;
+    }
+    if (url.pathname === "/api/chat/messages" && method === "POST") {
+      const body = await readJsonBody(request);
+      json(response, 201, postLocalChatMessage(
+        repoRoot,
+        requireString(body, "body"),
+        options
+      ));
+      return;
+    }
+    const parts = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+    if (method === "POST" && parts.length === 5 &&
+      parts[1] === "chat" && parts[2] === "messages" && parts[4] === "dispatch") {
+      const body = await readJsonBody(request);
+      json(response, 200, dispatchLocalChatMessage(
+        repoRoot,
+        parts[3]!,
+        requireString(body, "principalId"),
+        options
+      ));
+      return;
+    }
+    if (method === "POST" && parts.length === 5 &&
+      parts[1] === "chat" && parts[2] === "agents" && parts[4] === "new-session") {
+      json(response, 200, {
+        generation: rotateLocalAgentSession(repoRoot, parts[3]!, options)
+      });
+      return;
+    }
+    json(response, method === "GET" ? 404 : 405, {
+      error: method === "GET" ? "not_found" : "method_not_allowed"
+    });
+  } catch (error) {
+    json(response, 400, { error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function serveLocalAgentApi(
+  repoRoot: string,
+  runtimeDirectory: string | undefined,
+  request: import("node:http").IncomingMessage,
+  requestMarker: string | readonly string[] | undefined,
+  url: URL,
+  response: import("node:http").ServerResponse
+): Promise<void> {
+  const method = request.method ?? "GET";
+  const options = runtimeDirectory === undefined ? {} : { runtimeDirectory };
+  try {
+    if (url.pathname === "/api/local" && method === "GET") {
+      json(response, 200, localRuntimeSnapshot(repoRoot, options));
+      return;
+    }
+    if (url.pathname === "/api/agents" && method === "GET") {
+      json(response, 200, agentConsoleList(repoRoot, options));
+      return;
+    }
+    if (requestMarker !== "console") {
+      json(response, 403, { error: "console_request_marker_required" });
+      return;
+    }
+    if (url.pathname === "/api/agents" && method === "POST") {
+      const body = await readJsonBody(request);
+      const client = requireString(body, "client");
+      if (client !== "codex") {
+        throw new Error("client must be codex");
+      }
+      json(response, 201, addLocalAgent(
+        repoRoot,
+        requireString(body, "handle"),
+        client,
+        options
+      ));
+      return;
+    }
+    const parts = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+    const principalId = parts[2];
+    const action = parts[3];
+    if (method === "POST" && principalId !== undefined && action !== undefined &&
+      parts.length === 4) {
+      if (action === "rename") {
+        const body = await readJsonBody(request);
+        json(response, 200, renameLocalAgent(
+          repoRoot,
+          principalId,
+          requireString(body, "handle"),
+          options
+        ));
+        return;
+      }
+      if (action === "suspend") {
+        json(response, 200, suspendLocalAgent(repoRoot, principalId, options));
+        return;
+      }
+      if (action === "resume") {
+        json(response, 200, resumeLocalAgent(repoRoot, principalId, options));
+        return;
+      }
+    }
+    json(response, method === "GET" ? 404 : 405, {
+      error: method === "GET" ? "not_found" : "method_not_allowed"
+    });
+  } catch (error) {
+    json(response, 400, { error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function readJsonBody(
+  request: import("node:http").IncomingMessage
+): Promise<Readonly<Record<string, unknown>>> {
+  let body = "";
+  for await (const chunk of request) {
+    body += String(chunk);
+    if (Buffer.byteLength(body, "utf8") > 65_536) {
+      throw new Error("request_body_too_large");
+    }
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(body || "{}") as unknown;
+  } catch {
+    throw new Error("request_body_must_be_json");
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("request_body_must_be_object");
+  }
+  return value as Readonly<Record<string, unknown>>;
+}
+
+function requireString(value: Readonly<Record<string, unknown>>, field: string): string {
+  const candidate = value[field];
+  if (typeof candidate !== "string" || candidate.trim() === "") {
+    throw new Error(`${field} must be a non-empty string`);
+  }
+  return candidate;
 }
 
 function serveRuntimeApi(
@@ -238,7 +433,7 @@ function serveSubscriptionApi(
     const parts = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
     if (parts.length === 2 && method === "GET") {
       json(response, 200, listPollSubscriptions(repoRoot, runtimeDirectory)
-        .map(({ subscription }) => pollSubscriptionView(subscription)));
+        .map(pollSubscriptionView));
       return;
     }
     const subscriptionId = parts[2];
@@ -248,13 +443,13 @@ function serveSubscriptionApi(
     }
     if (parts.length === 3 && method === "GET") {
       json(response, 200, pollSubscriptionView(
-        inspectPollSubscription(repoRoot, subscriptionId, runtimeDirectory).subscription
+        inspectPollSubscription(repoRoot, subscriptionId, runtimeDirectory)
       ));
       return;
     }
     const action = parts[3];
     if (parts.length === 4 && method === "POST" &&
-      (action === "pause" || action === "resume" || action === "cancel" || action === "revoke")) {
+      (action === "pause" || action === "resume" || action === "cancel")) {
       if (requestMarker !== "console") {
         json(response, 403, { error: "console_request_marker_required" });
         return;
@@ -264,7 +459,7 @@ function serveSubscriptionApi(
         subscriptionId,
         action,
         runtimeDirectory
-      ).subscription;
+      );
       json(response, 200, pollSubscriptionView(subscription));
       return;
     }

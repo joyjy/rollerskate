@@ -4,23 +4,31 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { LocalFoundationStore } from "../src/application/local-foundation.js";
 import type { CreatePollSubscription } from "../src/capabilities/subscription/model.js";
 import { PollSubscriptionStore } from "../src/capabilities/subscription/store.js";
 import { RuntimeStore } from "../src/core/runtime/store.js";
 
 test("terminal observation atomically creates one subscription.fire Event", () => {
   const database = testDatabase();
-  const sessionId = seedSession(database);
+  const ownerAgentId = seedAgent(database);
+  const sessionId = seedSession(database, ownerAgentId);
   const store = new PollSubscriptionStore(database);
+  let subscriptionId = "";
   try {
-    store.create(subscription(sessionId), "2026-07-22T10:00:00.000Z");
-    store.beginAttempt("sub-1", "2026-07-22T10:00:00.000Z");
-    const first = store.recordObservation("sub-1", {
+    subscriptionId = store.create(
+      subscription(ownerAgentId, sessionId),
+      "2026-07-22T10:00:00.000Z"
+    ).subscriptionId;
+    assert.match(subscriptionId, /^sub_[0-9a-f-]+$/);
+    assert.deepEqual(store.due("2026-07-22T10:00:00.000Z"), []);
+    store.beginAttempt(subscriptionId, "2026-07-22T10:00:00.100Z");
+    const first = store.recordObservation(subscriptionId, {
       version: "plugin-internal-version",
       facts: { status: "success" },
       terminal: "success"
     }, "2026-07-22T10:00:01.000Z");
-    const duplicate = store.recordObservation("sub-1", {
+    const duplicate = store.recordObservation(subscriptionId, {
       version: "different-version-is-not-an-event-field",
       facts: { status: "success" },
       terminal: "success"
@@ -44,7 +52,7 @@ test("terminal observation atomically creates one subscription.fire Event", () =
       }]
       : []), [{
       type: "subscription.fire",
-      source: { kind: "subscription", externalId: "sub-1" },
+      source: { kind: "subscription", externalId: subscriptionId },
       sessionId,
       prompt: "Report completion.",
       destinationIds: []
@@ -56,11 +64,15 @@ test("terminal observation atomically creates one subscription.fire Event", () =
 
 test("non-terminal polls update durable schedule without creating Events", () => {
   const database = testDatabase();
-  const sessionId = seedSession(database);
+  const ownerAgentId = seedAgent(database);
+  const sessionId = seedSession(database, ownerAgentId);
   const store = new PollSubscriptionStore(database);
-  store.create(subscription(sessionId), "2026-07-22T10:00:00.000Z");
-  store.beginAttempt("sub-1", "2026-07-22T10:00:00.000Z");
-  store.recordObservation("sub-1", {
+  const subscriptionId = store.create(
+    subscription(ownerAgentId, sessionId),
+    "2026-07-22T10:00:00.000Z"
+  ).subscriptionId;
+  store.beginAttempt(subscriptionId, "2026-07-22T10:00:00.100Z");
+  store.recordObservation(subscriptionId, {
     version: "poll-debug-only",
     facts: { status: "running" },
     terminal: null
@@ -69,9 +81,12 @@ test("non-terminal polls update durable schedule without creating Events", () =>
 
   const restored = new PollSubscriptionStore(database);
   try {
-    assert.equal(restored.require("sub-1").status, "active");
-    assert.equal(restored.require("sub-1").nextPollAt, "2026-07-22T10:00:01.100Z");
-    assert.equal(restored.require("sub-1").fireEventId, undefined);
+    assert.equal(restored.require(subscriptionId).status, "active");
+    assert.equal(
+      restored.require(subscriptionId).nextPollAt,
+      "2026-07-22T10:00:01.100Z"
+    );
+    assert.equal(restored.require(subscriptionId).fireEventId, undefined);
   } finally {
     restored.close();
   }
@@ -85,12 +100,16 @@ test("non-terminal polls update durable schedule without creating Events", () =>
 
 test("cancelled Subscription never admits a fire Event", () => {
   const database = testDatabase();
-  const sessionId = seedSession(database);
+  const ownerAgentId = seedAgent(database);
+  const sessionId = seedSession(database, ownerAgentId);
   const store = new PollSubscriptionStore(database);
   try {
-    store.create(subscription(sessionId), "2026-07-22T10:00:00.000Z");
-    store.setStatus("sub-1", "cancel", "2026-07-22T10:00:01.000Z");
-    const recorded = store.recordObservation("sub-1", {
+    const subscriptionId = store.create(
+      subscription(ownerAgentId, sessionId),
+      "2026-07-22T10:00:00.000Z"
+    ).subscriptionId;
+    store.setStatus(subscriptionId, "cancel", "2026-07-22T10:00:01.000Z");
+    const recorded = store.recordObservation(subscriptionId, {
       version: "late-terminal",
       facts: {},
       terminal: "success"
@@ -104,17 +123,18 @@ test("cancelled Subscription never admits a fire Event", () => {
 
 test("Subscription becomes expired after maxWaitMilliseconds without firing", () => {
   const database = testDatabase();
-  const sessionId = seedSession(database);
+  const ownerAgentId = seedAgent(database);
+  const sessionId = seedSession(database, ownerAgentId);
   const store = new PollSubscriptionStore(database);
   try {
-    store.create({
-      ...subscription(sessionId),
+    const subscriptionId = store.create({
+      ...subscription(ownerAgentId, sessionId),
       maxWaitMilliseconds: 1_000
-    }, "2026-07-22T10:00:00.000Z");
+    }, "2026-07-22T10:00:00.000Z").subscriptionId;
 
     assert.deepEqual(store.due("2026-07-22T10:00:01.000Z"), []);
-    assert.equal(store.require("sub-1").status, "expired");
-    assert.equal(store.require("sub-1").fireEventId, undefined);
+    assert.equal(store.require(subscriptionId).status, "expired");
+    assert.equal(store.require(subscriptionId).fireEventId, undefined);
   } finally {
     store.close();
   }
@@ -130,31 +150,42 @@ function testDatabase(): string {
   return join(mkdtempSync(join(tmpdir(), "rollerskate-subscription-store-")), "runtime.db");
 }
 
-function seedSession(database: string): string {
+function seedAgent(database: string): string {
+  const foundation = new LocalFoundationStore(database);
+  try {
+    return foundation.addAgent("alice", "codex").principalId;
+  } finally {
+    foundation.close();
+  }
+}
+
+function seedSession(database: string, ownerAgentId: string): string {
   const runtime = new RuntimeStore(database);
   try {
     const appended = runtime.appendEvent({
       type: "agent.request",
       source: { kind: "cli", externalId: "session-seed" },
-      agentId: "agent-1",
+      agentId: ownerAgentId,
       prompt: "seed",
       createdAt: "2026-07-22T09:59:00.000Z"
     });
     const execution = runtime.claimDueExecutions(1, "2026-07-22T09:59:00.000Z")[0]!;
-    return runtime.completeExecution(execution.executionId, {
+    const result = runtime.completeExecution(execution.executionId, {
       adapterId: "fake-agent-v1",
       workspace: "/workspace",
       providerSessionId: "provider-session-1",
       output: "seeded"
-    }, "2026-07-22T09:59:01.000Z").sessionId!;
+    }, "2026-07-22T09:59:01.000Z");
+    assert.equal(result?.type, "agent.result");
+    return result.sessionId!;
   } finally {
     runtime.close();
   }
 }
 
-function subscription(sessionId: string): CreatePollSubscription {
+function subscription(ownerAgentId: string, sessionId: string): CreatePollSubscription {
   return {
-    subscriptionId: "sub-1",
+    ownerAgentId,
     pluginPath: "/workspace/plugin.ts",
     pluginId: "fixture-plugin",
     pluginSchemaVersion: 1,
@@ -170,6 +201,12 @@ function subscription(sessionId: string): CreatePollSubscription {
     intervalMilliseconds: 100,
     maxWaitMilliseconds: 60_000,
     maxAttempts: 10,
-    callback: { sessionId, prompt: "Report completion." }
+    callback: {
+      providerSessionId: "provider-session-1",
+      adapterId: "fake-agent-v1",
+      workspace: "/workspace",
+      localSessionId: sessionId,
+      prompt: "Report completion."
+    }
   };
 }

@@ -14,27 +14,30 @@ timestamp: 2026-07-17
 
 | 事实 | 权威系统 | Rollerskate 的其他层如何使用 |
 | --- | --- | --- |
-| 用户登录、设备 identity、Agent identity、Home placement | Server | Local 接收 desired placement，但保留本地执行否决权。 |
+| Local Owner/Agent Principal、LocalDevice、LocalWorkspace、`Local` Chat/Topic | Local Runtime SQLite/filesystem | 首次启动本地生成；未来 Server binding 不合并或替换 Local identity。 |
+| Server 用户登录、remote Device/Agent identity、Home placement | Server | Local 通过 connection-scoped binding 引用，保留本地执行否决权。 |
 | Matrix room、thread、sender、message history | Matrix | Adapter 保存最小 transport reference 与 delivery evidence。 |
 | 产品 identity、Agent、placement、Room/membership/binding 与产品 Event projection | Server | Client 和 Local 只保存当前操作需要的投影与引用。 |
-| Local execution Event、trust decision、work/lease/result/outbox | Local Runtime SQLite | 只对本机执行与恢复权威；payload 按 working-set retention 清理，不构成产品完整历史。 |
+| Local `chat.message`/`chat.dispatch` history、Topic ID、dispatch receipt、Execution/Session/Delivery | Local Runtime SQLite | 对唯一 `Local` Chat/Topic 与本机执行恢复权威；远端产品/聊天历史仍不在此复制。 |
 | Agent sandbox workspace | Local filesystem / owner | 是本地执行空间，不是 Server、Matrix 或 provider 数据的副本；Runtime 保存 canonical root 与授权引用。 |
 | 额外 path、secret grant、pause/stop decision | Local Runtime / owner | Server 可请求，不能自行授予或读取值。 |
 | Agent provider session/tool execution | Agent provider | Runtime 保存 invocation state、receipt 与必要摘要。 |
-| 用户聊天展示与待投递消息 | Server projection + Matrix transport | Local 仅暂存未消费内容、最小 reference、result 与 delivery receipt。 |
-| 当前架构事实 | `docs/architecture/` + source | 未实现计划不能覆盖已实现事实。 |
+| Local Chat 聊天展示 | Local immutable Event projection | Owner/system/Agent message 直接从 SQLite Event 投影，不存在可修改 message record。 |
+| Server Room 聊天展示与待投递消息 | Server projection + Matrix transport | Local 仅保存执行所需 reference、result 与 delivery receipt。 |
+| 当前架构事实 | `docs/architecture/` + source | Active plan 不能覆盖已实现事实。 |
 
 ## Data movement limits
 
-- Client 和 Local 不在本地保存 Server、Matrix 或 Agent provider 的完整信息副本；只保留当前操作与恢复需要的有界投影、引用和 payload。
+- Local 永久保存自身 `Local` Chat Event history；但不因此复制 Server Room、Matrix 或 Agent provider 的完整信息。
 - Server 不同步整个 workspace、Local SQLite、path grant 或 secret value。
 - Local 调用外部 Agent provider 时，只在明确 sandbox/cwd 与用户知情边界内发送完成请求所需上下文。
 - Matrix history 留在 Matrix；Local 只保存未消费 working set，以及幂等、correlation、trace 与 reply 所需的最小事实。
 - Agent 迁移到另一设备时，workspace 数据迁移与额外授权是显式流程，不由 placement 自动隐式复制。
 
-## Local retention classes
+## Remote working-set retention classes
 
-- 未消费消息正文：保留到 Attention Turn 消费、明确过期或被 Server 撤回。
+- 以下规则只适用于 Server/Matrix working set；Local `Local` 的 immutable Event history 按本地 Chat/Topic 事实长期保留。
+- 未消费 remote 消息正文：保留到 Attention Turn 消费、明确过期或被 Server 撤回。
 - 失败或待重试内容：保留到恢复完成或达到 bounded TTL。
 - 已消费内容：清除正文，只保留 remote event reference、hash、cursor、decision 与 receipt。
 - `delta.md` 等 context artifact：Attention Turn 结束后清理；需要历史时通过 Server BFF 查询 Matrix，而不是要求 Local 永久搜索。

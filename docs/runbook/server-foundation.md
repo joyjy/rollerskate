@@ -121,15 +121,8 @@ scripts/rs device logout
 
 `device login` 不接收 Server、Device name、Client 或 Agent 参数，只使用 `ROLLERSKATE_SERVER_URL` 或当前 Runtime 已保存的 Server；未配置时直接报错。它会打印 Provider 的 verification URI/user code，并按 discovery 返回的 interval 轮询 Rollerskate Server；设备显示名自动取本机 hostname。企业 `device_code`、OIDC token 与最终 Device credential 都不会出现在命令参数或日志中。credential 保存在 `.rollerskate/device-credential.json`，必须是普通 mode-0600 文件；SQLite 只保存元数据。`device logout` 在 Server revoke 成功后删除本地 credential；网络失败时保留文件，避免只做本地假退出。
 
-## 配置并创建 Agent
+## Legacy Agent enrollment 边界
 
-交互入口会在首次添加 Agent 时配置 workspace root，并询问 Agent name 与 Client。非交互入口仍可用于自动化；workspace root 只配置一次，必须是绝对路径：
+v0.3.1 的 `agent` namespace 已归属 Local Runtime；`agent create` 的 `--client` 只选择本地 adapter，不执行 Server Agent enrollment。`workspace set` 仍保留为 legacy Server workspace 配置入口，但不是 Local-first 主路径。
 
-```bash
-scripts/rs workspace set /absolute/path/to/agent-workspaces
-scripts/rs agent create alice --client codex
-scripts/rs agent list
-scripts/rs agent status alice
-```
-
-每个 Agent 使用当前 Device 完成 enrollment，不重复 Human OIDC 或 Device login。Local 在 workspace root 下建立 `<name>`，Agent credential 分别保存到 `.rollerskate/agent-credentials/<name>.json` 的 mode-0600 文件；`.rollerskate/runtime.db` 只保存 Agent、placement、credential ID 和 workspace path 元数据。`list` 使用 Device credential 读取本 Device inventory，`status <name>` 使用该 Agent 自己的 credential 验证 principal 与 active placement，两个命令都不打印 secret。
+当前全部命令和 Local/Server 分区见 [CLI Command Reference](./cli-reference.md)。

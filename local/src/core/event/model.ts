@@ -1,8 +1,14 @@
 import { randomBytes } from "node:crypto";
 
-export const eventTypes = ["agent.request", "subscription.fire", "agent.result"] as const;
+export const eventTypes = [
+  "agent.request",
+  "subscription.fire",
+  "agent.result",
+  "chat.message",
+  "chat.dispatch"
+] as const;
 export type EventType = (typeof eventTypes)[number];
-export type AgentInputEventType = Exclude<EventType, "agent.result">;
+export type AgentInputEventType = "agent.request" | "subscription.fire" | "chat.dispatch";
 
 export const eventSourceKinds = ["cli", "subscription", "matrix", "server", "handler"] as const;
 export type EventSourceKind = (typeof eventSourceKinds)[number];
@@ -22,7 +28,7 @@ interface EventBase {
   readonly eventId: string;
   readonly type: EventType;
   readonly source: EventSource;
-  readonly agentId: string;
+  readonly agentId?: string;
   readonly sessionId?: string;
   readonly destinationIds: readonly string[];
   readonly causality: EventCausality;
@@ -30,22 +36,55 @@ interface EventBase {
 }
 
 export interface AgentInputEvent extends EventBase {
-  readonly type: AgentInputEventType;
+  readonly type: Exclude<AgentInputEventType, "chat.dispatch">;
+  readonly agentId: string;
   readonly prompt: string;
 }
 
 export interface AgentResultEvent extends EventBase {
   readonly type: "agent.result";
+  readonly agentId: string;
   readonly outcome: "succeeded" | "failed";
   readonly output?: string;
   readonly error?: string;
 }
 
-export type Event = AgentInputEvent | AgentResultEvent;
+export interface ChatMessageEvent extends EventBase {
+  readonly type: "chat.message";
+  readonly topicId: string;
+  readonly sender: {
+    readonly kind: "owner" | "agent" | "system";
+    readonly principalId?: string;
+    readonly handleSnapshot: string;
+  };
+  readonly body: string;
+  readonly target?: {
+    readonly principalId: string;
+    readonly handleSnapshot: string;
+  };
+  readonly dispatchCard?: {
+    readonly sourceMessageEventId: string;
+    readonly candidates: readonly {
+      readonly principalId: string;
+      readonly handle: string;
+    }[];
+  };
+}
+
+export interface ChatDispatchEvent extends EventBase {
+  readonly type: "chat.dispatch";
+  readonly agentId: string;
+  readonly topicId: string;
+  readonly sourceMessageEventId: string;
+  readonly targetHandleSnapshot: string;
+  readonly prompt: string;
+}
+
+export type Event = AgentInputEvent | AgentResultEvent | ChatMessageEvent | ChatDispatchEvent;
 
 export interface CreateEvent {
   readonly eventId?: string;
-  readonly type: AgentInputEventType;
+  readonly type: Exclude<AgentInputEventType, "chat.dispatch">;
   readonly source: EventSource;
   readonly agentId: string;
   readonly prompt: string;
@@ -60,12 +99,20 @@ export interface CreateEvent {
   readonly maxAttempts?: number;
 }
 
-export function isAgentInputEvent(event: Event): event is AgentInputEvent {
-  return event.type !== "agent.result";
+export function isAgentInputEvent(
+  event: Event
+): event is AgentInputEvent | ChatDispatchEvent {
+  return event.type === "agent.request" ||
+    event.type === "subscription.fire" ||
+    event.type === "chat.dispatch";
 }
 
 export function isAgentResultEvent(event: Event): event is AgentResultEvent {
   return event.type === "agent.result";
+}
+
+export function isChatMessageEvent(event: Event): event is ChatMessageEvent {
+  return event.type === "chat.message";
 }
 
 export function newEventId(): string {

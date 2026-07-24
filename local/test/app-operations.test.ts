@@ -14,6 +14,7 @@ import { setupLocalRuntime } from "../src/application/runtime-config.js";
 
 test("doctor checks local state and exact Matrix identity without exposing the token", async () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-app-doctor-"));
+  const runtimeDirectory = join(repo, "runtime");
   try {
     const codex = join(repo, "codex");
     writeFileSync(codex, "fixture");
@@ -26,9 +27,10 @@ test("doctor checks local state and exact Matrix identity without exposing the t
       matrixAccessToken: "secret-token",
       projectRoot: repo,
       codexExecutable: codex
-    });
+    }, undefined, runtimeDirectory);
     let requests = 0;
     const result = await doctorLocalRuntime(repo, {
+      runtimeDirectory,
       fetch: async (input, init) => {
         requests += 1;
         assert.equal(
@@ -47,7 +49,7 @@ test("doctor checks local state and exact Matrix identity without exposing the t
     assert.equal(requests, 2);
     assert.equal(result.status, "ready");
     assert.equal(result.projectRoot, setup.config.projectRoot);
-    assert.equal(result.schemaVersion, 31);
+    assert.equal(result.schemaVersion, 34);
     assert.deepEqual(result.matrix, {
       homeserver: "https://matrix.example",
       roomId: "!room:example",

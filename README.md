@@ -2,43 +2,33 @@
 
 ![Rollerskate logo](assets/logo.png)
 
-Rollerskate 是由中心 Server 与用户设备上的 Local Runtime 组成的 Agent proactive system。`v0.3.0` 将本地执行收敛为 offline-first canonical Event core：所有固定 ingress 先构造 Event，`Event.type` 只路由到一个 Handler，Result 再按可选 Destination 投递；同时提供 one-shot poll Subscription 与 loopback Console 审计。当前产品入口是 `scripts/rs` CLI 与 `scripts/rs start` 打开的本地 UI。
+Rollerskate 是 Local-first Agent proactive system。`v0.3.1` 首次启动无需 Server、OIDC 或 Device enrollment：Runtime 自动建立全局 `~/.rollerskate/`、共享 LocalWorkspace、Owner Principal、唯一 `Local` Chat 与前台 loop。当前产品入口是 `scripts/rs start` 打开的本地 UI；Server/Matrix 路径保留为独立的可选远端控制面。
 
-## Terminal product
+## Local product
 
-每台电脑运行一个 Local Runtime，并只完成一次 Device login。推荐按 [CLI Quickstart](docs/runbook/quickstart.md) 使用可重复执行的单命令完成 Device、workspace、Agent、Room 和 loop 初始化：
-
-```bash
-export ROLLERSKATE_SERVER_URL=http://localhost:4100
-scripts/rs device login
-scripts/rs workspace set "$PWD/.rollerskate/agents"
-```
-
-同一个 Runtime 下可以继续添加多个 Codex Agent，不重复 Human OIDC 或 Device login：
+每台电脑运行一个 Local Runtime。启动后在 Agents 页面填写短 handle 并选择 client，即可创建 generated Principal ID 并进入唯一的 `Chats / Local`：
 
 ```bash
-scripts/rs workspace set "$PWD/.rollerskate/agents"
-scripts/rs agent create alice --client codex
 scripts/rs start
 ```
 
-默认 Runtime 位于当前仓库的 `.rollerskate`；`--runtime` 只用于确实需要隔离另一个设备运行实例或测试参与端的场景，不是 Agent/Client 名。Room 创建、成员邀请、Agent binding、Human send、history、Attention policy、status、trace、pause/resume 和 recovery 都有 CLI 入口。
-
-本地可在没有 Device、Room 或 Matrix 的情况下向已注册 Agent 发送 Event：
+也可以通过 CLI 管理 Local Agent：
 
 ```bash
-scripts/rs agent request alice "检查当前 workspace"
-scripts/rs trace <event-id>
+scripts/rs agent create alice --client codex
+scripts/rs agent rename alice helper
+scripts/rs agent suspend helper
+scripts/rs agent resume helper
 ```
 
-request 会先构造 `agent.request` Event，再由唯一 AgentHandler 处理；SQLite 与 Console 保存 Event → Execution → Result → Session → Delivery 审计链。
+Local Chat 的 Owner/system/Agent message 都是 immutable canonical Event。明确 `@agent` 会直接创建一次 dispatch；无 mention 时 loop 追加 durable 单选 card。Agent reply 直接成为 typed `chat.message`，每个 Agent 独立续接 current Session。默认 Runtime 是 `~/.rollerskate/`；`--runtime <absolute-path>` 用于显式隔离测试。
 
 ## 项目结构
 
 - `local/`：已实现的设备侧 Runtime package。
 - `server/`：Node.js/TypeScript BFF、企业 OIDC、Human/Device/Agent/Room 控制面、Matrix Application Service 与 MySQL 8 migration package。
 - `packages/protocol/`：Server/Local 共享的运行时 schema 与 TypeScript 类型。
-- `scripts/rs`：当前用户 CLI；`scripts/rollerskate` 保留为兼容入口。
+- `scripts/rs`：当前用户 CLI。
 - `docs/architecture/`：当前有效的系统边界、模块关系、不变量和 ADR。
 - `docs/runbook/`：运行与恢复步骤。
 
@@ -62,6 +52,8 @@ npm run dev:up
 ## 文档入口
 
 - [CLI Quickstart](docs/runbook/quickstart.md)
+- [CLI Command Reference](docs/runbook/cli-reference.md)
+- [Event Reference](docs/architecture/event-reference.md)
 - [Current architecture](docs/architecture/index.md)
 - [Source map](docs/architecture/source-map.md)
 - [Poll Subscription runbook](docs/runbook/subscriptions.md)

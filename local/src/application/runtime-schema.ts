@@ -3,6 +3,7 @@ import { LocalDeviceStore } from "../application/device/store.js";
 import { LocalAgentRegistryStore } from "../application/agent/registry-store.js";
 import { PollSubscriptionStore } from "../capabilities/subscription/store.js";
 import { RuntimeStore } from "../core/runtime/store.js";
+import { LocalFoundationStore } from "./local-foundation.js";
 
 export interface RuntimeDiagnostics {
   readonly schemaVersion: number;
@@ -19,11 +20,13 @@ export function initializeRuntimeSchema(databasePath: string): RuntimeDiagnostic
   agents.close();
   const subscriptions = new PollSubscriptionStore(databasePath);
   subscriptions.close();
+  const foundation = new LocalFoundationStore(databasePath);
+  foundation.close();
   const writable = openRuntimeDatabase(databasePath);
   try {
     writable.prepare(`
-      INSERT INTO schema_meta (key, value) VALUES ('schema_version', '31')
-      ON CONFLICT(key) DO UPDATE SET value = '31'
+      INSERT INTO schema_meta (key, value) VALUES ('schema_version', '34')
+      ON CONFLICT(key) DO UPDATE SET value = '34'
     `).run();
   } finally {
     writable.close();

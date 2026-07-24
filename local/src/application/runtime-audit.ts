@@ -55,23 +55,23 @@ function auditView(audit: RuntimeAudit, all: readonly RuntimeAudit[]): unknown {
     .map((candidate) => ({
       eventId: candidate.event.eventId,
       type: candidate.event.type,
-      status: candidate.execution.status
+      status: candidate.execution?.status ?? "recorded"
     }));
   const timestamps = [
     audit.event.createdAt,
-    audit.execution.updatedAt,
+    audit.execution?.updatedAt,
     audit.resultEvent?.createdAt,
     audit.resultExecution?.updatedAt,
     ...audit.deliveries.map(({ delivery }) => delivery.updatedAt)
   ].filter((value): value is string => value !== undefined).sort();
-  const failure = audit.execution.status === "failed"
+  const failure = audit.execution?.status === "failed"
     ? audit.execution.lastError
     : audit.resultExecution?.status === "failed"
       ? audit.resultExecution.lastError
       : audit.deliveries.find(({ delivery }) => delivery.status === "failed")?.delivery.lastError;
   return {
     event,
-    execution: executionView(audit.execution),
+    execution: audit.execution === undefined ? null : executionView(audit.execution),
     ...(resultEvent === undefined ? {} : { resultEvent }),
     ...(audit.resultExecution === undefined
       ? {}
@@ -107,7 +107,7 @@ function auditView(audit: RuntimeAudit, all: readonly RuntimeAudit[]): unknown {
   };
 }
 
-function executionView(execution: RuntimeAudit["execution"]): unknown {
+function executionView(execution: NonNullable<RuntimeAudit["execution"]>): unknown {
   return {
     ...execution,
     firstStartedAt: execution.startedAt ?? null,

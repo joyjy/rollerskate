@@ -1,9 +1,9 @@
 <script setup lang="ts">
+import { formatDateTime } from "@/utils/format";
 import type { Subscription } from "@/types/subscription";
 import StatusBadge from "./StatusBadge.vue";
 
 defineProps<{ subscription: Subscription }>();
-const formatTime = (iso: string) => new Date(iso).toLocaleString("zh-CN", { hour12: false });
 </script>
 
 <template>
@@ -16,12 +16,20 @@ const formatTime = (iso: string) => new Date(iso).toLocaleString("zh-CN", { hour
 
     <div class="section-title">Registration</div>
     <dl class="kv">
-      <dt>Session</dt>
-      <dd class="mono">{{ subscription.sessionId }}</dd>
+      <dt>Owner</dt>
+      <dd>@{{ subscription.owner.handle }} · {{ subscription.owner.client }}</dd>
+      <dt>Provider Session</dt>
+      <dd class="mono">{{ subscription.callback.providerSessionId }}</dd>
+      <dt>Local Session</dt>
+      <dd class="mono">{{ subscription.callback.localSessionId ?? "materializes on terminal" }}</dd>
+      <dt>Adapter</dt>
+      <dd class="mono">{{ subscription.callback.adapterId }}</dd>
+      <dt>Workspace</dt>
+      <dd class="mono">{{ subscription.callback.workspace }}</dd>
       <dt>Prompt</dt>
-      <dd>{{ subscription.prompt }}</dd>
+      <dd>{{ subscription.callback.prompt }}</dd>
       <dt>Schedule</dt>
-      <dd>{{ subscription.schedule.attemptCount }}/{{ subscription.schedule.maxAttempts }} attempts · every {{ subscription.schedule.intervalMilliseconds }}ms · deadline {{ formatTime(subscription.schedule.deadlineAt) }}</dd>
+      <dd>{{ subscription.schedule.attemptCount }}/{{ subscription.schedule.maxAttempts }} attempts · every {{ subscription.schedule.intervalMilliseconds }}ms · deadline {{ formatDateTime(subscription.schedule.deadlineAt) }}</dd>
       <dt>Plugin</dt>
       <dd class="mono">{{ subscription.plugin.path }}</dd>
       <dt>Policy</dt>

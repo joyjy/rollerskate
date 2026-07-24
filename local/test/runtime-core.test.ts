@@ -70,7 +70,10 @@ test("unified core persists an offline Event through result Event and Matrix Del
           ...(input.providerSessionId === undefined ? {} : { providerSessionId: input.providerSessionId }),
           prompt: input.event.prompt
         });
-        return { providerSessionId: "provider-session-1", output: "finished" };
+        return {
+          providerSessionId: "provider-session-1",
+          outcome: { kind: "message", body: "finished" }
+        };
       }
     }, {
       async deliver(input) {
@@ -132,7 +135,7 @@ test("explicit local Session resumes exactly and a follow-up Event advances caus
         seenProviderSessions.push(input.providerSessionId);
         return {
           providerSessionId: input.providerSessionId ?? "provider-session-2",
-          output: "ok"
+          outcome: { kind: "message", body: "ok" }
         };
       }
     });
@@ -251,7 +254,10 @@ test("terminal ResultHandler failure does not recursively create result Events",
       adapterId: "fake-agent-v1",
       workspace: "/workspace",
       async invoke() {
-        return { providerSessionId: "provider-session-result-failure", output: "done" };
+        return {
+          providerSessionId: "provider-session-result-failure",
+          outcome: { kind: "message", body: "done" }
+        };
       }
     };
     const cycle = new RuntimeCycle({

@@ -12,7 +12,9 @@ export interface RuntimeRoute {
 const runtimeRoutes: Readonly<Record<EventType, RuntimeRoute>> = {
   "agent.request": { eventType: "agent.request", handler: "agent" },
   "subscription.fire": { eventType: "subscription.fire", handler: "agent" },
-  "agent.result": { eventType: "agent.result", handler: "result" }
+  "agent.result": { eventType: "agent.result", handler: "result" },
+  "chat.dispatch": { eventType: "chat.dispatch", handler: "agent" },
+  "chat.message": { eventType: "chat.message", handler: "result" }
 };
 
 export function runtimeRoute(eventType: EventType): RuntimeRoute {

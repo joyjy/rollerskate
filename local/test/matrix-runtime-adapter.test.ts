@@ -52,7 +52,7 @@ test("Matrix Room is an ingress and delivery destination and explicitly carries 
       providerSessions.push(input.providerSessionId);
       return {
         providerSessionId: input.providerSessionId ?? "provider-session-1",
-        output: `reply ${providerSessions.length}`
+        outcome: { kind: "message", body: `reply ${providerSessions.length}` }
       };
     }
   };

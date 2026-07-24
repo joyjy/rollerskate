@@ -2,6 +2,10 @@ import { realpathSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 
 import { runtimePaths } from "./runtime-config.js";
+import {
+  LocalFoundationStore,
+  type LocalAgent
+} from "./local-foundation.js";
 import type {
   CreatePollSubscription,
   PollSubscription,
@@ -11,12 +15,15 @@ import { PollSubscriptionStore } from "../capabilities/subscription/store.js";
 import { RuntimeStore } from "../core/runtime/store.js";
 
 export interface RegisterPollSubscriptionInput {
-  readonly subscriptionId: string;
+  readonly ownerAgentId: string;
   readonly pluginPath: string;
   readonly pluginId: string;
   readonly pluginConfig: unknown;
-  readonly sessionId: string;
-  readonly prompt: string;
+  readonly callback: {
+    readonly providerSessionId: string;
+    readonly workspace: string;
+    readonly prompt: string;
+  };
   readonly intervalMilliseconds: number;
   readonly maxWaitMilliseconds: number;
   readonly maxAttempts: number;
@@ -29,12 +36,24 @@ export interface RegisterPollSubscriptionInput {
 
 export interface PollSubscriptionInspection {
   readonly subscription: PollSubscription;
+  readonly owner: LocalAgent;
 }
 
 export interface PollSubscriptionView {
   readonly id: string;
   readonly status: PollSubscription["status"];
-  readonly sessionId: string;
+  readonly owner: {
+    readonly agentId: string;
+    readonly handle: string;
+    readonly client: LocalAgent["client"];
+  };
+  readonly callback: {
+    readonly providerSessionId: string;
+    readonly adapterId: string;
+    readonly workspace: string;
+    readonly localSessionId: string | null;
+    readonly prompt: string;
+  };
   readonly plugin: {
     readonly id: string;
     readonly path: string;
@@ -55,7 +74,6 @@ export interface PollSubscriptionView {
     readonly timeoutMilliseconds: number;
     readonly maxOutputBytes: number;
   };
-  readonly prompt: string;
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly fireEventId: string | null;
@@ -70,15 +88,34 @@ export function registerPollSubscription(
 ): PollSubscriptionInspection {
   const paths = runtimePaths(repoRoot, runtimeDirectory);
   const runtime = new RuntimeStore(paths.database);
+  const foundation = new LocalFoundationStore(paths.database);
   const subscriptions = new PollSubscriptionStore(paths.database);
   try {
-    const session = runtime.session(input.sessionId);
-    if (session === undefined) throw new Error(`Local Runtime Session not found: ${input.sessionId}`);
+    const owner = foundation.agent(input.ownerAgentId);
+    if (owner === undefined) throw new Error(`Local Agent not found: ${input.ownerAgentId}`);
+    if (owner.status !== "active") {
+      throw new Error(`Local Agent is not active: ${input.ownerAgentId}`);
+    }
+    const adapterId = "codex-runtime-jsonl-v1";
+    const workspace = canonicalDirectory(input.callback.workspace, "callback workspace");
+    const existingSession = runtime.sessionForProvider(
+      adapterId,
+      input.callback.providerSessionId
+    );
+    if (existingSession !== undefined && (
+      existingSession.agentId !== owner.principalId ||
+      existingSession.workspace !== workspace
+    )) {
+      throw new Error(
+        `Callback provider Session is already bound to another Agent or workspace: ` +
+        input.callback.providerSessionId
+      );
+    }
     const pluginPath = canonicalFile(input.pluginPath, "plugin");
     const allowedExecutables = input.allowedExecutables.map((path) => canonicalFile(path, "executable"));
     const allowedHttpOrigins = input.allowedHttpOrigins.map(canonicalOrigin);
     const policy: ProbeExecutionPolicy = {
-      workspaceRoot: session.workspace,
+      workspaceRoot: workspace,
       allowedHttpOrigins: [...new Set(allowedHttpOrigins)],
       allowedExecutables: [...new Set(allowedExecutables)],
       allowedEnvironment: [...new Set(input.allowedEnvironment)],
@@ -86,7 +123,7 @@ export function registerPollSubscription(
       maxOutputBytes: input.maxOutputBytes
     };
     const create: CreatePollSubscription = {
-      subscriptionId: input.subscriptionId,
+      ownerAgentId: owner.principalId,
       pluginPath,
       pluginId: input.pluginId,
       pluginSchemaVersion: 1,
@@ -96,14 +133,20 @@ export function registerPollSubscription(
       maxWaitMilliseconds: input.maxWaitMilliseconds,
       maxAttempts: input.maxAttempts,
       callback: {
-        sessionId: session.sessionId,
-        prompt: input.prompt
+        providerSessionId: input.callback.providerSessionId,
+        adapterId,
+        workspace,
+        ...(existingSession === undefined
+          ? {}
+          : { localSessionId: existingSession.sessionId }),
+        prompt: input.callback.prompt
       }
     };
     const subscription = subscriptions.create(create, at);
-    return { subscription };
+    return { subscription, owner };
   } finally {
     subscriptions.close();
+    foundation.close();
     runtime.close();
   }
 }
@@ -112,10 +155,13 @@ export function listPollSubscriptions(
   repoRoot: string,
   runtimeDirectory?: string
 ): PollSubscriptionInspection[] {
-  const store = new PollSubscriptionStore(runtimePaths(repoRoot, runtimeDirectory).database);
+  const database = runtimePaths(repoRoot, runtimeDirectory).database;
+  const store = new PollSubscriptionStore(database);
+  const foundation = new LocalFoundationStore(database);
   try {
-    return store.list().map((subscription) => ({ subscription }));
+    return store.list().map((subscription) => inspection(subscription, foundation));
   } finally {
+    foundation.close();
     store.close();
   }
 }
@@ -125,11 +171,14 @@ export function inspectPollSubscription(
   subscriptionId: string,
   runtimeDirectory?: string
 ): PollSubscriptionInspection {
-  const store = new PollSubscriptionStore(runtimePaths(repoRoot, runtimeDirectory).database);
+  const database = runtimePaths(repoRoot, runtimeDirectory).database;
+  const store = new PollSubscriptionStore(database);
+  const foundation = new LocalFoundationStore(database);
   try {
     const subscription = store.require(subscriptionId);
-    return { subscription };
+    return inspection(subscription, foundation);
   } finally {
+    foundation.close();
     store.close();
   }
 }
@@ -137,23 +186,40 @@ export function inspectPollSubscription(
 export function controlPollSubscription(
   repoRoot: string,
   subscriptionId: string,
-  action: "pause" | "resume" | "cancel" | "revoke",
+  action: "pause" | "resume" | "cancel",
   runtimeDirectory?: string
 ): PollSubscriptionInspection {
-  const store = new PollSubscriptionStore(runtimePaths(repoRoot, runtimeDirectory).database);
+  const database = runtimePaths(repoRoot, runtimeDirectory).database;
+  const store = new PollSubscriptionStore(database);
+  const foundation = new LocalFoundationStore(database);
   try {
     const subscription = store.setStatus(subscriptionId, action);
-    return { subscription };
+    return inspection(subscription, foundation);
   } finally {
+    foundation.close();
     store.close();
   }
 }
 
-export function pollSubscriptionView(subscription: PollSubscription): PollSubscriptionView {
+export function pollSubscriptionView(
+  inspection: PollSubscriptionInspection
+): PollSubscriptionView {
+  const { owner, subscription } = inspection;
   return {
     id: subscription.subscriptionId,
     status: subscription.status,
-    sessionId: subscription.callback.sessionId,
+    owner: {
+      agentId: owner.principalId,
+      handle: owner.handle,
+      client: owner.client
+    },
+    callback: {
+      providerSessionId: subscription.callback.providerSessionId,
+      adapterId: subscription.callback.adapterId,
+      workspace: subscription.callback.workspace,
+      localSessionId: subscription.callback.localSessionId ?? null,
+      prompt: subscription.callback.prompt
+    },
     plugin: {
       id: subscription.pluginId,
       path: subscription.pluginPath,
@@ -174,7 +240,6 @@ export function pollSubscriptionView(subscription: PollSubscription): PollSubscr
       timeoutMilliseconds: subscription.policy.timeoutMilliseconds,
       maxOutputBytes: subscription.policy.maxOutputBytes
     },
-    prompt: subscription.callback.prompt,
     createdAt: subscription.createdAt,
     updatedAt: subscription.updatedAt,
     fireEventId: subscription.fireEventId ?? null,
@@ -182,10 +247,28 @@ export function pollSubscriptionView(subscription: PollSubscription): PollSubscr
   };
 }
 
+function inspection(
+  subscription: PollSubscription,
+  foundation: LocalFoundationStore
+): PollSubscriptionInspection {
+  const owner = foundation.agent(subscription.ownerAgentId);
+  if (owner === undefined) {
+    throw new Error(`Subscription owner Agent not found: ${subscription.ownerAgentId}`);
+  }
+  return { subscription, owner };
+}
+
 function canonicalFile(path: string, field: string): string {
   if (!isAbsolute(path)) throw new Error(`${field} path must be absolute`);
   const canonical = realpathSync(path);
   if (!statSync(canonical).isFile()) throw new Error(`${field} path must be a file`);
+  return canonical;
+}
+
+function canonicalDirectory(path: string, field: string): string {
+  if (!isAbsolute(path)) throw new Error(`${field} path must be absolute`);
+  const canonical = realpathSync(path);
+  if (!statSync(canonical).isDirectory()) throw new Error(`${field} path must be a directory`);
   return canonical;
 }
 

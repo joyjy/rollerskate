@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { LocalFoundationStore } from "../src/application/local-foundation.js";
 import { RuntimeCycle } from "../src/core/runtime/cycle.js";
 import {
   AgentHandler,
@@ -34,9 +35,13 @@ export default {
   }
 };
 `);
-  const sessionId = seedSession(database);
+  const ownerAgentId = seedAgent(database);
+  const sessionId = seedSession(database, ownerAgentId);
   const subscriptions = new PollSubscriptionStore(database);
-  subscriptions.create(subscription(sessionId, plugin), "2026-07-22T10:00:00.000Z");
+  subscriptions.create(
+    subscription(ownerAgentId, sessionId, plugin),
+    "2026-07-22T10:00:00.000Z"
+  );
   subscriptions.close();
   const polling = new PollSubscriptionRuntime({
     databasePath: database,
@@ -46,7 +51,7 @@ export default {
   });
 
   const polled = await polling.runCycle(new AbortController().signal,
-    "2026-07-22T10:00:00.000Z");
+    "2026-07-22T10:00:00.100Z");
   assert.equal(polled.polled.length, 1);
   assert.equal(polled.fired.length, 1);
   assert.equal(polled.failed.length, 0);
@@ -64,13 +69,19 @@ export default {
       workspace: "/workspace",
       async invoke(input) {
         resumed.push(input.providerSessionId);
-        return { providerSessionId: input.providerSessionId!, output: "subscription handled" };
+        return {
+          providerSessionId: input.providerSessionId!,
+          outcome: { kind: "message", body: "subscription handled" }
+        };
       }
     };
     const cycle = new RuntimeCycle({
       store: runtime,
       handlers: new Map<RuntimeHandlerKind, RuntimeEventHandler>([
-        ["agent", new AgentHandler({ store: runtime, adapters: new Map([["agent-1", adapter]]) })],
+        ["agent", new AgentHandler({
+          store: runtime,
+          adapters: new Map([[ownerAgentId, adapter]])
+        })],
         ["result", new ResultHandler(runtime)]
       ]),
       deliveryHandler: new DeliveryHandler({ store: runtime, adapters: new Map() })
@@ -86,13 +97,22 @@ export default {
   }
 });
 
-function seedSession(database: string): string {
+function seedAgent(database: string): string {
+  const foundation = new LocalFoundationStore(database);
+  try {
+    return foundation.addAgent("alice", "codex").principalId;
+  } finally {
+    foundation.close();
+  }
+}
+
+function seedSession(database: string, ownerAgentId: string): string {
   const runtime = new RuntimeStore(database);
   try {
     runtime.appendEvent({
       type: "agent.request",
       source: { kind: "cli", externalId: "session-seed" },
-      agentId: "agent-1",
+      agentId: ownerAgentId,
       prompt: "seed",
       createdAt: "2026-07-22T09:59:00.000Z"
     });
@@ -103,6 +123,7 @@ function seedSession(database: string): string {
       providerSessionId: "provider-session-1",
       output: "seeded"
     }, "2026-07-22T09:59:01.000Z");
+    assert.equal(resultEvent?.type, "agent.result");
     const resultExecution = runtime.claimDueExecutions(1, "2026-07-22T09:59:01.000Z")[0]!;
     runtime.completeResultExecution(resultExecution.executionId, "2026-07-22T09:59:01.000Z");
     return resultEvent.sessionId!;
@@ -111,9 +132,13 @@ function seedSession(database: string): string {
   }
 }
 
-function subscription(sessionId: string, pluginPath: string): CreatePollSubscription {
+function subscription(
+  ownerAgentId: string,
+  sessionId: string,
+  pluginPath: string
+): CreatePollSubscription {
   return {
-    subscriptionId: "sub-runtime-1",
+    ownerAgentId,
     pluginPath,
     pluginId: "fixture-plugin",
     pluginSchemaVersion: 1,
@@ -129,6 +154,12 @@ function subscription(sessionId: string, pluginPath: string): CreatePollSubscrip
     intervalMilliseconds: 100,
     maxWaitMilliseconds: 60_000,
     maxAttempts: 10,
-    callback: { sessionId, prompt: "Report completion." }
+    callback: {
+      providerSessionId: "provider-session-1",
+      adapterId: "fake-agent-v1",
+      workspace: "/workspace",
+      localSessionId: sessionId,
+      prompt: "Report completion."
+    }
   };
 }

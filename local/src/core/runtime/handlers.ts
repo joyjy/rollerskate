@@ -3,7 +3,9 @@ import {
   isAgentResultEvent,
   type AgentInputEvent,
   type AgentResultEvent,
-  type Event
+  type Event,
+  type ChatDispatchEvent,
+  type ChatMessageEvent
 } from "../event/model.js";
 import type {
   RuntimeExecution,
@@ -18,34 +20,50 @@ export interface RuntimeAgentAdapter {
   readonly adapterId: string;
   readonly workspace: string;
   invoke(input: {
-    readonly event: AgentInputEvent;
+    readonly event: AgentInputEvent | ChatDispatchEvent;
     readonly providerSessionId?: string;
   }): Promise<{
     readonly providerSessionId: string;
-    readonly output: string;
+    readonly outcome:
+      | { readonly kind: "message"; readonly body: string }
+      | { readonly kind: "silent" };
   }>;
 }
 
 export class AgentHandler {
   public readonly kind = "agent" as const;
-  readonly #adapters: ReadonlyMap<string, RuntimeAgentAdapter>;
+  readonly #adapterForAgent: (
+    agentId: string,
+    workspace?: string
+  ) => RuntimeAgentAdapter | undefined;
   readonly #store: RuntimeStore;
   readonly #retryBaseMilliseconds: number;
 
   public constructor(options: {
     readonly store: RuntimeStore;
-    readonly adapters: ReadonlyMap<string, RuntimeAgentAdapter>;
+    readonly adapters?: ReadonlyMap<string, RuntimeAgentAdapter>;
+    readonly adapterForAgent?: (
+      agentId: string,
+      workspace?: string
+    ) => RuntimeAgentAdapter | undefined;
     readonly retryBaseMilliseconds?: number;
   }) {
     this.#store = options.store;
-    this.#adapters = options.adapters;
+    if (options.adapters !== undefined && options.adapterForAgent !== undefined) {
+      throw new Error("AgentHandler accepts adapters or adapterForAgent, not both");
+    }
+    if (options.adapters === undefined && options.adapterForAgent === undefined) {
+      throw new Error("AgentHandler requires an Agent adapter source");
+    }
+    this.#adapterForAgent = options.adapterForAgent ??
+      ((agentId) => options.adapters!.get(agentId));
     this.#retryBaseMilliseconds = options.retryBaseMilliseconds ?? 1_000;
   }
 
   public async handle(
     execution: RuntimeExecution,
     at = new Date().toISOString()
-  ): Promise<AgentResultEvent | undefined> {
+  ): Promise<AgentResultEvent | ChatMessageEvent | undefined> {
     if (execution.handler !== "agent" || execution.status !== "running") {
       throw new Error(`AgentHandler cannot process Execution: ${execution.executionId}`);
     }
@@ -54,10 +72,14 @@ export class AgentHandler {
     if (!isAgentInputEvent(event)) {
       throw new Error(`AgentHandler requires an Agent input Event: ${event.eventId}`);
     }
-    const adapter = this.#adapters.get(event.agentId);
     try {
+      const sessionId = event.sessionId ??
+        (event.type === "chat.dispatch"
+          ? this.#store.currentLocalAgentSession(event.agentId)?.sessionId
+          : undefined);
+      const session = sessionId === undefined ? undefined : this.#session(sessionId);
+      const adapter = this.#adapterForAgent(event.agentId, session?.workspace);
       if (adapter === undefined) throw new Error(`Agent adapter not available: ${event.agentId}`);
-      const session = event.sessionId === undefined ? undefined : this.#session(event.sessionId);
       if (session !== undefined && (session.agentId !== event.agentId ||
         session.adapterId !== adapter.adapterId || session.workspace !== adapter.workspace)) {
         throw new Error(
@@ -75,7 +97,8 @@ export class AgentHandler {
         adapterId: adapter.adapterId,
         workspace: adapter.workspace,
         providerSessionId: receipt.providerSessionId,
-        output: receipt.output
+        ...(session === undefined ? {} : { sessionId: session.sessionId }),
+        ...(receipt.outcome.kind === "message" ? { output: receipt.outcome.body } : {})
       }, at);
     } catch (error) {
       return this.#store.failExecution(

@@ -10,6 +10,7 @@ import {
   unlinkSync,
   writeFileSync
 } from "node:fs";
+import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
 import { initializeRuntimeSchema } from "./runtime-schema.js";
@@ -49,6 +50,7 @@ export interface RuntimePaths {
   readonly agentConfig: string;
   readonly agentCredentials: string;
   readonly database: string;
+  readonly workspace: string;
   readonly logs: string;
   readonly daemonLog: string;
   readonly loopState: string;
@@ -76,7 +78,7 @@ export interface LoadedLocalRuntime {
 export function runtimePaths(repoRoot: string, configuredRuntimeDirectory?: string): RuntimePaths {
   const canonicalRoot = realpathSync(repoRoot);
   const runtimeDirectory = configuredRuntimeDirectory === undefined
-    ? join(canonicalRoot, ".rollerskate")
+    ? join(homedir(), ".rollerskate")
     : normalizeRuntimeDirectory(configuredRuntimeDirectory);
   const logs = join(runtimeDirectory, "logs");
   return {
@@ -88,6 +90,7 @@ export function runtimePaths(repoRoot: string, configuredRuntimeDirectory?: stri
     agentConfig: join(runtimeDirectory, "agent-config.json"),
     agentCredentials: join(runtimeDirectory, "agent-credentials"),
     database: join(runtimeDirectory, "runtime.db"),
+    workspace: join(runtimeDirectory, "workspace"),
     logs,
     daemonLog: join(logs, "daemon.log"),
     loopState: join(runtimeDirectory, "loop-state.json"),
@@ -113,9 +116,13 @@ function normalizeRuntimeDirectory(value: string): string {
 export function setupLocalRuntime(
   repoRoot: string,
   input: SetupInput,
-  setupAt = new Date().toISOString()
+  setupAt = new Date().toISOString(),
+  configuredRuntimeDirectory?: string
 ): LoadedLocalRuntime {
-  const paths = runtimePaths(repoRoot);
+  let paths = runtimePaths(repoRoot, configuredRuntimeDirectory);
+  mkdirSync(paths.runtimeDirectory, { recursive: true, mode: 0o700 });
+  chmodSync(paths.runtimeDirectory, 0o700);
+  paths = runtimePaths(repoRoot, paths.runtimeDirectory);
   const proposed = normalizeSetup(input, setupAt);
   let config = proposed;
   if (existsSync(paths.config)) {
@@ -124,8 +131,6 @@ export function setupLocalRuntime(
     config = existing;
   }
 
-  mkdirSync(paths.runtimeDirectory, { recursive: true, mode: 0o700 });
-  chmodSync(paths.runtimeDirectory, 0o700);
   mkdirSync(paths.logs, { recursive: true, mode: 0o700 });
   chmodSync(paths.logs, 0o700);
   initializeRuntimeSchema(paths.database);
@@ -137,8 +142,11 @@ export function setupLocalRuntime(
   return { paths, config, matrixAccessToken: input.matrixAccessToken };
 }
 
-export function loadLocalRuntime(repoRoot: string): LoadedLocalRuntime {
-  const paths = runtimePaths(repoRoot);
+export function loadLocalRuntime(
+  repoRoot: string,
+  configuredRuntimeDirectory?: string
+): LoadedLocalRuntime {
+  const paths = runtimePaths(repoRoot, configuredRuntimeDirectory);
   const config = readConfig(paths.config);
   const secret = readJson(paths.secrets) as { matrixAccessToken?: unknown };
   requireNonEmpty(secret.matrixAccessToken, "matrixAccessToken");

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
+import { formatDateTime } from "@/utils/format";
 import type { RuntimeAudit, RuntimeInfo } from "@/types/runtime";
 
 type Lifecycle = "queued" | "running" | "retrying" | "succeeded" | "failed" | "delivery_pending" | "delivered" | "delivery_failed";
@@ -7,7 +8,7 @@ type Lifecycle = "queued" | "running" | "retrying" | "succeeded" | "failed" | "d
 const audits = ref<RuntimeAudit[]>([]);
 const selectedEventId = ref("");
 const query = ref("");
-const filterType = ref<"all" | "agent.request" | "subscription.fire" | "agent.result">("all");
+const filterType = ref<"all" | RuntimeAudit["event"]["type"]>("all");
 const filterSource = ref<"all" | "cli" | "subscription" | "matrix" | "server" | "handler">("all");
 const filterLifecycle = ref<"all" | Lifecycle>("all");
 const filterAgent = ref<"all" | string>("all");
@@ -24,17 +25,21 @@ const runtime = ref<RuntimeInfo | null>(null);
 const runtimePaused = computed(() => runtime.value?.status === "paused");
 const runtimeStale = computed(() => runtime.value?.stale ?? false);
 
-const agents = computed(() => [...new Set(audits.value.map((a) => a.event.agentId))].sort());
+const agents = computed(() =>
+  [...new Set(audits.value.flatMap((audit) =>
+    audit.event.agentId === undefined ? [] : [audit.event.agentId]
+  ))].sort()
+);
 
-const formatTime = (value: string | null) => value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "—";
 
 function deriveLifecycle(audit: RuntimeAudit): Lifecycle {
   const execution = audit.execution;
-  if (!execution || execution.status === "queued") return "queued";
+  if (!execution) return "succeeded";
+  if (execution.status === "queued") return "queued";
   if (execution.status === "running") return "running";
   if (execution.status === "retry_wait") return "retrying";
   if (execution.status === "failed") return "failed";
-  if (!audit.resultEvent) return "running";
+  if (!audit.resultEvent) return "succeeded";
   if (audit.resultEvent.outcome === "failed") return "failed";
   if (audit.deliveries.length === 0) return "succeeded";
   const deliveries = audit.deliveries.map((d) => d.delivery.status);
@@ -55,6 +60,10 @@ function lifecycleLabel(lifecycle: Lifecycle): string {
     delivery_failed: "Delivery Failed"
   };
   return labels[lifecycle];
+}
+
+function chatMessageChild(audit: RuntimeAudit) {
+  return audit.directChildren.find((child) => child.type === "chat.message");
 }
 
 function lifecycleClass(lifecycle: Lifecycle): string {
@@ -145,7 +154,7 @@ onMounted(load);
 </script>
 
 <template>
-  <div class="events-layout">
+  <div class="events-layout layout-base layout-two-pane">
     <aside class="panel event-list">
       <div class="panel-header">Events</div>
       <div class="list-toolbar">
@@ -155,6 +164,8 @@ onMounted(load);
           <option value="agent.request">agent.request</option>
           <option value="subscription.fire">subscription.fire</option>
           <option value="agent.result">agent.result</option>
+          <option value="chat.message">chat.message</option>
+          <option value="chat.dispatch">chat.dispatch</option>
         </select>
         <select v-model="filterSource" class="filter-select" @change="applyFilters">
           <option value="all">All sources</option>
@@ -211,14 +222,14 @@ onMounted(load);
             <span class="lifecycle-badge" :class="lifecycleClass(deriveLifecycle(audit))">{{ lifecycleLabel(deriveLifecycle(audit)) }}</span>
           </span>
           <span class="mono event-id">{{ audit.event.eventId }}</span>
-          <span class="event-meta">{{ audit.event.source.kind }}<span v-if="audit.event.source.externalId"> · {{ audit.event.source.externalId }}</span> · {{ formatTime(audit.event.createdAt) }}</span>
+          <span class="event-meta">{{ audit.event.source.kind }}<span v-if="audit.event.source.externalId"> · {{ audit.event.source.externalId }}</span> · {{ formatDateTime(audit.event.createdAt) }}</span>
           <span class="event-summary">
-            <span>Agent <span class="mono">{{ audit.event.agentId }}</span></span>
+            <span>Agent <span class="mono">{{ audit.event.agentId ?? "none" }}</span></span>
             <span>Session {{ audit.session ? "yes" : "no" }}</span>
             <span>Destinations {{ audit.event.destinationIds.length }}</span>
           </span>
           <span v-if="audit.event.boundedPromptSummary" class="event-prompt">{{ audit.event.boundedPromptSummary }}</span>
-          <span class="event-lifecycle-change">changed {{ formatTime(audit.lifecycleChangedAt) }}</span>
+          <span class="event-lifecycle-change">changed {{ formatDateTime(audit.lifecycleChangedAt) }}</span>
           <span v-if="audit.reasonForIntervention" class="event-reason">{{ audit.reasonForIntervention }}</span>
         </button>
       </template>
@@ -243,7 +254,21 @@ onMounted(load);
             <div class="chain-id mono">{{ selected.event.eventId }}</div>
             <div class="chain-status">{{ selected.event.type }}</div>
           </div>
-          <template v-if="selected.event.type !== 'agent.result'">
+          <template v-if="selected.execution && selected.event.type === 'chat.dispatch'">
+            <div class="chain-arrow">→</div>
+            <div class="chain-node" :class="chainNodeClass(selected.execution.status)">
+              <div class="chain-label">AgentHandler</div>
+              <div class="chain-id mono">{{ selected.execution.executionId }}</div>
+              <div class="chain-status">{{ selected.execution.status }}</div>
+            </div>
+            <div class="chain-arrow">→</div>
+            <div class="chain-node" :class="chainNodeClass(chatMessageChild(selected) ? 'succeeded' : 'pending')">
+              <div class="chain-label">chat.message</div>
+              <div class="chain-id mono">{{ chatMessageChild(selected)?.eventId ?? "—" }}</div>
+              <div class="chain-status">{{ chatMessageChild(selected) ? "recorded" : "pending" }}</div>
+            </div>
+          </template>
+          <template v-else-if="selected.execution && selected.event.type !== 'agent.result'">
             <div class="chain-arrow">→</div>
             <div class="chain-node" :class="chainNodeClass(selected.execution.status)">
               <div class="chain-label">AgentHandler</div>
@@ -269,7 +294,7 @@ onMounted(load);
               <div class="chain-status">{{ selected.deliveries.length === 0 ? (selected.resultEvent ? "none" : "pending") : deriveLifecycle(selected) }}</div>
             </div>
           </template>
-          <template v-else>
+          <template v-else-if="selected.execution">
             <div class="chain-arrow">→</div>
             <div class="chain-node" :class="chainNodeClass(selected.execution.status)">
               <div class="chain-label">ResultHandler</div>
@@ -288,7 +313,7 @@ onMounted(load);
         <div class="section-title">Route</div>
         <dl class="kv">
           <dt>Event type</dt><dd class="mono">{{ selected.event.type }}</dd>
-          <dt>Handler</dt><dd class="mono">{{ selected.execution.handler }}</dd>
+          <dt>Handler</dt><dd class="mono">{{ selected.execution?.handler ?? "none" }}</dd>
           <dt>Fanout</dt><dd>disabled · exactly one Handler</dd>
         </dl>
 
@@ -296,11 +321,12 @@ onMounted(load);
         <dl class="kv">
           <dt>ID</dt><dd class="mono">{{ selected.event.eventId }}</dd>
           <dt>Source</dt><dd>{{ selected.event.source.kind }}<span v-if="selected.event.source.externalId" class="mono"> · {{ selected.event.source.externalId }}</span></dd>
-          <dt>Agent</dt><dd class="mono">{{ selected.event.agentId }}</dd>
+          <dt>Agent</dt><dd class="mono">{{ selected.event.agentId ?? "none" }}</dd>
           <dt>Session</dt><dd class="mono">{{ selected.event.sessionId ?? "new" }}</dd>
           <dt>Destinations</dt><dd>{{ selected.event.destinationIds.length }}</dd>
-          <dt>Created</dt><dd>{{ formatTime(selected.event.createdAt) }}</dd>
+          <dt>Created</dt><dd>{{ formatDateTime(selected.event.createdAt) }}</dd>
           <dt v-if="selected.event.prompt">Prompt</dt><dd v-if="selected.event.prompt" class="bounded-text">{{ selected.event.prompt }}</dd>
+          <dt v-if="selected.event.body">Body</dt><dd v-if="selected.event.body" class="bounded-text">{{ selected.event.body }}</dd>
         </dl>
 
         <div class="section-title">Causality</div>
@@ -316,24 +342,26 @@ onMounted(load);
           <dt>Boundary</dt><dd>{{ selected.causalityBoundary ?? "complete" }}</dd>
         </dl>
 
+        <template v-if="selected.execution">
         <div class="section-title">{{ selected.execution.handler === "agent" ? "AgentHandler" : "ResultHandler" }} Execution</div>
         <dl class="kv">
           <dt>ID</dt><dd class="mono">{{ selected.execution.executionId }}</dd>
           <dt>Status</dt><dd>{{ selected.execution.status }}</dd>
           <dt>Attempts</dt><dd>{{ selected.execution.attemptCount }}/{{ selected.execution.maxAttempts }}</dd>
-          <dt>First started</dt><dd>{{ formatTime(selected.execution.firstStartedAt) }}</dd>
-          <dt>Last attempt</dt><dd>{{ formatTime(selected.execution.lastAttemptAt) }}</dd>
-          <dt>Completed</dt><dd>{{ formatTime(selected.execution.completedAt) }}</dd>
-          <dt>Next retry</dt><dd>{{ formatTime(selected.execution.nextAttemptAt) }}</dd>
+          <dt>First started</dt><dd>{{ formatDateTime(selected.execution.firstStartedAt) }}</dd>
+          <dt>Last attempt</dt><dd>{{ formatDateTime(selected.execution.lastAttemptAt) }}</dd>
+          <dt>Completed</dt><dd>{{ formatDateTime(selected.execution.completedAt) }}</dd>
+          <dt>Next retry</dt><dd>{{ formatDateTime(selected.execution.nextAttemptAt) }}</dd>
           <dt v-if="selected.execution.lastError">Error</dt><dd v-if="selected.execution.lastError" class="error">{{ selected.execution.lastError }}</dd>
         </dl>
+        </template>
 
         <template v-if="selected.resultEvent && selected.event.type !== 'agent.result'">
           <div class="section-title">Result Event</div>
           <dl class="kv">
             <dt>ID</dt><dd class="mono">{{ selected.resultEvent.eventId }}</dd>
             <dt>Outcome</dt><dd>{{ selected.resultEvent.outcome }}</dd>
-            <dt>Created</dt><dd>{{ formatTime(selected.resultEvent.createdAt) }}</dd>
+            <dt>Created</dt><dd>{{ formatDateTime(selected.resultEvent.createdAt) }}</dd>
             <dt>Root</dt><dd class="mono">{{ selected.resultEvent.causality.rootEventId }}</dd>
             <dt>Parent</dt><dd class="mono">{{ selected.resultEvent.causality.parentEventId ?? "none" }}</dd>
             <dt>Output</dt><dd class="bounded-text">{{ selected.resultEvent.output ?? selected.resultEvent.error ?? "—" }}</dd>
@@ -346,10 +374,10 @@ onMounted(load);
             <dt>ID</dt><dd class="mono">{{ selected.resultExecution.executionId }}</dd>
             <dt>Status</dt><dd>{{ selected.resultExecution.status }}</dd>
             <dt>Attempts</dt><dd>{{ selected.resultExecution.attemptCount }}/{{ selected.resultExecution.maxAttempts }}</dd>
-            <dt>First started</dt><dd>{{ formatTime(selected.resultExecution.firstStartedAt) }}</dd>
-            <dt>Last attempt</dt><dd>{{ formatTime(selected.resultExecution.lastAttemptAt) }}</dd>
-            <dt>Completed</dt><dd>{{ formatTime(selected.resultExecution.completedAt) }}</dd>
-            <dt>Next retry</dt><dd>{{ formatTime(selected.resultExecution.nextAttemptAt) }}</dd>
+            <dt>First started</dt><dd>{{ formatDateTime(selected.resultExecution.firstStartedAt) }}</dd>
+            <dt>Last attempt</dt><dd>{{ formatDateTime(selected.resultExecution.lastAttemptAt) }}</dd>
+            <dt>Completed</dt><dd>{{ formatDateTime(selected.resultExecution.completedAt) }}</dd>
+            <dt>Next retry</dt><dd>{{ formatDateTime(selected.resultExecution.nextAttemptAt) }}</dd>
             <dt v-if="selected.resultExecution.lastError">Error</dt><dd v-if="selected.resultExecution.lastError" class="error">{{ selected.resultExecution.lastError }}</dd>
           </dl>
         </template>
@@ -360,10 +388,10 @@ onMounted(load);
             <dt>ID</dt><dd class="mono">{{ selected.session.sessionId }}</dd>
             <dt>Mode</dt><dd>{{ selected.session.resumedAt ? "resumed" : "created" }}</dd>
             <template v-if="selected.session.resumedAt">
-              <dt>Resumed at</dt><dd>{{ formatTime(selected.session.resumedAt) }}</dd>
+              <dt>Resumed at</dt><dd>{{ formatDateTime(selected.session.resumedAt) }}</dd>
             </template>
             <template v-else>
-              <dt>Created at</dt><dd>{{ formatTime(selected.session.createdAt) }}</dd>
+              <dt>Created at</dt><dd>{{ formatDateTime(selected.session.createdAt) }}</dd>
             </template>
             <dt>Agent</dt><dd class="mono">{{ selected.session.agentId }}</dd>
             <dt>Adapter</dt><dd class="mono">{{ selected.session.adapterId }}</dd>
@@ -381,9 +409,9 @@ onMounted(load);
           <dt>Destination</dt><dd class="mono">{{ item.destination.kind }} · {{ item.destination.destinationId }}</dd>
           <dt>Status</dt><dd>{{ item.delivery.status }}</dd>
           <dt>Attempts</dt><dd>{{ item.delivery.attemptCount }}</dd>
-          <dt>Created</dt><dd>{{ formatTime(item.delivery.createdAt) }}</dd>
-          <dt>Attempted</dt><dd>{{ formatTime(item.delivery.attemptedAt) }}</dd>
-          <dt>Delivered</dt><dd>{{ formatTime(item.delivery.deliveredAt) }}</dd>
+          <dt>Created</dt><dd>{{ formatDateTime(item.delivery.createdAt) }}</dd>
+          <dt>Attempted</dt><dd>{{ formatDateTime(item.delivery.attemptedAt) }}</dd>
+          <dt>Delivered</dt><dd>{{ formatDateTime(item.delivery.deliveredAt) }}</dd>
           <dt>Receipt</dt><dd class="mono">{{ item.delivery.receipt ?? "—" }}</dd>
           <dt v-if="item.delivery.boundedError">Error</dt><dd v-if="item.delivery.boundedError" class="error">{{ item.delivery.boundedError }}</dd>
         </dl>
@@ -393,7 +421,7 @@ onMounted(load);
 </template>
 
 <style scoped>
-.events-layout { max-width: 1500px; margin: 0 auto; display: grid; grid-template-columns: minmax(360px, 0.95fr) minmax(520px, 1.55fr); gap: 18px; align-items: start; }
+.events-layout { grid-template-columns: minmax(360px, 0.95fr) minmax(520px, 1.55fr); }
 .event-list { max-height: calc(100vh - 170px); overflow-y: auto; }
 .list-toolbar { padding: 12px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px; }
 .search-input, .filter-select { appearance: none; border: 1px solid var(--border); border-radius: 6px; padding: 7px 10px; font-size: 13px; background: var(--surface); color: var(--text); }
@@ -401,10 +429,6 @@ onMounted(load);
 .time-range { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .time-range input { flex: 1 1 auto; min-width: 0; }
 .time-range span { color: var(--text-secondary); font-size: 12px; }
-.list-banner { padding: 8px 12px; font-size: 12px; border-bottom: 1px solid var(--border); }
-.list-banner.stale { background: var(--warning-soft); color: var(--warning); }
-.list-banner.paused { background: var(--muted-soft); color: var(--muted); }
-.list-banner.new-events { background: var(--primary-soft); color: var(--primary); display: flex; justify-content: space-between; align-items: center; }
 .refresh-button { appearance: none; border: 1px solid var(--primary); background: var(--primary); color: #fff; border-radius: 4px; padding: 3px 10px; font-size: 12px; cursor: pointer; }
 .event-row { width: 100%; display: flex; flex-direction: column; gap: 4px; padding: 13px 16px; border: 0; border-bottom: 1px solid var(--border); background: var(--surface); color: var(--text); text-align: left; cursor: pointer; }
 .event-row:hover { background: var(--surface-2); }
@@ -429,9 +453,7 @@ onMounted(load);
 .pagination button:disabled { opacity: 0.5; cursor: not-allowed; }
 .audit-detail { min-height: 420px; }
 .detail-body { padding: 20px; }
-.state { padding: 28px 18px; color: var(--text-secondary); text-align: center; }
 .error { color: var(--danger); }
-.empty-inline { padding: 12px; border: 1px dashed var(--border); border-radius: 8px; color: var(--text-secondary); }
 .delivery { padding: 12px; border: 1px solid var(--border); border-radius: 8px; }
 .bounded-text { color: var(--text-secondary); font-size: 13px; word-break: break-word; }
 .missing-object { padding: 12px; border: 1px dashed var(--danger); border-radius: 8px; color: var(--danger); background: var(--danger-soft); margin-bottom: 16px; }
@@ -447,6 +469,12 @@ onMounted(load);
 .chain-status { font-size: 11px; font-weight: 600; }
 .chain-arrow { display: flex; align-items: center; color: var(--text-dim); font-size: 12px; flex-shrink: 0; }
 .child-tag { display: inline-block; padding: 2px 6px; border-radius: 4px; background: var(--surface-2); border: 1px solid var(--border); margin-right: 6px; margin-bottom: 4px; font-size: 12px; }
-@media (max-width: 900px) { .events-layout { grid-template-columns: 1fr; } .event-list { max-height: 360px; } .chain-overview { flex-wrap: wrap; } .chain-arrow { display: none; } }
+@media (max-width: 1100px) {
+  .events-layout { grid-template-columns: minmax(0, 1fr); }
+  .events-layout > * { min-width: 0; }
+  .event-list { max-height: 360px; }
+  .chain-overview { flex-wrap: wrap; }
+  .chain-arrow { display: none; }
+}
 @media (max-width: 375px) { .time-range { flex-direction: column; align-items: stretch; } .time-range input { width: 100%; } }
 </style>

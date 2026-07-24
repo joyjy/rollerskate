@@ -66,6 +66,8 @@ rollerskate/
 
 - `packages/protocol/src/index.ts`：Local/Server 网络 contract 的唯一源码入口。
 - `local/src/core/event/model.ts`：Local canonical Event 与本地 Event ID 的事实源。
+- `local/src/application/local-foundation.ts`：LocalDevice、LocalWorkspace、Principal、LocalAgent 与 Server-ready binding schema 的 application 事实源。
+- `local/src/application/local-chat-store.ts`：唯一 `Local` Chat、immutable Event projection、dispatch receipt 与 current Session pointer 的事实源。
 - `local/src/core/loop.ts`：唯一长期运行 loop、phase 调度和顶层异常隔离的事实源。
 - `local/src/core/runtime/model.ts`：Local Route 与 durable execution facts 的事实源。
 - `local/src/capabilities/subscription/plugin-contract.ts`：用户 Subscription Plugin 唯一允许实现的 strategy slot contract。

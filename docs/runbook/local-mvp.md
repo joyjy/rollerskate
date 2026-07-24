@@ -8,10 +8,9 @@ timestamp: 2026-07-23
 
 # Offline Local Runtime Smoke
 
-先完成本地 Agent 注册与 workspace 配置，然后启动唯一 Local Runtime loop：
+创建 Local Agent，然后启动唯一 Local Runtime loop：
 
 ```bash
-scripts/rs workspace set "$PWD/.rollerskate/agents"
 scripts/rs agent create alice --client codex
 scripts/rs start
 ```

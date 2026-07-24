@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
+import { formatDateTime } from "@/utils/format";
 import type { RuntimeStatus, RuntimeIntegration, RuntimeLogEntry } from "@/types/runtime";
 import type { RuntimeInfo } from "@/types/runtime";
 
@@ -8,7 +9,6 @@ const loading = ref(true);
 const apiError = ref("");
 const controlling = ref(false);
 
-const formatTime = (value: string | null) => value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "—";
 
 const uptime = computed(() => {
   if (runtime.value?.startedAt === null || runtime.value === null) return "—";
@@ -95,7 +95,7 @@ onMounted(load);
         <div class="status-main">
           <span class="status-dot"></span>
           <span class="status-word">{{ runtime.status }}</span>
-          <span class="status-since">since {{ formatTime(runtime.statusSince) }}</span>
+          <span class="status-since">since {{ formatDateTime(runtime.statusSince) }}</span>
         </div>
         <div class="status-reason">
           <strong>Reason:</strong> {{ runtime.statusReason }}
@@ -109,7 +109,7 @@ onMounted(load);
           <span>PID {{ runtime.pid }}</span>
           <span>Uptime {{ uptime }}</span>
           <span>Schema v{{ runtime.schemaVersion }}</span>
-          <span class="freshness" :class="{ stale: runtime.stale }">refreshed {{ formatTime(runtime.lastRefreshedAt) }}</span>
+          <span class="freshness" :class="{ stale: runtime.stale }">refreshed {{ formatDateTime(runtime.lastRefreshedAt) }}</span>
         </div>
       </div>
     </div>
@@ -122,7 +122,7 @@ onMounted(load);
             <dt>Runtime root</dt><dd class="mono secret">{{ runtime.runtimeRoot }}</dd>
             <dt>Workspace</dt><dd class="mono secret">{{ runtime.workspaceRoot }}</dd>
             <dt>Console</dt><dd class="mono">{{ runtime.consoleAddress }}</dd>
-            <dt>Started</dt><dd>{{ formatTime(runtime.startedAt) }}</dd>
+            <dt>Started</dt><dd>{{ formatDateTime(runtime.startedAt) }}</dd>
           </dl>
         </div>
       </section>
@@ -133,7 +133,7 @@ onMounted(load);
           <dl class="kv compact">
             <dt>State</dt><dd><span class="loop-state" :class="runtime.loop.state">{{ runtime.loop.state }}</span></dd>
             <dt>Total cycles</dt><dd class="mono">{{ runtime.loop.totalCycles.toLocaleString() }}</dd>
-            <dt>Last cycle</dt><dd>{{ formatTime(runtime.loop.lastCycleEndAt) }}<span v-if="runtime.loop.lastCycleDurationMs !== null"> · {{ runtime.loop.lastCycleDurationMs }}ms</span></dd>
+            <dt>Last cycle</dt><dd>{{ formatDateTime(runtime.loop.lastCycleEndAt) }}<span v-if="runtime.loop.lastCycleDurationMs !== null"> · {{ runtime.loop.lastCycleDurationMs }}ms</span></dd>
             <dt>Next cycle</dt><dd>{{ loopNext }}</dd>
             <dt>In cycle</dt><dd>{{ runtime.loop.inCycle ? runtime.loop.currentPhaseSummary ?? "ticking" : "no" }}</dd>
           </dl>
@@ -190,7 +190,7 @@ onMounted(load);
               <span class="ok">{{ runtime.events.succeeded }} ok</span>
               <span v-if="runtime.events.failed" class="bad">{{ runtime.events.failed }} failed</span>
             </div>
-            <div class="workload-hint">last {{ formatTime(runtime.events.lastReceivedAt) }} · Events page</div>
+            <div class="workload-hint">last {{ formatDateTime(runtime.events.lastReceivedAt) }} · Events page</div>
           </div>
           <div class="workload-card">
             <div class="workload-label">Sessions</div>
@@ -198,7 +198,7 @@ onMounted(load);
               <span>{{ runtime.sessions.total }} total</span>
               <span v-if="runtime.sessions.mismatched" class="bad">{{ runtime.sessions.mismatched }} mismatched</span>
             </div>
-            <div class="workload-hint">last resumed {{ formatTime(runtime.sessions.lastResumedAt) }}</div>
+            <div class="workload-hint">last resumed {{ formatDateTime(runtime.sessions.lastResumedAt) }}</div>
           </div>
           <div class="workload-card">
             <div class="workload-label">Subscriptions</div>
@@ -244,7 +244,7 @@ onMounted(load);
               <span class="status-pill-small" :class="integrationClass(integration.status)"></span>
               <span>{{ integration.name }}</span>
               <span class="dim">{{ integration.status }}</span>
-              <span class="dim">last {{ formatTime(integration.lastSuccessAt) }}</span>
+              <span class="dim">last {{ formatDateTime(integration.lastSuccessAt) }}</span>
               <span v-if="integration.failureReason" class="integration-error">{{ integration.failureReason }}</span>
             </li>
           </ul>
@@ -258,7 +258,7 @@ onMounted(load);
           <div v-for="iso in runtime.recentIsolations" v-else :key="iso.eventId + iso.occurredAt" class="isolation-row">
             <div class="isolation-head">
               <span class="mono">{{ iso.eventId }}</span>
-              <span class="dim">{{ formatTime(iso.occurredAt) }}</span>
+              <span class="dim">{{ formatDateTime(iso.occurredAt) }}</span>
               <span class="loop-continued">loop {{ iso.loopContinued ? "continued" : "halted" }}</span>
             </div>
             <div class="isolation-detail">
@@ -294,7 +294,7 @@ onMounted(load);
               <span class="log-subsystem">{{ log.subsystem }}</span>
               <span class="log-message">{{ log.message }}</span>
               <span v-if="log.objectId" class="mono log-object">{{ log.objectId }}</span>
-              <span class="log-time">{{ formatTime(log.timestamp) }}</span>
+              <span class="log-time">{{ formatDateTime(log.timestamp) }}</span>
             </div>
           </div>
         </div>
@@ -422,7 +422,6 @@ onMounted(load);
 .control-result-status { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 4px; }
 .control-result-message { font-size: 13px; color: var(--text-secondary); margin-bottom: 10px; }
 .recover-counts { display: flex; gap: 8px; flex-wrap: wrap; }
-.empty-inline { padding: 12px; border: 1px dashed var(--border); border-radius: 8px; color: var(--text-secondary); }
 .dim { color: var(--text-secondary); font-size: 12px; }
 @media (max-width: 900px) {
   .dashboard-grid { grid-template-columns: 1fr; }

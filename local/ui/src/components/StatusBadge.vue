@@ -14,8 +14,7 @@ const labels: Record<SubscriptionStatus, string> = {
   failed: "Failed",
   unknown: "Unknown",
   cancelled: "Cancelled",
-  expired: "Expired",
-  revoked: "Revoked"
+  expired: "Expired"
 };
 </script>
 
@@ -26,19 +25,6 @@ const labels: Record<SubscriptionStatus, string> = {
 </template>
 
 <style scoped>
-.badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 3px 9px;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
-  white-space: nowrap;
-}
-
 .badge.active { background: var(--success-soft); color: var(--success); }
 .badge.paused { background: var(--muted-soft); color: var(--muted); }
 .badge.running { background: var(--primary-soft); color: var(--primary); }
@@ -48,5 +34,4 @@ const labels: Record<SubscriptionStatus, string> = {
 .badge.unknown { background: var(--warning-soft); color: var(--warning); }
 .badge.cancelled { background: var(--muted-soft); color: var(--muted); }
 .badge.expired { background: var(--muted-soft); color: var(--muted); }
-.badge.revoked { background: var(--danger-soft); color: var(--danger); }
 </style>

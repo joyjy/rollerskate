@@ -5,6 +5,7 @@ import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 import { createInterface, type Interface } from "node:readline/promises";
+import { finished } from "node:stream/promises";
 
 import { setupLocalRuntime, type SetupInput } from "../../application/runtime-config.js";
 import { runtimePaths } from "../../application/runtime-config.js";
@@ -18,12 +19,19 @@ import {
 } from "../../application/device/operations.js";
 import {
   configureAgents,
-  createAgent,
-  enqueueAgentRequest,
-  listAgents,
-  statusAgent,
-  type LocalAgentStatus
+  enqueueAgentRequest
 } from "../../application/agent/operations.js";
+import {
+  addLocalAgent,
+  localRuntimeSnapshot,
+  renameLocalAgent,
+  resumeLocalAgent,
+  suspendLocalAgent
+} from "../../application/local-agent-control.js";
+import type {
+  LocalAgent,
+  LocalAgentClient
+} from "../../application/local-foundation.js";
 import { AgentConfigStore } from "../../application/agent/config.js";
 import type { AgentClient } from "../../application/agent/registry-store.js";
 import { runAdminCommand, runRoomCommand } from "./room.js";
@@ -51,6 +59,7 @@ export interface LocalAppDependencies {
   readonly fetch?: typeof fetch;
   readonly now?: () => Date;
   readonly sleep?: (milliseconds: number) => Promise<void>;
+  readonly cwd?: string;
 }
 
 interface GlobalOptions {
@@ -63,33 +72,23 @@ const HELP = [
   "",
   "Usage:",
   "  scripts/rs [--runtime <absolute-path>] [command]",
-  "  scripts/rs                open the interactive Local Runtime console",
-  "  scripts/rs setup          configure the legacy v0.1 runtime",
-  "  scripts/rs doctor         verify legacy v0.1 Matrix access",
+  "  scripts/rs --help",
   "  scripts/rs start [--no-open] [--ui-port <port>]  run Local Runtime loop + Local UI",
   "  scripts/rs status         inspect Local Runtime loop state",
   "  scripts/rs trace <event-id>",
   "  scripts/rs recover        reconcile interrupted Runtime work",
   "  scripts/rs pause          pause Local Runtime cycles",
   "  scripts/rs resume         resume Local Runtime cycles",
-  "  scripts/rs device login   authenticate this Local Runtime using saved configuration",
-  "  scripts/rs device status|logout",
-  "  scripts/rs admin allow <oidc-subject>",
-  "  scripts/rs workspace set <absolute-path>",
-  "  scripts/rs agent create <name> [--client codex]",
-  "  scripts/rs agent status <name>",
+  "  scripts/rs agent create <handle> --client codex",
+  "  scripts/rs agent status <handle>",
   "  scripts/rs agent list",
+  "  scripts/rs agent rename <handle> <new-handle>",
+  "  scripts/rs agent suspend|resume <handle>",
   "  scripts/rs agent request <name> [--session <ses_uuidv7>] <prompt...>",
-  "  scripts/rs subscription add <id> --plugin <absolute-path> --plugin-id <id> --config <json-file> --session <ses_uuidv7> --prompt-file <file> --interval-ms <n> --max-wait-ms <n> --max-attempts <n>",
-  "  scripts/rs subscription list|inspect|pause|resume|cancel|revoke ...",
-  "  scripts/rs room create <name> [--public]",
-  "  scripts/rs room list|join|invite-human ...",
-  "  scripts/rs room add-agent|set-wake|remove-agent|bindings|policy ...",
-  "  scripts/rs room send <room-id> <message...>",
-  "  scripts/rs room agent-send <room-id> <agent-name> <message...>",
-  "  scripts/rs room history <room-id> <agent-name> [--limit <1-100>]",
+  "  scripts/rs subscription add <json-file>",
+  "  scripts/rs subscription list|inspect|pause|resume|cancel ...",
   "",
-  "Runtime: <this repo>/.rollerskate, or the path selected with --runtime"
+  "Runtime: ~/.rollerskate, or the path selected with --runtime"
 ].join("\n");
 
 export async function runLocalApp(
@@ -102,15 +101,9 @@ export async function runLocalApp(
   const global = parseGlobalOptions(argv, environment);
   const [command, ...rest] = global.argv;
   if (command === undefined) {
-    return runInteractiveCli(
-      repoRoot,
-      global.runtimeDirectory,
-      environment,
-      output,
-      dependencies
-    );
+    throw new Error("command required; run scripts/rs --help");
   }
-  if (command === "help" || command === "--help" || command === "-h") {
+  if (command === "--help") {
     rejectArguments(rest);
     output.write(`${HELP}\n`);
     return 0;
@@ -119,12 +112,17 @@ export async function runLocalApp(
     case "setup": {
       rejectArguments(rest);
       const input = await collectSetupInput(repoRoot, environment);
-      const runtime = setupLocalRuntime(repoRoot, input);
+      const runtime = setupLocalRuntime(
+        repoRoot,
+        input,
+        new Date().toISOString(),
+        global.runtimeDirectory
+      );
       output.write([
         "Rollerskate setup complete.",
         `Runtime: ${runtime.paths.runtimeDirectory}`,
         `Source: ${runtime.config.projectRoot}`,
-        "Next: scripts/rollerskate doctor"
+        "Next: scripts/rs doctor"
       ].join("\n") + "\n");
       return 0;
     }
@@ -133,7 +131,10 @@ export async function runLocalApp(
         throw new Error("doctor accepts only the optional --local flag");
       }
       const result = await doctorLocalRuntime(repoRoot, {
-        includeMatrix: rest[0] !== "--local"
+        includeMatrix: rest[0] !== "--local",
+        ...(global.runtimeDirectory === undefined
+          ? {}
+          : { runtimeDirectory: global.runtimeDirectory })
       });
       output.write([
         "Rollerskate is ready.",
@@ -168,7 +169,7 @@ export async function runLocalApp(
             `PID: ${status.state.pid}`,
             `Runtime: ${status.state.runtimeDirectory}`,
             `Agents: ${status.state.agentNames.join(", ") || "none"}`,
-            `Rooms: ${status.state.roomIds.join(", ") || "none"}`,
+            `Routes: ${status.state.routeIds.join(", ") || "none"}`,
             `Cycles: ${status.state.cycles}`,
             `Paused: ${status.state.paused ? "yes" : "no"}`,
             ...(status.activity === undefined ? [] : activityLines(status.activity)),
@@ -209,13 +210,19 @@ export async function runLocalApp(
     case "agent":
       return runAgentCommand(repoRoot, rest, output, global.runtimeDirectory);
     case "subscription":
-      return runSubscriptionCommand(repoRoot, rest, output, global.runtimeDirectory);
+      return runSubscriptionCommand(
+        repoRoot,
+        rest,
+        output,
+        global.runtimeDirectory,
+        dependencies.cwd ?? process.cwd()
+      );
     case "room":
       return runRoomCommand(repoRoot, rest, output, global.runtimeDirectory);
     case "admin":
       return runAdminCommand(repoRoot, rest, output, global.runtimeDirectory);
     default:
-      throw new Error(`unknown command: ${command}; run scripts/rollerskate help`);
+      throw new Error(`unknown command: ${command}; run scripts/rs --help`);
   }
 }
 
@@ -264,22 +271,11 @@ async function runInteractiveCli(
 
   try {
     output.write("Rollerskate Local Runtime\n\n");
-    const inspection = inspectLocalDevice(repoRoot, runtimeDirectory);
-    if (!inspection.hasCredential) {
-      output.write("This Local Runtime is not logged in.\n");
-      const serverUrl = await askText(
-        prompts,
-        "Rollerskate Server",
-        environment.ROLLERSKATE_SERVER_URL?.trim() ||
-          inspection.metadata?.serverUrl ||
-          "http://localhost:4100"
-      );
-      const result = await loginDevice(repoRoot, { serverUrl }, {
-        write: (text) => output.write(text),
-        ...networkDependencies
-      });
-      output.write(`${formatDeviceStatus("Device paired.", result)}\n`);
-    }
+    const local = localRuntimeSnapshot(repoRoot, runtimeDependency(runtimeDirectory));
+    output.write(
+      `Local Device: ${local.foundation.deviceName} (${local.foundation.deviceId})\n` +
+      `Local Chat: ${local.foundation.topicHandle}\n\n`
+    );
 
     while (true) {
       const action = await choose(prompts, output, "What would you like to do?", [
@@ -300,10 +296,13 @@ async function runInteractiveCli(
           networkDependencies
         );
       } else if (action === "agent-list") {
-        const agents = await listAgents(repoRoot, networkDependencies);
+        const agents = localRuntimeSnapshot(
+          repoRoot,
+          runtimeDependency(runtimeDirectory)
+        ).agents;
         output.write(agents.length === 0
-          ? "No Agents are registered on this Device.\n\n"
-          : `${agents.map((agent) => formatAgentStatus("Agent", agent).trimEnd())
+          ? "No local Agents are registered on this Device.\n\n"
+          : `${agents.map((agent) => formatLocalAgent("Agent", agent).trimEnd())
               .join("\n\n")}\n\n`);
       } else if (action === "device-status") {
         output.write(`${formatDeviceStatus(
@@ -335,24 +334,15 @@ async function createAgentInteractively(
     readonly now?: () => Date;
   }
 ): Promise<void> {
-  const paths = runtimePaths(repoRoot, runtimeDirectory);
-  const configStore = new AgentConfigStore(paths.agentConfig);
-  if (configStore.load() === undefined) {
-    const workspaceRoot = await askText(
-      prompts,
-      "Agent workspace root",
-      join(paths.runtimeDirectory, "agents")
-    );
-    configureAgents(repoRoot, workspaceRoot, runtimeDirectory);
-  }
-  const name = await askText(prompts, "Agent name");
-  const client = await choose<AgentClient>(prompts, output, "Agent client", [
+  const handle = await askText(prompts, "Agent handle");
+  const client = await choose(prompts, output, "Agent client", [
     { value: "codex", label: "Codex" }
   ]);
-  output.write(`${formatAgentStatus("Agent created.", await createAgent(
+  output.write(`${formatLocalAgent("Agent created.", addLocalAgent(
     repoRoot,
-    name,
-    { ...dependencies, client }
+    handle,
+    client,
+    runtimeDependency(runtimeDirectory)
   ))}\n`);
 }
 
@@ -441,42 +431,58 @@ async function runAgentCommand(
   runtimeDirectory?: string
 ): Promise<number> {
   const [command, ...rest] = arguments_;
-  const dependencies = runtimeDependency(runtimeDirectory);
+  const options = runtimeDependency(runtimeDirectory);
   if (command === "create") {
-    const { name, client } = parseAgentCreate(rest);
-    output.write(formatAgentStatus("Agent created.", await createAgent(
-      repoRoot,
-      name,
-      { ...dependencies, ...(client === undefined ? {} : { client }) }
-    )));
+    const create = parseAgentCreate(rest);
+    output.write(formatLocalAgent(
+      "Agent created.",
+      addLocalAgent(repoRoot, create.handle, create.client, options)
+    ));
     return 0;
   }
   if (command === "list") {
     rejectArguments(rest);
-    const agents = await listAgents(repoRoot, dependencies);
+    const agents = localRuntimeSnapshot(repoRoot, options).agents;
     if (agents.length === 0) {
-      output.write("No Agents are registered on this Device.\n");
+      output.write("No local Agents are registered on this Device.\n");
     } else {
-      output.write(`${agents.map((agent) => formatAgentStatus("Agent", agent).trimEnd())
+      output.write(`${agents.map((agent) => formatLocalAgent("Agent", agent).trimEnd())
         .join("\n\n")}\n`);
     }
     return 0;
   }
   if (command === "status") {
-    if (rest.length !== 1) {
-      throw new Error("agent status requires exactly one name");
-    }
-    output.write(formatAgentStatus("Agent is active.", await statusAgent(
-      repoRoot,
-      rest[0] ?? "",
-      dependencies
-    )));
+    requireCount(rest, 1, "agent status requires exactly one handle");
+    output.write(formatLocalAgent(
+      "Agent.",
+      requireLocalAgent(repoRoot, rest[0]!, options)
+    ));
+    return 0;
+  }
+  if (command === "rename") {
+    requireCount(rest, 2, "agent rename requires <handle> <new-handle>");
+    const agent = requireLocalAgent(repoRoot, rest[0]!, options);
+    output.write(formatLocalAgent(
+      "Agent renamed.",
+      renameLocalAgent(repoRoot, agent.principalId, rest[1]!, options)
+    ));
+    return 0;
+  }
+  if (command === "suspend" || command === "resume") {
+    requireCount(rest, 1, `agent ${command} requires exactly one handle`);
+    const agent = requireLocalAgent(repoRoot, rest[0]!, options);
+    output.write(formatLocalAgent(
+      command === "suspend" ? "Agent suspended." : "Agent resumed.",
+      command === "suspend"
+        ? suspendLocalAgent(repoRoot, agent.principalId, options)
+        : resumeLocalAgent(repoRoot, agent.principalId, options)
+    ));
     return 0;
   }
   if (command === "request") {
     const request = parseAgentRequest(rest);
     const receipt = enqueueAgentRequest(repoRoot, request.name, request.prompt, {
-      ...dependencies,
+      ...options,
       ...(request.sessionId === undefined ? {} : { sessionId: request.sessionId })
     });
     output.write(`${JSON.stringify({
@@ -487,7 +493,24 @@ async function runAgentCommand(
     })}\n`);
     return 0;
   }
-  throw new Error("agent requires create, list, status or request");
+  throw new Error("agent requires create, list, status, rename, suspend, resume or request");
+}
+
+function parseAgentCreate(arguments_: readonly string[]): {
+  readonly handle: string;
+  readonly client: LocalAgentClient;
+} {
+  if (arguments_.length !== 3 || arguments_[1] !== "--client") {
+    throw new Error(
+      "agent create requires <handle> --client codex"
+    );
+  }
+  const handle = arguments_[0]!;
+  const client = arguments_[2];
+  if (client !== "codex") {
+    throw new Error("agent client must be codex");
+  }
+  return { handle, client };
 }
 
 function parseAgentRequest(arguments_: readonly string[]): {
@@ -572,36 +595,25 @@ function formatDeviceStatus(prefix: string, result: LocalDeviceStatus): string {
   ].join("\n") + "\n";
 }
 
-function formatAgentStatus(prefix: string, result: LocalAgentStatus): string {
+function formatLocalAgent(prefix: string, agent: LocalAgent): string {
   return [
     prefix,
-    `Agent: ${result.summary.name} (${result.summary.id})`,
-    `Status: ${result.summary.status}`,
-    `Client: ${result.metadata.client}`,
-    `Placement: ${result.summary.placement.id} (generation ${result.summary.placement.generation})`,
-    `Workspace: ${result.metadata.workspacePath}`,
-    `Owner: ${result.summary.owner.displayName} (${result.summary.owner.id})`
+    `Agent: @${agent.handle} (${agent.principalId})`,
+    `Status: ${agent.status}`,
+    `Client: ${agent.client}`
   ].join("\n") + "\n";
 }
 
-function parseAgentCreate(arguments_: readonly string[]): {
-  readonly name: string;
-  readonly client?: "codex";
-} {
-  const name = arguments_[0];
-  if (name === undefined || arguments_.length > 3 ||
-    (arguments_.length > 1 && arguments_[1] !== "--client")) {
-    throw new Error("agent create requires <name> [--client codex]");
-  }
-  const client = arguments_[2];
-  if (arguments_.length === 2 ||
-    (client !== undefined && client !== "codex")) {
-    throw new Error("--client must be codex");
-  }
-  return {
-    name,
-    ...(client === undefined ? {} : { client })
-  };
+function requireLocalAgent(
+  repoRoot: string,
+  handle: string,
+  options: { readonly runtimeDirectory?: string }
+): LocalAgent {
+  const agent = localRuntimeSnapshot(repoRoot, options).agents.find(
+    (candidate) => candidate.handle.toLocaleLowerCase("und") === handle.toLocaleLowerCase("und")
+  );
+  if (agent === undefined) throw new Error(`Local Agent not found: ${handle}`);
+  return agent;
 }
 
 async function collectSetupInput(
@@ -728,6 +740,12 @@ interface StartOptions {
   readonly uiPort: number;
 }
 
+const GRACEFUL_SHUTDOWN_SIGNALS = [
+  "SIGINT",
+  "SIGTERM",
+  "SIGHUP"
+] as const satisfies readonly NodeJS.Signals[];
+
 async function runStartForeground(
   repoRoot: string,
   runtimeDirectory: string | undefined,
@@ -747,9 +765,23 @@ async function runStartForeground(
     }
   };
   const controller = new AbortController();
-  const stop = (): void => controller.abort();
-  process.once("SIGINT", stop);
-  process.once("SIGTERM", stop);
+  const signalHandlers = GRACEFUL_SHUTDOWN_SIGNALS.map((signal) => {
+    const handler = (): void => {
+      sink.write(`Rollerskate received ${signal}; stopping.\n`);
+      controller.abort();
+    };
+    process.once(signal, handler);
+    return { signal, handler };
+  });
+  const removeSignalHandlers = (): void => {
+    for (const { signal, handler } of signalHandlers) {
+      process.off(signal, handler);
+    }
+  };
+  const closeLog = async (): Promise<void> => {
+    log.end();
+    await finished(log);
+  };
   sink.write("Rollerskate starting. Press Ctrl-C to stop.\n");
   sink.write(`Log: ${paths.daemonLog}\n`);
 
@@ -771,10 +803,9 @@ async function runStartForeground(
     }
   } catch (error) {
     sink.write(`Local UI failed to start: ${error instanceof Error ? error.message : String(error)}\n`);
-    stop();
-    process.off("SIGINT", stop);
-    process.off("SIGTERM", stop);
-    log.end();
+    controller.abort();
+    removeSignalHandlers();
+    await closeLog();
     return 1;
   }
 
@@ -789,12 +820,14 @@ async function runStartForeground(
     sink.write(`Rollerskate stopped after ${result.cycles} Runtime cycle(s).\n`);
     return 0;
   } finally {
-    process.off("SIGINT", stop);
-    process.off("SIGTERM", stop);
-    if (uiClose !== undefined) {
-      await uiClose();
+    removeSignalHandlers();
+    try {
+      if (uiClose !== undefined) {
+        await uiClose();
+      }
+    } finally {
+      await closeLog();
     }
-    log.end();
   }
 }
 
@@ -908,7 +941,7 @@ function resolveRepoRoot(): string {
   if (configured !== undefined && configured.trim() !== "") {
     return realpathSync(configured);
   }
-  return resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..");
+  return resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..", "..");
 }
 
 const invokedPath = process.argv[1];

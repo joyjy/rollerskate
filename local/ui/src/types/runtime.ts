@@ -134,12 +134,17 @@ export interface Causality {
 
 export interface RuntimeEvent {
   readonly eventId: string;
-  readonly type: "agent.request" | "subscription.fire" | "agent.result";
+  readonly type:
+    | "agent.request"
+    | "subscription.fire"
+    | "agent.result"
+    | "chat.message"
+    | "chat.dispatch";
   readonly source: {
     readonly kind: "cli" | "subscription" | "matrix" | "server" | "handler";
     readonly externalId?: string;
   };
-  readonly agentId: string;
+  readonly agentId?: string;
   readonly prompt?: string;
   readonly boundedPromptSummary?: string;
   readonly outcome?: "succeeded" | "failed";
@@ -149,6 +154,26 @@ export interface RuntimeEvent {
   readonly destinationIds: readonly string[];
   readonly causality: Causality;
   readonly createdAt: string;
+  readonly topicId?: string;
+  readonly sender?: {
+    readonly kind: "owner" | "agent" | "system";
+    readonly principalId?: string;
+    readonly handleSnapshot: string;
+  };
+  readonly body?: string;
+  readonly target?: {
+    readonly principalId: string;
+    readonly handleSnapshot: string;
+  };
+  readonly dispatchCard?: {
+    readonly sourceMessageEventId: string;
+    readonly candidates: readonly {
+      readonly principalId: string;
+      readonly handle: string;
+    }[];
+  };
+  readonly sourceMessageEventId?: string;
+  readonly targetHandleSnapshot?: string;
 }
 
 export interface RuntimeExecution {
@@ -208,7 +233,7 @@ export interface RuntimeDelivery {
 
 export interface RuntimeAudit {
   readonly event: RuntimeEvent;
-  readonly execution: RuntimeExecution;
+  readonly execution?: RuntimeExecution;
   readonly resultEvent?: RuntimeResultEvent;
   readonly resultExecution?: RuntimeExecution;
   readonly session?: RuntimeSession;

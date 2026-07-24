@@ -20,6 +20,7 @@ import {
 
 test("setup keeps all Local app state under the selected repo .rollerskate", () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-app-config-"));
+  const runtime = join(repo, "runtime");
   try {
     const codex = join(repo, "codex");
     writeFileSync(codex, "fixture");
@@ -32,11 +33,11 @@ test("setup keeps all Local app state under the selected repo .rollerskate", () 
       matrixAccessToken: "secret-token",
       projectRoot: repo,
       codexExecutable: codex
-    }, "2026-07-16T10:00:00.000Z");
+    }, "2026-07-16T10:00:00.000Z", runtime);
     const canonicalRepo = realpathSync(repo);
 
-    assert.deepEqual(setup.paths, runtimePaths(repo));
-    assert.equal(setup.paths.runtimeDirectory, join(canonicalRepo, ".rollerskate"));
+    assert.deepEqual(setup.paths, runtimePaths(repo, runtime));
+    assert.equal(setup.paths.runtimeDirectory, join(canonicalRepo, "runtime"));
     assert.equal(setup.config.projectRoot, canonicalRepo);
     assert.equal(setup.config.grantExpiresAt, "2027-07-16T10:00:00.000Z");
     assert.doesNotMatch(readFileSync(setup.paths.config, "utf8"), /secret-token/);
@@ -55,11 +56,11 @@ test("setup keeps all Local app state under the selected repo .rollerskate", () 
       database.close();
     }
 
-    const loaded = loadLocalRuntime(repo);
+    const loaded = loadLocalRuntime(repo, runtime);
     assert.equal(loaded.matrixAccessToken, "secret-token");
     assert.equal(
       loaded.paths.database,
-      join(canonicalRepo, ".rollerskate", "runtime.db")
+      join(canonicalRepo, "runtime", "runtime.db")
     );
     assert.equal((loaded.config.runtime.requestTimeoutMilliseconds), 35_000);
 
@@ -71,9 +72,9 @@ test("setup keeps all Local app state under the selected repo .rollerskate", () 
       matrixAccessToken: "rotated-token",
       projectRoot: repo,
       codexExecutable: codex
-    }, "2026-07-16T11:00:00.000Z");
+    }, "2026-07-16T11:00:00.000Z", runtime);
     assert.equal(repeated.config.grantExpiresAt, setup.config.grantExpiresAt);
-    assert.equal(loadLocalRuntime(repo).matrixAccessToken, "rotated-token");
+    assert.equal(loadLocalRuntime(repo, runtime).matrixAccessToken, "rotated-token");
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }
@@ -81,6 +82,7 @@ test("setup keeps all Local app state under the selected repo .rollerskate", () 
 
 test("load rejects a secrets file readable by other users", () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-app-secret-"));
+  const runtime = join(repo, "runtime");
   try {
     const codex = join(repo, "codex");
     writeFileSync(codex, "fixture");
@@ -92,10 +94,10 @@ test("load rejects a secrets file readable by other users", () => {
       matrixAccessToken: "secret-token",
       projectRoot: repo,
       codexExecutable: codex
-    });
+    }, undefined, runtime);
     chmodSync(setup.paths.secrets, 0o644);
     assert.throws(
-      () => loadLocalRuntime(repo),
+      () => loadLocalRuntime(repo, runtime),
       /must not be accessible by group or others/
     );
   } finally {

@@ -1,12 +1,12 @@
 import { realpathSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 
-import type { AgentInputEvent } from "../../core/event/model.js";
+import type { AgentInputEvent, ChatDispatchEvent } from "../../core/event/model.js";
 import type { RuntimeAgentAdapter } from "../../core/runtime/handlers.js";
 import { AgentProcessClient, type AgentProcessProtocol } from "./process-client.js";
 
 interface CodexRequest {
-  readonly event: AgentInputEvent;
+  readonly event: AgentInputEvent | ChatDispatchEvent;
   readonly providerSessionId?: string;
 }
 
@@ -57,13 +57,13 @@ export class CodexRuntimeAgent implements RuntimeAgentAdapter {
 function codexArgs(request: CodexRequest, projectRoot: string): string[] {
   const options = [
     "--json",
-    "--ignore-user-config",
     "--sandbox", "read-only",
+    "--config", "approval_policy=\"never\"",
     "--skip-git-repo-check",
     "-C", projectRoot
   ];
   return request.providerSessionId === undefined
-    ? ["exec", ...options, "-"]
+    ? ["exec", "--ignore-user-config", ...options, "-"]
     : ["exec", ...options, "resume", request.providerSessionId, "-"];
 }
 
@@ -82,7 +82,7 @@ const codexProtocol: AgentProcessProtocol = {
     if (typeof providerSessionId !== "string" || typeof text !== "string" || text.trim() === "") {
       throw new Error("Codex Runtime response is missing Session or final message");
     }
-    return { providerSessionId, output: text };
+    return { providerSessionId, outcome: { kind: "message", body: text } };
   }
 };
 

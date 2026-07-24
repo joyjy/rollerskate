@@ -6,11 +6,15 @@ import { openRuntimeDatabase } from "../../infrastructure/sqlite/database.js";
 import {
   eventSourceKinds,
   eventTypes,
+  isAgentInputEvent,
   newEventId,
   requireEventId,
   type AgentResultEvent,
+  type AgentInputEvent,
   type CreateEvent,
-  type Event
+  type Event,
+  type ChatDispatchEvent,
+  type ChatMessageEvent
 } from "../event/model.js";
 import {
   requireRuntimeId,
@@ -28,11 +32,12 @@ interface EventRow {
   type: Event["type"];
   source_kind: Event["source"]["kind"];
   source_external_id: string | null;
-  agent_id: string;
+  agent_id: string | null;
   prompt: string | null;
   outcome: AgentResultEvent["outcome"] | null;
   output: string | null;
   error: string | null;
+  payload_json: string | null;
   session_id: string | null;
   destination_ids_json: string;
   root_event_id: string;
@@ -98,12 +103,15 @@ export interface CompleteRuntimeExecution {
   readonly adapterId: string;
   readonly workspace: string;
   readonly providerSessionId: string;
-  readonly output: string;
+  readonly sessionId?: string;
+  readonly output?: string;
 }
+
+export type RuntimeExecutionOutcome = AgentResultEvent | ChatMessageEvent | undefined;
 
 export interface RuntimeAudit {
   readonly event: Event;
-  readonly execution: RuntimeExecution;
+  readonly execution?: RuntimeExecution;
   readonly resultEvent?: AgentResultEvent;
   readonly resultExecution?: RuntimeExecution;
   readonly session?: RuntimeSession;
@@ -195,11 +203,11 @@ export class RuntimeStore {
     const event = this.event(eventId);
     if (event === undefined) return undefined;
     const execution = this.executionForEvent(eventId);
-    if (execution === undefined) throw new Error(`Event has no Execution: ${eventId}`);
     const resultEvent = event.type === "agent.result"
       ? event
       : this.#resultEventForParent(event.eventId);
-    const session = resultEvent?.sessionId === undefined ? undefined : this.session(resultEvent.sessionId);
+    const sessionId = resultEvent?.sessionId ?? event.sessionId;
+    const session = sessionId === undefined ? undefined : this.session(sessionId);
     const resultExecution = resultEvent === undefined || resultEvent.eventId === event.eventId
       ? undefined
       : this.executionForEvent(resultEvent.eventId);
@@ -211,7 +219,7 @@ export class RuntimeStore {
     });
     return {
       event,
-      execution,
+      ...(execution === undefined ? {} : { execution }),
       ...(resultEvent === undefined ? {} : { resultEvent }),
       ...(resultExecution === undefined ? {} : { resultExecution }),
       ...(session === undefined ? {} : { session }),
@@ -268,11 +276,10 @@ export class RuntimeStore {
     executionId: string,
     receipt: CompleteRuntimeExecution,
     at = new Date().toISOString()
-  ): AgentResultEvent {
+  ): RuntimeExecutionOutcome {
     requireText(receipt.adapterId, "adapterId");
     requireText(receipt.workspace, "workspace");
     requireText(receipt.providerSessionId, "providerSessionId");
-    requireText(receipt.output, "output");
     const timestamp = iso(at);
     this.#database.exec("BEGIN IMMEDIATE");
     try {
@@ -282,17 +289,25 @@ export class RuntimeStore {
         throw new Error(`only AgentHandler can complete with provider receipt: ${executionId}`);
       }
       const event = this.#requireEvent(execution.eventId);
-      if (event.type === "agent.result") {
-        throw new Error(`AgentHandler cannot complete agent.result: ${event.eventId}`);
+      if (event.type === "agent.result" || event.type === "chat.message") {
+        throw new Error(`AgentHandler cannot complete ${event.type}: ${event.eventId}`);
       }
+      if (event.type !== "chat.dispatch" && receipt.output === undefined) {
+        throw new Error(`Agent outcome must include a message: ${event.eventId}`);
+      }
+      if (event.sessionId !== undefined && receipt.sessionId !== undefined &&
+        event.sessionId !== receipt.sessionId) {
+        throw new Error(`Execution Session changed while handling Event: ${event.eventId}`);
+      }
+      const sessionId = event.sessionId ?? receipt.sessionId;
       let session: RuntimeSession;
-      if (event.sessionId === undefined) {
+      if (sessionId === undefined) {
         session = this.#createSession(event.agentId, receipt, timestamp);
       } else {
-        session = this.#requireSession(event.sessionId);
+        session = this.#requireSession(sessionId);
         if (session.agentId !== event.agentId || session.adapterId !== receipt.adapterId ||
           session.workspace !== receipt.workspace || session.providerSessionId !== receipt.providerSessionId) {
-          throw new Error(`Session changed while handling Event: ${event.sessionId}`);
+          throw new Error(`Session changed while handling Event: ${sessionId}`);
         }
         this.#database.prepare("UPDATE sessions SET updated_at = ? WHERE session_id = ?")
           .run(timestamp, session.sessionId);
@@ -301,12 +316,26 @@ export class RuntimeStore {
         UPDATE executions SET status = 'succeeded', completed_at = ?, updated_at = ?, last_error = NULL
         WHERE execution_id = ?
       `).run(timestamp, timestamp, executionId);
+      if (event.type === "chat.dispatch") {
+        this.#database.prepare(`
+          INSERT INTO local_agent_sessions (principal_id, current_session_id, generation, updated_at)
+          VALUES (?, ?, 1, ?)
+          ON CONFLICT(principal_id) DO UPDATE SET
+            current_session_id = excluded.current_session_id,
+            updated_at = excluded.updated_at
+        `).run(event.agentId, session.sessionId, timestamp);
+        const reply = receipt.output === undefined || receipt.output.trim() === ""
+          ? undefined
+          : this.#createChatReply(event, session.sessionId, receipt.output, timestamp);
+        this.#database.exec("COMMIT");
+        return reply;
+      }
       const resultEvent = this.#createResultEvent({
         execution,
         event,
         outcome: "succeeded",
         sessionId: session.sessionId,
-        output: receipt.output,
+        output: receipt.output!,
         at: timestamp
       });
       this.#database.exec("COMMIT");
@@ -345,7 +374,9 @@ export class RuntimeStore {
       `).run(failure, timestamp, timestamp, executionId);
       const event = this.#requireEvent(execution.eventId);
       const failed = this.#requireExecution(executionId);
-      const resultEvent = execution.handler === "agent"
+      const resultEvent = execution.handler === "agent" &&
+        isAgentInputEvent(event) &&
+        event.type !== "chat.dispatch"
         ? this.#createResultEvent({
           execution,
           event,
@@ -408,6 +439,28 @@ export class RuntimeStore {
   public session(sessionId: string): RuntimeSession | undefined {
     const row = this.#database.prepare("SELECT * FROM sessions WHERE session_id = ?")
       .get(sessionId) as SessionRow | undefined;
+    return row === undefined ? undefined : mapSession(row);
+  }
+
+  public sessionForProvider(
+    adapterId: string,
+    providerSessionId: string
+  ): RuntimeSession | undefined {
+    const row = this.#database.prepare(`
+      SELECT * FROM sessions WHERE adapter_id = ? AND provider_session_id = ?
+    `).get(
+      requireText(adapterId, "adapterId"),
+      requireText(providerSessionId, "providerSessionId")
+    ) as SessionRow | undefined;
+    return row === undefined ? undefined : mapSession(row);
+  }
+
+  public currentLocalAgentSession(agentId: string): RuntimeSession | undefined {
+    const row = this.#database.prepare(`
+      SELECT s.* FROM local_agent_sessions AS current
+      JOIN sessions AS s ON s.session_id = current.current_session_id
+      WHERE current.principal_id = ?
+    `).get(requireText(agentId, "agentId")) as unknown as SessionRow | undefined;
     return row === undefined ? undefined : mapSession(row);
   }
 
@@ -617,7 +670,7 @@ export class RuntimeStore {
 
   #createResultEvent(input: {
     readonly execution: RuntimeExecution;
-    readonly event: Event;
+    readonly event: AgentInputEvent;
     readonly outcome: AgentResultEvent["outcome"];
     readonly sessionId?: string;
     readonly output?: string;
@@ -660,21 +713,64 @@ export class RuntimeStore {
     return event;
   }
 
+  #createChatReply(
+    dispatch: ChatDispatchEvent,
+    sessionId: string,
+    body: string,
+    at: string
+  ): ChatMessageEvent {
+    const eventId = newEventId();
+    const payload = {
+      topicId: dispatch.topicId,
+      sender: {
+        kind: "agent",
+        principalId: dispatch.agentId,
+        handleSnapshot: dispatch.targetHandleSnapshot
+      },
+      body
+    };
+    this.#database.prepare(`
+      INSERT INTO events (
+        event_id, type, source_kind, source_external_id, agent_id, prompt,
+        outcome, output, error, payload_json, session_id, destination_ids_json,
+        root_event_id, parent_event_id, causal_hop, created_at
+      ) VALUES (?, 'chat.message', 'handler', ?, ?, NULL, NULL, NULL, NULL, ?, ?, '[]',
+        ?, ?, ?, ?)
+    `).run(
+      eventId,
+      dispatch.eventId,
+      dispatch.agentId,
+      JSON.stringify(payload),
+      sessionId,
+      dispatch.causality.rootEventId,
+      dispatch.eventId,
+      dispatch.causality.hop + 1,
+      at
+    );
+    const event = this.#requireEvent(eventId);
+    if (event.type !== "chat.message") throw new Error(`Event is not chat.message: ${eventId}`);
+    return event;
+  }
+
   #migrate(): void {
     this.#resetIncompatibleCore();
+    this.#migrateLocalChatEvents();
     this.#database.exec(`
       PRAGMA journal_mode = WAL;
       PRAGMA foreign_keys = ON;
       CREATE TABLE IF NOT EXISTS events (
         event_id TEXT PRIMARY KEY,
-        type TEXT NOT NULL CHECK(type IN ('agent.request', 'subscription.fire', 'agent.result')),
+        type TEXT NOT NULL CHECK(type IN (
+          'agent.request', 'subscription.fire', 'agent.result', 'chat.message', 'chat.dispatch'
+        )),
         source_kind TEXT NOT NULL CHECK(source_kind IN ('cli', 'subscription', 'matrix', 'server', 'handler')),
         source_external_id TEXT,
-        agent_id TEXT NOT NULL,
+        agent_id TEXT,
         prompt TEXT,
         outcome TEXT CHECK(outcome IN ('succeeded', 'failed')),
         output TEXT,
         error TEXT,
+        payload_json TEXT,
         session_id TEXT REFERENCES sessions(session_id),
         destination_ids_json TEXT NOT NULL,
         root_event_id TEXT NOT NULL,
@@ -682,12 +778,21 @@ export class RuntimeStore {
         causal_hop INTEGER NOT NULL CHECK(causal_hop >= 0),
         created_at TEXT NOT NULL,
         CHECK(
-          (type IN ('agent.request', 'subscription.fire') AND prompt IS NOT NULL
-            AND outcome IS NULL AND output IS NULL AND error IS NULL)
+          (type IN ('agent.request', 'subscription.fire') AND agent_id IS NOT NULL
+            AND prompt IS NOT NULL AND outcome IS NULL AND output IS NULL
+            AND error IS NULL AND payload_json IS NULL)
           OR
-          (type = 'agent.result' AND prompt IS NULL AND outcome IS NOT NULL
+          (type = 'agent.result' AND agent_id IS NOT NULL AND prompt IS NULL
+            AND outcome IS NOT NULL AND payload_json IS NULL
             AND ((outcome = 'succeeded' AND output IS NOT NULL AND error IS NULL)
               OR (outcome = 'failed' AND output IS NULL AND error IS NOT NULL)))
+          OR
+          (type = 'chat.message' AND prompt IS NULL AND outcome IS NULL
+            AND output IS NULL AND error IS NULL AND payload_json IS NOT NULL)
+          OR
+          (type = 'chat.dispatch' AND agent_id IS NOT NULL AND prompt IS NOT NULL
+            AND outcome IS NULL AND output IS NULL AND error IS NULL
+            AND payload_json IS NOT NULL)
         ),
         UNIQUE(source_kind, source_external_id)
       );
@@ -743,9 +848,102 @@ export class RuntimeStore {
     `);
   }
 
+  #migrateLocalChatEvents(): void {
+    const row = this.#database.prepare(`
+      SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'
+    `).get() as { sql: string | null } | undefined;
+    if (row?.sql === null || row?.sql === undefined || !row.sql.includes("'room.message'")) {
+      return;
+    }
+    this.#database.exec(`
+      PRAGMA foreign_keys = OFF;
+      BEGIN IMMEDIATE;
+      CREATE TABLE events_v33 (
+        event_id TEXT PRIMARY KEY,
+        type TEXT NOT NULL CHECK(type IN (
+          'agent.request', 'subscription.fire', 'agent.result', 'chat.message', 'chat.dispatch'
+        )),
+        source_kind TEXT NOT NULL CHECK(source_kind IN ('cli', 'subscription', 'matrix', 'server', 'handler')),
+        source_external_id TEXT,
+        agent_id TEXT,
+        prompt TEXT,
+        outcome TEXT CHECK(outcome IN ('succeeded', 'failed')),
+        output TEXT,
+        error TEXT,
+        payload_json TEXT,
+        session_id TEXT REFERENCES sessions(session_id),
+        destination_ids_json TEXT NOT NULL,
+        root_event_id TEXT NOT NULL,
+        parent_event_id TEXT,
+        causal_hop INTEGER NOT NULL CHECK(causal_hop >= 0),
+        created_at TEXT NOT NULL,
+        CHECK(
+          (type IN ('agent.request', 'subscription.fire') AND agent_id IS NOT NULL
+            AND prompt IS NOT NULL AND outcome IS NULL AND output IS NULL
+            AND error IS NULL AND payload_json IS NULL)
+          OR
+          (type = 'agent.result' AND agent_id IS NOT NULL AND prompt IS NULL
+            AND outcome IS NOT NULL AND payload_json IS NULL
+            AND ((outcome = 'succeeded' AND output IS NOT NULL AND error IS NULL)
+              OR (outcome = 'failed' AND output IS NULL AND error IS NOT NULL)))
+          OR
+          (type = 'chat.message' AND prompt IS NULL AND outcome IS NULL
+            AND output IS NULL AND error IS NULL AND payload_json IS NOT NULL)
+          OR
+          (type = 'chat.dispatch' AND agent_id IS NOT NULL AND prompt IS NOT NULL
+            AND outcome IS NULL AND output IS NULL AND error IS NULL
+            AND payload_json IS NOT NULL)
+        ),
+        UNIQUE(source_kind, source_external_id)
+      );
+      INSERT INTO events_v33 (
+        event_id, type, source_kind, source_external_id, agent_id, prompt,
+        outcome, output, error, payload_json, session_id, destination_ids_json,
+        root_event_id, parent_event_id, causal_hop, created_at
+      )
+      SELECT
+        event_id,
+        CASE type
+          WHEN 'room.message' THEN 'chat.message'
+          WHEN 'room.dispatch' THEN 'chat.dispatch'
+          ELSE type
+        END,
+        source_kind,
+        CASE
+          WHEN source_external_id LIKE 'local-room-dispatch:%'
+            THEN 'local-chat-dispatch:' || substr(source_external_id, 21)
+          ELSE source_external_id
+        END,
+        agent_id,
+        prompt,
+        outcome,
+        output,
+        error,
+        CASE
+          WHEN type IN ('room.message', 'room.dispatch')
+            THEN json_remove(
+              json_set(payload_json, '$.topicId', json_extract(payload_json, '$.roomId')),
+              '$.roomId'
+            )
+          ELSE payload_json
+        END,
+        session_id,
+        destination_ids_json,
+        root_event_id,
+        parent_event_id,
+        causal_hop,
+        created_at
+      FROM events;
+      DROP TABLE events;
+      ALTER TABLE events_v33 RENAME TO events;
+      COMMIT;
+      PRAGMA foreign_keys = ON;
+    `);
+  }
+
   #resetIncompatibleCore(): void {
     const expectedColumns = new Map<string, readonly string[]>([
-      ["events", ["event_id", "type", "destination_ids_json"]],
+      ["events", ["event_id", "type", "destination_ids_json", "payload_json"]],
       ["executions", ["execution_id", "event_id", "handler"]],
       ["sessions", ["session_id", "provider_session_id"]],
       ["destinations", ["destination_id", "kind", "address_json"]],
@@ -824,7 +1022,7 @@ function mapEvent(row: EventRow): Event {
       kind: row.source_kind,
       ...(row.source_external_id === null ? {} : { externalId: row.source_external_id })
     },
-    agentId: row.agent_id,
+    ...(row.agent_id === null ? {} : { agentId: row.agent_id }),
     ...(row.session_id === null ? {} : { sessionId: row.session_id }),
     destinationIds: destinations as string[],
     causality: {
@@ -834,11 +1032,93 @@ function mapEvent(row: EventRow): Event {
     },
     createdAt: row.created_at
   };
+  if (row.type === "chat.message") {
+    const payload = chatPayload(row);
+    const sender = payload.sender;
+    if (!isRecord(sender) ||
+      (sender.kind !== "owner" && sender.kind !== "agent" && sender.kind !== "system") ||
+      typeof sender.handleSnapshot !== "string") {
+      throw new Error(`Chat message sender is malformed: ${row.event_id}`);
+    }
+    const target = payload.target;
+    if (target !== undefined && (!isRecord(target) ||
+      typeof target.principalId !== "string" ||
+      typeof target.handleSnapshot !== "string")) {
+      throw new Error(`Chat message target is malformed: ${row.event_id}`);
+    }
+    const dispatchCard = payload.dispatchCard;
+    if (dispatchCard !== undefined && (!isRecord(dispatchCard) ||
+      typeof dispatchCard.sourceMessageEventId !== "string" ||
+      !Array.isArray(dispatchCard.candidates) ||
+      dispatchCard.candidates.some((candidate) => !isRecord(candidate) ||
+        typeof candidate.principalId !== "string" ||
+        typeof candidate.handle !== "string"))) {
+      throw new Error(`Chat dispatch card is malformed: ${row.event_id}`);
+    }
+    return {
+      ...common,
+      type: "chat.message",
+      topicId: requirePayloadText(payload.topicId, row.event_id, "topicId"),
+      sender: {
+        kind: sender.kind,
+        ...(typeof sender.principalId === "string"
+          ? { principalId: sender.principalId }
+          : {}),
+        handleSnapshot: sender.handleSnapshot
+      },
+      body: requirePayloadText(payload.body, row.event_id, "body"),
+      ...(target === undefined
+        ? {}
+        : {
+            target: {
+              principalId: target.principalId as string,
+              handleSnapshot: target.handleSnapshot as string
+            }
+          }),
+      ...(dispatchCard === undefined
+        ? {}
+        : {
+            dispatchCard: {
+              sourceMessageEventId: dispatchCard.sourceMessageEventId as string,
+              candidates: (dispatchCard.candidates as Array<{
+                principalId: string;
+                handle: string;
+              }>).map(({ principalId, handle }) => ({ principalId, handle }))
+            }
+          })
+    };
+  }
+  if (row.type === "chat.dispatch") {
+    if (row.agent_id === null || row.prompt === null) {
+      throw new Error(`Chat dispatch is missing Agent input: ${row.event_id}`);
+    }
+    const payload = chatPayload(row);
+    return {
+      ...common,
+      type: "chat.dispatch",
+      agentId: row.agent_id,
+      topicId: requirePayloadText(payload.topicId, row.event_id, "topicId"),
+      sourceMessageEventId: requirePayloadText(
+        payload.sourceMessageEventId,
+        row.event_id,
+        "sourceMessageEventId"
+      ),
+      targetHandleSnapshot: requirePayloadText(
+        payload.targetHandleSnapshot,
+        row.event_id,
+        "targetHandleSnapshot"
+      ),
+      prompt: row.prompt
+    };
+  }
   if (row.type === "agent.result") {
-    if (row.outcome === null) throw new Error(`Result Event has no outcome: ${row.event_id}`);
+    if (row.outcome === null || row.agent_id === null) {
+      throw new Error(`Result Event is incomplete: ${row.event_id}`);
+    }
     return {
       ...common,
       type: "agent.result",
+      agentId: row.agent_id,
       outcome: row.outcome,
       ...(row.output === null ? {} : { output: row.output }),
       ...(row.error === null ? {} : { error: row.error })
@@ -848,8 +1128,38 @@ function mapEvent(row: EventRow): Event {
   return {
     ...common,
     type: row.type,
+    agentId: row.agent_id!,
     prompt: row.prompt
   };
+}
+
+function chatPayload(row: EventRow): Readonly<Record<string, unknown>> {
+  if (row.payload_json === null) {
+    throw new Error(`Chat Event payload is missing: ${row.event_id}`);
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(row.payload_json) as unknown;
+  } catch {
+    throw new Error(`Chat Event payload is malformed: ${row.event_id}`);
+  }
+  if (!isRecord(value)) throw new Error(`Chat Event payload is not an object: ${row.event_id}`);
+  return value;
+}
+
+function requirePayloadText(
+  value: unknown,
+  eventId: string,
+  field: string
+): string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error(`Chat Event ${field} is malformed: ${eventId}`);
+  }
+  return value;
+}
+
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function mapExecution(row: ExecutionRow): RuntimeExecution {

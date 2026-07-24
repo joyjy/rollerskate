@@ -3,8 +3,7 @@ export type SubscriptionStatus =
   | "paused"
   | "completed"
   | "cancelled"
-  | "expired"
-  | "revoked";
+  | "expired";
 
 export interface ProbeExecutionPolicy {
   readonly workspaceRoot: string;
@@ -16,12 +15,15 @@ export interface ProbeExecutionPolicy {
 }
 
 export interface SubscriptionCallback {
-  readonly sessionId: string;
+  readonly providerSessionId: string;
+  readonly adapterId: string;
+  readonly workspace: string;
+  readonly localSessionId?: string;
   readonly prompt: string;
 }
 
 export interface CreatePollSubscription {
-  readonly subscriptionId: string;
+  readonly ownerAgentId: string;
   readonly pluginPath: string;
   readonly pluginId: string;
   readonly pluginSchemaVersion: 1;
@@ -34,6 +36,7 @@ export interface CreatePollSubscription {
 }
 
 export interface PollSubscription extends CreatePollSubscription {
+  readonly subscriptionId: string;
   readonly status: SubscriptionStatus;
   readonly attemptCount: number;
   readonly startedAt: string;

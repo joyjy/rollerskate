@@ -1,33 +1,45 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { onBeforeUnmount, onMounted, ref } from "vue";
 import type { ConsoleView } from "@/types/subscription";
 import type { RuntimeInfo } from "@/types/runtime";
+import type { LocalSnapshot } from "@/types/local";
 import SubscriptionsView from "@/views/SubscriptionsView.vue";
-import PlaceholderView from "@/views/PlaceholderView.vue";
 import RuntimeView from "@/views/RuntimeView.vue";
 import EventsView from "@/views/EventsView.vue";
+import AgentsView from "@/views/AgentsView.vue";
+import ChatsView from "@/views/ChatsView.vue";
 
-const routableViews: readonly ConsoleView[] = ["runtime", "events", "subscriptions"];
-const requestedView = window.location.pathname.split("/").filter(Boolean).at(-1);
-const browserAddress = window.location.host;
-const activeView = ref<ConsoleView>(
-  routableViews.includes(requestedView as ConsoleView)
+const routableViews: readonly ConsoleView[] = [
+  "runtime", "events", "agents", "chats", "subscriptions"
+];
+function viewFromPath(): ConsoleView | null {
+  const requestedView = window.location.pathname.split("/").filter(Boolean).at(-1);
+  return routableViews.includes(requestedView as ConsoleView)
     ? requestedView as ConsoleView
-    : "subscriptions"
-);
+    : null;
+}
+
+const explicitView = viewFromPath();
+const browserAddress = window.location.host;
+const activeView = ref<ConsoleView | null>(explicitView);
 const runtimeSummary = ref<RuntimeInfo | null>(null);
 
-const views: { key: ConsoleView; label: string; placeholder: boolean }[] = [
-  { key: "runtime", label: "Runtime", placeholder: false },
-  { key: "events", label: "Events", placeholder: false },
-  { key: "agents", label: "Agents", placeholder: true },
-  { key: "subscriptions", label: "Subscriptions", placeholder: false },
-  { key: "rooms", label: "Rooms", placeholder: true }
+const views: { key: ConsoleView; label: string }[] = [
+  { key: "runtime", label: "Runtime" },
+  { key: "events", label: "Events" },
+  { key: "agents", label: "Agents" },
+  { key: "chats", label: "Chats" },
+  { key: "subscriptions", label: "Subscriptions" }
 ];
 
 function setView(view: ConsoleView) {
   activeView.value = view;
   window.history.pushState({}, "", `/console/${view}`);
+}
+
+function syncViewFromHistory() {
+  const view = viewFromPath();
+  if (view !== null) activeView.value = view;
 }
 
 async function loadRuntimeSummary() {
@@ -39,7 +51,30 @@ async function loadRuntimeSummary() {
   }
 }
 
-onMounted(loadRuntimeSummary);
+async function selectInitialView() {
+  if (explicitView !== null) return;
+  try {
+    const response = await fetch("/api/local", { headers: { Accept: "application/json" } });
+    if (!response.ok) throw new Error(`Local HTTP ${response.status}`);
+    const local = await response.json() as LocalSnapshot;
+    activeView.value = local.agents.some((agent) => agent.status === "active")
+      ? "chats"
+      : "agents";
+  } catch {
+    activeView.value = "agents";
+  }
+  window.history.replaceState({}, "", `/console/${activeView.value}`);
+}
+
+onMounted(() => {
+  window.addEventListener("popstate", syncViewFromHistory);
+  void loadRuntimeSummary();
+  void selectInitialView();
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener("popstate", syncViewFromHistory);
+});
 </script>
 
 <template>
@@ -51,15 +86,16 @@ onMounted(loadRuntimeSummary);
           Rollerskate Console
         </div>
         <nav class="console-nav">
-          <a
+          <button
             v-for="item in views"
             :key="item.key"
-            href="#"
-            :class="{ active: activeView === item.key, placeholder: item.placeholder }"
-            @click.prevent="!item.placeholder && setView(item.key)"
+            type="button"
+            class="nav-tab"
+            :class="{ active: activeView === item.key }"
+            @click="setView(item.key)"
           >
             {{ item.label }}
-          </a>
+          </button>
         </nav>
       </div>
       <div class="runtime-strip">
@@ -73,10 +109,12 @@ onMounted(loadRuntimeSummary);
     </header>
 
     <main>
-      <SubscriptionsView v-if="activeView === 'subscriptions'" />
+      <div v-if="activeView === null" class="app-loading">Starting Local Console…</div>
       <RuntimeView v-else-if="activeView === 'runtime'" />
       <EventsView v-else-if="activeView === 'events'" />
-      <PlaceholderView v-else :title="activeView" />
+      <AgentsView v-else-if="activeView === 'agents'" @agent-added="setView('chats')" />
+      <ChatsView v-else-if="activeView === 'chats'" />
+      <SubscriptionsView v-else />
     </main>
   </div>
 </template>
@@ -164,36 +202,28 @@ header {
   padding: 4px;
 }
 
-.console-nav a {
+.console-nav .nav-tab {
   padding: 9px 20px;
+  border: 0;
   border-radius: 8px;
   font-size: 14px;
   font-weight: 700;
   color: var(--text-secondary);
-  text-decoration: none;
+  background: transparent;
+  cursor: pointer;
   transition: background 0.15s, color 0.15s;
   letter-spacing: 0.01em;
 }
 
-.console-nav a:hover {
+.console-nav .nav-tab:hover {
   background: var(--bg);
   color: var(--text);
 }
 
-.console-nav a.active {
+.console-nav .nav-tab.active {
   background: var(--primary);
   color: #fff;
   box-shadow: 0 2px 6px rgba(37, 99, 235, 0.35);
-}
-
-.console-nav a.placeholder {
-  color: var(--text-dim);
-  cursor: not-allowed;
-}
-
-.console-nav a.placeholder:hover {
-  background: transparent;
-  color: var(--text-dim);
 }
 
 .runtime-strip {
@@ -245,6 +275,13 @@ header {
 
 main {
   padding: 20px 24px 40px;
+}
+
+.app-loading {
+  max-width: 1120px;
+  margin: 80px auto;
+  color: var(--text-secondary);
+  text-align: center;
 }
 
 .panel {
@@ -306,6 +343,176 @@ main {
   word-break: break-word;
 }
 
+.panel-body {
+  padding: 20px;
+}
+
+.primary-button {
+  appearance: none;
+  border: 1px solid var(--primary);
+  background: var(--primary);
+  color: #fff;
+  padding: 9px 18px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.primary-button:hover:not(:disabled) {
+  background: #1d4ed8;
+}
+
+.primary-button:disabled {
+  opacity: .55;
+  cursor: not-allowed;
+}
+
+.secondary-button {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  padding: 7px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.secondary-button:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+.secondary-button:disabled {
+  opacity: .55;
+  cursor: not-allowed;
+}
+
+.secondary-button.danger {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.secondary-button.warning {
+  color: var(--warning);
+  border-color: var(--warning);
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+}
+
+.state {
+  padding: 28px 18px;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.state.error {
+  color: var(--danger);
+}
+
+.empty-inline {
+  padding: 12px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  color: var(--text-secondary);
+}
+
+.inline-error {
+  padding: 10px 12px;
+  margin-bottom: 14px;
+  border-radius: 6px;
+  color: var(--danger);
+  background: var(--danger-soft);
+  border: 1px solid #fecaca;
+  font-size: 13px;
+}
+
+.list-banner {
+  padding: 8px 12px;
+  font-size: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.list-banner.stale {
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+.list-banner.paused {
+  background: var(--muted-soft);
+  color: var(--muted);
+}
+
+.list-banner.new-events {
+  background: var(--primary-soft);
+  color: var(--primary);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.system-card {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 5px 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.system-card::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--primary);
+}
+
+.system-card.success { color: var(--success); }
+.system-card.success::before { background: var(--success); }
+.system-card strong { color: var(--text); font-weight: 600; }
+
+.layout-base {
+  max-width: 1500px;
+  margin: 0 auto;
+  display: grid;
+  gap: 18px;
+  align-items: start;
+}
+
+.layout-base.narrow { max-width: 1120px; }
+.layout-base.gap-lg { gap: 20px; }
+
+.layout-two-pane { grid-template-columns: minmax(360px, 0.95fr) minmax(520px, 1.55fr); }
+.layout-two-pane-compact { grid-template-columns: minmax(300px, 0.9fr) minmax(420px, 1.1fr); }
+.layout-three-pane { grid-template-columns: 260px 1fr 280px; }
+.layout-three-pane-wide { grid-template-columns: 280px 1fr 300px; }
+
+@media (max-width: 1100px) {
+  .layout-two-pane,
+  .layout-two-pane-compact,
+  .layout-three-pane,
+  .layout-three-pane-wide { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 768px) {
+  .layout-three-pane,
+  .layout-three-pane-wide { grid-template-columns: 1fr; }
+}
+
 @media (max-width: 1100px) {
   .header-inner {
     flex-wrap: wrap;
@@ -327,7 +534,7 @@ main {
     padding-right: 12px;
   }
 
-  .console-nav a {
+  .console-nav .nav-tab {
     padding: 7px 9px;
     font-size: 12px;
   }

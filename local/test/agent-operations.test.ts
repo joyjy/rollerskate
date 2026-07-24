@@ -27,8 +27,9 @@ const DEVICE_CREDENTIAL = "device-credential.device-secret";
 
 test("Local Runtime provisions isolated Agents and recovers them after restart", async () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-agents-"));
+  const runtime = join(repo, "runtime");
   const workspaceRoot = join(repo, "workspaces");
-  const paths = runtimePaths(repo);
+  const paths = runtimePaths(repo, runtime);
   const agents = new Map<string, {
     summary: AgentSummary;
     enrollmentId: string;
@@ -92,12 +93,12 @@ test("Local Runtime provisions isolated Agents and recovers them after restart",
   };
 
   try {
-    const configured = configureAgents(repo, workspaceRoot);
+    const configured = configureAgents(repo, workspaceRoot, runtime);
     const canonicalWorkspaceRoot = realpathSync(workspaceRoot);
     assert.equal(configured.workspaceRoot, canonicalWorkspaceRoot);
-    assert.equal(configureAgents(repo, workspaceRoot).workspaceRoot, canonicalWorkspaceRoot);
+    assert.equal(configureAgents(repo, workspaceRoot, runtime).workspaceRoot, canonicalWorkspaceRoot);
     assert.throws(
-      () => configureAgents(repo, join(repo, "other-workspaces")),
+      () => configureAgents(repo, join(repo, "other-workspaces"), runtime),
       /already configured differently/
     );
     new DeviceCredentialStore(paths.deviceCredential).save({
@@ -108,12 +109,15 @@ test("Local Runtime provisions isolated Agents and recovers them after restart",
     });
 
     const alice = await createAgent(repo, "alice", {
+      runtimeDirectory: runtime,
       fetch: fakeFetch,
       now: () => new Date("2026-07-19T10:00:00.000Z")
     });
     const bob = await createAgent(repo, "bob", {
+      runtimeDirectory: runtime,
       fetch: fakeFetch,
-      now: () => new Date("2026-07-19T10:01:00.000Z")
+      now: () => new Date("2026-07-19T10:01:00.000Z"),
+      client: "codex"
     });
     assert.notEqual(alice.summary.id, bob.summary.id);
     assert.notEqual(alice.metadata.credentialId, bob.metadata.credentialId);
@@ -124,19 +128,27 @@ test("Local Runtime provisions isolated Agents and recovers them after restart",
     assert.equal(lstatSync(alice.metadata.workspacePath).isDirectory(), true);
     assert.equal(lstatSync(bob.metadata.workspacePath).isDirectory(), true);
 
-    const restartedAlice = await statusAgent(repo, "alice", { fetch: fakeFetch });
+    const restartedAlice = await statusAgent(
+      repo,
+      "alice",
+      { runtimeDirectory: runtime, fetch: fakeFetch }
+    );
     assert.equal(restartedAlice.summary.id, alice.summary.id);
-    assert.equal((await statusAgent(repo, "bob", { fetch: fakeFetch })).summary.id, bob.summary.id);
+    assert.equal((await statusAgent(
+      repo,
+      "bob",
+      { runtimeDirectory: runtime, fetch: fakeFetch }
+    )).summary.id, bob.summary.id);
     assert.deepEqual(
-      (await listAgents(repo, { fetch: fakeFetch })).map((agent) => agent.summary.name),
+      (await listAgents(repo, { runtimeDirectory: runtime, fetch: fakeFetch }))
+        .map((agent) => agent.summary.name),
       ["alice", "bob"]
     );
-    assert.equal((await createAgent(repo, "alice", { fetch: fakeFetch })).summary.id, alice.summary.id);
-    assert.equal((await createAgent(repo, "bob", {
-      fetch: fakeFetch,
-      client: "codex"
-    })).summary.id, bob.summary.id);
-
+    assert.equal((await createAgent(
+      repo,
+      "alice",
+      { runtimeDirectory: runtime, fetch: fakeFetch }
+    )).summary.id, alice.summary.id);
     const aliceSecret = readFileSync(join(paths.agentCredentials, "alice.json"), "utf8");
     const bobSecret = readFileSync(join(paths.agentCredentials, "bob.json"), "utf8");
     assert.equal(lstatSync(join(paths.agentCredentials, "alice.json")).mode & 0o777, 0o600);
@@ -151,7 +163,11 @@ test("Local Runtime provisions isolated Agents and recovers them after restart",
     assert.ok(authorizations.includes(`Bearer ${DEVICE_CREDENTIAL}`));
     assert.ok(authorizations.some((value) => value.startsWith("Bearer enrollment-alice.")));
     assert.ok(authorizations.some((value) => value.startsWith("Bearer enrollment-bob.")));
-    await assert.rejects(() => createAgent(repo, "../escape", { fetch: fakeFetch }));
+    await assert.rejects(() => createAgent(
+      repo,
+      "../escape",
+      { runtimeDirectory: runtime, fetch: fakeFetch }
+    ));
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }

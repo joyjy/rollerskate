@@ -26,7 +26,8 @@ const emit = defineEmits<{
         <StatusBadge :status="sub.status" />
       </div>
       <div class="row-title">{{ sub.plugin.id }}</div>
-      <div class="row-meta">Session {{ sub.sessionId }}</div>
+      <div class="row-meta">@{{ sub.owner.handle }} · {{ sub.owner.client }}</div>
+      <div class="row-meta">Provider Session {{ sub.callback.providerSessionId }}</div>
     </div>
   </div>
 </template>

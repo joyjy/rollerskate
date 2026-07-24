@@ -10,6 +10,8 @@ timestamp: 2026-07-20
 
 [返回 architecture index](./index.md)
 
+本页只描述 v0.2 已实现的 legacy Server Room control plane。v0.3.1 Local 产品已 clean cutover 为 `Local` Chat + Local Topic，不使用 Room 抽象；它不能创建、迁移、同步或转换成 Server Room。Server Room 仍只由现有 Server 控制面创建和管理，v0.3.1 Local UI 不展示该产品面；未来 Server Topic、membership、Runtime subscription 与 fanout 由 [v0.4 plan](../plan/v0.4.0.md) 收敛。
+
 ## 产品事实与 Matrix 事实
 
 Server 中的 `Room`、`RoomHumanMembership`、`AgentRoomBinding` 与 Matrix membership 是不同事实。Matrix membership 只表示 virtual user 已进入 transport Room，不能授予 Agent 调用 Room API、读取历史或接收候选 Event 的权限；所有 Agent endpoint 都要求请求 credential 与 path 中的 Agent 完全匹配，并存在 active binding。

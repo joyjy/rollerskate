@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 
 import { LocalAgentRegistryStore } from "./agent/registry-store.js";
@@ -8,6 +8,7 @@ import { runtimePaths } from "./runtime-config.js";
 import { PollSubscriptionStore } from "../capabilities/subscription/store.js";
 import type { RuntimeAudit } from "../core/runtime/store.js";
 import { RuntimeStore } from "../core/runtime/store.js";
+import { LocalFoundationStore } from "./local-foundation.js";
 
 export interface RuntimeControlResultView {
   readonly kind: "pause" | "resume" | "recover";
@@ -30,12 +31,27 @@ export function runtimeConsoleView(
   const runtime = new RuntimeStore(paths.database);
   const subscriptions = new PollSubscriptionStore(paths.database);
   const agents = new LocalAgentRegistryStore(paths.database);
+  const foundation = new LocalFoundationStore(paths.database);
   try {
     const audits = runtime.audits(1_000);
     const sessions = runtime.sessions(1_000);
     const destinations = runtime.destinations(1_000);
     const subscriptionItems = subscriptions.list();
     const agentItems = agents.list();
+    const legacyAgentItems = agentItems.map((agent) => {
+      const workspaceAvailable = availableWorkspace(agent.workspacePath);
+      return {
+        ...agent,
+        status: agent.status === "active" && !workspaceAvailable
+          ? "unavailable"
+          : agent.status,
+        ...(workspaceAvailable
+          ? {}
+          : { failureReason: `Agent workspace is unavailable: ${agent.workspacePath}` })
+      };
+    });
+    const localAgentItems = foundation.listAgents();
+    const localFoundation = foundation.foundation();
     const state = loop.state;
     const paused = new LoopControlStore(paths.loopControl).paused();
     const stale = state?.status === "running" &&
@@ -45,7 +61,12 @@ export function runtimeConsoleView(
       : paused
         ? "paused"
         : "running";
-    const workspaceRoots = [...new Set(agentItems.map((agent) => agent.workspacePath))];
+    const workspaceRoots = [...new Set([
+      ...(localFoundation === undefined ? [] : [localFoundation.workspacePath]),
+      ...legacyAgentItems
+        .filter((agent) => agent.status !== "unavailable")
+        .map((agent) => agent.workspacePath)
+    ])];
     const lifecycle = audits.map(deriveLifecycle);
     const executionCounts = loop.activity?.executions ?? {};
     const resultCounts = loop.activity?.resultEvents ?? {};
@@ -101,9 +122,11 @@ export function runtimeConsoleView(
       },
       recentIsolations: isolationViews(audits),
       agents: {
-        registered: agentItems.length,
-        callable: agentItems.filter((agent) => agent.status === "active").length,
-        unavailable: agentItems.filter((agent) => agent.status !== "active").length
+        registered: localAgentItems.length + legacyAgentItems.length,
+        callable: localAgentItems.filter((agent) => agent.status === "active").length +
+          legacyAgentItems.filter((agent) => agent.status === "active").length,
+        unavailable: localAgentItems.filter((agent) => agent.status !== "active").length +
+          legacyAgentItems.filter((agent) => agent.status !== "active").length
       },
       events: {
         lastReceivedAt: audits[0]?.event.createdAt ?? null,
@@ -138,11 +161,19 @@ export function runtimeConsoleView(
       capabilities: [
         { name: "poll-subscription", version: "1", available: true }
       ],
-      integrations: integrationViews(agentItems, state?.roomIds ?? [], loop.running),
+      integrations: integrationViews([
+        ...localAgentItems.map((agent) => ({
+          name: agent.handle,
+          client: agent.client,
+          status: agent.status
+        })),
+        ...legacyAgentItems
+      ], state?.routeIds ?? [], loop.running),
       recentLogs: [],
       controlResult
     };
   } finally {
+    foundation.close();
     agents.close();
     subscriptions.close();
     runtime.close();
@@ -153,11 +184,12 @@ function deriveLifecycle(
   audit: RuntimeAudit
 ): "queued" | "running" | "retrying" | "succeeded" | "failed" | "delivery_pending" |
   "delivered" | "delivery_failed" {
+  if (audit.execution === undefined) return "succeeded";
   if (audit.execution.status === "queued") return "queued";
   if (audit.execution.status === "running") return "running";
   if (audit.execution.status === "retry_wait") return "retrying";
   if (audit.execution.status === "failed" || audit.resultEvent?.outcome === "failed") return "failed";
-  if (audit.resultEvent === undefined) return "running";
+  if (audit.resultEvent === undefined) return "succeeded";
   if (audit.deliveries.length === 0) return "succeeded";
   const statuses = audit.deliveries.map(({ delivery }) => delivery.status);
   if (statuses.some((status) => status === "failed")) return "delivery_failed";
@@ -168,6 +200,7 @@ function deriveLifecycle(
 function isolationViews(audits: readonly RuntimeAudit[]): unknown[] {
   return audits.flatMap((audit) => {
     const values: unknown[] = [];
+    if (audit.execution === undefined) return values;
     if (audit.execution.status === "failed" && audit.execution.lastError !== undefined) {
       values.push({
         occurredAt: audit.execution.updatedAt,
@@ -193,8 +226,13 @@ function isolationViews(audits: readonly RuntimeAudit[]): unknown[] {
 }
 
 function integrationViews(
-  agents: readonly { readonly name: string; readonly client: string; readonly status: string }[],
-  roomIds: readonly string[],
+  agents: readonly {
+    readonly name: string;
+    readonly client: string;
+    readonly status: string;
+    readonly failureReason?: string;
+  }[],
+  routeIds: readonly string[],
   running: boolean
 ): unknown[] {
   const adapters = agents.map((agent) => ({
@@ -202,18 +240,19 @@ function integrationViews(
     kind: "adapter",
     status: running && agent.status === "active" ? "connected" : "disconnected",
     lastSuccessAt: null,
-    failureReason: agent.status === "active" ? null : `Agent status is ${agent.status}`
+    failureReason: agent.failureReason ??
+      (agent.status === "active" ? null : `Agent status is ${agent.status}`)
   }));
-  return [
-    ...adapters,
-    {
-      name: "matrix",
-      kind: "ingress",
-      status: running && roomIds.length > 0 ? "connected" : "disconnected",
-      lastSuccessAt: null,
-      failureReason: roomIds.length > 0 ? null : "No active Matrix binding"
-    }
-  ];
+  void routeIds;
+  return adapters;
+}
+
+function availableWorkspace(path: string): boolean {
+  try {
+    return existsSync(path) && statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 function databaseSchemaVersion(path: string): number | null {

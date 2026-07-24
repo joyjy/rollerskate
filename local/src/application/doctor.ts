@@ -27,13 +27,14 @@ export interface LocalDoctorResult {
 export interface DoctorOptions {
   readonly includeMatrix?: boolean;
   readonly fetch?: typeof fetch;
+  readonly runtimeDirectory?: string;
 }
 
 export async function doctorLocalRuntime(
   repoRoot: string,
   options: DoctorOptions = {}
 ): Promise<LocalDoctorResult> {
-  const runtime = loadLocalRuntime(repoRoot);
+  const runtime = loadLocalRuntime(repoRoot, options.runtimeDirectory);
   validateLocalRuntime(runtime);
   const result: LocalDoctorResult = {
     status: "ready",

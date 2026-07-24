@@ -4,7 +4,7 @@ Rollerskate 是一个 npm monorepo。仓库根目录只负责 workspace 编排�
 
 ## Read First
 
-- [Source Map](docs/architecture/source-map.md) 是 package、source root、ownership、generated artifact 与验证入口的唯一事实源；不要在本文件复制目录地图。
+- [Source Map](docs/architecture/source-map.md) 是 package、source root、ownership、generated artifact 与验证入口的唯一事实源。
 - [Architecture Index](docs/architecture/index.md) 是当前产品架构、稳定不变量、ADR 与专题文档入口。
 - 未实现计划不能覆盖 architecture 文档和源码事实；公开源码快照不包含内部计划文件。
 
@@ -19,6 +19,8 @@ Rollerskate 是一个 npm monorepo。仓库根目录只负责 workspace 编排�
 - 新外部输出实现 Destination/Delivery integration，不把 Room、webhook 或 channel 建模为 Handler Route。
 - Console 浏览器源码属于 `local/ui/src/`；loopback API/static host 属于 `local/src/entrypoints/console/`，只能调用 application control/query，不能直接读写 store。
 - 不创建根 `src/`。任何 `dist/` 都是生成物，不得编辑、评审或当作源码事实。
+- 修改 cli 命令需要维持 [CLI Reference](docs/runbook/cli-reference.md) 准确
+- 修改 event.type 需要维持 [Event Reference](docs/architecture/event-reference.md) 准确
 
 ## Verification
 

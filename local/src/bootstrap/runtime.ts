@@ -32,6 +32,12 @@ import {
 } from "../integrations/server/room-client.js";
 import { runtimePaths } from "../application/runtime-config.js";
 import { initializeRuntimeSchema } from "../application/runtime-schema.js";
+import {
+  bootstrapLocalFoundation,
+  LocalFoundationStore,
+  type LocalAgent
+} from "../application/local-foundation.js";
+import { LocalChatStore } from "../application/local-chat-store.js";
 
 export interface RuntimeStartOptions {
   readonly repoRoot: string;
@@ -48,7 +54,11 @@ export async function startRuntime(
   options: RuntimeStartOptions,
   signal: AbortSignal
 ): Promise<LoopResult> {
-  initializeRuntimeSchema(runtimePaths(options.repoRoot, options.runtimeDirectory).database);
+  const runtimePathSet = runtimePaths(options.repoRoot, options.runtimeDirectory);
+  mkdirSync(runtimePathSet.runtimeDirectory, { recursive: true, mode: 0o700 });
+  chmodSync(runtimePathSet.runtimeDirectory, 0o700);
+  initializeRuntimeSchema(runtimePathSet.database);
+  bootstrapLocalFoundation(runtimePathSet);
   const resources = await assembleRuntime(options);
   try {
     const reconciledAt = new Date().toISOString();
@@ -58,7 +68,7 @@ export async function startRuntime(
       statePath: resources.paths.loopState,
       runtimeDirectory: resources.paths.runtimeDirectory,
       agentNames: resources.agentNames,
-      roomIds: resources.roomIds,
+      routeIds: resources.routeIds,
       phases: resources.phases,
       paused: () => resources.loopControl.paused(),
       ...(options.pollMilliseconds === undefined
@@ -73,7 +83,15 @@ export async function startRuntime(
       try {
         resources.matrixDelivery?.close();
       } finally {
-        resources.runtimeStore.close();
+        try {
+          resources.runtimeStore.close();
+        } finally {
+          try {
+            resources.localChat.close();
+          } finally {
+            resources.foundationStore.close();
+          }
+        }
       }
     }
   }
@@ -85,10 +103,14 @@ async function assembleRuntime(options: RuntimeStartOptions) {
   chmodSync(paths.runtimeDirectory, 0o700);
   const deviceStore = new LocalDeviceStore(paths.database);
   const registry = new LocalAgentRegistryStore(paths.database);
+  const foundationStore = new LocalFoundationStore(paths.database);
+  const localChat = new LocalChatStore(paths.database);
   const runtimeStore = new RuntimeStore(paths.database);
   let handedOff = false;
   try {
     const device = deviceStore.current();
+    const foundation = foundationStore.foundation();
+    if (foundation === undefined) throw new Error("Local foundation is not initialized");
     const credentialStore = new AgentCredentialStore(paths.agentCredentials);
     const runtimeAgents = new Map<string, RuntimeAgentAdapter>();
     const publishers = new Map<string, RoomServerClient>();
@@ -97,14 +119,35 @@ async function assembleRuntime(options: RuntimeStartOptions) {
     const roomPolicies = new RoomPolicyStore(paths.matrixPolicy);
     const loopControl = new LoopControlStore(paths.loopControl);
     const agentNames: string[] = [];
+    for (const localAgent of foundationStore.listAgents().filter(
+      (agent) => agent.status === "active"
+    )) {
+      agentNames.push(localAgent.handle);
+      const adapter = runtimeAgent(localAgent, paths.workspace, options);
+      runtimeAgents.set(
+        localRuntimeAgentKey(localAgent.principalId, adapter.workspace),
+        adapter
+      );
+    }
     for (const metadata of registry.list().filter((agent) => agent.status === "active")) {
+      let agent: RuntimeAgentAdapter;
+      try {
+        agent = new CodexRuntimeAgent({
+          executable: requireExecutable(options.codexExecutable, "Codex"),
+          projectRoot: metadata.workspacePath,
+          environment: options.environment,
+          timeoutMilliseconds: options.codexTimeoutMilliseconds ?? 300_000
+        });
+      } catch (error) {
+        options.output?.write(`${JSON.stringify({
+          type: "runtime.adapter_unavailable",
+          adapter: metadata.client,
+          agentId: metadata.agentId,
+          error: message(error)
+        })}\n`);
+        continue;
+      }
       agentNames.push(metadata.name);
-      const agent = new CodexRuntimeAgent({
-        executable: requireExecutable(options.codexExecutable, "Codex"),
-        projectRoot: metadata.workspacePath,
-        environment: options.environment,
-        timeoutMilliseconds: options.codexTimeoutMilliseconds ?? 300_000
-      });
       runtimeAgents.set(metadata.agentId, agent);
       const credential = credentialStore.load(metadata.name);
       if (credential?.state !== "active" || device?.status !== "active" ||
@@ -167,7 +210,25 @@ async function assembleRuntime(options: RuntimeStartOptions) {
     const runtimeCycle = new RuntimeCycle({
       store: runtimeStore,
       handlers: new Map<RuntimeHandlerKind, RuntimeEventHandler>([
-        ["agent", new AgentHandler({ store: runtimeStore, adapters: runtimeAgents })],
+        ["agent", new AgentHandler({
+          store: runtimeStore,
+          adapterForAgent(agentId, sessionWorkspace) {
+            const localAgent = foundationStore.listAgents().find(
+              (agent) => agent.principalId === agentId
+            );
+            if (localAgent !== undefined) {
+              if (localAgent.status !== "active") return undefined;
+              const workspace = sessionWorkspace ?? paths.workspace;
+              const key = localRuntimeAgentKey(agentId, workspace);
+              const cached = runtimeAgents.get(key);
+              if (cached !== undefined) return cached;
+              const adapter = runtimeAgent(localAgent, workspace, options);
+              runtimeAgents.set(key, adapter);
+              return adapter;
+            }
+            return runtimeAgents.get(agentId);
+          }
+        })],
         ["result", new ResultHandler(runtimeStore)]
       ]),
       deliveryHandler: new DeliveryHandler({
@@ -180,6 +241,7 @@ async function assembleRuntime(options: RuntimeStartOptions) {
     const phases: LoopPhase[] = [
       subscriptionPhase(subscriptions),
       ...matrixPhases(matrixIngress),
+      localChatPhase(localChat, foundation.topicId, foundationStore),
       runtimePhase(runtimeCycle)
     ];
     handedOff = true;
@@ -189,16 +251,42 @@ async function assembleRuntime(options: RuntimeStartOptions) {
       matrixDelivery,
       subscriptions,
       runtimeStore,
+      localChat,
+      foundationStore,
       loopControl,
       phases,
       agentNames: agentNames.sort(),
-      roomIds: [...new Set(bindings.map((binding) => binding.roomId))].sort()
+      routeIds: [
+        foundation.topicId,
+        ...new Set(bindings.map((binding) => binding.roomId))
+      ].sort()
     };
   } finally {
     if (!handedOff) runtimeStore.close();
     registry.close();
     deviceStore.close();
+    if (!handedOff) {
+      localChat.close();
+      foundationStore.close();
+    }
   }
+}
+
+function runtimeAgent(
+  agent: LocalAgent,
+  workspace: string,
+  options: RuntimeStartOptions
+): RuntimeAgentAdapter {
+  return new CodexRuntimeAgent({
+    executable: requireExecutable(options.codexExecutable, "Codex"),
+    projectRoot: workspace,
+    environment: options.environment,
+    timeoutMilliseconds: options.codexTimeoutMilliseconds ?? 300_000
+  });
+}
+
+function localRuntimeAgentKey(agentId: string, workspace: string): string {
+  return `local:${agentId}:${workspace}`;
 }
 
 function subscriptionPhase(runtime: PollSubscriptionRuntime): LoopPhase {
@@ -225,6 +313,33 @@ function matrixPhases(ingress: MatrixIngress | undefined): LoopPhase[] {
         : { type: "matrix.ingress_cycle", ...result };
     }
   }));
+}
+
+function localChatPhase(
+  chat: LocalChatStore,
+  topicId: string,
+  foundation: LocalFoundationStore
+): LoopPhase {
+  return {
+    scope: "local-chat",
+    run: async () => {
+      const prompts = chat.promptPending(
+        topicId,
+        foundation.listAgents()
+          .filter((agent) => agent.status === "active")
+          .map((agent) => ({
+            principalId: agent.principalId,
+            handle: agent.handle
+          }))
+      );
+      return prompts.length === 0
+        ? undefined
+        : {
+            type: "local_chat.dispatch_prompted",
+            messageEventIds: prompts.map((event) => event.eventId)
+          };
+    }
+  };
 }
 
 function runtimePhase(runtime: RuntimeCycle): LoopPhase {

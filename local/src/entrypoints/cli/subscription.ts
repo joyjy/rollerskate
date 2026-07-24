@@ -17,11 +17,12 @@ export function runSubscriptionCommand(
   repoRoot: string,
   arguments_: readonly string[],
   output: Output,
-  runtimeDirectory?: string
+  runtimeDirectory?: string,
+  callbackWorkspace = process.cwd()
 ): number {
   const [command, ...rest] = arguments_;
   if (command === "add") {
-    const input = parseAdd(rest);
+    const input = parseAdd(rest, callbackWorkspace);
     output.write(`${JSON.stringify(
       publicInspection(registerPollSubscription(repoRoot, input, runtimeDirectory)),
       null,
@@ -47,7 +48,7 @@ export function runSubscriptionCommand(
     )), null, 2)}\n`);
     return 0;
   }
-  if (command === "pause" || command === "resume" || command === "cancel" || command === "revoke") {
+  if (command === "pause" || command === "resume" || command === "cancel") {
     if (rest.length !== 1) throw new Error(`subscription ${command} requires exactly one id`);
     output.write(`${JSON.stringify(publicInspection(controlPollSubscription(
       repoRoot,
@@ -57,83 +58,141 @@ export function runSubscriptionCommand(
     )), null, 2)}\n`);
     return 0;
   }
-  throw new Error("subscription requires add, list, inspect, pause, resume, cancel or revoke");
+  throw new Error("subscription requires add, list, inspect, pause, resume or cancel");
 }
 
 function publicInspection(inspection: PollSubscriptionInspection): unknown {
   const { pluginConfig: _pluginConfig, ...subscription } = inspection.subscription;
-  return { subscription };
-}
-
-function parseAdd(arguments_: readonly string[]): RegisterPollSubscriptionInput {
-  const subscriptionId = arguments_[0];
-  if (subscriptionId === undefined || subscriptionId.startsWith("--")) {
-    throw new Error("subscription add requires an id before options");
-  }
-  const values = new Map<string, string[]>();
-  for (let offset = 1; offset < arguments_.length; offset += 2) {
-    const option = arguments_[offset];
-    const value = arguments_[offset + 1];
-    if (option === undefined || !option.startsWith("--") || value === undefined || value.startsWith("--")) {
-      throw new Error(`subscription add option requires a value: ${option ?? "unknown"}`);
-    }
-    const key = option.slice(2);
-    const supported = [
-      "plugin", "plugin-id", "config", "session", "prompt-file",
-      "interval-ms", "max-wait-ms", "max-attempts", "probe-timeout-ms",
-      "max-output-bytes", "allow-http-origin", "allow-executable", "allow-env"
-    ];
-    if (!supported.includes(key)) throw new Error(`unknown subscription add option: ${option}`);
-    values.set(key, [...(values.get(key) ?? []), value]);
-  }
-  const configPath = realpathSync(one(values, "config"));
-  const promptPath = realpathSync(one(values, "prompt-file"));
-  let pluginConfig: unknown;
-  try {
-    pluginConfig = JSON.parse(readFileSync(configPath, "utf8")) as unknown;
-  } catch (error) {
-    throw new Error(`subscription config must be valid JSON: ${message(error)}`);
-  }
-  const prompt = readFileSync(promptPath, "utf8").trim();
-  if (prompt === "") throw new Error("callback prompt file must be non-empty");
   return {
-    subscriptionId,
-    pluginPath: one(values, "plugin"),
-    pluginId: one(values, "plugin-id"),
-    pluginConfig,
-    sessionId: one(values, "session"),
-    prompt,
-    intervalMilliseconds: integer(values, "interval-ms"),
-    maxWaitMilliseconds: integer(values, "max-wait-ms"),
-    maxAttempts: integer(values, "max-attempts"),
-    probeTimeoutMilliseconds: optionalInteger(values, "probe-timeout-ms", 30_000),
-    maxOutputBytes: optionalInteger(values, "max-output-bytes", 1_048_576),
-    allowedHttpOrigins: values.get("allow-http-origin") ?? [],
-    allowedExecutables: values.get("allow-executable") ?? [],
-    allowedEnvironment: values.get("allow-env") ?? []
+    subscription,
+    owner: {
+      agentId: inspection.owner.principalId,
+      handle: inspection.owner.handle,
+      client: inspection.owner.client
+    }
   };
 }
 
-function one(values: ReadonlyMap<string, readonly string[]>, key: string): string {
-  const found = values.get(key);
-  if (found?.length !== 1 || found[0] === undefined || found[0].trim() === "") {
-    throw new Error(`subscription add requires exactly one --${key}`);
+function parseAdd(
+  arguments_: readonly string[],
+  callbackWorkspace: string
+): RegisterPollSubscriptionInput {
+  if (arguments_.length !== 1) {
+    throw new Error("subscription add requires exactly one JSON file");
   }
-  return found[0];
+  const path = realpathSync(arguments_[0]!);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+  } catch (error) {
+    throw new Error(`subscription file must be valid JSON: ${message(error)}`);
+  }
+  const root = record(parsed, "subscription file");
+  exactKeys(root, [
+    "schemaVersion", "ownerAgentId", "plugin", "callback", "schedule", "executionPolicy"
+  ], "subscription file");
+  if (root.schemaVersion !== 1) {
+    throw new Error("subscription file schemaVersion must be 1");
+  }
+  const plugin = record(root.plugin, "plugin");
+  exactKeys(plugin, ["path", "id", "config"], "plugin");
+  const callback = record(root.callback, "callback");
+  exactKeys(callback, ["providerSessionId", "prompt"], "callback");
+  const schedule = record(root.schedule, "schedule");
+  exactKeys(schedule, [
+    "intervalMilliseconds", "maxWaitMilliseconds", "maxAttempts"
+  ], "schedule");
+  const policy = root.executionPolicy === undefined
+    ? {}
+    : record(root.executionPolicy, "executionPolicy");
+  exactKeys(policy, [
+    "allowedHttpOrigins", "allowedExecutables", "allowedEnvironment",
+    "timeoutMilliseconds", "maxOutputBytes"
+  ], "executionPolicy");
+  return {
+    ownerAgentId: text(root.ownerAgentId, "ownerAgentId"),
+    pluginPath: text(plugin.path, "plugin.path"),
+    pluginId: text(plugin.id, "plugin.id"),
+    pluginConfig: plugin.config,
+    callback: {
+      providerSessionId: text(
+        callback.providerSessionId,
+        "callback.providerSessionId"
+      ),
+      workspace: callbackWorkspace,
+      prompt: text(callback.prompt, "callback.prompt")
+    },
+    intervalMilliseconds: integer(schedule.intervalMilliseconds, "schedule.intervalMilliseconds"),
+    maxWaitMilliseconds: integer(schedule.maxWaitMilliseconds, "schedule.maxWaitMilliseconds"),
+    maxAttempts: integer(schedule.maxAttempts, "schedule.maxAttempts"),
+    probeTimeoutMilliseconds: optionalInteger(
+      policy.timeoutMilliseconds,
+      "executionPolicy.timeoutMilliseconds",
+      30_000
+    ),
+    maxOutputBytes: optionalInteger(
+      policy.maxOutputBytes,
+      "executionPolicy.maxOutputBytes",
+      1_048_576
+    ),
+    allowedHttpOrigins: stringArray(
+      policy.allowedHttpOrigins,
+      "executionPolicy.allowedHttpOrigins"
+    ),
+    allowedExecutables: stringArray(
+      policy.allowedExecutables,
+      "executionPolicy.allowedExecutables"
+    ),
+    allowedEnvironment: stringArray(
+      policy.allowedEnvironment,
+      "executionPolicy.allowedEnvironment"
+    )
+  };
 }
 
-function integer(values: ReadonlyMap<string, readonly string[]>, key: string): number {
-  const value = Number(one(values, key));
-  if (!Number.isInteger(value)) throw new Error(`--${key} must be an integer`);
+function record(value: unknown, field: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`${field} must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function exactKeys(
+  value: Readonly<Record<string, unknown>>,
+  allowed: readonly string[],
+  field: string
+): void {
+  const unknown = Object.keys(value).filter((key) => !allowed.includes(key));
+  if (unknown.length > 0) throw new Error(`${field} has unknown field: ${unknown[0]}`);
+}
+
+function text(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error(`${field} must be a non-empty string`);
+  }
   return value;
 }
 
 function optionalInteger(
-  values: ReadonlyMap<string, readonly string[]>,
-  key: string,
+  value: unknown,
+  field: string,
   fallback: number
 ): number {
-  return values.has(key) ? integer(values, key) : fallback;
+  return value === undefined ? fallback : integer(value, field);
+}
+
+function integer(value: unknown, field: string): number {
+  if (!Number.isInteger(value)) throw new Error(`${field} must be an integer`);
+  return value as number;
+}
+
+function stringArray(value: unknown, field: string): readonly string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some((item) =>
+    typeof item !== "string" || item.trim() === "")) {
+    throw new Error(`${field} must be an array of non-empty strings`);
+  }
+  return value;
 }
 
 function message(error: unknown): string {

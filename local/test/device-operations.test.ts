@@ -18,6 +18,7 @@ import {
 
 test("device login persists only a private credential and survives restart", async () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-device-"));
+  const runtimeDirectory = join(repo, "runtime");
   const serverUrl = "http://127.0.0.1:7777";
   const credential = "credential-id.this-is-a-device-secret-that-must-remain-private";
   let pairedDeviceId = "";
@@ -73,6 +74,7 @@ test("device login persists only a private credential and survives restart", asy
     const login = await loginDevice(repo, {
       serverUrl
     }, {
+      runtimeDirectory,
       fetch: fakeFetch,
       now: () => new Date("2026-07-19T09:00:00.000Z"),
       sleep: async () => {},
@@ -85,12 +87,13 @@ test("device login persists only a private credential and survives restart", asy
     assert.match(output, /Enter code: ABCD-EFGH/);
     assert.doesNotMatch(output, /this-is-a-device-secret/);
 
-    const paths = runtimePaths(repo);
+    const paths = runtimePaths(repo, runtimeDirectory);
     assert.equal(lstatSync(paths.deviceCredential).mode & 0o777, 0o600);
     assert.match(readFileSync(paths.deviceCredential, "utf8"), /this-is-a-device-secret/);
     assert.doesNotMatch(readFileSync(paths.database).toString("utf8"), /this-is-a-device-secret/);
 
     const afterRestart = await statusDevice(repo, {
+      runtimeDirectory,
       fetch: fakeFetch,
       now: () => new Date("2026-07-19T09:05:00.000Z")
     });
@@ -98,12 +101,16 @@ test("device login persists only a private credential and survives restart", asy
     assert.equal(afterRestart.metadata.status, "active");
 
     await logoutDevice(repo, {
+      runtimeDirectory,
       fetch: fakeFetch,
       now: () => new Date("2026-07-19T09:10:00.000Z")
     });
     assert.equal(revoked, true);
     assert.equal(lstatOrUndefined(paths.deviceCredential), undefined);
-    await assert.rejects(() => statusDevice(repo, { fetch: fakeFetch }), /not paired/);
+    await assert.rejects(
+      () => statusDevice(repo, { runtimeDirectory, fetch: fakeFetch }),
+      /not paired/
+    );
     assert.ok(requests.some((request) => request.authorization === `Bearer ${credential}`));
   } finally {
     rmSync(repo, { recursive: true, force: true });
@@ -112,16 +119,19 @@ test("device login persists only a private credential and survives restart", asy
 
 test("device login reuses the server saved in its runtime", async () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-device-resume-"));
+  const runtimeDirectory = join(repo, "runtime");
   const serverUrl = "http://127.0.0.1:7777";
   try {
     await assert.rejects(() => loginDevice(repo, {
       serverUrl
     }, {
+      runtimeDirectory,
       fetch: async () => Response.json({ error: "unavailable" }, { status: 503 })
     }));
 
     let requestedOrigin = "";
     await assert.rejects(() => loginDevice(repo, {}, {
+      runtimeDirectory,
       fetch: async (input, init) => {
         requestedOrigin = new URL(input instanceof Request ? input.url : input.toString()).origin;
         assert.notEqual(

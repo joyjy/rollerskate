@@ -25,11 +25,118 @@ import { PollSubscriptionStore } from "../src/capabilities/subscription/store.js
 import { runLocalApp } from "../src/entrypoints/cli/main.js";
 import { RuntimeStore } from "../src/core/runtime/store.js";
 import { startUiServer } from "../src/entrypoints/console/launcher.js";
+import { addLocalAgent } from "../src/application/local-agent-control.js";
+import { runtimeConsoleView } from "../src/application/runtime-console.js";
+import {
+  localChatView,
+  postLocalChatMessage
+} from "../src/application/local-chat-control.js";
 
 const now = "2026-07-20T00:00:00.000Z";
 const roomId = "room-1";
 const head = `r1.${Buffer.from(JSON.stringify([roomId, 1])).toString("base64url")}`;
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+
+test("stale legacy Agent workspace does not block Local-first startup", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "rollerskate-stale-agent-repo-"));
+  const runtime = mkdtempSync(join(tmpdir(), "rollerskate-stale-agent-runtime-"));
+  try {
+    const paths = runtimePaths(repo, runtime);
+    const agents = new LocalAgentRegistryStore(paths.database);
+    const summary = agentSummary("stale-device");
+    agents.provision(summary, join(runtime, "deleted-workspace"));
+    agents.activate(summary, "stale-credential", now);
+    agents.close();
+
+    const controller = new AbortController();
+    let output = "";
+    let consoleView: {
+      agents: { registered: number; callable: number; unavailable: number };
+      workspaceRoot: string;
+      integrations: Array<{ status: string; failureReason: string | null }>;
+    } | undefined;
+    await startRuntime({
+      repoRoot: repo,
+      runtimeDirectory: runtime,
+      codexExecutable: process.execPath,
+      environment: { HOME: repo },
+      pollMilliseconds: 50,
+      output: { write(text) {
+        output += text;
+        if (text.includes("Runtime loop ready:")) {
+          consoleView = runtimeConsoleView(
+            projectRoot,
+            runtime,
+            "localhost:4300"
+          ) as typeof consoleView;
+          controller.abort();
+        }
+      } }
+    }, controller.signal);
+
+    assert.match(output, /"type":"runtime\.adapter_unavailable"/);
+    assert.match(output, /deleted-workspace/);
+    assert.match(output, /Runtime loop ready: 0 Agent\(s\), 1 Route\(s\)/);
+    assert.deepEqual(consoleView?.agents, {
+      registered: 1,
+      callable: 0,
+      unavailable: 1
+    });
+    assert.equal(consoleView?.workspaceRoot, join(realpathSync(runtime), "workspace"));
+    assert.equal(consoleView?.integrations[0]?.status, "disconnected");
+    assert.match(consoleView?.integrations[0]?.failureReason ?? "", /workspace is unavailable/);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("Local Runtime resolves an Agent added after the foreground loop starts", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "rollerskate-late-agent-repo-"));
+  const runtime = mkdtempSync(join(tmpdir(), "rollerskate-late-agent-runtime-"));
+  try {
+    const executable = join(runtime, "codex-fixture");
+    writeFileSync(executable, `#!${process.execPath}
+process.stdin.resume();
+process.stdin.on("end", () => {
+  process.stdout.write([
+    JSON.stringify({ type: "thread.started", thread_id: "late-provider-session" }),
+    JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "late Agent ready" } })
+  ].join("\\n") + "\\n");
+});
+`);
+    chmodSync(executable, 0o700);
+    const controller = new AbortController();
+    let admitted = false;
+    await startRuntime({
+      repoRoot: repo,
+      runtimeDirectory: runtime,
+      codexExecutable: executable,
+      environment: { HOME: repo },
+      pollMilliseconds: 50,
+      output: { write(text) {
+        if (!admitted && text.includes("Runtime loop ready:")) {
+          admitted = true;
+          addLocalAgent(repo, "late", "codex", { runtimeDirectory: runtime });
+          postLocalChatMessage(repo, "@late prove dynamic admission", {
+            runtimeDirectory: runtime
+          });
+        }
+        if (text.includes('"type":"runtime.cycle"')) controller.abort();
+      } }
+    }, controller.signal);
+    assert.equal(admitted, true);
+    const reply = localChatView(repo, { runtimeDirectory: runtime }).events.find(
+      (event) => event.type === "chat.message" &&
+        event.sender.kind === "agent"
+    );
+    assert.equal(reply?.type, "chat.message");
+    assert.equal(reply?.body, "late Agent ready");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
 
 test("offline agent request enters SQLite and is handled without Device, Room or Matrix", async () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-offline-request-repo-"));
@@ -81,7 +188,7 @@ process.stdin.on("end", () => {
       try {
         assert.equal((schemaVersion.prepare(`
           SELECT value FROM schema_meta WHERE key = 'schema_version'
-        `).get() as { value: string }).value, "31");
+        `).get() as { value: string }).value, "34");
       } finally {
         schemaVersion.close();
       }
@@ -93,7 +200,7 @@ process.stdin.on("end", () => {
     } finally {
       store.close();
     }
-    assert.match(loopOutput, /Runtime loop ready: 1 Agent\(s\), 0 Matrix binding\(s\)/);
+    assert.match(loopOutput, /Runtime loop ready: 1 Agent\(s\), 1 Route\(s\)/);
 
     const uiController = new AbortController();
     const ui = await startUiServer({
@@ -248,6 +355,15 @@ test("Local Runtime loop turns a terminal poll into subscription.fire and resume
   const runtime = mkdtempSync(join(tmpdir(), "rollerskate-subscription-loop-runtime-"));
   try {
     const fixture = seedRuntime(repo, runtime);
+    const owner = addLocalAgent(repo, "subscriber", "codex", { runtimeDirectory: runtime });
+    const queued = new RuntimeStore(runtimePaths(repo, runtime).database);
+    queued.appendEvent({
+      type: "agent.request",
+      source: { kind: "cli", externalId: "subscription-owner-session" },
+      agentId: owner.principalId,
+      prompt: "Create a callback Session."
+    });
+    queued.close();
     const fetchImplementation = serverFetch(fixture.deviceId);
     const firstController = new AbortController();
     await startRuntime({
@@ -262,8 +378,13 @@ test("Local Runtime loop turns a terminal poll into subscription.fire and resume
       } }
     }, firstController.signal);
 
+    const invocationsBeforeSubscription = readFileSync(fixture.invocations, "utf8")
+      .trim().split("\n").length;
     const runtimeStore = new RuntimeStore(runtimePaths(repo, runtime).database);
-    const callbackSessionId = runtimeStore.sessions()[0]!.sessionId;
+    const callbackSession = runtimeStore.sessions().find(
+      (session) => session.agentId === owner.principalId
+    )!;
+    const callbackSessionId = callbackSession.sessionId;
     runtimeStore.close();
 
     const plugin = join(fixture.workspace, "pipeline.ts");
@@ -280,25 +401,43 @@ export default {
   }
 };
 `);
-    const config = join(fixture.workspace, "pipeline.json");
-    const prompt = join(fixture.workspace, "continuation.md");
-    writeFileSync(config, JSON.stringify({ url: "http://localhost:3000/pipeline" }));
-    writeFileSync(prompt, "Report the pipeline outcome.\n");
+    const subscriptionFile = join(fixture.workspace, "subscription.json");
+    writeFileSync(subscriptionFile, JSON.stringify({
+      schemaVersion: 1,
+      ownerAgentId: owner.principalId,
+      plugin: {
+        path: plugin,
+        id: "fixture-pipeline",
+        config: { url: "http://localhost:3000/pipeline" }
+      },
+      callback: {
+        providerSessionId: callbackSession.providerSessionId,
+        prompt: "Report the pipeline outcome."
+      },
+      schedule: {
+        intervalMilliseconds: 100,
+        maxWaitMilliseconds: 60_000,
+        maxAttempts: 10
+      },
+      executionPolicy: {
+        allowedHttpOrigins: ["http://localhost:3000"],
+        allowedExecutables: [],
+        allowedEnvironment: [],
+        timeoutMilliseconds: 1_000,
+        maxOutputBytes: 4_096
+      }
+    }));
+    let addOutput = "";
     assert.equal(await runLocalApp(repo, [
       "--runtime", runtime,
-      "subscription", "add", "sub-loop-1",
-      "--plugin", plugin,
-      "--plugin-id", "fixture-pipeline",
-      "--config", config,
-      "--session", callbackSessionId,
-      "--prompt-file", prompt,
-      "--interval-ms", "100",
-      "--max-wait-ms", "60000",
-      "--max-attempts", "10",
-      "--probe-timeout-ms", "1000",
-      "--max-output-bytes", "4096",
-      "--allow-http-origin", "http://localhost:3000"
-    ], {}, { write() {} }), 0);
+      "subscription", "add", subscriptionFile
+    ], {}, { write(text) { addOutput += text; } }, {
+      cwd: runtimePaths(repo, runtime).workspace
+    }), 0);
+    const subscriptionId = (JSON.parse(addOutput) as {
+      subscription: { subscriptionId: string };
+    }).subscription.subscriptionId;
+    assert.match(subscriptionId, /^sub_[0-9a-f-]+$/);
 
     const secondController = new AbortController();
     let output = "";
@@ -319,16 +458,22 @@ export default {
         }
       } }
     }, secondController.signal);
-    assert.match(output, /"fired":\[\{"subscriptionId":"sub-loop-1","eventId":"evt_/);
+    assert.ok(output.includes(
+      `"fired":[{"subscriptionId":"${subscriptionId}","eventId":"evt_`
+    ));
     const inspect = new PollSubscriptionStore(runtimePaths(repo, runtime).database);
     try {
-      assert.equal(inspect.require("sub-loop-1").status, "completed");
-      assert.match(inspect.require("sub-loop-1").fireEventId ?? "", /^evt_/);
+      assert.equal(inspect.require(subscriptionId).status, "completed");
+      assert.match(inspect.require(subscriptionId).fireEventId ?? "", /^evt_/);
       const audit = new RuntimeStore(runtimePaths(repo, runtime).database);
       try {
-        const execution = audit.executionForEvent(inspect.require("sub-loop-1").fireEventId!);
+        const execution = audit.executionForEvent(
+          inspect.require(subscriptionId).fireEventId!
+        );
         const session = audit.session(callbackSessionId);
-        assert.equal(readFileSync(fixture.invocations, "utf8").trim().split("\n").length, 2,
+        assert.equal(
+          readFileSync(fixture.invocations, "utf8").trim().split("\n").length,
+          invocationsBeforeSubscription + 1,
           `${output}\nExecution: ${JSON.stringify(execution)}\nSession: ${JSON.stringify(session)}`);
       } finally {
         audit.close();
@@ -427,7 +572,7 @@ function serverFetch(deviceId: string): typeof fetch {
           event: {
             protocolVersion: 1,
             eventId: "$human-message",
-            type: "m.room.message",
+            type: "m.chat.message",
             occurredAt: now,
             source: { kind: "human", id: "human-1" },
             payload: { body: "@alice please reply" }

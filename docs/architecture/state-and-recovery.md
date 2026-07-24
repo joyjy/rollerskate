@@ -15,11 +15,14 @@ Local Runtime 使用 Node 内置 SQLite 与 WAL。SQLite 是本机执行事实�
 ## Durable domains
 
 - canonical Event：统一 ID、type/source、Agent、Session/Destination 引用与 causality；输入 Event 携带 prompt，`agent.result` 携带 outcome/output/error。
+- Local foundation：generated LocalDevice、唯一 LocalWorkspace/Local Chat、Local Topic、Owner Principal 与创建时间。
+- Principal/LocalAgent：Owner/Agent 统一 ID 空间、短 handle、active/suspended、client 与 execution config。
+- Local Chat：immutable `chat.message`/`chat.dispatch`、dispatch prompt/receipt 与 handle snapshot。
 - Execution：唯一 Event、唯一 Handler、attempt/max attempts、next retry、terminal status。
 - Session：Agent、adapter、workspace 与 provider session ID。
 - Destination/Delivery：显式外部目标、稳定 delivery ID、attempt、retry 与 receipt。
-- Poll Subscription：Plugin/config/policy、interval/deadline/max attempts、next poll、固定 callback Session/prompt 与唯一 fire Event ID。
-- Device/Agent identity 与本地 credential/config。
+- Poll Subscription：owner Agent、Plugin/config/policy、interval/deadline/max attempts、next poll、固定 provider Session/adapter/workspace/prompt snapshot、terminal 时 lazy materialize 的本地 Session 与唯一 fire Event ID。
+- ServerConnection、ServerDeviceBinding 与 ServerAgentBinding：按 connection 建模；当前 application policy 最多一个 active connection，但数据库不是 singleton。
 - Matrix binding：Destination、Room、Agent、当前 Session 与 read-through cursor。
 
 旧 Work、lease、generic outbox、RoomChat invocation/turn/outbox 与独立 continuation work 不再是当前 Runtime domain。
@@ -28,8 +31,9 @@ Local Runtime 使用 Node 内置 SQLite 与 WAL。SQLite 是本机执行事实�
 
 - Event 入库与唯一 queued Execution 原子完成。
 - 同一 `(source.kind, source.externalId)` 只接受一次；Server Event 直接以全局 Event ID 去重。
+- 同一 source owner message 只能有一个 `chat.dispatch` receipt；重复请求返回已有 receipt。
 - 每个 Event type 只有一个 Handler，不 fanout。
-- Agent Execution 使用有限指数退火；达到 max attempts 后产生一个 failed `agent.result` Event。
+- Agent Execution 使用有限指数退火；传统 input 达到 max attempts 后产生一个 failed `agent.result` Event，`chat.dispatch` failure 不产生 relay。
 - `agent.result` 只由 ResultHandler Execution 处理；Delivery retry 不重跑 Handler，ResultHandler terminal failure 不递归创建 Event。
 - Matrix Delivery 使用稳定 delivery ID 作为 transaction ID。
 - terminal Subscription 与 `subscription.fire` Event/Execution 原子建立；非 terminal poll 不创建 Event。
@@ -45,7 +49,7 @@ Local Runtime loop 串行推进 Subscription、Matrix ingress 与 Runtime cycle�
 
 ## Schema cutover
 
-schema v31 只维护当前统一核心与 Device/Agent/Subscription facts，不再包含 `results` 表。检测到旧 Work `deliveries`、中间 Route schema 或独立 Result schema 时，Runtime 清理不兼容的执行事实表并重建统一表；Device/Agent identity 保留。v0.3 没有真实用户，不提供 legacy production data migration。
+schema v34 维护统一核心、Local foundation/Principal/Chat/Topic/Session、Server-ready binding 与 Subscription provider callback facts，不包含 `results` 表。v33 负责把 v32 的 Local `room_id`、`room.message`、`room.dispatch` 与 dispatch helper table 原位迁移成 Topic/Chat 命名并保留 Event、Execution、Session 与 receipt；既存 `rom_` ID 作为 opaque Topic ID 保持稳定，fresh Topic 使用 `top_` ID。v34 将 Subscription callback 固定为 owner Agent、adapter、workspace 与 provider Session snapshot，terminal 事务才 materialize/reuse 本地 `ses_`。默认 Runtime 完全忽略旧 repo-local `.rollerskate/`，不迁移也不删除；只有用户显式选择某个 runtime 时才执行其 schema migration。
 
 ## Change guidance
 

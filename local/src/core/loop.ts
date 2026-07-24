@@ -20,7 +20,7 @@ export interface LoopState {
   readonly updatedAt: string;
   readonly runtimeDirectory: string;
   readonly agentNames: readonly string[];
-  readonly roomIds: readonly string[];
+  readonly routeIds: readonly string[];
   readonly cycles: number;
   readonly paused: boolean;
   readonly error?: string;
@@ -41,7 +41,7 @@ export interface LoopOptions {
   readonly statePath: string;
   readonly runtimeDirectory: string;
   readonly agentNames: readonly string[];
-  readonly roomIds: readonly string[];
+  readonly routeIds: readonly string[];
   readonly phases: readonly LoopPhase[];
   readonly paused: () => boolean;
   readonly pollMilliseconds?: number;
@@ -64,7 +64,7 @@ export async function runLoop(
   try {
     options.output?.write(
       `Runtime loop ready: ${options.agentNames.length} Agent(s), ` +
-      `${options.roomIds.length} Matrix binding(s).\n`
+      `${options.routeIds.length} Route(s).\n`
     );
     main: while (!signal.aborted) {
       const paused = options.paused();
@@ -109,7 +109,13 @@ export async function runLoop(
 export function readLoopStatus(path: string): LoopStatus {
   if (!existsSync(path)) return { running: false };
   assertPrivateRegularFile(path);
-  const state = JSON.parse(readFileSync(path, "utf8")) as LoopState;
+  const stored = JSON.parse(readFileSync(path, "utf8")) as LoopState & {
+    readonly roomIds?: readonly string[];
+  };
+  const state: LoopState = {
+    ...stored,
+    routeIds: stored.routeIds ?? stored.roomIds ?? []
+  };
   if (state.schemaVersion !== 1 || !Number.isInteger(state.pid)) {
     throw new Error("Runtime loop state file has an unsupported schema");
   }
@@ -133,7 +139,7 @@ function state(
     updatedAt: new Date().toISOString(),
     runtimeDirectory: options.runtimeDirectory,
     agentNames: options.agentNames,
-    roomIds: options.roomIds,
+    routeIds: options.routeIds,
     cycles,
     paused
   };

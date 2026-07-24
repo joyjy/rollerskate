@@ -9,7 +9,9 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { once } from "node:events";
+import { createServer } from "node:net";
 import test from "node:test";
 
 import { roomAgentEnvironment, runLocalApp } from "../src/entrypoints/cli/main.js";
@@ -17,12 +19,13 @@ import { loadLocalRuntime } from "../src/application/runtime-config.js";
 
  test("setup command accepts non-interactive environment without leaking its token", async () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-app-cli-"));
+  const runtime = join(repo, "runtime");
   try {
     const codex = join(repo, "codex");
     writeFileSync(codex, "fixture");
     chmodSync(codex, 0o700);
     let output = "";
-    const code = await runLocalApp(repo, ["setup"], {
+    const code = await runLocalApp(repo, ["--runtime", runtime, "setup"], {
       PATH: "/bin:/usr/bin",
       ROLLERSKATE_MATRIX_HOMESERVER: "https://matrix.example",
       ROLLERSKATE_MATRIX_ROOM_ID: "!room:example",
@@ -39,7 +42,7 @@ import { loadLocalRuntime } from "../src/application/runtime-config.js";
     assert.equal(code, 0);
     assert.match(output, /Rollerskate setup complete/);
     assert.doesNotMatch(output, /secret-token/);
-    assert.equal(loadLocalRuntime(repo).matrixAccessToken, "secret-token");
+    assert.equal(loadLocalRuntime(repo, runtime).matrixAccessToken, "secret-token");
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }
@@ -49,28 +52,42 @@ test("repo-local script resolves Rollerskate independently of caller cwd", () =>
   const caller = mkdtempSync(join(tmpdir(), "rollerskate-app-caller-"));
   try {
     const script = join(process.cwd(), "..", "scripts", "rs");
-    const result = spawnSync(script, ["help"], {
+    const result = spawnSync(script, ["--help"], {
       cwd: caller,
       encoding: "utf8"
     });
     assert.equal(result.status, 0, result.stderr);
     assert.equal(result.stderr, "");
-    assert.match(result.stdout, /scripts\/rs setup/);
+    assert.match(result.stdout, /scripts\/rs --help/);
     assert.match(result.stdout, /--runtime <absolute-path>/);
-    assert.match(result.stdout, /room create/);
-    assert.match(result.stdout, /--client codex/);
-    assert.match(result.stdout, /workspace set <absolute-path>/);
+    assert.match(result.stdout, /subscription add <json-file>/);
+    assert.match(result.stdout, /agent rename <handle> <new-handle>/);
+    assert.doesNotMatch(result.stdout, /workspace set|room create|device login|subscription.*revoke/);
   } finally {
     rmSync(caller, { recursive: true, force: true });
   }
 });
 
+test("help has one explicit form", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "rollerskate-help-cli-"));
+  try {
+    assert.equal(await runLocalApp(repo, ["--help"]), 0);
+    await assert.rejects(() => runLocalApp(repo, ["help"]), /unknown command/);
+    await assert.rejects(() => runLocalApp(repo, ["-h"]), /unknown command/);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
 test("workspace set command persists one canonical Agent workspace root", async () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-agent-configure-"));
+  const runtime = join(repo, "runtime");
   try {
     const workspaceRoot = join(repo, "agents");
     let output = "";
     const code = await runLocalApp(repo, [
+      "--runtime",
+      runtime,
       "workspace",
       "set",
       workspaceRoot
@@ -108,91 +125,25 @@ test("global --runtime isolates Local configuration from the checkout", async ()
   }
 });
 
-test("interactive CLI logs in one Device and adds multiple Agents", async () => {
-  const repo = mkdtempSync(join(tmpdir(), "rollerskate-interactive-"));
-  const answers = ["", "1", "", "alice", "1", "1", "bob", "1", "6"];
-  const createdAgents: string[] = [];
-  let pairingRequests = 0;
-  let deviceId = "";
-  const fakeFetch: typeof fetch = async (input, init) => {
-    const url = new URL(input instanceof Request ? input.url : input.toString());
-    const body = JSON.parse(init?.body?.toString() ?? "{}") as Record<string, string>;
-    if (url.pathname === "/api/device-pairings" && init?.method === "POST") {
-      pairingRequests += 1;
-      deviceId = body.deviceId ?? "";
-      return Response.json({
-        pairingId: "pairing-id",
-        deviceId,
-        verificationUri: "https://identity.example/device",
-        userCode: "ABCD-EFGH",
-        expiresAt: "2099-01-01T00:00:00.000Z",
-        pollIntervalMilliseconds: 100
-      }, { status: 201 });
-    }
-    if (url.pathname === "/api/device-pairings/pairing-id" && init?.method === "GET") {
-      return Response.json({
-        pairingId: "pairing-id",
-        deviceId,
-        status: "approved",
-        expiresAt: "2099-01-01T00:00:00.000Z",
-        pollIntervalMilliseconds: 100
-      });
-    }
-    if (url.pathname === "/api/device-pairings/pairing-id/redeem") {
-      return Response.json({
-        credentialId: "device-credential-id",
-        credential: "device-credential-id.device-secret",
-        device: deviceSummary(deviceId)
-      });
-    }
-    if (url.pathname === "/api/agents" && init?.method === "POST") {
-      const name = body.name ?? "";
-      createdAgents.push(name);
-      return Response.json({
-        agent: agentSummary(name, deviceId, false),
-        enrollment: {
-          id: `enrollment-${name}`,
-          agentId: `agent-${name}`,
-          deviceId,
-          placementId: `placement-${name}`,
-          status: "issued",
-          expiresAt: "2099-01-01T00:00:00.000Z"
-        }
-      }, { status: 201 });
-    }
-    const enrollment = /^\/api\/agent-enrollments\/enrollment-([^/]+)\/redeem$/
-      .exec(url.pathname)?.[1];
-    if (enrollment !== undefined) {
-      return Response.json({
-        credentialId: `agent-credential-${enrollment}`,
-        credential: `agent-credential-${enrollment}.agent-secret`,
-        agent: agentSummary(enrollment, deviceId, true)
-      });
-    }
-    return Response.json({ error: "not_found" }, { status: 404 });
-  };
+test("Local Agent CLI requires an explicit client", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "rollerskate-agent-create-cli-"));
+  const runtime = join(repo, "runtime");
   let output = "";
   try {
-    const code = await runLocalApp(repo, [], {}, {
+    await assert.rejects(() => runLocalApp(repo, [
+      "--runtime", runtime, "agent", "create", "alice"
+    ]), /--client/);
+    const code = await runLocalApp(repo, [
+      "--runtime", runtime,
+      "agent", "create", "alice", "--client", "codex"
+    ], {}, {
       write: (text) => {
         output += text;
       }
-    }, {
-      prompts: {
-        question: async () => answers.shift() ?? "6",
-        close: () => {}
-      },
-      fetch: fakeFetch,
-      sleep: async () => {}
     });
     assert.equal(code, 0);
-    assert.equal(pairingRequests, 1);
-    assert.deepEqual(createdAgents, ["alice", "bob"]);
-    assert.match(output, /Device paired/);
-    assert.match(output, /Agent: alice/);
+    assert.match(output, /Agent: @alice/);
     assert.match(output, /Client: codex/);
-    assert.match(output, /Agent: bob/);
-    assert.equal(output.match(/Client: codex/g)?.length, 2);
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }
@@ -200,15 +151,18 @@ test("interactive CLI logs in one Device and adds multiple Agents", async () => 
 
 test("device login is a zero-argument authentication command", async () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-device-login-cli-"));
+  const runtime = join(repo, "runtime");
   try {
     await assert.rejects(() => runLocalApp(repo, [
+      "--runtime",
+      runtime,
       "device",
       "login",
       "--server",
       "http://localhost:4100"
     ]), /unexpected arguments/);
     await assert.rejects(
-      () => runLocalApp(repo, ["device", "login"]),
+      () => runLocalApp(repo, ["--runtime", runtime, "device", "login"]),
       /requires ROLLERSKATE_SERVER_URL or a server saved in this runtime/
     );
   } finally {
@@ -229,32 +183,95 @@ test("Room Agent environment keeps executable lookup without inheriting secrets"
   });
 });
 
-function deviceSummary(deviceId: string): object {
-  return {
-    id: deviceId,
-    name: "Test Laptop",
-    status: "active",
-    createdAt: "2026-07-22T00:00:00.000Z",
-    human: { id: "human-id", displayName: "Example Human", isAdmin: true }
-  };
+test("start logs graceful shutdown signals before exiting", async () => {
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+    const repo = mkdtempSync(join(tmpdir(), `rollerskate-signal-${signal.toLowerCase()}-`));
+    const runtime = join(repo, "runtime");
+    const port = await unusedLoopbackPort();
+    const script = join(process.cwd(), "..", "scripts", "rs");
+    const child = spawn(script, [
+      "--runtime",
+      runtime,
+      "start",
+      "--no-open",
+      "--ui-port",
+      String(port)
+    ], {
+      cwd: repo,
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+
+    try {
+      await waitForOutput(child, "Rollerskate UI:");
+      assert.equal(child.kill(signal), true);
+      const [code, exitSignal] = await once(child, "exit") as [
+        number | null,
+        NodeJS.Signals | null
+      ];
+      assert.equal(code, 0, stderr);
+      assert.equal(exitSignal, null);
+      const log = readFileSync(join(runtime, "logs", "daemon.log"), "utf8");
+      assert.match(log, new RegExp(`Rollerskate received ${signal}; stopping\\.`));
+      assert.match(log, /Rollerskate stopped after \d+ Runtime cycle\(s\)\./);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+        await once(child, "exit");
+      }
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }
+});
+
+async function unusedLoopbackPort(): Promise<number> {
+  const server = createServer();
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("loopback server did not expose an IP port");
+  }
+  const port = address.port;
+  server.close();
+  await once(server, "close");
+  return port;
 }
 
-function agentSummary(name: string, deviceId: string, active: boolean): object {
-  return {
-    id: `agent-${name}`,
-    name,
-    status: active ? "active" : "provisioning",
-    createdAt: "2026-07-22T00:00:00.000Z",
-    owner: { id: "human-id", displayName: "Example Human", isAdmin: true },
-    operator: { id: "human-id", displayName: "Example Human", isAdmin: true },
-    placement: {
-      id: `placement-${name}`,
-      deviceId,
-      state: active ? "active" : "pending",
-      generation: 1,
-      createdAt: "2026-07-22T00:00:00.000Z",
-      ...(active ? { activatedAt: "2026-07-22T00:00:01.000Z" } : {})
-    },
-    credentialStatus: active ? "active" : "pending"
-  };
+async function waitForOutput(
+  child: ChildProcessWithoutNullStreams,
+  expected: string
+): Promise<void> {
+  child.stdout.setEncoding("utf8");
+  let stdout = "";
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error(`timed out waiting for ${expected}; stdout: ${stdout}`));
+    }, 10_000);
+    const onData = (chunk: string): void => {
+      stdout += chunk;
+      if (stdout.includes(expected)) {
+        cleanup();
+        resolve();
+      }
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+      cleanup();
+      reject(new Error(
+        `process exited before ${expected}; code=${String(code)} signal=${String(signal)}`
+      ));
+    };
+    const cleanup = (): void => {
+      clearTimeout(timeout);
+      child.stdout.off("data", onData);
+      child.off("exit", onExit);
+    };
+    child.stdout.on("data", onData);
+    child.once("exit", onExit);
+  });
 }
