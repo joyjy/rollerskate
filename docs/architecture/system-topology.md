@@ -19,7 +19,7 @@ timestamp: 2026-07-19
 | Server | Phase 1–3 已实现并验收 | Node.js BFF、OIDC/Device/Agent、Room control plane、Matrix AS、MySQL projection 与 head/range/stream。 |
 | Matrix | Server/Local adapter 与隔离真实 Room Gate 已验收 | Server 与 Local Runtime 之间的网络 Event bus；保留 room/thread/message transport facts。 |
 | Local Runtime | `v0.3.1` Local-first product 已实现 | 自动 Local foundation、共享 workspace、Principal/Agent、immutable `Local` Chat、Session、Subscription、单 loop、Console 与停止权。 |
-| Agent provider | Codex adapter 已实现 | 在 Local 授予的 cwd、sandbox/permission mode、预算和进程边界内执行 Agent invocation。 |
+| Agent provider | Codex、Claude Code 与 Kimi Code adapter 已实现 | 在 Local 授予的 cwd、sandbox/permission mode、预算和进程边界内执行 Agent invocation；Kimi Code 在受信任本机上只承担 Review Implementer，不承担 Reviewer。 |
 
 Server 源码位于 `server/`，当前已提供身份、Device/Agent 和 Room API；这些能力不参与 Local 首次启动。Local Runtime 可以通过保留的 Server Room head/range/send adapter 接入 Matrix，但 v0.3.1 Local UI 不展示 Server connection、binding 或 Server Room。完整 Server Event ingress 留到 v0.4。
 
@@ -38,7 +38,7 @@ Server 源码位于 `server/`，当前已提供身份、Device/Agent 和 Room AP
 
 Local Runtime 拥有 LocalDevice、Owner/Agent Principal、共享 workspace、`Local` Event history、实际执行、Session、receipt 与最终停止权。Server 拥有网络可达的 remote identity、产品 Object/Event、placement desired state 和 Server Room history；Matrix 拥有 transport history。Local 不保存 Server、Matrix 或 provider 信息的完整副本。
 
-Local Console 创建 Agent 时只接受 handle 与受支持的 client；Principal ID 由本地生成。未来 Server binding 使用 `(principalId, serverConnectionId)` 建立独立 remote identity；Local identity 不自动与 OIDC Human 或 remote Agent 合并。
+Local Console 创建 Agent 时接受 handle、受支持的 client 与逐项 argv 启动参数；Principal ID 由本地生成。adapter 始终拥有协议、Session、workspace 和权限参数，用户配置不能覆盖这些边界。未来 Server binding 使用 `(principalId, serverConnectionId)` 建立独立 remote identity；Local identity 不自动与 OIDC Human 或 remote Agent 合并。
 
 ## Change guidance
 

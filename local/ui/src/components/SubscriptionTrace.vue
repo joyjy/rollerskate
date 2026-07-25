@@ -8,9 +8,10 @@ defineProps<{ subscription: Subscription }>();
 
 <template>
   <div class="main-body">
-    <div class="panel-title">{{ subscription.id }}</div>
+    <div class="panel-title">{{ subscription.title }}</div>
     <div class="panel-subtitle">
-      {{ subscription.plugin.id }}@{{ subscription.plugin.schemaVersion }} ·
+      {{ subscription.id }} ·
+      {{ subscription.probe.plugin.id }}@{{ subscription.probe.plugin.schemaVersion }} ·
       <StatusBadge :status="subscription.status" />
     </div>
 
@@ -31,9 +32,9 @@ defineProps<{ subscription: Subscription }>();
       <dt>Schedule</dt>
       <dd>{{ subscription.schedule.attemptCount }}/{{ subscription.schedule.maxAttempts }} attempts · every {{ subscription.schedule.intervalMilliseconds }}ms · deadline {{ formatDateTime(subscription.schedule.deadlineAt) }}</dd>
       <dt>Plugin</dt>
-      <dd class="mono">{{ subscription.plugin.path }}</dd>
+      <dd class="mono">{{ subscription.probe.plugin.path }}</dd>
       <dt>Policy</dt>
-      <dd>{{ subscription.executionPolicy.allowedHttpOrigins.length }} HTTP origin(s) · {{ subscription.executionPolicy.allowedExecutables.length }} executable(s)</dd>
+      <dd>{{ subscription.probe.policy.allowedHttpOrigins.length }} HTTP origin(s) · {{ subscription.probe.policy.allowedExecutables.length }} executable(s)</dd>
     </dl>
 
     <div class="section-title">One-shot Fire</div>

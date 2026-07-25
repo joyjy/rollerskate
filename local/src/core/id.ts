@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 
-export type LocalIdPrefix = "dev" | "prn" | "top" | "sub";
+export type LocalIdPrefix = "dev" | "prn" | "top" | "sub" | "sch" | "run";
 
 export function localId(prefix: LocalIdPrefix): string {
   const bytes = randomBytes(16);

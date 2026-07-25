@@ -4,6 +4,7 @@ import type { RuntimeAudit, RuntimeInfo } from "@/types/runtime";
 export const mockSubscriptions: Subscription[] = [
   {
     id: "sub-2f8a9e1c",
+    title: "Publish weekly review",
     status: "active",
     owner: { agentId: "prn-alice", handle: "alice", client: "codex" },
     callback: {
@@ -13,7 +14,16 @@ export const mockSubscriptions: Subscription[] = [
       localSessionId: "ses_1111-2222",
       prompt: "任务完成后，总结当前 Room 上下文并给出下一步建议。"
     },
-    plugin: { id: "ticktick-completed", path: "examples/plugins/ticktick.ts", schemaVersion: 1 },
+    probe: {
+      plugin: { id: "task-completed", path: "examples/plugins/task-completed.ts", schemaVersion: 1 },
+      policy: {
+        allowedHttpOrigins: ["https://tracker.example.com"],
+        allowedExecutables: [],
+        allowedEnvironment: [],
+        timeoutMilliseconds: 5000,
+        maxOutputBytes: 65536
+      }
+    },
     schedule: {
       intervalMilliseconds: 30000,
       maxWaitMilliseconds: 86400000,
@@ -22,13 +32,6 @@ export const mockSubscriptions: Subscription[] = [
       deadlineAt: "2026-08-22T00:00:00Z",
       nextPollAt: "2026-07-23T04:38:10Z"
     },
-    executionPolicy: {
-      allowedHttpOrigins: ["https://api.ticktick.com"],
-      allowedExecutables: [],
-      allowedEnvironment: [],
-      timeoutMilliseconds: 5000,
-      maxOutputBytes: 65536
-    },
     createdAt: "2026-07-21T09:12:00Z",
     updatedAt: "2026-07-21T09:12:00Z",
     fireEventId: null,
@@ -36,16 +39,26 @@ export const mockSubscriptions: Subscription[] = [
   },
   {
     id: "sub-9b4d21f7",
+    title: "Verify bug fix",
     status: "paused",
-    owner: { agentId: "prn-bob", handle: "bob", client: "codex" },
+    owner: { agentId: "prn-bob", handle: "bob", client: "claude-code" },
     callback: {
-      providerSessionId: "provider-codex-3333",
-      adapterId: "codex-runtime-jsonl-v1",
+      providerSessionId: "provider-claude-3333",
+      adapterId: "claude-code-runtime-json-v1",
       workspace: "/workspace",
       localSessionId: "ses_3333-4444",
       prompt: "Bug 修复后，在 Room 中更新进展。"
     },
-    plugin: { id: "ticktick-completed", path: "examples/plugins/ticktick.ts", schemaVersion: 1 },
+    probe: {
+      plugin: { id: "task-completed", path: "examples/plugins/task-completed.ts", schemaVersion: 1 },
+      policy: {
+        allowedHttpOrigins: ["https://tracker.example.com"],
+        allowedExecutables: [],
+        allowedEnvironment: [],
+        timeoutMilliseconds: 5000,
+        maxOutputBytes: 65536
+      }
+    },
     schedule: {
       intervalMilliseconds: 60000,
       maxWaitMilliseconds: 172800000,
@@ -54,13 +67,6 @@ export const mockSubscriptions: Subscription[] = [
       deadlineAt: "2026-08-22T00:00:00Z",
       nextPollAt: "2026-07-21T08:30:00Z"
     },
-    executionPolicy: {
-      allowedHttpOrigins: ["https://api.ticktick.com"],
-      allowedExecutables: [],
-      allowedEnvironment: [],
-      timeoutMilliseconds: 5000,
-      maxOutputBytes: 65536
-    },
     createdAt: "2026-07-20T16:45:00Z",
     updatedAt: "2026-07-21T08:30:00Z",
     fireEventId: null,
@@ -68,6 +74,7 @@ export const mockSubscriptions: Subscription[] = [
   },
   {
     id: "sub-77e3c5a0",
+    title: "Watch deployment",
     status: "running",
     owner: { agentId: "prn-alice", handle: "alice", client: "codex" },
     callback: {
@@ -77,7 +84,16 @@ export const mockSubscriptions: Subscription[] = [
       localSessionId: "ses_1111-2222",
       prompt: "任务完成后，总结当前 Room 上下文并给出下一步建议。"
     },
-    plugin: { id: "ticktick-completed", path: "examples/plugins/ticktick.ts", schemaVersion: 1 },
+    probe: {
+      plugin: { id: "task-completed", path: "examples/plugins/task-completed.ts", schemaVersion: 1 },
+      policy: {
+        allowedHttpOrigins: ["https://tracker.example.com"],
+        allowedExecutables: [],
+        allowedEnvironment: [],
+        timeoutMilliseconds: 5000,
+        maxOutputBytes: 65536
+      }
+    },
     schedule: {
       intervalMilliseconds: 30000,
       maxWaitMilliseconds: 86400000,
@@ -86,13 +102,6 @@ export const mockSubscriptions: Subscription[] = [
       deadlineAt: "2026-08-22T00:00:00Z",
       nextPollAt: "2026-07-21T10:05:00Z"
     },
-    executionPolicy: {
-      allowedHttpOrigins: ["https://api.ticktick.com"],
-      allowedExecutables: [],
-      allowedEnvironment: [],
-      timeoutMilliseconds: 5000,
-      maxOutputBytes: 65536
-    },
     createdAt: "2026-07-21T07:00:00Z",
     updatedAt: "2026-07-21T10:05:00Z",
     fireEventId: null,
@@ -100,6 +109,7 @@ export const mockSubscriptions: Subscription[] = [
   },
   {
     id: "sub-11aa88dd",
+    title: "Deployment completed",
     status: "completed",
     owner: { agentId: "prn-carol", handle: "carol", client: "codex" },
     callback: {
@@ -109,7 +119,16 @@ export const mockSubscriptions: Subscription[] = [
       localSessionId: "ses_5555-6666",
       prompt: "部署任务完成后，输出部署摘要。"
     },
-    plugin: { id: "ticktick-completed", path: "examples/plugins/ticktick.ts", schemaVersion: 1 },
+    probe: {
+      plugin: { id: "task-completed", path: "examples/plugins/task-completed.ts", schemaVersion: 1 },
+      policy: {
+        allowedHttpOrigins: ["https://tracker.example.com"],
+        allowedExecutables: [],
+        allowedEnvironment: [],
+        timeoutMilliseconds: 5000,
+        maxOutputBytes: 65536
+      }
+    },
     schedule: {
       intervalMilliseconds: 60000,
       maxWaitMilliseconds: 86400000,
@@ -118,13 +137,6 @@ export const mockSubscriptions: Subscription[] = [
       deadlineAt: "2026-08-22T00:00:00Z",
       nextPollAt: "2026-07-20T09:10:00Z"
     },
-    executionPolicy: {
-      allowedHttpOrigins: ["https://api.ticktick.com"],
-      allowedExecutables: [],
-      allowedEnvironment: [],
-      timeoutMilliseconds: 5000,
-      maxOutputBytes: 65536
-    },
     createdAt: "2026-07-19T14:20:00Z",
     updatedAt: "2026-07-20T09:10:00Z",
     fireEventId: "evt-subscription-fire-3300",
@@ -132,6 +144,7 @@ export const mockSubscriptions: Subscription[] = [
   },
   {
     id: "sub-cc4433aa",
+    title: "Investigate provider state",
     status: "unknown",
     owner: { agentId: "prn-alice", handle: "alice", client: "codex" },
     callback: {
@@ -141,7 +154,16 @@ export const mockSubscriptions: Subscription[] = [
       localSessionId: null,
       prompt: "任务完成后，总结当前 Room 上下文并给出下一步建议。"
     },
-    plugin: { id: "ticktick-completed", path: "examples/plugins/ticktick.ts", schemaVersion: 1 },
+    probe: {
+      plugin: { id: "task-completed", path: "examples/plugins/task-completed.ts", schemaVersion: 1 },
+      policy: {
+        allowedHttpOrigins: ["https://tracker.example.com"],
+        allowedExecutables: [],
+        allowedEnvironment: [],
+        timeoutMilliseconds: 5000,
+        maxOutputBytes: 65536
+      }
+    },
     schedule: {
       intervalMilliseconds: 30000,
       maxWaitMilliseconds: 86400000,
@@ -150,13 +172,6 @@ export const mockSubscriptions: Subscription[] = [
       deadlineAt: "2026-08-22T00:00:00Z",
       nextPollAt: "2026-07-21T09:45:00Z"
     },
-    executionPolicy: {
-      allowedHttpOrigins: ["https://api.ticktick.com"],
-      allowedExecutables: [],
-      allowedEnvironment: [],
-      timeoutMilliseconds: 5000,
-      maxOutputBytes: 65536
-    },
     createdAt: "2026-07-21T06:00:00Z",
     updatedAt: "2026-07-21T09:50:00Z",
     fireEventId: null,
@@ -164,16 +179,26 @@ export const mockSubscriptions: Subscription[] = [
   },
   {
     id: "sub-55ff1122",
+    title: "Cancelled review",
     status: "cancelled",
-    owner: { agentId: "prn-bob", handle: "bob", client: "codex" },
+    owner: { agentId: "prn-bob", handle: "bob", client: "claude-code" },
     callback: {
-      providerSessionId: "provider-codex-3333",
-      adapterId: "codex-runtime-jsonl-v1",
+      providerSessionId: "provider-claude-3333",
+      adapterId: "claude-code-runtime-json-v1",
       workspace: "/workspace",
       localSessionId: "ses_3333-4444",
       prompt: "任务取消后不再续接。"
     },
-    plugin: { id: "ticktick-completed", path: "examples/plugins/ticktick.ts", schemaVersion: 1 },
+    probe: {
+      plugin: { id: "task-completed", path: "examples/plugins/task-completed.ts", schemaVersion: 1 },
+      policy: {
+        allowedHttpOrigins: ["https://tracker.example.com"],
+        allowedExecutables: [],
+        allowedEnvironment: [],
+        timeoutMilliseconds: 5000,
+        maxOutputBytes: 65536
+      }
+    },
     schedule: {
       intervalMilliseconds: 60000,
       maxWaitMilliseconds: 172800000,
@@ -181,13 +206,6 @@ export const mockSubscriptions: Subscription[] = [
       attemptCount: 4,
       deadlineAt: "2026-08-22T00:00:00Z",
       nextPollAt: "2026-07-19T10:20:00Z"
-    },
-    executionPolicy: {
-      allowedHttpOrigins: ["https://api.ticktick.com"],
-      allowedExecutables: [],
-      allowedEnvironment: [],
-      timeoutMilliseconds: 5000,
-      maxOutputBytes: 65536
     },
     createdAt: "2026-07-18T11:00:00Z",
     updatedAt: "2026-07-19T10:20:00Z",
@@ -211,65 +229,59 @@ export const mockRuntimeInfo: RuntimeInfo = {
   lastRefreshedAt: "2026-07-23T04:38:00Z",
   stale: false,
   loop: {
-    state: "idle",
+    phase: "idle",
     totalCycles: 18492,
     lastCycleStartAt: "2026-07-23T04:37:58Z",
     lastCycleEndAt: "2026-07-23T04:37:59Z",
     lastCycleDurationMs: 340,
-    nextCycleAt: "2026-07-23T04:38:03Z",
-    inCycle: false,
     currentPhaseSummary: null
   },
-  workload: {
-    queuedExecutions: 1,
-    runningExecutions: 0,
-    retryWaitExecutions: 2,
-    failedExecutions: 1,
-    agentResultSucceeded: 47,
-    agentResultFailed: 2,
-    pendingDeliveries: 1,
-    retryingDeliveries: 0,
-    failedDeliveries: 1
+  controls: {
+    pause: true,
+    resume: false,
+    recover: false
   },
-  recentIsolations: [
+  workload: {
+    state: "queued",
+    ready: 2,
+    running: 0,
+    retrying: 2,
+    total: 4,
+    asOf: "2026-07-23T04:38:00Z"
+  },
+  failures: [
     {
-      occurredAt: "2026-07-23T04:12:00Z",
+      failureRef: "fnd-sub-77e3c5a0",
+      owner: "subscription",
+      severity: "error",
+      reason: "Plugin probe timed out after 5000ms",
+      objectRef: "sub-77e3c5a0",
       eventId: "evt-sub-77e3c5a0",
-      executionId: "inv-c8f2",
-      subscriptionId: "sub-77e3c5a0",
-      boundedError: "Plugin probe timed out after 5000ms",
-      loopContinued: true
+      relatedRef: "inv-c8f2",
+      occurredAt: "2026-07-23T04:12:00Z",
+      action: {
+        kind: "inspect",
+        available: true,
+        consoleRoute: "/console/events?eventId=evt-sub-77e3c5a0",
+        cliHint: "rs event trace evt-sub-77e3c5a0"
+      }
     },
     {
-      occurredAt: "2026-07-23T03:55:00Z",
+      failureRef: "fnd-result-44bb",
+      owner: "notice",
+      severity: "error",
+      reason: "Matrix delivery returned 503",
+      objectRef: "dest-room-deploy",
       eventId: "evt-result-44bb",
-      executionId: "res-44bb",
-      destinationId: "dest-room-deploy",
-      boundedError: "Matrix delivery returned 503",
-      loopContinued: true
+      relatedRef: "res-44bb",
+      occurredAt: "2026-07-23T03:55:00Z",
+      action: {
+        kind: "inspect",
+        available: true,
+        consoleRoute: "/console/events?eventId=evt-result-44bb",
+        cliHint: "rs event trace evt-result-44bb"
+      }
     }
-  ],
-  agents: { registered: 3, callable: 3, unavailable: 0 },
-  events: { lastReceivedAt: "2026-07-23T04:37:45Z", waiting: 1, running: 0, succeeded: 47, failed: 3 },
-  sessions: { total: 4, lastResumedAt: "2026-07-23T04:20:00Z", mismatched: 0 },
-  subscriptions: { active: 3, paused: 1, expired: 0, failedUnknown: 1 },
-  destinations: { available: 3, pending: 1, retrying: 0, failed: 1 },
-  capabilities: [
-    { name: "Poll Subscription", version: "0.3.0", available: true }
-  ],
-  integrations: [
-    { name: "Codex Desktop adapter", kind: "adapter", status: "connected", lastSuccessAt: "2026-07-23T04:37:30Z", failureReason: null },
-    { name: "Matrix ingress", kind: "ingress", status: "connected", lastSuccessAt: "2026-07-23T04:37:45Z", failureReason: null },
-    { name: "Matrix delivery", kind: "delivery", status: "degraded", lastSuccessAt: "2026-07-23T03:50:00Z", failureReason: "503 on !room-deploy:example.com" },
-    { name: "Server control plane", kind: "control-plane", status: "connected", lastSuccessAt: "2026-07-23T04:30:00Z", failureReason: null }
-  ],
-  recentLogs: [
-    { timestamp: "2026-07-23T04:37:59Z", level: "info", subsystem: "loop", message: "Cycle 18492 completed in 340ms", objectId: null },
-    { timestamp: "2026-07-23T04:37:58Z", level: "debug", subsystem: "subscription", message: "Polled sub-2f8a9e1c: no change", objectId: "sub-2f8a9e1c" },
-    { timestamp: "2026-07-23T04:37:56Z", level: "warn", subsystem: "delivery", message: "Retry 2/3 for failed Matrix delivery", objectId: "del-88aa" },
-    { timestamp: "2026-07-23T04:37:45Z", level: "info", subsystem: "ingress", message: "Received agent.request from matrix", objectId: "evt-matrix-001" },
-    { timestamp: "2026-07-23T04:37:30Z", level: "info", subsystem: "agent", message: "Agent handler completed", objectId: "inv-c8f2" },
-    { timestamp: "2026-07-23T04:12:00Z", level: "error", subsystem: "subscription", message: "Plugin probe timed out after 5000ms", objectId: "sub-77e3c5a0" }
   ],
   controlResult: {
     kind: "recover",
@@ -311,7 +323,7 @@ export const mockEventAudits: RuntimeAudit[] = [
       type: "agent.result",
       outcome: "succeeded",
       sessionId: "sess-1111-2222",
-      output: "今天完成了 ticktick 任务 task-8842 的初步拆解，剩余 task-5521 仍在处理。",
+      output: "今天完成了 任务追踪器中的 task-8842 的初步拆解，剩余 task-5521 仍在处理。",
       causality: { rootEventId: "evt-matrix-001", parentEventId: "evt-matrix-001", hop: 1 },
       createdAt: "2026-07-23T04:37:48Z"
     },
@@ -442,7 +454,7 @@ export const mockEventAudits: RuntimeAudit[] = [
   },
   {
     event: {
-      eventId: "evt-ticktick-5521-3",
+      eventId: "evt-tracker-5521-3",
       type: "subscription.fire",
       source: { kind: "subscription", externalId: "sub-77e3c5a0" },
       agentId: "agent-1",
@@ -450,7 +462,7 @@ export const mockEventAudits: RuntimeAudit[] = [
       boundedPromptSummary: "总结 Room 上下文并给出下一步建议",
       sessionId: "sess-1111-2222",
       destinationIds: ["task-xyz-123"],
-      causality: { rootEventId: "evt-ticktick-5521-3", hop: 0 },
+      causality: { rootEventId: "evt-tracker-5521-3", hop: 0 },
       createdAt: "2026-07-21T10:05:00Z"
     },
     execution: {
@@ -545,7 +557,7 @@ export const mockEventAudits: RuntimeAudit[] = [
     session: {
       sessionId: "sess-3333-4444",
       agentId: "agent-2",
-      adapterId: "codex",
+      adapterId: "claude-code",
       providerSessionId: "prov-sess-bob-001",
       workspace: "/workspace/bugs",
       createdAt: "2026-07-19T09:00:00Z",

@@ -18,7 +18,7 @@ import {
   sendRoomMessage,
   updateAgentRoomWakeMode,
   type RoomPolicyUpdate
-} from "../../application/room-control.js";
+} from "../../application/room/control.js";
 
 interface CommandOutput {
   readonly write: (text: string) => void;

@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { DeviceCredentialStore } from "../src/application/device/credential-store.js";
+import { DeviceCredentialStore } from "../src/infrastructure/files/device-credential-store.js";
 
 test("device credential store rejects loose permissions", () => {
   const directory = mkdtempSync(join(tmpdir(), "rollerskate-device-secret-"));

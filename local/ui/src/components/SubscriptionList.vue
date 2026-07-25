@@ -14,21 +14,24 @@ const emit = defineEmits<{
 
 <template>
   <div class="list-body">
-    <div
+    <button
       v-for="sub in subscriptions"
       :key="sub.id"
+      type="button"
       class="subscription-row"
       :class="{ active: sub.id === selectedId }"
+      :aria-selected="sub.id === selectedId"
       @click="emit('select', sub.id)"
     >
       <div class="row-header">
         <div class="row-id">{{ sub.id }}</div>
         <StatusBadge :status="sub.status" />
       </div>
-      <div class="row-title">{{ sub.plugin.id }}</div>
+      <div class="row-title">{{ sub.title }}</div>
+      <div class="row-meta">{{ sub.probe.plugin.id }}</div>
       <div class="row-meta">@{{ sub.owner.handle }} · {{ sub.owner.client }}</div>
       <div class="row-meta">Provider Session {{ sub.callback.providerSessionId }}</div>
-    </div>
+    </button>
   </div>
 </template>
 
@@ -41,6 +44,10 @@ const emit = defineEmits<{
 }
 
 .subscription-row {
+  width: 100%;
+  text-align: left;
+  background: var(--surface);
+  color: inherit;
   padding: 12px;
   border: 1px solid var(--border);
   border-radius: 8px;

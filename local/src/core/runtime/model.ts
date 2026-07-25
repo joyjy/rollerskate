@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import type { EventType } from "../event/model.js";
 
-export const runtimeHandlerKinds = ["agent", "result"] as const;
+export const runtimeHandlerKinds = ["agent", "result", "review", "chat"] as const;
 export type RuntimeHandlerKind = (typeof runtimeHandlerKinds)[number];
 
 export interface RuntimeRoute {
@@ -13,8 +13,10 @@ const runtimeRoutes: Readonly<Record<EventType, RuntimeRoute>> = {
   "agent.request": { eventType: "agent.request", handler: "agent" },
   "subscription.fire": { eventType: "subscription.fire", handler: "agent" },
   "agent.result": { eventType: "agent.result", handler: "result" },
+  "review.requested": { eventType: "review.requested", handler: "review" },
+  "review.decision": { eventType: "review.decision", handler: "review" },
   "chat.dispatch": { eventType: "chat.dispatch", handler: "agent" },
-  "chat.message": { eventType: "chat.message", handler: "result" }
+  "chat.message": { eventType: "chat.message", handler: "chat" }
 };
 
 export function runtimeRoute(eventType: EventType): RuntimeRoute {
@@ -55,7 +57,7 @@ export interface RuntimeSession {
 
 export interface RuntimeDestination {
   readonly destinationId: string;
-  readonly kind: "matrix";
+  readonly kind: "matrix" | "macos-notification";
   readonly address: Readonly<Record<string, string>>;
   readonly createdAt: string;
   readonly updatedAt: string;

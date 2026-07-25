@@ -4,13 +4,22 @@ export const eventTypes = [
   "agent.request",
   "subscription.fire",
   "agent.result",
+  "review.requested",
+  "review.decision",
   "chat.message",
   "chat.dispatch"
 ] as const;
 export type EventType = (typeof eventTypes)[number];
 export type AgentInputEventType = "agent.request" | "subscription.fire" | "chat.dispatch";
 
-export const eventSourceKinds = ["cli", "subscription", "matrix", "server", "handler"] as const;
+export const eventSourceKinds = [
+  "cli",
+  "subscription",
+  "schedule",
+  "matrix",
+  "server",
+  "handler"
+] as const;
 export type EventSourceKind = (typeof eventSourceKinds)[number];
 
 export interface EventSource {
@@ -35,11 +44,55 @@ interface EventBase {
   readonly createdAt: string;
 }
 
-export interface AgentInputEvent extends EventBase {
-  readonly type: Exclude<AgentInputEventType, "chat.dispatch">;
+export interface AgentRequestEvent extends EventBase {
+  readonly type: "agent.request";
   readonly agentId: string;
   readonly prompt: string;
+  readonly reviewInvocation?: ReviewAgentInvocation;
 }
+
+export interface ReviewReference {
+  readonly kind: "acceptance";
+  readonly ref: string;
+  readonly revision: string;
+}
+
+export interface ReviewEvidenceReference {
+  readonly kind: "workspace";
+  readonly ref: string;
+  readonly revision: string;
+}
+
+export interface ReviewAgentInvocation {
+  readonly schemaVersion: "review-invocation@1";
+  readonly role: "reviewer" | "implementer";
+  readonly rootEventId: string;
+  readonly cycleIndex: number;
+  readonly subject: ReviewReference;
+  readonly artifactRef: string;
+  readonly artifactRevision?: string;
+  readonly evidence: readonly ReviewEvidenceReference[];
+  readonly implementationRevision: string;
+  readonly workspaceAccess: "read" | "write";
+  readonly writableRoot?: string;
+  readonly resultSchema: "ReviewerResult@1" | "ImplementerResult@1";
+}
+
+export interface SubscriptionFireObservation {
+  readonly version: string;
+  readonly facts: Readonly<Record<string, unknown>>;
+  readonly terminal: "success" | "failure" | "cancelled";
+  readonly summary?: string;
+}
+
+export interface SubscriptionFireEvent extends EventBase {
+  readonly type: "subscription.fire";
+  readonly agentId: string;
+  readonly prompt: string;
+  readonly observation?: SubscriptionFireObservation;
+}
+
+export type AgentInputEvent = AgentRequestEvent | SubscriptionFireEvent;
 
 export interface AgentResultEvent extends EventBase {
   readonly type: "agent.result";
@@ -47,6 +100,36 @@ export interface AgentResultEvent extends EventBase {
   readonly outcome: "succeeded" | "failed";
   readonly output?: string;
   readonly error?: string;
+}
+
+export interface ReviewRequestedEvent extends EventBase {
+  readonly type: "review.requested";
+  readonly cycleIndex: number;
+  readonly subject: ReviewReference;
+  readonly artifactRef: string;
+  readonly artifactRevision?: string;
+  readonly evidence: readonly ReviewEvidenceReference[];
+  readonly implementationRevision: string;
+  readonly reviewerAgentId: string;
+  readonly implementerAgentId: string;
+  readonly reworkLimit: number;
+}
+
+export interface ReviewDecisionEvent extends EventBase {
+  readonly type: "review.decision";
+  readonly cycleIndex: number;
+  readonly requestedEventId: string;
+  readonly reviewerResultEventId: string;
+  readonly decision: "passed" | "findings" | "blocked";
+  readonly boundedSummary: string;
+  readonly revisionsRead: {
+    readonly subject: string;
+    readonly artifact?: string;
+    readonly evidence: readonly ReviewEvidenceReference[];
+  };
+  readonly artifactRevision: string;
+  readonly openFindingCount: number;
+  readonly blockedReason?: string;
 }
 
 export interface ChatMessageEvent extends EventBase {
@@ -77,17 +160,25 @@ export interface ChatDispatchEvent extends EventBase {
   readonly topicId: string;
   readonly sourceMessageEventId: string;
   readonly targetHandleSnapshot: string;
+  readonly promptResourceId: string;
   readonly prompt: string;
 }
 
-export type Event = AgentInputEvent | AgentResultEvent | ChatMessageEvent | ChatDispatchEvent;
+export type Event =
+  | AgentInputEvent
+  | AgentResultEvent
+  | ReviewRequestedEvent
+  | ReviewDecisionEvent
+  | ChatMessageEvent
+  | ChatDispatchEvent;
 
 export interface CreateEvent {
   readonly eventId?: string;
-  readonly type: Exclude<AgentInputEventType, "chat.dispatch">;
+  readonly type: "agent.request";
   readonly source: EventSource;
   readonly agentId: string;
   readonly prompt: string;
+  readonly reviewInvocation?: ReviewAgentInvocation;
   readonly sessionId?: string;
   readonly destinationIds?: readonly string[];
   readonly parent?: {

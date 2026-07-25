@@ -1,7 +1,14 @@
 import type { RuntimeEvent } from "@/types/runtime";
 
 export type LocalAgentStatus = "active" | "suspended";
-export type LocalAgentClient = "codex";
+export type LocalAgentClient =
+  | "codex"
+  | "claude-code"
+  | "kimi-code";
+
+export interface AgentExecutionConfig {
+  readonly launchArgs: readonly string[];
+}
 
 export interface LocalPrincipal {
   readonly principalId: string;
@@ -17,7 +24,7 @@ export interface LocalAgent {
   readonly handle: string;
   readonly status: LocalAgentStatus;
   readonly client: LocalAgentClient;
-  readonly executionConfig: Readonly<Record<string, unknown>>;
+  readonly executionConfig: AgentExecutionConfig;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -40,6 +47,7 @@ export interface AgentConsoleItem {
   readonly handle: string;
   readonly status: LocalAgentStatus;
   readonly client: LocalAgentClient;
+  readonly executionConfig: AgentExecutionConfig;
   readonly availability: AgentAvailability;
   readonly currentSession?: AgentCurrentSession;
   readonly createdAt: string;
@@ -65,6 +73,26 @@ export interface LocalChatSession {
   readonly principalId: string;
   readonly currentSessionId?: string;
   readonly generation: number;
+}
+
+export interface ChatPresence {
+  readonly scope: "topic" | "global";
+  readonly mode: "available" | "snoozed";
+  readonly until?: string;
+  readonly wakeKeywords: readonly string[];
+}
+
+export interface LocalChatPresenceAgent {
+  readonly principalId: string;
+  readonly handle: string;
+  readonly status: LocalAgentStatus;
+  readonly global?: ChatPresence;
+  readonly topic?: ChatPresence;
+}
+
+export interface LocalChatPresenceView {
+  readonly topicId: string;
+  readonly agents: readonly LocalChatPresenceAgent[];
 }
 
 export interface LocalChatView {

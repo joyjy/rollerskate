@@ -6,6 +6,7 @@
   "workspaces": [
     "packages/*",
     "local",
+    "local/ui",
     "server"
   ],
   "scripts": {
@@ -14,8 +15,9 @@
     "dev:up": "npm run dev:init && docker compose --env-file dev/.env -f dev/compose.yaml up --build",
     "dev:down": "docker compose --env-file dev/.env -f dev/compose.yaml down",
     "test": "$HOME/.ai/scripts/node-test-kit run",
+    "test:ui": "npm --prefix local/ui test",
     "test:coverage": "$HOME/.ai/scripts/node-test-kit coverage",
-    "verify": "npm test"
+    "verify": "npm test && npm run test:ui"
   },
   "engines": {
     "node": ">=24.0.0"

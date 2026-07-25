@@ -1,20 +1,63 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, nextTick, ref } from "vue";
+import { requestJson } from "@/api/client";
+import {
+  errorResponseSchema,
+  localChatPresenceViewSchema,
+  localChatViewSchema
+} from "@/api/schema";
+import { useApi } from "@/composables/useApi";
+import { useMutation } from "@/composables/useMutation";
 import ChatList from "@/components/ChatList.vue";
 import ChatTimeline from "@/components/ChatTimeline.vue";
 import ChatComposer from "@/components/ChatComposer.vue";
 import ChatContextPanel from "@/components/ChatContextPanel.vue";
-import type { ChatListItem, ChatView } from "@/types/chat";
-import type { LocalAgent, LocalChatView } from "@/types/local";
+import type { ChatListItem } from "@/types/chat";
+import type { LocalAgent } from "@/types/local";
 
-const loading = ref(true);
-const error = ref<string | null>(null);
-const chatView = ref<ChatView | null>(null);
 const selectedId = ref<string>("local");
 const composer = ref("");
 const pending = ref<string | null>(null);
 const chatTimelineRef = ref<InstanceType<typeof ChatTimeline> | null>(null);
-let timer: number | undefined;
+const pollingPaused = computed(() => pending.value !== null);
+const {
+  data: chatView,
+  loading: chatLoading,
+  error: loadError,
+  refresh: refreshChat
+} = useApi({
+  url: "/api/chat",
+  schema: localChatViewSchema,
+  interval: 2_000,
+  paused: pollingPaused
+});
+const presenceQuery = useApi({
+  url: "/api/chat/presence",
+  schema: localChatPresenceViewSchema,
+  interval: 2_000,
+  paused: pollingPaused
+});
+const mutation = useMutation({
+  execute(input: { path: string; body?: object }, signal) {
+    return requestJson(input.path, errorResponseSchema, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Rollerskate-Request": "console"
+      },
+      ...(input.body === undefined ? {} : { body: JSON.stringify(input.body) }),
+      signal
+    });
+  },
+  async refresh() {
+    await Promise.all([refreshChat(), presenceQuery.refresh()]);
+  }
+});
+const loading = computed(() => chatLoading.value || presenceQuery.loading.value);
+const presenceAgents = computed(() => presenceQuery.data.value?.agents ?? []);
+const error = computed(() =>
+  mutation.error.value ?? loadError.value ?? presenceQuery.error.value
+);
 
 const chats = computed<ChatListItem[]>(() => {
   const local = chatView.value?.chat;
@@ -41,26 +84,6 @@ const activeAgents = computed(() =>
   chatView.value?.agents.filter((agent) => agent.status === "active") ?? []
 );
 
-async function load(background = false) {
-  if (!background) loading.value = true;
-  try {
-    const response = await fetch("/api/chat", { headers: { Accept: "application/json" } });
-    if (!response.ok) throw new Error(`Chat HTTP ${response.status}`);
-    const local = await response.json() as LocalChatView;
-    chatView.value = {
-      chat: local.chat,
-      agents: local.agents,
-      events: local.events,
-      sessions: local.sessions
-    };
-    error.value = null;
-  } catch (reason) {
-    error.value = message(reason);
-  } finally {
-    if (!background) loading.value = false;
-  }
-}
-
 function mention(agent: LocalAgent) {
   const token = `@${agent.handle} `;
   if (!composer.value.toLocaleLowerCase().includes(`@${agent.handle.toLocaleLowerCase()}`)) {
@@ -72,77 +95,57 @@ async function send(body: string) {
   const text = body.trim();
   if (!text || pending.value) return;
   pending.value = "send";
-  error.value = null;
-  try {
-    await mutate("/api/chat/messages", { body: text }, 201);
+  const result = await mutation.execute({
+    path: "/api/chat/messages",
+    body: { body: text }
+  });
+  if (result !== null) {
     composer.value = "";
-    await load(true);
     await nextTick();
     chatTimelineRef.value?.scrollToBottom();
-  } catch (reason) {
-    error.value = message(reason);
-  } finally {
-    pending.value = null;
   }
+  pending.value = null;
 }
 
 async function dispatch(sourceMessageEventId: string, principalId: string) {
   if (pending.value) return;
   pending.value = sourceMessageEventId;
-  error.value = null;
-  try {
-    await mutate(`/api/chat/messages/${encodeURIComponent(sourceMessageEventId)}/dispatch`, {
-      principalId
-    });
-    await load(true);
+  const result = await mutation.execute({
+    path: `/api/chat/messages/${encodeURIComponent(sourceMessageEventId)}/dispatch`,
+    body: { principalId }
+  });
+  if (result !== null) {
     await nextTick();
     chatTimelineRef.value?.scrollToBottom();
-  } catch (reason) {
-    error.value = message(reason);
-  } finally {
-    pending.value = null;
   }
+  pending.value = null;
 }
 
 async function newSession(agent: LocalAgent) {
   if (pending.value) return;
   pending.value = agent.principalId;
-  error.value = null;
-  try {
-    await mutate(`/api/chat/agents/${encodeURIComponent(agent.principalId)}/new-session`);
-    await load(true);
-  } catch (reason) {
-    error.value = message(reason);
-  } finally {
-    pending.value = null;
-  }
-}
-
-async function mutate(path: string, body?: object, expected = 200) {
-  const response = await fetch(path, {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/json",
-      "X-Rollerskate-Request": "console"
-    },
-    ...(body === undefined ? {} : { body: JSON.stringify(body) })
+  await mutation.execute({
+    path: `/api/chat/agents/${encodeURIComponent(agent.principalId)}/new-session`
   });
-  const result = await response.json() as { error?: string };
-  if (response.status !== expected) throw new Error(result.error ?? `HTTP ${response.status}`);
+  pending.value = null;
 }
 
-function message(reason: unknown): string {
-  return reason instanceof Error ? reason.message : String(reason);
+async function refreshAll() {
+  await Promise.all([refreshChat(), presenceQuery.refresh()]);
 }
 
-onMounted(async () => {
-  await load();
-  timer = window.setInterval(() => {
-    if (!pending.value) void load(true);
-  }, 2_000);
-});
-onBeforeUnmount(() => window.clearInterval(timer));
+async function setPresence(
+  agent: LocalAgent,
+  presence: { readonly mode: "available" | "snoozed"; readonly until?: string }
+) {
+  if (pending.value || agent.status !== "active") return;
+  pending.value = `presence:${agent.principalId}`;
+  await mutation.execute({
+    path: `/api/chat/agents/${encodeURIComponent(agent.principalId)}/presence`,
+    body: presence
+  });
+  pending.value = null;
+}
 </script>
 
 <template>
@@ -150,7 +153,11 @@ onBeforeUnmount(() => window.clearInterval(timer));
     <div v-if="loading" class="state">Loading immutable Chat history…</div>
     <div v-else-if="error && !chatView" class="state error" role="alert">
       Could not load Chats: {{ error }}
-      <button class="secondary-button retry" @click="load()">Retry</button>
+      <button
+        type="button"
+        class="secondary-button retry"
+        @click="refreshAll"
+      >Retry</button>
     </div>
     <div v-else-if="!selectedChat" class="state">No chat available.</div>
     <div v-else class="chats-layout layout-base">
@@ -184,9 +191,11 @@ onBeforeUnmount(() => window.clearInterval(timer));
         <div class="panel-header">Agent Sessions</div>
         <ChatContextPanel
           :agents="chatView?.agents ?? []"
+          :presence-agents="presenceAgents"
           :sessions="chatView?.sessions ?? []"
           :pending="pending"
           @new-session="newSession"
+          @set-presence="setPresence"
         />
       </section>
     </div>
@@ -197,6 +206,7 @@ onBeforeUnmount(() => window.clearInterval(timer));
 .chats-layout {
   grid-template-columns: 260px 1fr 280px;
   height: calc(100vh - 170px);
+  height: calc(100dvh - 170px);
 }
 .chat-panel { display: flex; flex-direction: column; height: 100%; }
 .chat-list-panel { height: 100%; }
@@ -211,6 +221,6 @@ onBeforeUnmount(() => window.clearInterval(timer));
 @media (max-width: 768px) {
   .chats-layout { grid-template-columns: 1fr; height: auto; }
   .chat-list-panel { display: none; }
-  .chat-panel { min-height: calc(100vh - 170px); }
+  .chat-panel { min-height: calc(100vh - 170px); min-height: calc(100dvh - 170px); }
 }
 </style>

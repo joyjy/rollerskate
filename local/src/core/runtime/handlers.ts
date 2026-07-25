@@ -7,6 +7,15 @@ import {
   type ChatDispatchEvent,
   type ChatMessageEvent
 } from "../event/model.js";
+import {
+  availableChatDecision,
+  chatMentionPromptResourceId,
+  parseChatHistoryRequest,
+  parseChatDecision,
+  parseChatMentionDecision,
+  silentChatMentionDecision,
+  type ChatPromptHistory
+} from "../chat/model.js";
 import type {
   RuntimeExecution,
   RuntimeDelivery,
@@ -19,6 +28,10 @@ import { RuntimeStore } from "./store.js";
 export interface RuntimeAgentAdapter {
   readonly adapterId: string;
   readonly workspace: string;
+  readonly reviewCapabilities?: {
+    readonly resultSchemas: readonly ("ReviewerResult@1" | "ImplementerResult@1")[];
+    readonly workspaceAccess: readonly ("read" | "write")[];
+  };
   invoke(input: {
     readonly event: AgentInputEvent | ChatDispatchEvent;
     readonly providerSessionId?: string;
@@ -30,6 +43,21 @@ export interface RuntimeAgentAdapter {
   }>;
 }
 
+export interface RuntimeReviewContinuation {
+  handleAgentResult(
+    execution: RuntimeExecution,
+    result: AgentResultEvent,
+    request: import("../event/model.js").AgentRequestEvent,
+    at: string
+  ): boolean;
+}
+
+export interface ChatHistoryPageInput {
+  readonly topicId: string;
+  readonly beforeEventId: string;
+  readonly limit: number;
+}
+
 export class AgentHandler {
   public readonly kind = "agent" as const;
   readonly #adapterForAgent: (
@@ -38,6 +66,7 @@ export class AgentHandler {
   ) => RuntimeAgentAdapter | undefined;
   readonly #store: RuntimeStore;
   readonly #retryBaseMilliseconds: number;
+  readonly #chatHistory: ((input: ChatHistoryPageInput) => ChatPromptHistory) | undefined;
 
   public constructor(options: {
     readonly store: RuntimeStore;
@@ -46,6 +75,7 @@ export class AgentHandler {
       agentId: string,
       workspace?: string
     ) => RuntimeAgentAdapter | undefined;
+    readonly chatHistory?: (input: ChatHistoryPageInput) => ChatPromptHistory;
     readonly retryBaseMilliseconds?: number;
   }) {
     this.#store = options.store;
@@ -57,6 +87,7 @@ export class AgentHandler {
     }
     this.#adapterForAgent = options.adapterForAgent ??
       ((agentId) => options.adapters!.get(agentId));
+    this.#chatHistory = options.chatHistory;
     this.#retryBaseMilliseconds = options.retryBaseMilliseconds ?? 1_000;
   }
 
@@ -78,7 +109,15 @@ export class AgentHandler {
           ? this.#store.currentLocalAgentSession(event.agentId)?.sessionId
           : undefined);
       const session = sessionId === undefined ? undefined : this.#session(sessionId);
-      const adapter = this.#adapterForAgent(event.agentId, session?.workspace);
+      const reviewWorkspace = event.type === "agent.request"
+        ? event.reviewInvocation?.evidence.find(
+            (evidence) => evidence.kind === "workspace"
+          )?.ref
+        : undefined;
+      const adapter = this.#adapterForAgent(
+        event.agentId,
+        reviewWorkspace ?? session?.workspace
+      );
       if (adapter === undefined) throw new Error(`Agent adapter not available: ${event.agentId}`);
       if (session !== undefined && (session.agentId !== event.agentId ||
         session.adapterId !== adapter.adapterId || session.workspace !== adapter.workspace)) {
@@ -89,16 +128,35 @@ export class AgentHandler {
           `workspace=${session.workspace === adapter.workspace ? "match" : "mismatch"}`
         );
       }
-      const receipt = await adapter.invoke({
+      let receipt = await adapter.invoke({
         event,
         ...(session === undefined ? {} : { providerSessionId: session.providerSessionId })
       });
+      if (event.type === "chat.dispatch") {
+        receipt = await this.#continueChatHistory(
+          adapter,
+          event,
+          receipt
+        );
+      }
+      const chatDecision = event.type === "chat.dispatch"
+        ? receipt.outcome.kind === "message"
+          ? event.promptResourceId === chatMentionPromptResourceId
+            ? parseChatMentionDecision(receipt.outcome.body)
+            : parseChatDecision(receipt.outcome.body, at)
+          : event.promptResourceId === chatMentionPromptResourceId
+            ? silentChatMentionDecision()
+            : availableChatDecision()
+        : undefined;
       return this.#store.completeExecution(execution.executionId, {
         adapterId: adapter.adapterId,
         workspace: adapter.workspace,
         providerSessionId: receipt.providerSessionId,
         ...(session === undefined ? {} : { sessionId: session.sessionId }),
-        ...(receipt.outcome.kind === "message" ? { output: receipt.outcome.body } : {})
+        ...(event.type !== "chat.dispatch" && receipt.outcome.kind === "message"
+          ? { output: receipt.outcome.body }
+          : {}),
+        ...(chatDecision === undefined ? {} : { chatDecision })
       }, at);
     } catch (error) {
       return this.#store.failExecution(
@@ -115,14 +173,88 @@ export class AgentHandler {
     if (session === undefined) throw new Error(`Session not found: ${sessionId}`);
     return session;
   }
+
+  async #continueChatHistory(
+    adapter: RuntimeAgentAdapter,
+    event: ChatDispatchEvent,
+    initialReceipt: Awaited<ReturnType<RuntimeAgentAdapter["invoke"]>>
+  ): Promise<Awaited<ReturnType<RuntimeAgentAdapter["invoke"]>>> {
+    let receipt = initialReceipt;
+    if (receipt.outcome.kind !== "message") return receipt;
+    let request = parseChatHistoryRequest(receipt.outcome.body);
+    if (request === undefined) return receipt;
+    if (this.#chatHistory === undefined) {
+      throw new Error("Chat history recall is not available");
+    }
+
+    const initialHistory = this.#chatHistory({
+      topicId: event.topicId,
+      beforeEventId: event.sourceMessageEventId,
+      limit: 50
+    });
+    let expectedCursor = initialHistory.hasEarlier
+      ? initialHistory.beforeEventId
+      : undefined;
+    let recalledMessages = 0;
+    let recalledBytes = 0;
+    let pages = 0;
+    while (request !== undefined) {
+      if (pages >= 3) throw new Error("Chat history recall exceeds three pages");
+      if (expectedCursor === undefined || request.beforeEventId !== expectedCursor) {
+        throw new Error("Chat history recall cursor does not match the previous page");
+      }
+      const page = this.#chatHistory({
+        topicId: event.topicId,
+        beforeEventId: request.beforeEventId,
+        limit: request.limit
+      });
+      if (page.items.length === 0) {
+        throw new Error("Chat history recall returned an empty page");
+      }
+      const pageJson = JSON.stringify(page);
+      recalledMessages += page.items.length;
+      recalledBytes += Buffer.byteLength(pageJson, "utf8");
+      if (recalledMessages > 200 || recalledBytes > 65_536) {
+        throw new Error("Chat history recall exceeds the bounded context budget");
+      }
+      if (page.hasEarlier &&
+        (page.beforeEventId === undefined || page.beforeEventId === request.beforeEventId)) {
+        throw new Error("Chat history recall cursor did not advance");
+      }
+      pages += 1;
+      expectedCursor = page.hasEarlier ? page.beforeEventId : undefined;
+      receipt = await adapter.invoke({
+        event: {
+          ...event,
+          prompt: [
+            "The Runtime accepted your ChatHistoryRequest@1.",
+            "Here is the bounded earlier history page:",
+            JSON.stringify(page, null, 2),
+            "Return the original Chat decision schema now. Request another page only when",
+            "`hasEarlier` is true, using exactly this page's `beforeEventId`."
+          ].join("\n")
+        },
+        providerSessionId: receipt.providerSessionId
+      });
+      request = receipt.outcome.kind === "message"
+        ? parseChatHistoryRequest(receipt.outcome.body)
+        : undefined;
+    }
+    return receipt;
+  }
 }
 
 export class ResultHandler {
   public readonly kind = "result" as const;
   readonly #store: RuntimeStore;
+  readonly #review: RuntimeReviewContinuation | undefined;
 
-  public constructor(store: RuntimeStore) {
+  public constructor(
+    store: RuntimeStore,
+    review?: RuntimeReviewContinuation
+  ) {
     this.#store = store;
+    this.#review = review;
   }
 
   public handle(
@@ -135,6 +267,14 @@ export class ResultHandler {
     const event = this.#store.event(execution.eventId);
     if (event === undefined || !isAgentResultEvent(event)) {
       throw new Error(`ResultHandler requires agent.result: ${execution.eventId}`);
+    }
+    const parentEventId = event.causality.parentEventId;
+    if (parentEventId !== undefined) {
+      const request = this.#store.event(parentEventId);
+      if (request?.type === "agent.request" && request.reviewInvocation !== undefined &&
+        this.#review?.handleAgentResult(execution, event, request, at) === true) {
+        return [];
+      }
     }
     return this.#store.completeResultExecution(execution.executionId, at);
   }

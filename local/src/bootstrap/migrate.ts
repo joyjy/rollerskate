@@ -2,7 +2,7 @@
 
 import { resolve } from "node:path";
 
-import { initializeRuntimeSchema } from "../application/runtime-schema.js";
+import { initializeRuntimeSchema } from "../infrastructure/sqlite/schema.js";
 
 export function migrateLocalDatabase(argv = process.argv.slice(2)): number {
   const [databasePath, ...extra] = argv;

@@ -1,53 +1,74 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
-import type { Subscription } from "@/types/subscription";
+import { computed, ref, watch } from "vue";
+import { useRoute } from "vue-router";
+import { requestJson } from "@/api/client";
+import { subscriptionSchema, subscriptionsSchema } from "@/api/schema";
+import { useApi } from "@/composables/useApi";
+import { useMutation } from "@/composables/useMutation";
 import SubscriptionList from "@/components/SubscriptionList.vue";
 import SubscriptionTrace from "@/components/SubscriptionTrace.vue";
 import QuickHint from "@/components/QuickHint.vue";
 
-const subscriptions = ref<Subscription[]>([]);
-const selectedId = ref("");
-const selected = ref<Subscription | null>(null);
-const loading = ref(true);
-const error = ref("");
+const route = useRoute();
+const initialSubscriptionId = Array.isArray(route.query.subscriptionId)
+  ? route.query.subscriptionId[0]
+  : route.query.subscriptionId;
 
-async function load() {
-  loading.value = true;
-  error.value = "";
-  try {
-    const response = await fetch("/api/subscriptions", { headers: { Accept: "application/json" } });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    subscriptions.value = await response.json() as Subscription[];
-    const current = subscriptions.value.find((item) => item.id === selectedId.value) ?? subscriptions.value[0] ?? null;
-    selected.value = current;
-    selectedId.value = current?.id ?? "";
-  } catch (reason) {
-    error.value = reason instanceof Error ? reason.message : String(reason);
-  } finally {
-    loading.value = false;
+const selectedId = ref(initialSubscriptionId ?? "");
+const mutationPaused = ref(false);
+const { data, loading, error: loadError, refresh } = useApi({
+  url: "/api/subscriptions",
+  schema: subscriptionsSchema,
+  interval: 3_000,
+  paused: mutationPaused
+});
+const subscriptions = computed(() => data.value ?? []);
+const selected = computed(() => {
+  if (selectedId.value === "") {
+    return subscriptions.value[0] ?? null;
   }
-}
-
-onMounted(load);
+  return subscriptions.value.find((item) => item.id === selectedId.value) ?? null;
+});
+watch(subscriptions, (next) => {
+  if (selectedId.value === "" && next.length > 0) {
+    selectedId.value = next[0]!.id;
+  }
+}, { immediate: true });
+const actionMutation = useMutation({
+  async execute(input: {
+    id: string;
+    action: "pause" | "resume" | "cancel";
+  }, signal) {
+    return requestJson(
+      `/api/subscriptions/${encodeURIComponent(input.id)}/${input.action}`,
+      subscriptionSchema,
+      {
+        method: "POST",
+        headers: { "X-Rollerskate-Request": "console" },
+        signal
+      }
+    );
+  },
+  refresh
+});
+const error = computed(() => actionMutation.error.value ?? loadError.value);
 
 function onSelect(id: string) {
   selectedId.value = id;
-  const found = subscriptions.value.find((s: Subscription) => s.id === id);
-  if (found) selected.value = found;
 }
 
-function updateSubscription(updated: Subscription) {
-  const index = subscriptions.value.findIndex((s: Subscription) => s.id === updated.id);
-  if (index >= 0) {
-    subscriptions.value[index] = updated;
-    selected.value = updated;
-  }
+async function act(action: "pause" | "resume" | "cancel") {
+  if (!selected.value) return;
+  mutationPaused.value = true;
+  await actionMutation.execute({ id: selected.value.id, action });
+  mutationPaused.value = false;
 }
 </script>
 
 <template>
   <div v-if="loading" class="state">Loading durable Subscriptions…</div>
-  <div v-else-if="error" class="state error">Failed to load Subscriptions: {{ error }}</div>
+  <div v-else-if="error" class="state error" role="alert">Failed to load Subscriptions: {{ error }}</div>
+  <div v-else-if="selectedId && !selected" class="state">Subscription {{ selectedId }} not found.</div>
   <div v-else-if="!selected" class="state">No Subscription is registered.</div>
   <div v-else class="subscriptions-layout layout-base gap-lg layout-three-pane-wide">
     <div class="panel">
@@ -65,7 +86,12 @@ function updateSubscription(updated: Subscription) {
 
     <div class="panel">
       <div class="panel-header">Quick Hint</div>
-      <QuickHint :subscription="selected" @update="updateSubscription" />
+      <QuickHint
+        :subscription="selected"
+        :busy="actionMutation.pending.value"
+        :error="actionMutation.error.value"
+        @action="act"
+      />
     </div>
   </div>
 </template>

@@ -16,7 +16,7 @@ import {
   loadLocalRuntime,
   runtimePaths,
   setupLocalRuntime
-} from "../src/application/runtime-config.js";
+} from "../src/infrastructure/runtime/config.js";
 
 test("setup keeps all Local app state under the selected repo .rollerskate", () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-app-config-"));

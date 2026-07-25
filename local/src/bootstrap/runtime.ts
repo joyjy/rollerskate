@@ -1,18 +1,23 @@
 import { chmodSync, mkdirSync } from "node:fs";
 
 import type { RoomEventPage, RoomHead } from "../protocol.js";
-import { LoopControlStore } from "../application/loop-control-store.js";
-import { RoomPolicyStore } from "../application/room-policy-store.js";
-import { AgentCredentialStore, type ActiveAgentCredential } from "../application/agent/credential-store.js";
-import { LocalAgentRegistryStore } from "../application/agent/registry-store.js";
-import { LocalDeviceStore } from "../application/device/store.js";
+import { LoopControlStore } from "../infrastructure/files/loop-control-store.js";
+import { RoomPolicyStore } from "../infrastructure/files/room-policy-store.js";
+import { AgentCredentialStore, type ActiveAgentCredential } from "../infrastructure/files/agent-credential-store.js";
+import { LocalAgentRegistryStore } from "../infrastructure/sqlite/agent-registry-store.js";
+import { LocalDeviceStore } from "../infrastructure/sqlite/device-store.js";
 import { PollProbeExecutor } from "../capabilities/subscription/plugin-runner.js";
 import { PollSubscriptionRuntime } from "../capabilities/subscription/runtime.js";
+import { ScheduledTaskRuntime } from "../capabilities/scheduled-task/runtime.js";
+import { ScheduledTaskStore } from "../capabilities/scheduled-task/store.js";
+import { ReviewRuntime } from "../capabilities/review/runtime.js";
+import { ReviewStore } from "../capabilities/review/store.js";
 import {
   AgentHandler,
   DeliveryHandler,
   ResultHandler,
   type RuntimeAgentAdapter,
+  type RuntimeDestinationAdapter,
   type RuntimeEventHandler
 } from "../core/runtime/handlers.js";
 import type { RuntimeHandlerKind } from "../core/runtime/model.js";
@@ -20,6 +25,12 @@ import { RuntimeCycle } from "../core/runtime/cycle.js";
 import { RuntimeStore } from "../core/runtime/store.js";
 import { runLoop, type LoopPhase, type LoopResult } from "../core/loop.js";
 import { CodexRuntimeAgent } from "../integrations/agent/codex.js";
+import { ClaudeCodeRuntimeAgent } from "../integrations/agent/claude-code.js";
+import { KimiCodeRuntimeAgent } from "../integrations/agent/kimi-code.js";
+import {
+  MacOsNotificationAdapter,
+  type MacOsNotificationRunner
+} from "../integrations/notification/macos.js";
 import {
   MatrixDeliveryAdapter,
   MatrixIngress,
@@ -30,24 +41,32 @@ import {
   RoomServerClient,
   RoomServerPublisherRouter
 } from "../integrations/server/room-client.js";
-import { runtimePaths } from "../application/runtime-config.js";
-import { initializeRuntimeSchema } from "../application/runtime-schema.js";
+import { runtimePaths } from "../infrastructure/runtime/config.js";
+import { initializeRuntimeSchema } from "../infrastructure/sqlite/schema.js";
 import {
   bootstrapLocalFoundation,
-  LocalFoundationStore,
-  type LocalAgent
-} from "../application/local-foundation.js";
-import { LocalChatStore } from "../application/local-chat-store.js";
+  LocalFoundationStore
+} from "../infrastructure/sqlite/foundation-store.js";
+import type { LocalAgent } from "../modules/foundation/model.js";
+import { LocalChatStore } from "../infrastructure/sqlite/chat-store.js";
+import { ChatHandler } from "../application/chat/handler.js";
+import {
+  boundedChatPromptHistory,
+  chatTimelineFromStore
+} from "../application/chat/query.js";
 
 export interface RuntimeStartOptions {
   readonly repoRoot: string;
   readonly runtimeDirectory?: string;
   readonly codexExecutable?: string;
+  readonly claudeCodeExecutable?: string;
+  readonly kimiCodeExecutable?: string;
   readonly environment: Readonly<Record<string, string>>;
   readonly pollMilliseconds?: number;
   readonly codexTimeoutMilliseconds?: number;
   readonly output?: { readonly write: (text: string) => void };
   readonly fetch?: typeof fetch;
+  readonly macOsNotificationRunner?: MacOsNotificationRunner;
 }
 
 export async function startRuntime(
@@ -62,6 +81,7 @@ export async function startRuntime(
   const resources = await assembleRuntime(options);
   try {
     const reconciledAt = new Date().toISOString();
+    resources.scheduledTaskStore.reconcileInterrupted(reconciledAt);
     resources.runtimeStore.reconcileInterrupted(reconciledAt);
     resources.subscriptions.reconcileInterrupted();
     return await runLoop({
@@ -87,9 +107,17 @@ export async function startRuntime(
           resources.runtimeStore.close();
         } finally {
           try {
-            resources.localChat.close();
+            resources.scheduledTaskStore.close();
           } finally {
-            resources.foundationStore.close();
+            try {
+              resources.reviewStore.close();
+            } finally {
+              try {
+                resources.localChat.close();
+              } finally {
+                resources.foundationStore.close();
+              }
+            }
           }
         }
       }
@@ -106,6 +134,8 @@ async function assembleRuntime(options: RuntimeStartOptions) {
   const foundationStore = new LocalFoundationStore(paths.database);
   const localChat = new LocalChatStore(paths.database);
   const runtimeStore = new RuntimeStore(paths.database);
+  const scheduledTaskStore = new ScheduledTaskStore(paths.database);
+  const reviewStore = new ReviewStore(paths.database);
   let handedOff = false;
   try {
     const device = deviceStore.current();
@@ -123,21 +153,30 @@ async function assembleRuntime(options: RuntimeStartOptions) {
       (agent) => agent.status === "active"
     )) {
       agentNames.push(localAgent.handle);
-      const adapter = runtimeAgent(localAgent, paths.workspace, options);
-      runtimeAgents.set(
-        localRuntimeAgentKey(localAgent.principalId, adapter.workspace),
-        adapter
-      );
+      try {
+        const adapter = runtimeAgent(localAgent, paths.workspace, options);
+        runtimeAgents.set(
+          localRuntimeAgentKey(localAgent, adapter.workspace),
+          adapter
+        );
+      } catch (error) {
+        options.output?.write(`${JSON.stringify({
+          type: "runtime.adapter_unavailable",
+          adapter: localAgent.client,
+          agentId: localAgent.principalId,
+          error: message(error)
+        })}\n`);
+      }
     }
     for (const metadata of registry.list().filter((agent) => agent.status === "active")) {
       let agent: RuntimeAgentAdapter;
       try {
-        agent = new CodexRuntimeAgent({
-          executable: requireExecutable(options.codexExecutable, "Codex"),
-          projectRoot: metadata.workspacePath,
-          environment: options.environment,
-          timeoutMilliseconds: options.codexTimeoutMilliseconds ?? 300_000
-        });
+        agent = runtimeAgentForClient(
+          metadata.client,
+          { launchArgs: [] },
+          metadata.workspacePath,
+          options
+        );
       } catch (error) {
         options.output?.write(`${JSON.stringify({
           type: "runtime.adapter_unavailable",
@@ -201,47 +240,96 @@ async function assembleRuntime(options: RuntimeStartOptions) {
       databasePath: paths.database,
       publisher: new RoomServerPublisherRouter(publishers)
     });
+    const macOsNotification = new MacOsNotificationAdapter(
+      options.macOsNotificationRunner
+    );
+    const deliveryAdapters = new Map<
+      RuntimeDestinationAdapter["kind"],
+      RuntimeDestinationAdapter
+    >([["macos-notification", macOsNotification]]);
+    if (matrixDelivery !== undefined) {
+      deliveryAdapters.set("matrix", matrixDelivery);
+    }
     const subscriptions = new PollSubscriptionRuntime({
       databasePath: paths.database,
       probeExecutor: new PollProbeExecutor({
         ...(options.fetch === undefined ? {} : { fetch: options.fetch })
       })
     });
+    const scheduledTasks = new ScheduledTaskRuntime({
+      store: scheduledTaskStore,
+      runtime: runtimeStore,
+      validateTarget(revision) {
+        const agent = foundationStore.agent(revision.agentId);
+        if (agent === undefined) return "agent-not-found";
+        if (agent.status !== "active") return "agent-suspended";
+        if (revision.workspace !== foundation.workspacePath) {
+          return "workspace-authority-mismatch";
+        }
+        if (revision.fixedSessionId !== undefined) {
+          const session = runtimeStore.session(revision.fixedSessionId);
+          if (session === undefined) return "fixed-session-not-found";
+          if (session.agentId !== revision.agentId ||
+            session.workspace !== revision.workspace) {
+            return "fixed-session-target-mismatch";
+          }
+        }
+        return undefined;
+      }
+    });
+    const adapterForAgent = (
+      agentId: string,
+      sessionWorkspace?: string
+    ): RuntimeAgentAdapter | undefined => {
+      const localAgent = foundationStore.listAgents().find(
+        (agent) => agent.principalId === agentId
+      );
+      if (localAgent !== undefined) {
+        if (localAgent.status !== "active") return undefined;
+        const workspace = sessionWorkspace ?? paths.workspace;
+        const key = localRuntimeAgentKey(localAgent, workspace);
+        const cached = runtimeAgents.get(key);
+        if (cached !== undefined) return cached;
+        const adapter = runtimeAgent(localAgent, workspace, options);
+        runtimeAgents.set(key, adapter);
+        return adapter;
+      }
+      return runtimeAgents.get(agentId);
+    };
+    const reviews = new ReviewRuntime({
+      store: reviewStore,
+      runtime: runtimeStore,
+      adapterForAgent: (agentId, workspace) => adapterForAgent(agentId, workspace)
+    });
     const runtimeCycle = new RuntimeCycle({
       store: runtimeStore,
       handlers: new Map<RuntimeHandlerKind, RuntimeEventHandler>([
         ["agent", new AgentHandler({
           store: runtimeStore,
-          adapterForAgent(agentId, sessionWorkspace) {
-            const localAgent = foundationStore.listAgents().find(
-              (agent) => agent.principalId === agentId
-            );
-            if (localAgent !== undefined) {
-              if (localAgent.status !== "active") return undefined;
-              const workspace = sessionWorkspace ?? paths.workspace;
-              const key = localRuntimeAgentKey(agentId, workspace);
-              const cached = runtimeAgents.get(key);
-              if (cached !== undefined) return cached;
-              const adapter = runtimeAgent(localAgent, workspace, options);
-              runtimeAgents.set(key, adapter);
-              return adapter;
-            }
-            return runtimeAgents.get(agentId);
-          }
+          adapterForAgent,
+          chatHistory: ({ topicId, beforeEventId, limit }) =>
+            boundedChatPromptHistory(chatTimelineFromStore(localChat, topicId, {
+              beforeEventId,
+              limit
+            }))
         })],
-        ["result", new ResultHandler(runtimeStore)]
+        ["result", new ResultHandler(runtimeStore, reviews)],
+        ["review", reviews],
+        ["chat", new ChatHandler({
+          store: runtimeStore,
+          chat: localChat,
+          listAgents: () => foundationStore.listAgents()
+        })]
       ]),
       deliveryHandler: new DeliveryHandler({
         store: runtimeStore,
-        adapters: matrixDelivery === undefined
-          ? new Map()
-          : new Map([["matrix", matrixDelivery]])
+        adapters: deliveryAdapters
       })
     });
     const phases: LoopPhase[] = [
       subscriptionPhase(subscriptions),
       ...matrixPhases(matrixIngress),
-      localChatPhase(localChat, foundation.topicId, foundationStore),
+      scheduledTaskPhase(scheduledTasks),
       runtimePhase(runtimeCycle)
     ];
     handedOff = true;
@@ -250,6 +338,8 @@ async function assembleRuntime(options: RuntimeStartOptions) {
       matrixIngress,
       matrixDelivery,
       subscriptions,
+      scheduledTaskStore,
+      reviewStore,
       runtimeStore,
       localChat,
       foundationStore,
@@ -262,7 +352,11 @@ async function assembleRuntime(options: RuntimeStartOptions) {
       ].sort()
     };
   } finally {
-    if (!handedOff) runtimeStore.close();
+    if (!handedOff) {
+      scheduledTaskStore.close();
+      reviewStore.close();
+      runtimeStore.close();
+    }
     registry.close();
     deviceStore.close();
     if (!handedOff) {
@@ -277,16 +371,48 @@ function runtimeAgent(
   workspace: string,
   options: RuntimeStartOptions
 ): RuntimeAgentAdapter {
-  return new CodexRuntimeAgent({
-    executable: requireExecutable(options.codexExecutable, "Codex"),
-    projectRoot: workspace,
-    environment: options.environment,
-    timeoutMilliseconds: options.codexTimeoutMilliseconds ?? 300_000
-  });
+  return runtimeAgentForClient(agent.client, agent.executionConfig, workspace, options);
 }
 
-function localRuntimeAgentKey(agentId: string, workspace: string): string {
-  return `local:${agentId}:${workspace}`;
+function runtimeAgentForClient(
+  client: LocalAgent["client"],
+  executionConfig: LocalAgent["executionConfig"],
+  workspace: string,
+  options: RuntimeStartOptions
+): RuntimeAgentAdapter {
+  const common = {
+    projectRoot: workspace,
+    environment: options.environment,
+    timeoutMilliseconds: options.codexTimeoutMilliseconds ?? 300_000,
+    launchArgs: executionConfig.launchArgs
+  };
+  switch (client) {
+    case "codex":
+      return new CodexRuntimeAgent({
+        executable: requireExecutable(options.codexExecutable, "Codex"),
+        ...common
+      });
+    case "claude-code":
+      return new ClaudeCodeRuntimeAgent({
+        executable: requireExecutable(options.claudeCodeExecutable, "Claude Code"),
+        ...common
+      });
+    case "kimi-code":
+      return new KimiCodeRuntimeAgent({
+        executable: requireExecutable(options.kimiCodeExecutable, "Kimi Code"),
+        ...common
+      });
+  }
+}
+
+function localRuntimeAgentKey(agent: LocalAgent, workspace: string): string {
+  return [
+    "local",
+    agent.principalId,
+    workspace,
+    agent.client,
+    JSON.stringify(agent.executionConfig)
+  ].join(":");
 }
 
 function subscriptionPhase(runtime: PollSubscriptionRuntime): LoopPhase {
@@ -315,33 +441,6 @@ function matrixPhases(ingress: MatrixIngress | undefined): LoopPhase[] {
   }));
 }
 
-function localChatPhase(
-  chat: LocalChatStore,
-  topicId: string,
-  foundation: LocalFoundationStore
-): LoopPhase {
-  return {
-    scope: "local-chat",
-    run: async () => {
-      const prompts = chat.promptPending(
-        topicId,
-        foundation.listAgents()
-          .filter((agent) => agent.status === "active")
-          .map((agent) => ({
-            principalId: agent.principalId,
-            handle: agent.handle
-          }))
-      );
-      return prompts.length === 0
-        ? undefined
-        : {
-            type: "local_chat.dispatch_prompted",
-            messageEventIds: prompts.map((event) => event.eventId)
-          };
-    }
-  };
-}
-
 function runtimePhase(runtime: RuntimeCycle): LoopPhase {
   return {
     scope: "runtime",
@@ -351,6 +450,18 @@ function runtimePhase(runtime: RuntimeCycle): LoopPhase {
         result.failures.length === 0
         ? undefined
         : { type: "runtime.cycle", ...result };
+    }
+  };
+}
+
+function scheduledTaskPhase(runtime: ScheduledTaskRuntime): LoopPhase {
+  return {
+    scope: "scheduled-task",
+    run: async () => {
+      const result = runtime.runCycle();
+      return Object.values(result).every((ids) => ids.length === 0)
+        ? undefined
+        : { type: "scheduled_task.cycle", ...result };
     }
   };
 }

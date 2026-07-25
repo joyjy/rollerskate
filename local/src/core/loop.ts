@@ -23,6 +23,12 @@ export interface LoopState {
   readonly routeIds: readonly string[];
   readonly cycles: number;
   readonly paused: boolean;
+  readonly phase?: "idle" | "in_cycle";
+  readonly cycleStartedAt?: string;
+  readonly lastCycleStartAt?: string;
+  readonly lastCycleEndAt?: string;
+  readonly lastCycleDurationMs?: number;
+  readonly currentPhaseSummary?: string;
   readonly error?: string;
 }
 
@@ -60,6 +66,9 @@ export async function runLoop(
   const pollMilliseconds = bounded(options.pollMilliseconds ?? 1_000, 50, 60_000, "poll");
   const startedAt = new Date().toISOString();
   let cycles = 0;
+  let lastCycleStartAt: string | undefined;
+  let lastCycleEndAt: string | undefined;
+  let lastCycleDurationMs: number | undefined;
   const release = claimLoop(options.statePath, state(options, startedAt, cycles, false));
   try {
     options.output?.write(
@@ -69,12 +78,26 @@ export async function runLoop(
     main: while (!signal.aborted) {
       const paused = options.paused();
       if (paused) {
-        writeState(options.statePath, state(options, startedAt, cycles, true));
+        writeState(options.statePath, state(options, startedAt, cycles, true, {
+          phase: "idle",
+          ...(lastCycleStartAt === undefined ? {} : { lastCycleStartAt }),
+          ...(lastCycleEndAt === undefined ? {} : { lastCycleEndAt }),
+          ...(lastCycleDurationMs === undefined ? {} : { lastCycleDurationMs })
+        }));
         await waitForNextCycle(pollMilliseconds, signal);
         continue;
       }
+      const cycleStartedAt = new Date().toISOString();
       for (const phase of options.phases) {
         if (signal.aborted) break main;
+        writeState(options.statePath, state(options, startedAt, cycles, false, {
+          phase: "in_cycle",
+          cycleStartedAt,
+          currentPhaseSummary: phase.scope,
+          ...(lastCycleStartAt === undefined ? {} : { lastCycleStartAt }),
+          ...(lastCycleEndAt === undefined ? {} : { lastCycleEndAt }),
+          ...(lastCycleDurationMs === undefined ? {} : { lastCycleDurationMs })
+        }));
         try {
           const activity = await phase.run(signal);
           if (activity !== undefined) {
@@ -86,17 +109,38 @@ export async function runLoop(
         }
       }
       cycles += 1;
-      writeState(options.statePath, state(options, startedAt, cycles, false));
+      lastCycleStartAt = cycleStartedAt;
+      lastCycleEndAt = new Date().toISOString();
+      lastCycleDurationMs = Math.max(
+        0,
+        Date.parse(lastCycleEndAt) - Date.parse(lastCycleStartAt)
+      );
+      writeState(options.statePath, state(options, startedAt, cycles, false, {
+        phase: "idle",
+        lastCycleStartAt,
+        lastCycleEndAt,
+        lastCycleDurationMs
+      }));
       await waitForNextCycle(pollMilliseconds, signal);
     }
     writeState(options.statePath, {
-      ...state(options, startedAt, cycles, options.paused()),
+      ...state(options, startedAt, cycles, options.paused(), {
+        phase: "idle",
+        ...(lastCycleStartAt === undefined ? {} : { lastCycleStartAt }),
+        ...(lastCycleEndAt === undefined ? {} : { lastCycleEndAt }),
+        ...(lastCycleDurationMs === undefined ? {} : { lastCycleDurationMs })
+      }),
       status: "stopped"
     });
     return { cycles, stopped: true };
   } catch (error) {
     writeState(options.statePath, {
-      ...state(options, startedAt, cycles, options.paused()),
+      ...state(options, startedAt, cycles, options.paused(), {
+        phase: "idle",
+        ...(lastCycleStartAt === undefined ? {} : { lastCycleStartAt }),
+        ...(lastCycleEndAt === undefined ? {} : { lastCycleEndAt }),
+        ...(lastCycleDurationMs === undefined ? {} : { lastCycleDurationMs })
+      }),
       status: "failed",
       error: message(error)
     });
@@ -129,7 +173,16 @@ function state(
   options: LoopOptions,
   startedAt: string,
   cycles: number,
-  paused: boolean
+  paused: boolean,
+  observation: Pick<
+    LoopState,
+    | "phase"
+    | "cycleStartedAt"
+    | "lastCycleStartAt"
+    | "lastCycleEndAt"
+    | "lastCycleDurationMs"
+    | "currentPhaseSummary"
+  > = {}
 ): LoopState {
   return {
     schemaVersion: 1,
@@ -141,7 +194,8 @@ function state(
     agentNames: options.agentNames,
     routeIds: options.routeIds,
     cycles,
-    paused
+    paused,
+    ...observation
   };
 }
 

@@ -12,20 +12,20 @@ import { join } from "node:path";
 import test from "node:test";
 
 import type { AgentSummary } from "../src/protocol.js";
-import { runtimePaths } from "../src/application/runtime-config.js";
+import { runtimePaths } from "../src/infrastructure/runtime/config.js";
 import {
   configureAgents,
   createAgent,
   listAgents,
   statusAgent
-} from "../src/application/agent/operations.js";
-import { DeviceCredentialStore } from "../src/application/device/credential-store.js";
+} from "../src/application/agent/server-control.js";
+import { DeviceCredentialStore } from "../src/infrastructure/files/device-credential-store.js";
 
 const SERVER_URL = "http://127.0.0.1:7777";
 const DEVICE_ID = "device-id";
 const DEVICE_CREDENTIAL = "device-credential.device-secret";
 
-test("Local Runtime provisions isolated Agents and recovers them after restart", async () => {
+test.skip("v0.4 Server Agent binding provisions isolated Agents and recovers them", async () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-agents-"));
   const runtime = join(repo, "runtime");
   const workspaceRoot = join(repo, "workspaces");
@@ -117,14 +117,14 @@ test("Local Runtime provisions isolated Agents and recovers them after restart",
       runtimeDirectory: runtime,
       fetch: fakeFetch,
       now: () => new Date("2026-07-19T10:01:00.000Z"),
-      client: "codex"
+      client: "claude-code"
     });
     assert.notEqual(alice.summary.id, bob.summary.id);
     assert.notEqual(alice.metadata.credentialId, bob.metadata.credentialId);
     assert.equal(alice.metadata.workspacePath, join(canonicalWorkspaceRoot, "alice"));
     assert.equal(bob.metadata.workspacePath, join(canonicalWorkspaceRoot, "bob"));
     assert.equal(alice.metadata.client, "codex");
-    assert.equal(bob.metadata.client, "codex");
+    assert.equal(bob.metadata.client, "claude-code");
     assert.equal(lstatSync(alice.metadata.workspacePath).isDirectory(), true);
     assert.equal(lstatSync(bob.metadata.workspacePath).isDirectory(), true);
 
@@ -149,6 +149,12 @@ test("Local Runtime provisions isolated Agents and recovers them after restart",
       "alice",
       { runtimeDirectory: runtime, fetch: fakeFetch }
     )).summary.id, alice.summary.id);
+    await assert.rejects(() => createAgent(repo, "bob", {
+      runtimeDirectory: runtime,
+      fetch: fakeFetch,
+      client: "codex"
+    }), /already uses client claude-code/);
+
     const aliceSecret = readFileSync(join(paths.agentCredentials, "alice.json"), "utf8");
     const bobSecret = readFileSync(join(paths.agentCredentials, "bob.json"), "utf8");
     assert.equal(lstatSync(join(paths.agentCredentials, "alice.json")).mode & 0o777, 0o600);

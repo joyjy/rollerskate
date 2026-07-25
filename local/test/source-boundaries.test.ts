@@ -15,7 +15,8 @@ test("Local source layers preserve the core and Capability dependency boundary",
   assertLayerImports("capabilities", new Set([
     "capabilities",
     "core",
-    "infrastructure"
+    "infrastructure",
+    "modules"
   ]));
   assertLayerImports("application", new Set([
     "application",
@@ -23,7 +24,11 @@ test("Local source layers preserve the core and Capability dependency boundary",
     "core",
     "infrastructure",
     "integrations",
+    "modules",
     "protocol.js"
+  ]));
+  assertLayerImports("modules", new Set([
+    "modules"
   ]));
   assertLayerImports("entrypoints", new Set([
     "application",
@@ -31,7 +36,14 @@ test("Local source layers preserve the core and Capability dependency boundary",
     "entrypoints",
     "protocol.js"
   ]));
-  assertLayerImports("infrastructure", new Set(["infrastructure"]));
+  assertLayerImports("infrastructure", new Set([
+    "capabilities",
+    "core",
+    "infrastructure",
+    "integrations",
+    "modules",
+    "protocol.js"
+  ]));
 });
 
 test("Local core owns the only long-running loop", () => {

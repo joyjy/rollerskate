@@ -42,7 +42,11 @@ test("loopback Console API manages local Agents without Server login", async () 
     const created = await jsonRequest(`${origin}/api/agents`, {
       method: "POST",
       headers: consoleHeaders(),
-      body: JSON.stringify({ handle: "alice", client: "codex" })
+      body: JSON.stringify({
+        handle: "alice",
+        client: "claude-code",
+        launchArgs: ["--model", "claude-sonnet-4-6"]
+      })
     });
     assert.equal(created.response.status, 201);
     const alice = created.body as {
@@ -53,7 +57,22 @@ test("loopback Console API manages local Agents without Server login", async () 
     };
     assert.equal(alice.handle, "alice");
     assert.equal(alice.status, "active");
-    assert.equal(alice.client, "codex");
+    assert.equal(alice.client, "claude-code");
+
+    const configured = await jsonRequest(
+      `${origin}/api/agents/${alice.principalId}/configure`,
+      {
+        method: "POST",
+        headers: consoleHeaders(),
+        body: JSON.stringify({ launchArgs: ["--model", "claude-opus-4-6"] })
+      }
+    );
+    assert.equal(configured.response.status, 200);
+    assert.deepEqual(
+      (configured.body as { executionConfig: { launchArgs: string[] } })
+        .executionConfig.launchArgs,
+      ["--model", "claude-opus-4-6"]
+    );
 
     const renamed = await jsonRequest(`${origin}/api/agents/${alice.principalId}/rename`, {
       method: "POST",
@@ -79,6 +98,52 @@ test("loopback Console API manages local Agents without Server login", async () 
       (listed.body as Array<{ handle: string }>).map(({ handle }) => handle),
       ["helper"]
     );
+
+    const initialPresence = await jsonRequest(`${origin}/api/chat/presence`);
+    assert.equal(initialPresence.response.status, 200);
+    assert.equal((initialPresence.body as {
+      agents: Array<{ handle: string; topic?: unknown }>;
+    }).agents[0]?.handle, "helper");
+
+    const rejectedPresence = await jsonRequest(
+      `${origin}/api/chat/agents/${alice.principalId}/presence`,
+      {
+        method: "POST",
+        body: JSON.stringify({ mode: "available" })
+      }
+    );
+    assert.equal(rejectedPresence.response.status, 403);
+
+    const until = new Date(Date.now() + 60 * 60 * 1_000).toISOString();
+    const snoozed = await jsonRequest(
+      `${origin}/api/chat/agents/${alice.principalId}/presence`,
+      {
+        method: "POST",
+        headers: consoleHeaders(),
+        body: JSON.stringify({ mode: "snoozed", until })
+      }
+    );
+    assert.equal(snoozed.response.status, 200);
+    assert.equal((snoozed.body as { mode: string }).mode, "snoozed");
+
+    const persistedPresence = await jsonRequest(`${origin}/api/chat/presence`);
+    assert.equal((persistedPresence.body as {
+      agents: Array<{ topic?: { mode: string; until?: string } }>;
+    }).agents[0]?.topic?.mode, "snoozed");
+    assert.equal((persistedPresence.body as {
+      agents: Array<{ topic?: { mode: string; until?: string } }>;
+    }).agents[0]?.topic?.until, until);
+
+    const listening = await jsonRequest(
+      `${origin}/api/chat/agents/${alice.principalId}/presence`,
+      {
+        method: "POST",
+        headers: consoleHeaders(),
+        body: JSON.stringify({ mode: "available" })
+      }
+    );
+    assert.equal(listening.response.status, 200);
+    assert.equal((listening.body as { mode: string }).mode, "available");
 
     const rejectedMessage = await jsonRequest(`${origin}/api/chat/messages`, {
       method: "POST",
@@ -133,12 +198,24 @@ test("loopback Console API manages local Agents without Server login", async () 
     const chatView = chat.body as {
       chat: { handle: string };
       events: Array<{ type: string; eventId: string }>;
+      timeline: {
+        items: Array<{ eventId: string; sender: { handleSnapshot: string } }>;
+      };
     };
     assert.equal(chatView.chat.handle, "local");
     assert.ok(chatView.events.some(
       ({ type, eventId }) => type === "chat.message" && eventId === sourceEventId
     ));
     assert.ok(chatView.events.some(({ type }) => type === "chat.dispatch"));
+    assert.ok(chatView.timeline.items.some(
+      ({ eventId, sender }) =>
+        eventId === sourceEventId && sender.handleSnapshot === "owner"
+    ));
+
+    const pagedChat = await jsonRequest(`${origin}/api/chat?limit=1`);
+    assert.equal((pagedChat.body as {
+      timeline: { items: unknown[] };
+    }).timeline.items.length, 1);
 
     const removedRoomApi = await jsonRequest(`${origin}/api/room`);
     assert.equal(removedRoomApi.response.status, 404);

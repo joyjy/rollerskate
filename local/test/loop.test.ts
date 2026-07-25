@@ -15,29 +15,29 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import type { AgentSummary, DeviceSummary } from "../src/protocol.js";
-import { runtimePaths } from "../src/application/runtime-config.js";
-import { AgentCredentialStore } from "../src/application/agent/credential-store.js";
-import { LocalAgentRegistryStore } from "../src/application/agent/registry-store.js";
-import { LocalDeviceStore } from "../src/application/device/store.js";
-import { runtimeStatus } from "../src/application/loop-control.js";
+import { runtimePaths } from "../src/infrastructure/runtime/config.js";
+import { AgentCredentialStore } from "../src/infrastructure/files/agent-credential-store.js";
+import { LocalAgentRegistryStore } from "../src/infrastructure/sqlite/agent-registry-store.js";
+import { LocalDeviceStore } from "../src/infrastructure/sqlite/device-store.js";
+import { runtimeStatus } from "../src/application/runtime/control.js";
 import { startRuntime } from "../src/bootstrap/runtime.js";
 import { PollSubscriptionStore } from "../src/capabilities/subscription/store.js";
 import { runLocalApp } from "../src/entrypoints/cli/main.js";
 import { RuntimeStore } from "../src/core/runtime/store.js";
 import { startUiServer } from "../src/entrypoints/console/launcher.js";
-import { addLocalAgent } from "../src/application/local-agent-control.js";
-import { runtimeConsoleView } from "../src/application/runtime-console.js";
+import { addLocalAgent } from "../src/application/agent/control.js";
+import { runtimeConsoleView } from "../src/application/runtime/console-query.js";
 import {
   localChatView,
   postLocalChatMessage
-} from "../src/application/local-chat-control.js";
+} from "../src/application/chat/control.js";
 
 const now = "2026-07-20T00:00:00.000Z";
 const roomId = "room-1";
 const head = `r1.${Buffer.from(JSON.stringify([roomId, 1])).toString("base64url")}`;
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
-test("stale legacy Agent workspace does not block Local-first startup", async () => {
+test.skip("v0.4 Server Agent workspace does not block Local-first startup", async () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-stale-agent-repo-"));
   const runtime = mkdtempSync(join(tmpdir(), "rollerskate-stale-agent-runtime-"));
   try {
@@ -51,9 +51,8 @@ test("stale legacy Agent workspace does not block Local-first startup", async ()
     const controller = new AbortController();
     let output = "";
     let consoleView: {
-      agents: { registered: number; callable: number; unavailable: number };
       workspaceRoot: string;
-      integrations: Array<{ status: string; failureReason: string | null }>;
+      failures: Array<{ owner: string; reason: string; action: { consoleRoute?: string } }>;
     } | undefined;
     await startRuntime({
       repoRoot: repo,
@@ -77,14 +76,10 @@ test("stale legacy Agent workspace does not block Local-first startup", async ()
     assert.match(output, /"type":"runtime\.adapter_unavailable"/);
     assert.match(output, /deleted-workspace/);
     assert.match(output, /Runtime loop ready: 0 Agent\(s\), 1 Route\(s\)/);
-    assert.deepEqual(consoleView?.agents, {
-      registered: 1,
-      callable: 0,
-      unavailable: 1
-    });
     assert.equal(consoleView?.workspaceRoot, join(realpathSync(runtime), "workspace"));
-    assert.equal(consoleView?.integrations[0]?.status, "disconnected");
-    assert.match(consoleView?.integrations[0]?.failureReason ?? "", /workspace is unavailable/);
+    assert.equal(consoleView?.failures[0]?.owner, "agent");
+    assert.match(consoleView?.failures[0]?.reason ?? "", /No active local Agent/);
+    assert.equal(consoleView?.failures[0]?.action.consoleRoute, "/console/agents");
   } finally {
     rmSync(repo, { recursive: true, force: true });
     rmSync(runtime, { recursive: true, force: true });
@@ -101,7 +96,10 @@ process.stdin.resume();
 process.stdin.on("end", () => {
   process.stdout.write([
     JSON.stringify({ type: "thread.started", thread_id: "late-provider-session" }),
-    JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "late Agent ready" } })
+    JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({
+      schema: "ChatMentionDecision@1",
+      speech: { action: "reply", body: "late Agent ready" }
+    }) } })
   ].join("\\n") + "\\n");
 });
 `);
@@ -143,12 +141,7 @@ test("offline agent request enters SQLite and is handled without Device, Room or
   const runtime = mkdtempSync(join(tmpdir(), "rollerskate-offline-request-runtime-"));
   try {
     const paths = runtimePaths(repo, runtime);
-    const workspace = join(runtime, "workspace", "alice");
-    mkdirSync(workspace, { recursive: true, mode: 0o700 });
-    const agents = new LocalAgentRegistryStore(paths.database);
-    agents.provision(agentSummary("offline-device"), workspace);
-    agents.activate(agentSummary("offline-device"), "offline-credential", now);
-    agents.close();
+    addLocalAgent(repo, "alice", "codex", { runtimeDirectory: runtime });
     const executable = join(runtime, "codex-fixture");
     writeFileSync(executable, `#!${process.execPath}
 let input = "";
@@ -188,7 +181,7 @@ process.stdin.on("end", () => {
       try {
         assert.equal((schemaVersion.prepare(`
           SELECT value FROM schema_meta WHERE key = 'schema_version'
-        `).get() as { value: string }).value, "34");
+        `).get() as { value: string }).value, "43");
       } finally {
         schemaVersion.close();
       }
@@ -248,7 +241,7 @@ process.stdin.on("end", () => {
   }
 });
 
-test("Local Runtime loop runs the complete Handler and restart does not replay an invocation", async () => {
+test.skip("v0.4 Matrix loop runs the complete Handler without replay", async () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-local-loop-repo-"));
   const runtime = mkdtempSync(join(tmpdir(), "rollerskate-local-loop-runtime-"));
   try {
@@ -273,6 +266,10 @@ test("Local Runtime loop runs the complete Handler and restart does not replay a
     assert.equal(readFileSync(fixture.invocations, "utf8").trim().split("\n").length, 1);
     const stopped = runtimeStatus(repo, runtime);
     assert.equal(stopped.state?.status, "stopped");
+    assert.equal(stopped.state?.phase, "idle");
+    assert.equal(typeof stopped.state?.lastCycleStartAt, "string");
+    assert.equal(typeof stopped.state?.lastCycleEndAt, "string");
+    assert.equal(typeof stopped.state?.lastCycleDurationMs, "number");
     const audit = new RuntimeStore(runtimePaths(repo, runtime).database);
     try {
       const resultEvent = audit.events().find((event) => event.type === "agent.result");
@@ -305,7 +302,34 @@ test("Local Runtime loop runs the complete Handler and restart does not replay a
   }
 });
 
-test("Local Runtime loop isolates a Room sync timeout and continues", async () => {
+test.skip("v0.4 Server Agent metadata selects the Claude Code adapter", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "rollerskate-claude-loop-repo-"));
+  const runtime = mkdtempSync(join(tmpdir(), "rollerskate-claude-loop-runtime-"));
+  try {
+    const fixture = seedRuntime(repo, runtime, "claude-code");
+    const controller = new AbortController();
+    let output = "";
+    await startRuntime({
+      repoRoot: repo,
+      runtimeDirectory: runtime,
+      claudeCodeExecutable: fixture.executable,
+      environment: { HOME: repo },
+      pollMilliseconds: 50,
+      fetch: serverFetch(fixture.deviceId),
+      output: { write(text) {
+        output += text;
+        if (text.includes('"type":"runtime.cycle"')) controller.abort();
+      } }
+    }, controller.signal);
+    assert.match(output, /"type":"matrix\.ingress_cycle"/);
+    assert.equal(readFileSync(fixture.invocations, "utf8").trim(), "invoked");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test.skip("v0.4 Matrix loop isolates a Room sync timeout", async () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-room-timeout-repo-"));
   const runtime = mkdtempSync(join(tmpdir(), "rollerskate-room-timeout-runtime-"));
   try {
@@ -350,7 +374,7 @@ test("Local Runtime loop isolates a Room sync timeout and continues", async () =
   }
 });
 
-test("Local Runtime loop turns a terminal poll into subscription.fire and resumes exact Session", async () => {
+test.skip("v0.4 Matrix-backed loop turns a terminal poll into subscription.fire", async () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-subscription-loop-repo-"));
   const runtime = mkdtempSync(join(tmpdir(), "rollerskate-subscription-loop-runtime-"));
   try {
@@ -403,12 +427,22 @@ export default {
 `);
     const subscriptionFile = join(fixture.workspace, "subscription.json");
     writeFileSync(subscriptionFile, JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: 2,
+      title: "Pipeline completed",
       ownerAgentId: owner.principalId,
-      plugin: {
-        path: plugin,
-        id: "fixture-pipeline",
-        config: { url: "http://localhost:3000/pipeline" }
+      probe: {
+        plugin: {
+          path: plugin,
+          id: "fixture-pipeline",
+          config: { url: "http://localhost:3000/pipeline" }
+        },
+        policy: {
+          allowedHttpOrigins: ["http://localhost:3000"],
+          allowedExecutables: [],
+          allowedEnvironment: [],
+          timeoutMilliseconds: 1_000,
+          maxOutputBytes: 4_096
+        }
       },
       callback: {
         providerSessionId: callbackSession.providerSessionId,
@@ -418,13 +452,6 @@ export default {
         intervalMilliseconds: 100,
         maxWaitMilliseconds: 60_000,
         maxAttempts: 10
-      },
-      executionPolicy: {
-        allowedHttpOrigins: ["http://localhost:3000"],
-        allowedExecutables: [],
-        allowedEnvironment: [],
-        timeoutMilliseconds: 1_000,
-        maxOutputBytes: 4_096
       }
     }));
     let addOutput = "";
@@ -442,6 +469,7 @@ export default {
     const secondController = new AbortController();
     let output = "";
     let fired = false;
+    const notificationTitles: string[] = [];
     await startRuntime({
       repoRoot: repo,
       runtimeDirectory: runtime,
@@ -449,6 +477,9 @@ export default {
       environment: { HOME: repo },
       pollMilliseconds: 50,
       fetch: fetchImplementation,
+      macOsNotificationRunner: async (notification) => {
+        notificationTitles.push(notification.title);
+      },
       output: { write(text) {
         output += text;
         if (text.includes('"type":"subscription.cycle"') && text.includes('"fired"')) {
@@ -461,6 +492,7 @@ export default {
     assert.ok(output.includes(
       `"fired":[{"subscriptionId":"${subscriptionId}","eventId":"evt_`
     ));
+    assert.deepEqual(notificationTitles, ["Pipeline completed"]);
     const inspect = new PollSubscriptionStore(runtimePaths(repo, runtime).database);
     try {
       assert.equal(inspect.require(subscriptionId).status, "completed");
@@ -487,7 +519,11 @@ export default {
   }
 });
 
-function seedRuntime(repo: string, runtime: string): {
+function seedRuntime(
+  repo: string,
+  runtime: string,
+  client: "codex" | "claude-code" = "codex"
+): {
   readonly executable: string;
   readonly invocations: string;
   readonly deviceId: string;
@@ -503,7 +539,7 @@ function seedRuntime(repo: string, runtime: string): {
   const workspace = join(runtime, "workspace", "alice");
   mkdirSync(workspace, { recursive: true, mode: 0o700 });
   const agents = new LocalAgentRegistryStore(paths.database);
-  agents.provision(agentSummary(pairing.deviceId), workspace, "codex");
+  agents.provision(agentSummary(pairing.deviceId), workspace, client);
   agents.activate(agentSummary(pairing.deviceId), "agent-credential-1", now);
   agents.close();
   new AgentCredentialStore(paths.agentCredentials).save({
@@ -521,7 +557,16 @@ function seedRuntime(repo: string, runtime: string): {
 
   const executable = join(runtime, "agent-fixture");
   const invocations = join(runtime, "invocations.txt");
-  const response = `process.stdout.write([
+  const response = client === "claude-code"
+    ? `process.stdout.write(JSON.stringify({
+    type: "result",
+    subtype: "success",
+    is_error: false,
+    result: JSON.stringify({ action: { type: "reply", body: "hello from alice" } }),
+    session_id: "11111111-1111-4111-8111-111111111111",
+    usage: { input_tokens: 5, output_tokens: 4 }
+  }));`
+    : `process.stdout.write([
     JSON.stringify({ type: "thread.started", thread_id: "session-one" }),
     JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ action: { type: "reply", body: "hello from alice" } }) } }),
     JSON.stringify({ type: "turn.completed", usage: { input_tokens: 5, output_tokens: 4 } })

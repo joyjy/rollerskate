@@ -7,43 +7,73 @@ import { spawn } from "node:child_process";
 import { createInterface, type Interface } from "node:readline/promises";
 import { finished } from "node:stream/promises";
 
-import { setupLocalRuntime, type SetupInput } from "../../application/runtime-config.js";
-import { runtimePaths } from "../../application/runtime-config.js";
-import { doctorLocalRuntime } from "../../application/doctor.js";
+import { doctorLocalRuntime } from "../../application/runtime/doctor.js";
+import { inspectLocalDevice } from "../../application/device/query.js";
 import {
-  inspectLocalDevice,
   loginDevice,
   logoutDevice,
   statusDevice,
   type LocalDeviceStatus
-} from "../../application/device/operations.js";
+} from "../../application/device/server-control.js";
 import {
   configureAgents,
   enqueueAgentRequest
-} from "../../application/agent/operations.js";
+} from "../../application/agent/server-control.js";
 import {
   addLocalAgent,
+  configureLocalAgent,
+  inspectAgent,
+  isAgentClient,
+  listAgents,
   localRuntimeSnapshot,
   renameLocalAgent,
   resumeLocalAgent,
-  suspendLocalAgent
-} from "../../application/local-agent-control.js";
-import type {
-  LocalAgent,
-  LocalAgentClient
-} from "../../application/local-foundation.js";
-import { AgentConfigStore } from "../../application/agent/config.js";
-import type { AgentClient } from "../../application/agent/registry-store.js";
+  suspendLocalAgent,
+  type LocalAgent,
+  type LocalAgentClient,
+  type AgentSummary
+} from "../../application/agent/control.js";
 import { runAdminCommand, runRoomCommand } from "./room.js";
 import {
-  reconcileRuntime,
-  runtimeStatus,
-  setLoopPaused
-} from "../../application/loop-control.js";
-import { runtimeTrace } from "../../application/runtime-audit.js";
+  controlRuntime,
+  runtimeLogPaths,
+  setupRuntime,
+  type SetupInput
+} from "../../application/runtime/control.js";
+import {
+  eventTrace,
+  listEventTraces
+} from "../../application/event/query.js";
+import {
+  inspectRuntimeFailure,
+  listRuntimeFailures
+} from "../../application/runtime/failure-query.js";
+import { runtimeOperationsView } from "../../application/runtime/query.js";
+import { runtimeWorkloadStatus } from "../../application/runtime/workload-query.js";
+import {
+  inspectNoticeView,
+  listNoticeViews
+} from "../../application/notice/query.js";
+import {
+  acknowledgeNotice,
+  markNoticeRead,
+  rebuildNoticeIndex
+} from "../../application/notice/control.js";
 import { startRuntime } from "../../bootstrap/runtime.js";
 import { startUiServer } from "../console/launcher.js";
 import { runSubscriptionCommand } from "./subscription.js";
+import { runScheduleCommand } from "./schedule.js";
+import { runReviewCommand } from "./review.js";
+import {
+  localChatPresenceView,
+  postLocalChatMessage,
+  rotateLocalAgentSession,
+  setLocalChatPresence
+} from "../../application/chat/control.js";
+import {
+  localChatTimeline,
+  type ChatTimelineOptions
+} from "../../application/chat/query.js";
 
 interface AppOutput {
   readonly write: (text: string) => void;
@@ -73,20 +103,37 @@ const HELP = [
   "Usage:",
   "  scripts/rs [--runtime <absolute-path>] [command]",
   "  scripts/rs --help",
-  "  scripts/rs start [--no-open] [--ui-port <port>]  run Local Runtime loop + Local UI",
+  "  scripts/rs start [--no-open] [--ui-port <port>]  run Local Runtime loop + Vite Console",
+  "  scripts/rs doctor --local  validate Local-first state without legacy Matrix config",
   "  scripts/rs status         inspect Local Runtime loop state",
   "  scripts/rs trace <event-id>",
+  "  scripts/rs event list|trace ...",
+  "  scripts/rs workload status",
+  "  scripts/rs failure list|inspect ...",
   "  scripts/rs recover        reconcile interrupted Runtime work",
   "  scripts/rs pause          pause Local Runtime cycles",
   "  scripts/rs resume         resume Local Runtime cycles",
-  "  scripts/rs agent create <handle> --client codex",
+  "  scripts/rs agent create <handle> --client <codex|claude-code|kimi-code> [--launch-arg <arg>]...",
+  "  scripts/rs agent configure <handle> [--launch-arg <arg>]...  replace launch args; omit to clear",
   "  scripts/rs agent status <handle>",
   "  scripts/rs agent list",
   "  scripts/rs agent rename <handle> <new-handle>",
   "  scripts/rs agent suspend|resume <handle>",
   "  scripts/rs agent request <name> [--session <ses_uuidv7>] <prompt...>",
+  "  scripts/rs chat post <message...>",
+  "  scripts/rs chat history [--before <event-id>] [--limit <1-200>]",
+  "  scripts/rs chat status",
+  "  scripts/rs chat presence set <handle> --scope <topic|global> --mode <available|snoozed> [--until <iso>] [--wake-keyword <literal>]...",
+  "  scripts/rs chat session new <handle>",
+  "  scripts/rs notice list [--limit <1-1000>]",
+  "  scripts/rs notice inspect <notice-id>",
+  "  scripts/rs notice mark-read|ack <notice-id>",
+  "  scripts/rs notice rebuild",
   "  scripts/rs subscription add <json-file>",
   "  scripts/rs subscription list|inspect|pause|resume|cancel ...",
+  "  scripts/rs schedule create|update|list|inspect ...",
+  "  scripts/rs schedule pause|resume|cancel|run-now|runs|trace|resolve ...",
+  "  scripts/rs review create|list|inspect|trace|recover ...",
   "",
   "Runtime: ~/.rollerskate, or the path selected with --runtime"
 ].join("\n");
@@ -112,7 +159,7 @@ export async function runLocalApp(
     case "setup": {
       rejectArguments(rest);
       const input = await collectSetupInput(repoRoot, environment);
-      const runtime = setupLocalRuntime(
+      const runtime = setupRuntime(
         repoRoot,
         input,
         new Date().toISOString(),
@@ -158,43 +205,38 @@ export async function runLocalApp(
     }
     case "status": {
       rejectArguments(rest);
-      const status = runtimeStatus(repoRoot, global.runtimeDirectory);
-      output.write(status.state === undefined
-        ? [
-            "Local Runtime loop: not started",
-            ...(status.activity === undefined ? [] : activityLines(status.activity))
-          ].join("\n") + "\n"
-        : [
-            `Local Runtime loop: ${status.running ? "running" : status.state.status}`,
-            `PID: ${status.state.pid}`,
-            `Runtime: ${status.state.runtimeDirectory}`,
-            `Agents: ${status.state.agentNames.join(", ") || "none"}`,
-            `Routes: ${status.state.routeIds.join(", ") || "none"}`,
-            `Cycles: ${status.state.cycles}`,
-            `Paused: ${status.state.paused ? "yes" : "no"}`,
-            ...(status.activity === undefined ? [] : activityLines(status.activity)),
-            ...(status.state.error === undefined ? [] : [`Error: ${status.state.error}`])
-          ].join("\n") + "\n");
+      const status = runtimeOperationsView(repoRoot, global.runtimeDirectory, "");
+      output.write([
+        `Local Runtime: ${status.status}`,
+        `Core Loop: ${status.loop.phase}`,
+        `PID: ${status.pid ?? "none"}`,
+        `Cycles: ${status.loop.totalCycles}`,
+        `Workload: ${status.workload.state}`,
+        `Failures: ${status.failures.length}`,
+        `Reason: ${status.statusReason}`
+      ].join("\n") + "\n");
       return 0;
     }
     case "trace":
       requireCount(rest, 1, "trace requires exactly one Event id");
-      output.write(`${JSON.stringify(runtimeTrace(repoRoot, rest[0]!, global.runtimeDirectory), null, 2)}\n`);
+      output.write(`${JSON.stringify(eventTrace(repoRoot, rest[0]!, global.runtimeDirectory), null, 2)}\n`);
       return 0;
+    case "event":
+      return runEventCommand(repoRoot, rest, output, global.runtimeDirectory);
+    case "workload":
+      return runWorkloadCommand(repoRoot, rest, output, global.runtimeDirectory);
+    case "failure":
+      return runFailureCommand(repoRoot, rest, output, global.runtimeDirectory);
     case "recover": {
       rejectArguments(rest);
-      if (runtimeStatus(repoRoot, global.runtimeDirectory).running) {
-        throw new Error("stop the Local Runtime loop before running recovery");
-      }
-      const reconciled = reconcileRuntime(repoRoot, global.runtimeDirectory);
-      output.write(`Reconciled interrupted Runtime work: ${reconciled}\n`);
+      const result = controlRuntime(repoRoot, "recover", global.runtimeDirectory);
+      output.write(`${result.message}\n`);
       return 0;
     }
     case "pause":
     case "resume":
       rejectArguments(rest);
-      setLoopPaused(repoRoot, command === "pause", global.runtimeDirectory);
-      output.write(`Local Runtime ${command === "pause" ? "paused" : "resumed"}.\n`);
+      output.write(`${controlRuntime(repoRoot, command, global.runtimeDirectory).message}\n`);
       return 0;
     case "device":
       return runDeviceCommand(
@@ -209,6 +251,10 @@ export async function runLocalApp(
       return runWorkspaceCommand(repoRoot, rest, output, global.runtimeDirectory);
     case "agent":
       return runAgentCommand(repoRoot, rest, output, global.runtimeDirectory);
+    case "notice":
+      return runNoticeCommand(repoRoot, rest, output, global.runtimeDirectory);
+    case "chat":
+      return runChatCommand(repoRoot, rest, output, global.runtimeDirectory);
     case "subscription":
       return runSubscriptionCommand(
         repoRoot,
@@ -217,6 +263,20 @@ export async function runLocalApp(
         global.runtimeDirectory,
         dependencies.cwd ?? process.cwd()
       );
+    case "schedule":
+      return runScheduleCommand(
+        repoRoot,
+        rest,
+        output,
+        global.runtimeDirectory
+      );
+    case "review":
+      return runReviewCommand(
+        repoRoot,
+        rest,
+        output,
+        global.runtimeDirectory
+      );
     case "room":
       return runRoomCommand(repoRoot, rest, output, global.runtimeDirectory);
     case "admin":
@@ -224,6 +284,276 @@ export async function runLocalApp(
     default:
       throw new Error(`unknown command: ${command}; run scripts/rs --help`);
   }
+}
+
+function runEventCommand(
+  repoRoot: string,
+  arguments_: readonly string[],
+  output: AppOutput,
+  runtimeDirectory?: string
+): number {
+  const [command, ...rest] = arguments_;
+  if (command === "list") {
+    rejectArguments(rest);
+    output.write(`${JSON.stringify(listEventTraces(repoRoot, runtimeDirectory), null, 2)}\n`);
+    return 0;
+  }
+  if (command === "trace") {
+    requireCount(rest, 1, "event trace requires exactly one Event id");
+    output.write(`${JSON.stringify(eventTrace(repoRoot, rest[0]!, runtimeDirectory), null, 2)}\n`);
+    return 0;
+  }
+  throw new Error("event requires list or trace");
+}
+
+function runWorkloadCommand(
+  repoRoot: string,
+  arguments_: readonly string[],
+  output: AppOutput,
+  runtimeDirectory?: string
+): number {
+  if (arguments_[0] !== "status" || arguments_.length !== 1) {
+    throw new Error("workload requires status");
+  }
+  const workload = runtimeWorkloadStatus(repoRoot, runtimeDirectory);
+  output.write([
+    `Loop workload: ${workload.state}`,
+    `Ready: ${workload.ready}`,
+    `Running: ${workload.running}`,
+    `Retrying: ${workload.retrying}`,
+    `Total: ${workload.total}`,
+    `As of: ${workload.asOf}`
+  ].join("\n") + "\n");
+  return 0;
+}
+
+function runFailureCommand(
+  repoRoot: string,
+  arguments_: readonly string[],
+  output: AppOutput,
+  runtimeDirectory?: string
+): number {
+  const [command, ...rest] = arguments_;
+  if (command === "list") {
+    rejectArguments(rest);
+    output.write(`${JSON.stringify(listRuntimeFailures(
+      repoRoot,
+      runtimeDirectory
+    ), null, 2)}\n`);
+    return 0;
+  }
+  if (command === "inspect") {
+    requireCount(rest, 1, "failure inspect requires exactly one failure ref");
+    output.write(`${JSON.stringify(inspectRuntimeFailure(
+      repoRoot,
+      rest[0]!,
+      runtimeDirectory
+    ), null, 2)}\n`);
+    return 0;
+  }
+  throw new Error("failure requires list or inspect");
+}
+
+function runChatCommand(
+  repoRoot: string,
+  arguments_: readonly string[],
+  output: AppOutput,
+  runtimeDirectory?: string
+): number {
+  const [command, ...rest] = arguments_;
+  const options = runtimeDependency(runtimeDirectory);
+  if (command === "post") {
+    const body = rest.join(" ").trim();
+    if (body === "") throw new Error("chat post requires a non-empty message");
+    const receipt = postLocalChatMessage(repoRoot, body, options);
+    output.write(`${JSON.stringify({
+      eventId: receipt.message.eventId,
+      topicId: receipt.message.topicId,
+      ...(receipt.message.target === undefined ? {} : { target: receipt.message.target }),
+      status: "queued"
+    })}\n`);
+    return 0;
+  }
+  if (command === "history") {
+    output.write(`${JSON.stringify(
+      localChatTimeline(repoRoot, options, parseChatHistoryOptions(rest)),
+      null,
+      2
+    )}\n`);
+    return 0;
+  }
+  if (command === "status") {
+    rejectArguments(rest);
+    output.write(`${JSON.stringify(localChatPresenceView(repoRoot, options), null, 2)}\n`);
+    return 0;
+  }
+  if (command === "presence") {
+    if (rest[0] !== "set") {
+      throw new Error("chat presence requires set");
+    }
+    const change = parseChatPresenceSet(rest.slice(1));
+    const agent = requireLocalAgent(repoRoot, change.handle, options);
+    const presence = setLocalChatPresence(
+      repoRoot,
+      agent.principalId,
+      change.presence,
+      options
+    );
+    output.write(`${JSON.stringify({
+      agentId: agent.principalId,
+      handle: agent.handle,
+      presence
+    }, null, 2)}\n`);
+    return 0;
+  }
+  if (command === "session") {
+    if (rest[0] !== "new" || rest.length !== 2) {
+      throw new Error("chat session new requires exactly one Agent handle");
+    }
+    const agent = requireLocalAgent(repoRoot, rest[1]!, options);
+    const generation = rotateLocalAgentSession(
+      repoRoot,
+      agent.principalId,
+      options
+    );
+    output.write(`${JSON.stringify({
+      agentId: agent.principalId,
+      handle: agent.handle,
+      generation,
+      currentSessionId: null
+    })}\n`);
+    return 0;
+  }
+  throw new Error("chat requires post, history, status, presence set or session new");
+}
+
+function parseChatHistoryOptions(arguments_: readonly string[]): ChatTimelineOptions {
+  let beforeEventId: string | undefined;
+  let limit: number | undefined;
+  for (let index = 0; index < arguments_.length; index += 2) {
+    const option = arguments_[index];
+    const value = arguments_[index + 1];
+    if (value === undefined) {
+      throw new Error("chat history options require a value");
+    }
+    if (option === "--before") {
+      if (beforeEventId !== undefined || value.trim() === "") {
+        throw new Error("chat history --before requires one non-empty Event id");
+      }
+      beforeEventId = value;
+      continue;
+    }
+    if (option === "--limit") {
+      if (limit !== undefined) throw new Error("chat history --limit may appear once");
+      limit = parseBoundedInteger(value, "chat history limit", 1, 200);
+      continue;
+    }
+    throw new Error(`unknown chat history option: ${option}`);
+  }
+  return {
+    ...(beforeEventId === undefined ? {} : { beforeEventId }),
+    ...(limit === undefined ? {} : { limit })
+  };
+}
+
+function parseChatPresenceSet(arguments_: readonly string[]): {
+  readonly handle: string;
+  readonly presence: import("../../core/chat/model.js").ChatPresence;
+} {
+  const handle = arguments_[0];
+  if (handle === undefined || handle.trim() === "") {
+    throw new Error("chat presence set requires an Agent handle");
+  }
+  let scope: "topic" | "global" | undefined;
+  let mode: "available" | "snoozed" | undefined;
+  let until: string | undefined;
+  const wakeKeywords: string[] = [];
+  for (let offset = 1; offset < arguments_.length; offset += 2) {
+    const option = arguments_[offset];
+    const value = arguments_[offset + 1];
+    if (value === undefined) throw new Error(`${option} requires a value`);
+    if (option === "--scope") {
+      if (value !== "topic" && value !== "global") {
+        throw new Error("chat presence scope must be topic or global");
+      }
+      scope = value;
+    } else if (option === "--mode") {
+      if (value !== "available" && value !== "snoozed") {
+        throw new Error("chat presence mode must be available or snoozed");
+      }
+      mode = value;
+    } else if (option === "--until") {
+      until = value;
+    } else if (option === "--wake-keyword") {
+      wakeKeywords.push(value);
+    } else {
+      throw new Error(`unexpected chat presence option: ${option}`);
+    }
+  }
+  if (scope === undefined || mode === undefined) {
+    throw new Error("chat presence set requires --scope and --mode");
+  }
+  if (mode === "available") {
+    if (until !== undefined || wakeKeywords.length !== 0) {
+      throw new Error("available presence does not accept --until or --wake-keyword");
+    }
+    return { handle, presence: { scope, mode, wakeKeywords: [] } };
+  }
+  if (until === undefined) {
+    throw new Error("snoozed presence requires --until");
+  }
+  return { handle, presence: { scope, mode, until, wakeKeywords } };
+}
+
+function runNoticeCommand(
+  repoRoot: string,
+  arguments_: readonly string[],
+  output: AppOutput,
+  runtimeDirectory?: string
+): number {
+  const [command, ...rest] = arguments_;
+  if (command === "list") {
+    let limit = 100;
+    if (rest.length !== 0) {
+      if (rest.length !== 2 || rest[0] !== "--limit") {
+        throw new Error("notice list accepts only --limit <1-1000>");
+      }
+      limit = parseBoundedInteger(rest[1]!, "notice list limit", 1, 1_000);
+    }
+    output.write(`${JSON.stringify(listNoticeViews(
+      repoRoot,
+      runtimeDirectory,
+      limit
+    ), null, 2)}\n`);
+    return 0;
+  }
+  if (command === "inspect") {
+    requireCount(rest, 1, "notice inspect requires exactly one Notice id");
+    output.write(`${JSON.stringify(inspectNoticeView(
+      repoRoot,
+      rest[0]!,
+      runtimeDirectory
+    ), null, 2)}\n`);
+    return 0;
+  }
+  if (command === "mark-read" || command === "ack") {
+    requireCount(rest, 1, `notice ${command} requires exactly one Notice id`);
+    const detail = command === "mark-read"
+      ? markNoticeRead(repoRoot, rest[0]!, runtimeDirectory)
+      : acknowledgeNotice(repoRoot, rest[0]!, runtimeDirectory);
+    output.write(`${JSON.stringify(detail, null, 2)}\n`);
+    return 0;
+  }
+  if (command === "rebuild") {
+    rejectArguments(rest);
+    output.write(`${JSON.stringify(
+      rebuildNoticeIndex(repoRoot, runtimeDirectory),
+      null,
+      2
+    )}\n`);
+    return 0;
+  }
+  throw new Error("notice requires list, inspect, mark-read, ack, or rebuild");
 }
 
 function runWorkspaceCommand(
@@ -296,13 +626,10 @@ async function runInteractiveCli(
           networkDependencies
         );
       } else if (action === "agent-list") {
-        const agents = localRuntimeSnapshot(
-          repoRoot,
-          runtimeDependency(runtimeDirectory)
-        ).agents;
+        const agents = listAgents(repoRoot, runtimeDependency(runtimeDirectory));
         output.write(agents.length === 0
           ? "No local Agents are registered on this Device.\n\n"
-          : `${agents.map((agent) => formatLocalAgent("Agent", agent).trimEnd())
+          : `${agents.map((agent) => formatAgentSummary("Agent", agent).trimEnd())
               .join("\n\n")}\n\n`);
       } else if (action === "device-status") {
         output.write(`${formatDeviceStatus(
@@ -336,7 +663,9 @@ async function createAgentInteractively(
 ): Promise<void> {
   const handle = await askText(prompts, "Agent handle");
   const client = await choose(prompts, output, "Agent client", [
-    { value: "codex", label: "Codex" }
+    { value: "codex", label: "Codex" },
+    { value: "claude-code", label: "Claude Code" },
+    { value: "kimi-code", label: "Kimi Code" }
   ]);
   output.write(`${formatLocalAgent("Agent created.", addLocalAgent(
     repoRoot,
@@ -414,16 +743,6 @@ async function choose<T extends string>(
   }
 }
 
-function activityLines(activity: NonNullable<ReturnType<typeof runtimeStatus>["activity"]>): string[] {
-  return [
-    `Events: ${activity.events}`,
-    `Executions: ${JSON.stringify(activity.executions)}`,
-    `Result Events: ${JSON.stringify(activity.resultEvents)}`,
-    `Deliveries: ${JSON.stringify(activity.deliveries)}`,
-    `Sessions: ${activity.sessions}`
-  ];
-}
-
 async function runAgentCommand(
   repoRoot: string,
   arguments_: readonly string[],
@@ -434,48 +753,70 @@ async function runAgentCommand(
   const options = runtimeDependency(runtimeDirectory);
   if (command === "create") {
     const create = parseAgentCreate(rest);
-    output.write(formatLocalAgent(
+    const agent = addLocalAgent(
+      repoRoot,
+      create.handle,
+      create.client,
+      options,
+      create.launchArgs
+    );
+    output.write(formatAgentSummary(
       "Agent created.",
-      addLocalAgent(repoRoot, create.handle, create.client, options)
+      inspectAgent(repoRoot, agent.principalId, options)
+    ));
+    return 0;
+  }
+  if (command === "configure") {
+    const configure = parseAgentConfigure(rest);
+    const agent = requireLocalAgent(repoRoot, configure.handle, options);
+    configureLocalAgent(repoRoot, agent.principalId, configure.launchArgs, options);
+    output.write(formatAgentSummary(
+      "Agent configured.",
+      inspectAgent(repoRoot, agent.principalId, options)
     ));
     return 0;
   }
   if (command === "list") {
     rejectArguments(rest);
-    const agents = localRuntimeSnapshot(repoRoot, options).agents;
+    const agents = listAgents(repoRoot, options);
     if (agents.length === 0) {
       output.write("No local Agents are registered on this Device.\n");
     } else {
-      output.write(`${agents.map((agent) => formatLocalAgent("Agent", agent).trimEnd())
+      output.write(`${agents.map((agent) => formatAgentSummary("Agent", agent).trimEnd())
         .join("\n\n")}\n`);
     }
     return 0;
   }
   if (command === "status") {
     requireCount(rest, 1, "agent status requires exactly one handle");
-    output.write(formatLocalAgent(
+    const agent = requireLocalAgent(repoRoot, rest[0]!, options);
+    output.write(formatAgentSummary(
       "Agent.",
-      requireLocalAgent(repoRoot, rest[0]!, options)
+      inspectAgent(repoRoot, agent.principalId, options)
     ));
     return 0;
   }
   if (command === "rename") {
     requireCount(rest, 2, "agent rename requires <handle> <new-handle>");
     const agent = requireLocalAgent(repoRoot, rest[0]!, options);
-    output.write(formatLocalAgent(
+    renameLocalAgent(repoRoot, agent.principalId, rest[1]!, options);
+    output.write(formatAgentSummary(
       "Agent renamed.",
-      renameLocalAgent(repoRoot, agent.principalId, rest[1]!, options)
+      inspectAgent(repoRoot, agent.principalId, options)
     ));
     return 0;
   }
   if (command === "suspend" || command === "resume") {
     requireCount(rest, 1, `agent ${command} requires exactly one handle`);
     const agent = requireLocalAgent(repoRoot, rest[0]!, options);
-    output.write(formatLocalAgent(
+    if (command === "suspend") {
+      suspendLocalAgent(repoRoot, agent.principalId, options);
+    } else {
+      resumeLocalAgent(repoRoot, agent.principalId, options);
+    }
+    output.write(formatAgentSummary(
       command === "suspend" ? "Agent suspended." : "Agent resumed.",
-      command === "suspend"
-        ? suspendLocalAgent(repoRoot, agent.principalId, options)
-        : resumeLocalAgent(repoRoot, agent.principalId, options)
+      inspectAgent(repoRoot, agent.principalId, options)
     ));
     return 0;
   }
@@ -493,24 +834,66 @@ async function runAgentCommand(
     })}\n`);
     return 0;
   }
-  throw new Error("agent requires create, list, status, rename, suspend, resume or request");
+  throw new Error(
+    "agent requires create, configure, list, status, rename, suspend, resume or request"
+  );
 }
 
 function parseAgentCreate(arguments_: readonly string[]): {
   readonly handle: string;
   readonly client: LocalAgentClient;
+  readonly launchArgs: readonly string[];
 } {
-  if (arguments_.length !== 3 || arguments_[1] !== "--client") {
+  const handle = arguments_[0];
+  if (handle === undefined || handle.trim() === "") {
     throw new Error(
-      "agent create requires <handle> --client codex"
+      "agent create requires <handle> --client <codex|claude-code|kimi-code>"
     );
   }
-  const handle = arguments_[0]!;
-  const client = arguments_[2];
-  if (client !== "codex") {
-    throw new Error("agent client must be codex");
+  let client: LocalAgentClient | undefined;
+  const launchArgs: string[] = [];
+  for (let offset = 1; offset < arguments_.length; offset += 1) {
+    const option = arguments_[offset]!;
+    const value = arguments_[offset + 1];
+    if (option === "--client") {
+      if (!isAgentClient(value)) {
+        throw new Error(
+          "agent client must be codex, claude-code or kimi-code"
+        );
+      }
+      if (client !== undefined) throw new Error("--client may only be specified once");
+      client = value;
+      offset += 1;
+    } else if (option === "--launch-arg") {
+      if (value === undefined) throw new Error("--launch-arg requires a value");
+      launchArgs.push(value);
+      offset += 1;
+    } else {
+      throw new Error(`unexpected agent create option: ${option}`);
+    }
   }
-  return { handle, client };
+  if (client === undefined) throw new Error("agent create requires --client");
+  return { handle, client, launchArgs };
+}
+
+function parseAgentConfigure(arguments_: readonly string[]): {
+  readonly handle: string;
+  readonly launchArgs: readonly string[];
+} {
+  const handle = arguments_[0];
+  if (handle === undefined || handle.trim() === "") {
+    throw new Error("agent configure requires an Agent handle");
+  }
+  const launchArgs: string[] = [];
+  for (let offset = 1; offset < arguments_.length; offset += 2) {
+    if (arguments_[offset] !== "--launch-arg") {
+      throw new Error(`unexpected agent configure option: ${arguments_[offset]}`);
+    }
+    const value = arguments_[offset + 1];
+    if (value === undefined) throw new Error("--launch-arg requires a value");
+    launchArgs.push(value);
+  }
+  return { handle, launchArgs };
 }
 
 function parseAgentRequest(arguments_: readonly string[]): {
@@ -600,7 +983,21 @@ function formatLocalAgent(prefix: string, agent: LocalAgent): string {
     prefix,
     `Agent: @${agent.handle} (${agent.principalId})`,
     `Status: ${agent.status}`,
-    `Client: ${agent.client}`
+    `Client: ${agent.client}`,
+    `Launch args: ${JSON.stringify(agent.executionConfig.launchArgs)}`
+  ].join("\n") + "\n";
+}
+
+function formatAgentSummary(prefix: string, agent: AgentSummary): string {
+  return [
+    prefix,
+    `Agent: @${agent.handle} (${agent.principalId})`,
+    `Status: ${agent.status}`,
+    `Client: ${agent.client}`,
+    `Availability: ${agent.availability.state}` +
+      (agent.availability.reason === undefined ? "" : ` (${agent.availability.reason})`),
+    `Session: ${agent.currentSession?.sessionId ?? "none"}`,
+    `Launch args: ${JSON.stringify(agent.executionConfig.launchArgs)}`
   ].join("\n") + "\n";
 }
 
@@ -755,7 +1152,11 @@ async function runStartForeground(
 ): Promise<number> {
   const codexExecutable = environment.ROLLERSKATE_CODEX_EXECUTABLE?.trim() ||
     findExecutable("codex", environment.PATH);
-  const paths = runtimePaths(repoRoot, runtimeDirectory);
+  const claudeCodeExecutable = environment.ROLLERSKATE_CLAUDE_CODE_EXECUTABLE?.trim() ||
+    findExecutable("claude", environment.PATH);
+  const kimiCodeExecutable = environment.ROLLERSKATE_KIMI_CODE_EXECUTABLE?.trim() ||
+    findExecutable("kimi", environment.PATH);
+  const paths = runtimeLogPaths(repoRoot, runtimeDirectory);
   mkdirSync(paths.logs, { recursive: true, mode: 0o700 });
   const log = createWriteStream(paths.daemonLog, { flags: "a", mode: 0o600 });
   const sink: AppOutput = {
@@ -814,6 +1215,8 @@ async function runStartForeground(
       repoRoot,
       ...(runtimeDirectory === undefined ? {} : { runtimeDirectory }),
       ...(codexExecutable === undefined ? {} : { codexExecutable }),
+      ...(claudeCodeExecutable === undefined ? {} : { claudeCodeExecutable }),
+      ...(kimiCodeExecutable === undefined ? {} : { kimiCodeExecutable }),
       environment: roomAgentEnvironment(environment),
       output: sink
     }, controller.signal);
@@ -881,6 +1284,22 @@ function rejectArguments(arguments_: readonly string[]): void {
 
 function requireCount(arguments_: readonly string[], count: number, message: string): void {
   if (arguments_.length !== count) throw new Error(message);
+}
+
+function parseBoundedInteger(
+  value: string,
+  field: string,
+  minimum: number,
+  maximum: number
+): number {
+  if (!/^[0-9]+$/u.test(value)) {
+    throw new Error(`${field} must be an integer between ${minimum} and ${maximum}`);
+  }
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) {
+    throw new Error(`${field} must be an integer between ${minimum} and ${maximum}`);
+  }
+  return parsed;
 }
 
 function runtimeDependency(runtimeDirectory: string | undefined): {

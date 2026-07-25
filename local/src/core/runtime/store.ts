@@ -4,6 +4,45 @@ import type { DatabaseSync } from "node:sqlite";
 
 import { openRuntimeDatabase } from "../../infrastructure/sqlite/database.js";
 import {
+  mapChatAttentionReceipt,
+  mapChatDecisionReceipt,
+  mapChatPresence,
+  mapDelivery,
+  mapDestination,
+  mapEvent,
+  mapExecution,
+  mapSession,
+  validateReviewInvocation,
+  type ChatAttentionReceiptRow,
+  type ChatDecisionReceiptRow,
+  type ChatPresenceRow,
+  type DeliveryRow,
+  type DestinationRow,
+  type EventRow,
+  type ExecutionRow,
+  type SessionRow
+} from "../../infrastructure/sqlite/runtime-mappers.js";
+import { migrateRuntimeDatabase } from "../../infrastructure/sqlite/runtime-schema.js";
+export type {
+  ChatAttentionReceipt,
+  ChatDecisionReceipt
+} from "../../infrastructure/sqlite/runtime-mappers.js";
+import type {
+  ChatAttentionReceipt,
+  ChatDecisionReceipt
+} from "../../infrastructure/sqlite/runtime-mappers.js";
+import {
+  chatMentionPromptResourceId,
+  chatPromptResourceId,
+  parseChatPresence,
+  type ChatPresence,
+  type ChatTurnDecision
+} from "../chat/model.js";
+import type {
+  ChatAttentionPlan,
+  ChatAttentionReason
+} from "../chat/state-machine.js";
+import {
   eventSourceKinds,
   eventTypes,
   isAgentInputEvent,
@@ -27,72 +66,6 @@ import {
   type RuntimeSession
 } from "./model.js";
 
-interface EventRow {
-  event_id: string;
-  type: Event["type"];
-  source_kind: Event["source"]["kind"];
-  source_external_id: string | null;
-  agent_id: string | null;
-  prompt: string | null;
-  outcome: AgentResultEvent["outcome"] | null;
-  output: string | null;
-  error: string | null;
-  payload_json: string | null;
-  session_id: string | null;
-  destination_ids_json: string;
-  root_event_id: string;
-  parent_event_id: string | null;
-  causal_hop: number;
-  created_at: string;
-}
-
-interface ExecutionRow {
-  execution_id: string;
-  event_id: string;
-  handler: RuntimeHandlerKind;
-  status: RuntimeExecution["status"];
-  attempt_count: number;
-  max_attempts: number;
-  next_attempt_at: string;
-  last_error: string | null;
-  created_at: string;
-  started_at: string | null;
-  completed_at: string | null;
-  updated_at: string;
-}
-
-interface SessionRow {
-  session_id: string;
-  agent_id: string;
-  adapter_id: string;
-  provider_session_id: string;
-  workspace: string;
-  created_at: string;
-  updated_at: string;
-}
-
-interface DestinationRow {
-  destination_id: string;
-  kind: "matrix";
-  address_json: string;
-  created_at: string;
-  updated_at: string;
-}
-
-interface DeliveryRow {
-  delivery_id: string;
-  result_event_id: string;
-  destination_id: string;
-  status: RuntimeDelivery["status"];
-  attempt_count: number;
-  max_attempts: number;
-  next_attempt_at: string;
-  receipt: string | null;
-  last_error: string | null;
-  created_at: string;
-  updated_at: string;
-}
-
 export interface AppendRuntimeEventReceipt {
   readonly event: Event;
   readonly execution: RuntimeExecution;
@@ -105,9 +78,24 @@ export interface CompleteRuntimeExecution {
   readonly providerSessionId: string;
   readonly sessionId?: string;
   readonly output?: string;
+  readonly chatDecision?: ChatTurnDecision;
 }
 
 export type RuntimeExecutionOutcome = AgentResultEvent | ChatMessageEvent | undefined;
+
+export interface AdmitChatAttention {
+  readonly plan: ChatAttentionPlan;
+  readonly prompt?: string;
+  readonly promptResourceId?: string;
+}
+
+interface DestinationSnapshot {
+  readonly destinationId: string;
+  readonly kind: RuntimeDestination["kind"];
+  readonly address: Readonly<Record<string, string>>;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
 
 export interface RuntimeAudit {
   readonly event: Event;
@@ -119,16 +107,22 @@ export interface RuntimeAudit {
     readonly delivery: RuntimeDelivery;
     readonly destination: RuntimeDestination;
   }>;
+  readonly chat?: {
+    readonly promptResourceId?: string;
+    readonly attentionReceipts: readonly ChatAttentionReceipt[];
+    readonly decisionReceipt?: ChatDecisionReceipt;
+  };
 }
 
 export class RuntimeStore {
   readonly #database: DatabaseSync;
+  readonly #destinationCache = new Map<string, RuntimeDestination>();
 
   public constructor(databasePath: string) {
     const absolutePath = resolve(databasePath);
     mkdirSync(dirname(absolutePath), { recursive: true });
     this.#database = openRuntimeDatabase(absolutePath);
-    this.#migrate();
+    migrateRuntimeDatabase(this.#database);
   }
 
   public appendEvent(input: CreateEvent): AppendRuntimeEventReceipt {
@@ -139,7 +133,17 @@ export class RuntimeStore {
     const executionId = runtimeId("exe");
     const route = runtimeRoute(input.type);
     const destinations = [...new Set(input.destinationIds ?? [])];
+    if (destinations.length > 32) {
+      throw new Error("destinationIds must contain at most 32 entries");
+    }
     for (const destinationId of destinations) requireRuntimeId(destinationId, "dst", "destinationId");
+    const destinationSnapshots = destinations.map((destinationId) => {
+      const destination = this.destination(destinationId);
+      if (destination === undefined) {
+        throw new Error(`Destination not found: ${destinationId}`);
+      }
+      return destination;
+    });
     if (input.sessionId !== undefined) requireRuntimeId(input.sessionId, "ses", "sessionId");
     const rootEventId = input.parent?.rootEventId ?? eventId;
     const parentEventId = input.parent?.eventId;
@@ -164,12 +168,16 @@ export class RuntimeStore {
       this.#database.prepare(`
         INSERT INTO events (
           event_id, type, source_kind, source_external_id, agent_id, prompt,
-          outcome, output, error, session_id, destination_ids_json,
-          root_event_id, parent_event_id, causal_hop, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)
+          outcome, output, error, payload_json, session_id, destination_ids_json,
+          destination_snapshots_json, root_event_id, parent_event_id, causal_hop,
+          created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         eventId, input.type, input.source.kind, input.source.externalId ?? null,
-        input.agentId, input.prompt, input.sessionId ?? null, JSON.stringify(destinations),
+        input.agentId, input.prompt,
+        input.reviewInvocation === undefined ? null : JSON.stringify(input.reviewInvocation),
+        input.sessionId ?? null, JSON.stringify(destinations),
+        JSON.stringify(destinationSnapshots),
         rootEventId, parentEventId ?? null, hop, createdAt
       );
       this.#database.prepare(`
@@ -199,6 +207,214 @@ export class RuntimeStore {
     `).all(bounded(limit, 1, 1_000, "limit")) as unknown as EventRow[]).map(mapEvent);
   }
 
+  public chatMessages(topicId: string): ChatMessageEvent[] {
+    return (this.#database.prepare(`
+      SELECT * FROM events
+      WHERE type = 'chat.message'
+        AND json_extract(payload_json, '$.topicId') = ?
+      ORDER BY created_at DESC, event_id DESC
+    `).all(requireText(topicId, "topicId")) as
+      unknown as EventRow[])
+      .map(mapEvent)
+      .filter((event): event is ChatMessageEvent => event.type === "chat.message")
+      .reverse();
+  }
+
+  public chatPresence(
+    agentId: string,
+    topicId: string
+  ): { readonly global?: ChatPresence; readonly topic?: ChatPresence } {
+    const rows = this.#database.prepare(`
+      SELECT * FROM chat_presence
+      WHERE agent_id = ? AND (
+        (scope_kind = 'global' AND scope_id = '*')
+        OR (scope_kind = 'topic' AND scope_id = ?)
+      )
+    `).all(
+      requireText(agentId, "agentId"),
+      requireText(topicId, "topicId")
+    ) as unknown as ChatPresenceRow[];
+    const global = rows.find((row) => row.scope_kind === "global");
+    const topic = rows.find((row) => row.scope_kind === "topic");
+    return {
+      ...(global === undefined ? {} : { global: mapChatPresence(global) }),
+      ...(topic === undefined ? {} : { topic: mapChatPresence(topic) })
+    };
+  }
+
+  public setChatPresence(
+    agentId: string,
+    topicId: string,
+    presenceInput: ChatPresence,
+    at = new Date().toISOString()
+  ): ChatPresence {
+    const timestamp = iso(at);
+    const presence = parseChatPresence(presenceInput, timestamp);
+    const scopeId = presence.scope === "global" ? "*" : requireText(topicId, "topicId");
+    this.#database.prepare(`
+      INSERT INTO chat_presence (
+        agent_id, scope_kind, scope_id, mode, until_at, wake_keywords_json,
+        revision, updated_by_dispatch_event_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 1, NULL, ?, ?)
+      ON CONFLICT(agent_id, scope_kind, scope_id) DO UPDATE SET
+        mode = excluded.mode,
+        until_at = excluded.until_at,
+        wake_keywords_json = excluded.wake_keywords_json,
+        revision = chat_presence.revision + 1,
+        updated_by_dispatch_event_id = NULL,
+        updated_at = excluded.updated_at
+    `).run(
+      requireText(agentId, "agentId"),
+      presence.scope,
+      scopeId,
+      presence.mode,
+      presence.until ?? null,
+      JSON.stringify(presence.wakeKeywords),
+      timestamp,
+      timestamp
+    );
+    return presence;
+  }
+
+  public chatAttentionReceipts(sourceMessageEventId: string): ChatAttentionReceipt[] {
+    const row = this.#database.prepare(`
+      SELECT execution.receipt_json
+      FROM executions AS execution
+      WHERE execution.event_id = ?
+    `).get(requireEventId(sourceMessageEventId, "sourceMessageEventId")) as {
+      receipt_json: string | null;
+    } | undefined;
+    return parseChatAttentionReceiptList(row?.receipt_json ?? null);
+  }
+
+  public chatDecisionReceipt(dispatchEventId: string): ChatDecisionReceipt | undefined {
+    const row = this.#database.prepare(`
+      SELECT receipt_json FROM executions WHERE event_id = ?
+    `).get(requireEventId(dispatchEventId, "dispatchEventId")) as {
+      receipt_json: string | null;
+    } | undefined;
+    return parseChatDecisionReceipt(row?.receipt_json ?? null);
+  }
+
+  public admitChatAttention(
+    executionId: string,
+    admissions: readonly AdmitChatAttention[],
+    at = new Date().toISOString()
+  ): readonly ChatDispatchEvent[] {
+    const timestamp = iso(at);
+    this.#database.exec("BEGIN IMMEDIATE");
+    try {
+      const execution = this.#requireExecution(executionId);
+      if (execution.handler !== "chat" || execution.status !== "running") {
+        throw new Error(`ChatHandler execution is not running: ${executionId}`);
+      }
+      const sourceEvent = this.#requireEvent(execution.eventId);
+      if (sourceEvent.type !== "chat.message") {
+        throw new Error(`ChatHandler requires chat.message: ${sourceEvent.eventId}`);
+      }
+      const source = sourceEvent;
+      const dispatches: ChatDispatchEvent[] = [];
+      const attentionReceipts = this.chatAttentionReceipts(source.eventId);
+      for (const admission of admissions) {
+        const promptResourceId = admission.promptResourceId ?? chatPromptResourceId;
+        const existing = attentionReceipts.find(
+          (receipt) => receipt.agentId === admission.plan.agentId
+        );
+        if (existing !== undefined) {
+          if (existing.dispatchEventId !== undefined) {
+            const event = this.#requireEvent(existing.dispatchEventId);
+            if (event.type !== "chat.dispatch") {
+              throw new Error(
+                `Attention receipt dispatch is malformed: ${existing.dispatchEventId}`
+              );
+            }
+            dispatches.push(event);
+          }
+          continue;
+        }
+        if (admission.plan.outcome === "skip") {
+          attentionReceipts.push(chatAttentionReceipt(
+            source.eventId,
+            admission.plan,
+            undefined,
+            undefined,
+            timestamp
+          ));
+          continue;
+        }
+        if (admission.prompt === undefined) {
+          throw new Error("admission.prompt must be non-empty");
+        }
+        const prompt = requireText(admission.prompt, "admission.prompt");
+        const dispatchEventId = newEventId();
+        const dispatchExecutionId = runtimeId("exe");
+        const current = this.currentLocalAgentSession(admission.plan.agentId);
+        const payload = {
+          topicId: source.topicId,
+          sourceMessageEventId: source.eventId,
+          targetHandleSnapshot: admission.plan.handle,
+          promptResourceId
+        };
+        this.#database.prepare(`
+          INSERT INTO events (
+            event_id, type, source_kind, source_external_id, agent_id, prompt,
+            outcome, output, error, payload_json, session_id, destination_ids_json,
+            destination_snapshots_json, root_event_id, parent_event_id, causal_hop,
+            created_at
+          ) VALUES (?, 'chat.dispatch', 'handler', ?, ?, ?, NULL, NULL, NULL, ?, ?, '[]', '[]',
+            ?, ?, ?, ?)
+        `).run(
+          dispatchEventId,
+          `chat-attention:${source.eventId}:${admission.plan.agentId}`,
+          admission.plan.agentId,
+          prompt,
+          JSON.stringify(payload),
+          current?.sessionId ?? null,
+          source.causality.rootEventId,
+          source.eventId,
+          source.causality.hop + 1,
+          timestamp
+        );
+        this.#database.prepare(`
+          INSERT INTO executions (
+            execution_id, event_id, handler, status, attempt_count, max_attempts,
+            next_attempt_at, created_at, updated_at
+          ) VALUES (?, ?, 'agent', 'queued', 0, 3, ?, ?, ?)
+        `).run(dispatchExecutionId, dispatchEventId, timestamp, timestamp, timestamp);
+        attentionReceipts.push(chatAttentionReceipt(
+          source.eventId,
+          admission.plan,
+          dispatchEventId,
+          promptResourceId,
+          timestamp
+        ));
+        const dispatch = this.#requireEvent(dispatchEventId);
+        if (dispatch.type !== "chat.dispatch") {
+          throw new Error(`Created Event is not chat.dispatch: ${dispatchEventId}`);
+        }
+        dispatches.push(dispatch);
+      }
+      this.#database.prepare(`
+        UPDATE executions SET status = 'succeeded', completed_at = ?, updated_at = ?,
+          last_error = NULL, receipt_json = ?
+        WHERE execution_id = ?
+      `).run(
+        timestamp,
+        timestamp,
+        JSON.stringify({
+          schema: "ChatAttentionReceiptList@1",
+          receipts: attentionReceipts
+        }),
+        executionId
+      );
+      this.#database.exec("COMMIT");
+      return dispatches;
+    } catch (error) {
+      this.#database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   public audit(eventId: string): RuntimeAudit | undefined {
     const event = this.event(eventId);
     if (event === undefined) return undefined;
@@ -217,13 +433,28 @@ export class RuntimeStore {
       if (destination === undefined) throw new Error(`Destination not found: ${delivery.destinationId}`);
       return { delivery, destination };
     });
+    const chat = event.type === "chat.message"
+      ? {
+          attentionReceipts: this.chatAttentionReceipts(event.eventId)
+        }
+      : event.type === "chat.dispatch"
+        ? {
+            promptResourceId: event.promptResourceId,
+            attentionReceipts: this.chatAttentionReceipts(event.sourceMessageEventId)
+              .filter((receipt) => receipt.dispatchEventId === event.eventId),
+            ...(this.chatDecisionReceipt(event.eventId) === undefined
+              ? {}
+              : { decisionReceipt: this.chatDecisionReceipt(event.eventId)! })
+          }
+        : undefined;
     return {
       event,
       ...(execution === undefined ? {} : { execution }),
       ...(resultEvent === undefined ? {} : { resultEvent }),
       ...(resultExecution === undefined ? {} : { resultExecution }),
       ...(session === undefined ? {} : { session }),
-      deliveries
+      deliveries,
+      ...(chat === undefined ? {} : { chat })
     };
   }
 
@@ -289,11 +520,27 @@ export class RuntimeStore {
         throw new Error(`only AgentHandler can complete with provider receipt: ${executionId}`);
       }
       const event = this.#requireEvent(execution.eventId);
-      if (event.type === "agent.result" || event.type === "chat.message") {
+      if (!isAgentInputEvent(event)) {
         throw new Error(`AgentHandler cannot complete ${event.type}: ${event.eventId}`);
       }
       if (event.type !== "chat.dispatch" && receipt.output === undefined) {
         throw new Error(`Agent outcome must include a message: ${event.eventId}`);
+      }
+      if (event.type === "chat.dispatch" && receipt.chatDecision === undefined) {
+        throw new Error(`Chat Agent outcome must include ChatDecision@1: ${event.eventId}`);
+      }
+      if (event.type !== "chat.dispatch" && receipt.chatDecision !== undefined) {
+        throw new Error(`ChatDecision is only valid for chat.dispatch: ${event.eventId}`);
+      }
+      if (event.type === "chat.dispatch" && receipt.chatDecision !== undefined) {
+        const expectedSchema = event.promptResourceId === chatMentionPromptResourceId
+          ? "ChatMentionDecision@1"
+          : "ChatDecision@1";
+        if (receipt.chatDecision.schema !== expectedSchema) {
+          throw new Error(
+            `Chat Agent outcome must use ${expectedSchema} for ${event.promptResourceId}`
+          );
+        }
       }
       if (event.sessionId !== undefined && receipt.sessionId !== undefined &&
         event.sessionId !== receipt.sessionId) {
@@ -309,7 +556,7 @@ export class RuntimeStore {
           session.workspace !== receipt.workspace || session.providerSessionId !== receipt.providerSessionId) {
           throw new Error(`Session changed while handling Event: ${sessionId}`);
         }
-        this.#database.prepare("UPDATE sessions SET updated_at = ? WHERE session_id = ?")
+        this.#database.prepare("UPDATE agent_sessions SET updated_at = ? WHERE session_id = ?")
           .run(timestamp, session.sessionId);
       }
       this.#database.prepare(`
@@ -318,15 +565,29 @@ export class RuntimeStore {
       `).run(timestamp, timestamp, executionId);
       if (event.type === "chat.dispatch") {
         this.#database.prepare(`
-          INSERT INTO local_agent_sessions (principal_id, current_session_id, generation, updated_at)
-          VALUES (?, ?, 1, ?)
-          ON CONFLICT(principal_id) DO UPDATE SET
-            current_session_id = excluded.current_session_id,
-            updated_at = excluded.updated_at
-        `).run(event.agentId, session.sessionId, timestamp);
-        const reply = receipt.output === undefined || receipt.output.trim() === ""
-          ? undefined
-          : this.#createChatReply(event, session.sessionId, receipt.output, timestamp);
+          UPDATE agents
+          SET current_session_id = ?, updated_at = ?
+          WHERE principal_id = ?
+        `).run(session.sessionId, timestamp, event.agentId);
+        const decision = receipt.chatDecision!;
+        if ("presence" in decision) {
+          this.#applyChatPresence(event, decision.presence, timestamp);
+        }
+        const reply = decision.speech.action === "reply"
+          ? this.#createChatReply(event, session.sessionId, decision.speech.body, timestamp)
+          : undefined;
+        this.#database.prepare(`
+          UPDATE executions SET receipt_json = ? WHERE execution_id = ?
+        `).run(JSON.stringify({
+          schema: "ChatDecisionReceipt@1",
+          dispatchEventId: event.eventId,
+          speechAction: decision.speech.action,
+          ...("presence" in decision
+            ? { presenceTransition: decision.presence }
+            : {}),
+          ...(reply === undefined ? {} : { replyEventId: reply.eventId }),
+          createdAt: timestamp
+        }), executionId);
         this.#database.exec("COMMIT");
         return reply;
       }
@@ -412,16 +673,26 @@ export class RuntimeStore {
       if (resultEvent.type !== "agent.result") {
         throw new Error(`ResultHandler requires agent.result: ${resultEvent.eventId}`);
       }
-      for (const destinationId of resultEvent.destinationIds) {
-        this.#requireDestination(destinationId);
+      for (const destination of this.#destinationSnapshots(resultEvent.eventId)) {
+        const maxAttempts = destination.kind === "macos-notification" ? 1 : 5;
         this.#database.prepare(`
           INSERT INTO deliveries (
-            delivery_id, result_event_id, destination_id, status, attempt_count, max_attempts,
+            delivery_id, result_event_id, destination_id, destination_kind,
+            destination_address_json, status, attempt_count, max_attempts,
             next_attempt_at, created_at, updated_at
-          ) VALUES (?, ?, ?, 'pending', 0, 5, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)
           ON CONFLICT(result_event_id, destination_id) DO NOTHING
-        `).run(runtimeId("del"), resultEvent.eventId, destinationId,
-          timestamp, timestamp, timestamp);
+        `).run(
+          runtimeId("del"),
+          resultEvent.eventId,
+          destination.destinationId,
+          destination.kind,
+          JSON.stringify(destination.address),
+          maxAttempts,
+          timestamp,
+          timestamp,
+          timestamp
+        );
       }
       this.#database.prepare(`
         UPDATE executions SET status = 'succeeded', completed_at = ?, updated_at = ?,
@@ -437,7 +708,7 @@ export class RuntimeStore {
   }
 
   public session(sessionId: string): RuntimeSession | undefined {
-    const row = this.#database.prepare("SELECT * FROM sessions WHERE session_id = ?")
+    const row = this.#database.prepare("SELECT * FROM agent_sessions WHERE session_id = ?")
       .get(sessionId) as SessionRow | undefined;
     return row === undefined ? undefined : mapSession(row);
   }
@@ -447,7 +718,7 @@ export class RuntimeStore {
     providerSessionId: string
   ): RuntimeSession | undefined {
     const row = this.#database.prepare(`
-      SELECT * FROM sessions WHERE adapter_id = ? AND provider_session_id = ?
+      SELECT * FROM agent_sessions WHERE adapter_id = ? AND provider_session_id = ?
     `).get(
       requireText(adapterId, "adapterId"),
       requireText(providerSessionId, "providerSessionId")
@@ -457,22 +728,23 @@ export class RuntimeStore {
 
   public currentLocalAgentSession(agentId: string): RuntimeSession | undefined {
     const row = this.#database.prepare(`
-      SELECT s.* FROM local_agent_sessions AS current
-      JOIN sessions AS s ON s.session_id = current.current_session_id
-      WHERE current.principal_id = ?
+      SELECT session.* FROM agents AS agent
+      JOIN agent_sessions AS session
+        ON session.session_id = agent.current_session_id
+      WHERE agent.principal_id = ?
     `).get(requireText(agentId, "agentId")) as unknown as SessionRow | undefined;
     return row === undefined ? undefined : mapSession(row);
   }
 
   public sessions(limit = 100): RuntimeSession[] {
     return (this.#database.prepare(`
-      SELECT * FROM sessions ORDER BY updated_at DESC, session_id DESC LIMIT ?
+      SELECT * FROM agent_sessions ORDER BY updated_at DESC, session_id DESC LIMIT ?
     `).all(bounded(limit, 1, 1_000, "limit")) as unknown as SessionRow[]).map(mapSession);
   }
 
   public putDestination(input: {
     readonly destinationId?: string;
-    readonly kind: "matrix";
+    readonly kind: RuntimeDestination["kind"];
     readonly address: Readonly<Record<string, string>>;
     readonly at?: string;
   }): RuntimeDestination {
@@ -480,25 +752,64 @@ export class RuntimeStore {
     requireRuntimeId(destinationId, "dst", "destinationId");
     validateAddress(input.address);
     const timestamp = iso(input.at ?? new Date().toISOString());
-    this.#database.prepare(`
-      INSERT INTO destinations (destination_id, kind, address_json, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(destination_id) DO UPDATE SET
-        kind = excluded.kind, address_json = excluded.address_json, updated_at = excluded.updated_at
-    `).run(destinationId, input.kind, JSON.stringify(input.address), timestamp, timestamp);
-    return this.#requireDestination(destinationId);
+    const existing = this.destination(destinationId);
+    const destination: RuntimeDestination = {
+      destinationId,
+      kind: input.kind,
+      address: { ...input.address },
+      createdAt: existing?.createdAt ?? timestamp,
+      updatedAt: timestamp
+    };
+    this.#destinationCache.set(destinationId, destination);
+    return destination;
   }
 
   public destination(destinationId: string): RuntimeDestination | undefined {
-    const row = this.#database.prepare("SELECT * FROM destinations WHERE destination_id = ?")
-      .get(destinationId) as DestinationRow | undefined;
-    return row === undefined ? undefined : mapDestination(row);
+    const cached = this.#destinationCache.get(destinationId);
+    if (cached !== undefined) return cached;
+    const delivery = this.#database.prepare(`
+      SELECT destination_id, destination_kind AS kind,
+        destination_address_json AS address_json, created_at, updated_at
+      FROM deliveries
+      WHERE destination_id = ?
+      ORDER BY updated_at DESC
+      LIMIT 1
+    `).get(destinationId) as DestinationRow | undefined;
+    if (delivery !== undefined) return mapDestination(delivery);
+    for (const snapshot of this.#allEventDestinationSnapshots()) {
+      if (snapshot.destinationId === destinationId) return snapshot;
+    }
+    return undefined;
   }
 
   public destinations(limit = 100): RuntimeDestination[] {
-    return (this.#database.prepare(`
-      SELECT * FROM destinations ORDER BY updated_at DESC, destination_id DESC LIMIT ?
-    `).all(bounded(limit, 1, 1_000, "limit")) as unknown as DestinationRow[]).map(mapDestination);
+    const maximum = bounded(limit, 1, 1_000, "limit");
+    const destinations = new Map<string, RuntimeDestination>();
+    for (const destination of this.#destinationCache.values()) {
+      destinations.set(destination.destinationId, destination);
+    }
+    for (const destination of this.#allEventDestinationSnapshots()) {
+      if (!destinations.has(destination.destinationId)) {
+        destinations.set(destination.destinationId, destination);
+      }
+    }
+    const deliveryRows = this.#database.prepare(`
+      SELECT destination_id, destination_kind AS kind,
+        destination_address_json AS address_json,
+        MIN(created_at) AS created_at, MAX(updated_at) AS updated_at
+      FROM deliveries
+      GROUP BY destination_id, destination_kind, destination_address_json
+      ORDER BY updated_at DESC, destination_id DESC
+    `).all() as unknown as DestinationRow[];
+    for (const row of deliveryRows) {
+      const destination = mapDestination(row);
+      destinations.set(destination.destinationId, destination);
+    }
+    return [...destinations.values()]
+      .sort((left, right) =>
+        right.updatedAt.localeCompare(left.updatedAt) ||
+        right.destinationId.localeCompare(left.destinationId))
+      .slice(0, maximum);
   }
 
   public deliveriesForResultEvent(resultEventId: string): RuntimeDelivery[] {
@@ -517,7 +828,9 @@ export class RuntimeStore {
     try {
       const rows = this.#database.prepare(`
         SELECT delivery_id FROM deliveries
-        WHERE status IN ('pending', 'retry_wait') AND julianday(next_attempt_at) <= julianday(?)
+        WHERE status IN ('pending', 'retry_wait')
+          AND attempt_count < max_attempts
+          AND julianday(next_attempt_at) <= julianday(?)
         ORDER BY next_attempt_at, created_at, delivery_id LIMIT ?
       `).all(timestamp, bounded(limit, 1, 500, "limit")) as unknown as Array<{ delivery_id: string }>;
       const claimed: RuntimeDelivery[] = [];
@@ -577,6 +890,20 @@ export class RuntimeStore {
     return row === undefined ? undefined : mapDelivery(row);
   }
 
+  public deliveriesForDestinationKind(
+    kind: RuntimeDestination["kind"],
+    limit = 100
+  ): RuntimeDelivery[] {
+    return (this.#database.prepare(`
+      SELECT deliveries.*
+      FROM deliveries
+      WHERE deliveries.destination_kind = ?
+      ORDER BY deliveries.updated_at DESC, deliveries.delivery_id DESC
+      LIMIT ?
+    `).all(kind, bounded(limit, 1, 1_000, "limit")) as unknown as DeliveryRow[])
+      .map(mapDelivery);
+  }
+
   public reconcileInterrupted(at = new Date().toISOString()): number {
     const timestamp = iso(at);
     this.#database.exec("BEGIN IMMEDIATE");
@@ -586,13 +913,19 @@ export class RuntimeStore {
           last_error = 'runtime_interrupted', started_at = NULL, updated_at = ?
         WHERE status = 'running'
       `).run(timestamp, timestamp).changes;
-      const deliveries = this.#database.prepare(`
+      const exhaustedDeliveries = this.#database.prepare(`
+        UPDATE deliveries SET status = 'failed', next_attempt_at = ?,
+          last_error = 'runtime_interrupted', updated_at = ?
+        WHERE status = 'delivering' AND attempt_count >= max_attempts
+      `).run(timestamp, timestamp).changes;
+      const retryableDeliveries = this.#database.prepare(`
         UPDATE deliveries SET status = 'retry_wait', next_attempt_at = ?,
           last_error = 'runtime_interrupted', updated_at = ?
-        WHERE status = 'delivering'
+        WHERE status = 'delivering' AND attempt_count < max_attempts
       `).run(timestamp, timestamp).changes;
       this.#database.exec("COMMIT");
-      return Number(executions) + Number(deliveries);
+      return Number(executions) + Number(exhaustedDeliveries) +
+        Number(retryableDeliveries);
     } catch (error) {
       this.#database.exec("ROLLBACK");
       throw error;
@@ -618,7 +951,7 @@ export class RuntimeStore {
   ): RuntimeSession {
     const sessionId = runtimeId("ses");
     this.#database.prepare(`
-      INSERT INTO sessions (
+      INSERT INTO agent_sessions (
         session_id, agent_id, adapter_id, provider_session_id, workspace, created_at, updated_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run(sessionId, agentId, receipt.adapterId, receipt.providerSessionId,
@@ -686,8 +1019,9 @@ export class RuntimeStore {
       INSERT INTO events (
         event_id, type, source_kind, source_external_id, agent_id, prompt,
         outcome, output, error, session_id, destination_ids_json,
+        destination_snapshots_json,
         root_event_id, parent_event_id, causal_hop, created_at
-      ) VALUES (?, 'agent.result', 'handler', ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, 'agent.result', 'handler', ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       eventId,
       input.execution.executionId,
@@ -697,6 +1031,7 @@ export class RuntimeStore {
       input.error ?? null,
       input.sessionId ?? null,
       JSON.stringify(input.event.destinationIds),
+      JSON.stringify(this.#destinationSnapshots(input.event.eventId)),
       input.event.causality.rootEventId,
       input.event.eventId,
       input.event.causality.hop + 1,
@@ -733,8 +1068,9 @@ export class RuntimeStore {
       INSERT INTO events (
         event_id, type, source_kind, source_external_id, agent_id, prompt,
         outcome, output, error, payload_json, session_id, destination_ids_json,
-        root_event_id, parent_event_id, causal_hop, created_at
-      ) VALUES (?, 'chat.message', 'handler', ?, ?, NULL, NULL, NULL, NULL, ?, ?, '[]',
+        destination_snapshots_json, root_event_id, parent_event_id, causal_hop,
+        created_at
+      ) VALUES (?, 'chat.message', 'handler', ?, ?, NULL, NULL, NULL, NULL, ?, ?, '[]', '[]',
         ?, ?, ?, ?)
     `).run(
       eventId,
@@ -747,236 +1083,70 @@ export class RuntimeStore {
       dispatch.causality.hop + 1,
       at
     );
+    this.#database.prepare(`
+      INSERT INTO executions (
+        execution_id, event_id, handler, status, attempt_count, max_attempts,
+        next_attempt_at, created_at, updated_at
+      ) VALUES (?, ?, 'chat', 'queued', 0, 3, ?, ?, ?)
+    `).run(runtimeId("exe"), eventId, at, at, at);
     const event = this.#requireEvent(eventId);
     if (event.type !== "chat.message") throw new Error(`Event is not chat.message: ${eventId}`);
     return event;
   }
 
-  #migrate(): void {
-    this.#resetIncompatibleCore();
-    this.#migrateLocalChatEvents();
-    this.#database.exec(`
-      PRAGMA journal_mode = WAL;
-      PRAGMA foreign_keys = ON;
-      CREATE TABLE IF NOT EXISTS events (
-        event_id TEXT PRIMARY KEY,
-        type TEXT NOT NULL CHECK(type IN (
-          'agent.request', 'subscription.fire', 'agent.result', 'chat.message', 'chat.dispatch'
-        )),
-        source_kind TEXT NOT NULL CHECK(source_kind IN ('cli', 'subscription', 'matrix', 'server', 'handler')),
-        source_external_id TEXT,
-        agent_id TEXT,
-        prompt TEXT,
-        outcome TEXT CHECK(outcome IN ('succeeded', 'failed')),
-        output TEXT,
-        error TEXT,
-        payload_json TEXT,
-        session_id TEXT REFERENCES sessions(session_id),
-        destination_ids_json TEXT NOT NULL,
-        root_event_id TEXT NOT NULL,
-        parent_event_id TEXT,
-        causal_hop INTEGER NOT NULL CHECK(causal_hop >= 0),
-        created_at TEXT NOT NULL,
-        CHECK(
-          (type IN ('agent.request', 'subscription.fire') AND agent_id IS NOT NULL
-            AND prompt IS NOT NULL AND outcome IS NULL AND output IS NULL
-            AND error IS NULL AND payload_json IS NULL)
-          OR
-          (type = 'agent.result' AND agent_id IS NOT NULL AND prompt IS NULL
-            AND outcome IS NOT NULL AND payload_json IS NULL
-            AND ((outcome = 'succeeded' AND output IS NOT NULL AND error IS NULL)
-              OR (outcome = 'failed' AND output IS NULL AND error IS NOT NULL)))
-          OR
-          (type = 'chat.message' AND prompt IS NULL AND outcome IS NULL
-            AND output IS NULL AND error IS NULL AND payload_json IS NOT NULL)
-          OR
-          (type = 'chat.dispatch' AND agent_id IS NOT NULL AND prompt IS NOT NULL
-            AND outcome IS NULL AND output IS NULL AND error IS NULL
-            AND payload_json IS NOT NULL)
-        ),
-        UNIQUE(source_kind, source_external_id)
-      );
-      CREATE INDEX IF NOT EXISTS events_causal ON events(root_event_id, causal_hop, created_at);
-      CREATE TABLE IF NOT EXISTS executions (
-        execution_id TEXT PRIMARY KEY,
-        event_id TEXT NOT NULL UNIQUE REFERENCES events(event_id),
-        handler TEXT NOT NULL CHECK(handler IN ('agent', 'result')),
-        status TEXT NOT NULL CHECK(status IN ('queued','running','retry_wait','succeeded','failed')),
-        attempt_count INTEGER NOT NULL CHECK(attempt_count >= 0),
-        max_attempts INTEGER NOT NULL CHECK(max_attempts >= 1),
-        next_attempt_at TEXT NOT NULL,
-        last_error TEXT,
-        created_at TEXT NOT NULL,
-        started_at TEXT,
-        completed_at TEXT,
-        updated_at TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS executions_due ON executions(status, next_attempt_at);
-      CREATE TABLE IF NOT EXISTS sessions (
-        session_id TEXT PRIMARY KEY,
-        agent_id TEXT NOT NULL,
-        adapter_id TEXT NOT NULL,
-        provider_session_id TEXT NOT NULL,
-        workspace TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        UNIQUE(adapter_id, provider_session_id)
-      );
-      CREATE TABLE IF NOT EXISTS destinations (
-        destination_id TEXT PRIMARY KEY,
-        kind TEXT NOT NULL CHECK(kind = 'matrix'),
-        address_json TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS deliveries (
-        delivery_id TEXT PRIMARY KEY,
-        result_event_id TEXT NOT NULL REFERENCES events(event_id),
-        destination_id TEXT NOT NULL REFERENCES destinations(destination_id),
-        status TEXT NOT NULL CHECK(status IN ('pending','delivering','retry_wait','delivered','failed')),
-        attempt_count INTEGER NOT NULL CHECK(attempt_count >= 0),
-        max_attempts INTEGER NOT NULL CHECK(max_attempts >= 1),
-        next_attempt_at TEXT NOT NULL,
-        receipt TEXT,
-        last_error TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        UNIQUE(result_event_id, destination_id)
-      );
-      CREATE INDEX IF NOT EXISTS deliveries_due
-        ON deliveries(status, next_attempt_at);
-    `);
+  #applyChatPresence(
+    dispatch: ChatDispatchEvent,
+    presence: ChatPresence,
+    at: string
+  ): void {
+    const scopeId = presence.scope === "global" ? "*" : dispatch.topicId;
+    this.#database.prepare(`
+      INSERT INTO chat_presence (
+        agent_id, scope_kind, scope_id, mode, until_at, wake_keywords_json,
+        revision, updated_by_dispatch_event_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+      ON CONFLICT(agent_id, scope_kind, scope_id) DO UPDATE SET
+        mode = excluded.mode,
+        until_at = excluded.until_at,
+        wake_keywords_json = excluded.wake_keywords_json,
+        revision = chat_presence.revision + 1,
+        updated_by_dispatch_event_id = excluded.updated_by_dispatch_event_id,
+        updated_at = excluded.updated_at
+    `).run(
+      dispatch.agentId,
+      presence.scope,
+      scopeId,
+      presence.mode,
+      presence.until ?? null,
+      JSON.stringify(presence.wakeKeywords),
+      dispatch.eventId,
+      at,
+      at
+    );
   }
 
-  #migrateLocalChatEvents(): void {
+  #destinationSnapshots(eventId: string): readonly DestinationSnapshot[] {
     const row = this.#database.prepare(`
-      SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'
-    `).get() as { sql: string | null } | undefined;
-    if (row?.sql === null || row?.sql === undefined || !row.sql.includes("'room.message'")) {
-      return;
-    }
-    this.#database.exec(`
-      PRAGMA foreign_keys = OFF;
-      BEGIN IMMEDIATE;
-      CREATE TABLE events_v33 (
-        event_id TEXT PRIMARY KEY,
-        type TEXT NOT NULL CHECK(type IN (
-          'agent.request', 'subscription.fire', 'agent.result', 'chat.message', 'chat.dispatch'
-        )),
-        source_kind TEXT NOT NULL CHECK(source_kind IN ('cli', 'subscription', 'matrix', 'server', 'handler')),
-        source_external_id TEXT,
-        agent_id TEXT,
-        prompt TEXT,
-        outcome TEXT CHECK(outcome IN ('succeeded', 'failed')),
-        output TEXT,
-        error TEXT,
-        payload_json TEXT,
-        session_id TEXT REFERENCES sessions(session_id),
-        destination_ids_json TEXT NOT NULL,
-        root_event_id TEXT NOT NULL,
-        parent_event_id TEXT,
-        causal_hop INTEGER NOT NULL CHECK(causal_hop >= 0),
-        created_at TEXT NOT NULL,
-        CHECK(
-          (type IN ('agent.request', 'subscription.fire') AND agent_id IS NOT NULL
-            AND prompt IS NOT NULL AND outcome IS NULL AND output IS NULL
-            AND error IS NULL AND payload_json IS NULL)
-          OR
-          (type = 'agent.result' AND agent_id IS NOT NULL AND prompt IS NULL
-            AND outcome IS NOT NULL AND payload_json IS NULL
-            AND ((outcome = 'succeeded' AND output IS NOT NULL AND error IS NULL)
-              OR (outcome = 'failed' AND output IS NULL AND error IS NOT NULL)))
-          OR
-          (type = 'chat.message' AND prompt IS NULL AND outcome IS NULL
-            AND output IS NULL AND error IS NULL AND payload_json IS NOT NULL)
-          OR
-          (type = 'chat.dispatch' AND agent_id IS NOT NULL AND prompt IS NOT NULL
-            AND outcome IS NULL AND output IS NULL AND error IS NULL
-            AND payload_json IS NOT NULL)
-        ),
-        UNIQUE(source_kind, source_external_id)
-      );
-      INSERT INTO events_v33 (
-        event_id, type, source_kind, source_external_id, agent_id, prompt,
-        outcome, output, error, payload_json, session_id, destination_ids_json,
-        root_event_id, parent_event_id, causal_hop, created_at
-      )
-      SELECT
-        event_id,
-        CASE type
-          WHEN 'room.message' THEN 'chat.message'
-          WHEN 'room.dispatch' THEN 'chat.dispatch'
-          ELSE type
-        END,
-        source_kind,
-        CASE
-          WHEN source_external_id LIKE 'local-room-dispatch:%'
-            THEN 'local-chat-dispatch:' || substr(source_external_id, 21)
-          ELSE source_external_id
-        END,
-        agent_id,
-        prompt,
-        outcome,
-        output,
-        error,
-        CASE
-          WHEN type IN ('room.message', 'room.dispatch')
-            THEN json_remove(
-              json_set(payload_json, '$.topicId', json_extract(payload_json, '$.roomId')),
-              '$.roomId'
-            )
-          ELSE payload_json
-        END,
-        session_id,
-        destination_ids_json,
-        root_event_id,
-        parent_event_id,
-        causal_hop,
-        created_at
-      FROM events;
-      DROP TABLE events;
-      ALTER TABLE events_v33 RENAME TO events;
-      COMMIT;
-      PRAGMA foreign_keys = ON;
-    `);
+      SELECT destination_snapshots_json FROM events WHERE event_id = ?
+    `).get(eventId) as { destination_snapshots_json: string } | undefined;
+    if (row === undefined) throw new Error(`Event not found: ${eventId}`);
+    return parseDestinationSnapshots(row.destination_snapshots_json, eventId);
   }
 
-  #resetIncompatibleCore(): void {
-    const expectedColumns = new Map<string, readonly string[]>([
-      ["events", ["event_id", "type", "destination_ids_json", "payload_json"]],
-      ["executions", ["execution_id", "event_id", "handler"]],
-      ["sessions", ["session_id", "provider_session_id"]],
-      ["destinations", ["destination_id", "kind", "address_json"]],
-      ["deliveries", ["delivery_id", "result_event_id", "destination_id"]]
-    ]);
-    const tables = new Set((this.#database.prepare(`
-      SELECT name FROM sqlite_master WHERE type = 'table'
-    `).all() as unknown as Array<{ name: string }>).map((row) => row.name));
-    const hasIntermediateRouteSchema = tables.has("routes") || tables.has("route_deliveries");
-    const incompatible = hasIntermediateRouteSchema || tables.has("results") ||
-      [...expectedColumns].some(([table, columns]) => {
-      if (!tables.has(table)) return false;
-      const actual = new Set((this.#database.prepare(`PRAGMA table_info(${table})`).all() as unknown as
-        Array<{ name: string }>).map((row) => row.name));
-      return columns.some((column) => !actual.has(column)) ||
-        (table === "events" && (!actual.has("outcome") || actual.has("handler")));
-      });
-    if (!incompatible) return;
-    this.#database.exec(`
-      PRAGMA foreign_keys = OFF;
-      DROP TABLE IF EXISTS matrix_bindings;
-      DROP TABLE IF EXISTS poll_subscriptions;
-      DROP TABLE IF EXISTS route_deliveries;
-      DROP TABLE IF EXISTS deliveries;
-      DROP TABLE IF EXISTS results;
-      DROP TABLE IF EXISTS executions;
-      DROP TABLE IF EXISTS events;
-      DROP TABLE IF EXISTS routes;
-      DROP TABLE IF EXISTS destinations;
-      DROP TABLE IF EXISTS sessions;
-      PRAGMA foreign_keys = ON;
-    `);
+  #allEventDestinationSnapshots(): readonly DestinationSnapshot[] {
+    const rows = this.#database.prepare(`
+      SELECT event_id, destination_snapshots_json
+      FROM events
+      WHERE destination_snapshots_json != '[]'
+      ORDER BY created_at DESC, event_id DESC
+    `).all() as unknown as Array<{
+      event_id: string;
+      destination_snapshots_json: string;
+    }>;
+    return rows.flatMap((row) =>
+      parseDestinationSnapshots(row.destination_snapshots_json, row.event_id));
   }
+
 }
 
 export function annealedRetryAt(
@@ -999,222 +1169,152 @@ function validateCreateEvent(input: CreateEvent): void {
   }
   requireText(input.agentId, "agentId");
   requireText(input.prompt, "prompt");
+  if (input.reviewInvocation !== undefined) {
+    validateReviewInvocation(input.reviewInvocation, input.agentId);
+  }
   if (input.source.externalId !== undefined) requireText(input.source.externalId, "source.externalId");
   if (input.parent !== undefined) bounded(input.parent.hop, 0, 1_000, "parent.hop");
 }
 
 function validateAddress(address: Readonly<Record<string, string>>): void {
-  if (Object.keys(address).length === 0) throw new Error("Destination address must not be empty");
-  for (const [key, value] of Object.entries(address)) {
+  const entries = Object.entries(address);
+  if (entries.length === 0) throw new Error("Destination address must not be empty");
+  if (entries.length > 32) throw new Error("Destination address must contain at most 32 fields");
+  for (const [key, value] of entries) {
     requireText(key, "Destination address key");
     requireText(value, `Destination address ${key}`);
+    if (key.length > 128) throw new Error("Destination address key is too long");
+    if (value.length > 4_096) {
+      throw new Error(`Destination address ${key} exceeds 4096 characters`);
+    }
   }
 }
 
-function mapEvent(row: EventRow): Event {
-  const destinations = JSON.parse(row.destination_ids_json) as unknown;
-  if (!Array.isArray(destinations) || destinations.some((destination) => typeof destination !== "string")) {
-    throw new Error(`Event destination IDs are malformed: ${row.event_id}`);
-  }
-  const common = {
-    eventId: row.event_id,
-    source: {
-      kind: row.source_kind,
-      ...(row.source_external_id === null ? {} : { externalId: row.source_external_id })
-    },
-    ...(row.agent_id === null ? {} : { agentId: row.agent_id }),
-    ...(row.session_id === null ? {} : { sessionId: row.session_id }),
-    destinationIds: destinations as string[],
-    causality: {
-      rootEventId: row.root_event_id,
-      ...(row.parent_event_id === null ? {} : { parentEventId: row.parent_event_id }),
-      hop: row.causal_hop
-    },
-    createdAt: row.created_at
-  };
-  if (row.type === "chat.message") {
-    const payload = chatPayload(row);
-    const sender = payload.sender;
-    if (!isRecord(sender) ||
-      (sender.kind !== "owner" && sender.kind !== "agent" && sender.kind !== "system") ||
-      typeof sender.handleSnapshot !== "string") {
-      throw new Error(`Chat message sender is malformed: ${row.event_id}`);
-    }
-    const target = payload.target;
-    if (target !== undefined && (!isRecord(target) ||
-      typeof target.principalId !== "string" ||
-      typeof target.handleSnapshot !== "string")) {
-      throw new Error(`Chat message target is malformed: ${row.event_id}`);
-    }
-    const dispatchCard = payload.dispatchCard;
-    if (dispatchCard !== undefined && (!isRecord(dispatchCard) ||
-      typeof dispatchCard.sourceMessageEventId !== "string" ||
-      !Array.isArray(dispatchCard.candidates) ||
-      dispatchCard.candidates.some((candidate) => !isRecord(candidate) ||
-        typeof candidate.principalId !== "string" ||
-        typeof candidate.handle !== "string"))) {
-      throw new Error(`Chat dispatch card is malformed: ${row.event_id}`);
-    }
-    return {
-      ...common,
-      type: "chat.message",
-      topicId: requirePayloadText(payload.topicId, row.event_id, "topicId"),
-      sender: {
-        kind: sender.kind,
-        ...(typeof sender.principalId === "string"
-          ? { principalId: sender.principalId }
-          : {}),
-        handleSnapshot: sender.handleSnapshot
-      },
-      body: requirePayloadText(payload.body, row.event_id, "body"),
-      ...(target === undefined
-        ? {}
-        : {
-            target: {
-              principalId: target.principalId as string,
-              handleSnapshot: target.handleSnapshot as string
-            }
-          }),
-      ...(dispatchCard === undefined
-        ? {}
-        : {
-            dispatchCard: {
-              sourceMessageEventId: dispatchCard.sourceMessageEventId as string,
-              candidates: (dispatchCard.candidates as Array<{
-                principalId: string;
-                handle: string;
-              }>).map(({ principalId, handle }) => ({ principalId, handle }))
-            }
-          })
-    };
-  }
-  if (row.type === "chat.dispatch") {
-    if (row.agent_id === null || row.prompt === null) {
-      throw new Error(`Chat dispatch is missing Agent input: ${row.event_id}`);
-    }
-    const payload = chatPayload(row);
-    return {
-      ...common,
-      type: "chat.dispatch",
-      agentId: row.agent_id,
-      topicId: requirePayloadText(payload.topicId, row.event_id, "topicId"),
-      sourceMessageEventId: requirePayloadText(
-        payload.sourceMessageEventId,
-        row.event_id,
-        "sourceMessageEventId"
-      ),
-      targetHandleSnapshot: requirePayloadText(
-        payload.targetHandleSnapshot,
-        row.event_id,
-        "targetHandleSnapshot"
-      ),
-      prompt: row.prompt
-    };
-  }
-  if (row.type === "agent.result") {
-    if (row.outcome === null || row.agent_id === null) {
-      throw new Error(`Result Event is incomplete: ${row.event_id}`);
-    }
-    return {
-      ...common,
-      type: "agent.result",
-      agentId: row.agent_id,
-      outcome: row.outcome,
-      ...(row.output === null ? {} : { output: row.output }),
-      ...(row.error === null ? {} : { error: row.error })
-    };
-  }
-  if (row.prompt === null) throw new Error(`Input Event has no prompt: ${row.event_id}`);
+function chatAttentionReceipt(
+  sourceMessageEventId: string,
+  plan: ChatAttentionPlan,
+  dispatchEventId: string | undefined,
+  promptResourceId: string | undefined,
+  at: string
+): ChatAttentionReceipt {
   return {
-    ...common,
-    type: row.type,
-    agentId: row.agent_id!,
-    prompt: row.prompt
+    sourceMessageEventId,
+    agentId: plan.agentId,
+    outcome: plan.outcome === "dispatch" ? "dispatched" : "skipped",
+    reason: plan.reason,
+    presenceSnapshot: plan.presenceSnapshot,
+    ...(dispatchEventId === undefined ? {} : { dispatchEventId }),
+    ...(promptResourceId === undefined ? {} : { promptResourceId }),
+    createdAt: at
   };
 }
 
-function chatPayload(row: EventRow): Readonly<Record<string, unknown>> {
-  if (row.payload_json === null) {
-    throw new Error(`Chat Event payload is missing: ${row.event_id}`);
+function parseChatAttentionReceiptList(value: string | null): ChatAttentionReceipt[] {
+  if (value === null) return [];
+  const parsed = parseJsonObject(value, "Execution receipt");
+  if (parsed.schema !== "ChatAttentionReceiptList@1" ||
+    !Array.isArray(parsed.receipts)) {
+    return [];
   }
-  let value: unknown;
-  try {
-    value = JSON.parse(row.payload_json) as unknown;
-  } catch {
-    throw new Error(`Chat Event payload is malformed: ${row.event_id}`);
-  }
-  if (!isRecord(value)) throw new Error(`Chat Event payload is not an object: ${row.event_id}`);
-  return value;
+  return parsed.receipts.map((entry, index) => {
+    if (!isRecord(entry) ||
+      typeof entry.sourceMessageEventId !== "string" ||
+      typeof entry.agentId !== "string" ||
+      (entry.outcome !== "dispatched" && entry.outcome !== "skipped") ||
+      typeof entry.reason !== "string" ||
+      !isRecord(entry.presenceSnapshot) ||
+      typeof entry.createdAt !== "string") {
+      throw new Error(`Chat attention receipt ${index} is malformed`);
+    }
+    return {
+      sourceMessageEventId: entry.sourceMessageEventId,
+      agentId: entry.agentId,
+      outcome: entry.outcome,
+      reason: entry.reason as ChatAttentionReason,
+      presenceSnapshot: entry.presenceSnapshot as ChatAttentionPlan["presenceSnapshot"],
+      ...(typeof entry.dispatchEventId === "string"
+        ? { dispatchEventId: entry.dispatchEventId }
+        : {}),
+      ...(typeof entry.promptResourceId === "string"
+        ? { promptResourceId: entry.promptResourceId }
+        : {}),
+      createdAt: entry.createdAt
+    };
+  });
 }
 
-function requirePayloadText(
-  value: unknown,
-  eventId: string,
-  field: string
-): string {
-  if (typeof value !== "string" || value.trim() === "") {
-    throw new Error(`Chat Event ${field} is malformed: ${eventId}`);
+function parseChatDecisionReceipt(value: string | null): ChatDecisionReceipt | undefined {
+  if (value === null) return undefined;
+  const parsed = parseJsonObject(value, "Execution receipt");
+  if (parsed.schema !== "ChatDecisionReceipt@1") return undefined;
+  if (typeof parsed.dispatchEventId !== "string" ||
+    (parsed.speechAction !== "reply" && parsed.speechAction !== "silent") ||
+    typeof parsed.createdAt !== "string") {
+    throw new Error("Chat decision receipt is malformed");
   }
-  return value;
+  const presence = parsed.presenceTransition === undefined
+    ? undefined
+    : parseChatPresence(parsed.presenceTransition, parsed.createdAt);
+  return {
+    dispatchEventId: parsed.dispatchEventId,
+    speechAction: parsed.speechAction,
+    ...(presence === undefined ? {} : { presenceTransition: presence }),
+    ...(typeof parsed.replyEventId === "string"
+      ? { replyEventId: parsed.replyEventId }
+      : {}),
+    createdAt: parsed.createdAt
+  };
+}
+
+function parseDestinationSnapshots(
+  value: string,
+  eventId: string
+): DestinationSnapshot[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value) as unknown;
+  } catch {
+    throw new Error(`Event Destination snapshots are malformed: ${eventId}`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(`Event Destination snapshots are malformed: ${eventId}`);
+  }
+  return parsed.map((entry) => {
+    if (!isRecord(entry) ||
+      typeof entry.destinationId !== "string" ||
+      (entry.kind !== "matrix" && entry.kind !== "macos-notification") ||
+      !isStringRecord(entry.address) ||
+      typeof entry.createdAt !== "string" ||
+      typeof entry.updatedAt !== "string") {
+      throw new Error(`Event Destination snapshot is malformed: ${eventId}`);
+    }
+    return {
+      destinationId: entry.destinationId,
+      kind: entry.kind,
+      address: entry.address,
+      createdAt: entry.createdAt,
+      updatedAt: entry.updatedAt
+    };
+  });
+}
+
+function parseJsonObject(value: string, field: string): Readonly<Record<string, unknown>> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value) as unknown;
+  } catch {
+    throw new Error(`${field} must be valid JSON`);
+  }
+  if (!isRecord(parsed)) throw new Error(`${field} must be a JSON object`);
+  return parsed;
 }
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function mapExecution(row: ExecutionRow): RuntimeExecution {
-  return {
-    executionId: row.execution_id,
-    eventId: row.event_id,
-    handler: row.handler,
-    status: row.status,
-    attemptCount: row.attempt_count,
-    maxAttempts: row.max_attempts,
-    nextAttemptAt: row.next_attempt_at,
-    ...(row.last_error === null ? {} : { lastError: row.last_error }),
-    createdAt: row.created_at,
-    ...(row.started_at === null ? {} : { startedAt: row.started_at }),
-    ...(row.completed_at === null ? {} : { completedAt: row.completed_at }),
-    updatedAt: row.updated_at
-  };
-}
-
-function mapSession(row: SessionRow): RuntimeSession {
-  return {
-    sessionId: row.session_id,
-    agentId: row.agent_id,
-    adapterId: row.adapter_id,
-    providerSessionId: row.provider_session_id,
-    workspace: row.workspace,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at
-  };
-}
-
-function mapDestination(row: DestinationRow): RuntimeDestination {
-  return {
-    destinationId: row.destination_id,
-    kind: row.kind,
-    address: JSON.parse(row.address_json) as Readonly<Record<string, string>>,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at
-  };
-}
-
-function mapDelivery(row: DeliveryRow): RuntimeDelivery {
-  return {
-    deliveryId: row.delivery_id,
-    resultEventId: row.result_event_id,
-    destinationId: row.destination_id,
-    status: row.status,
-    attemptCount: row.attempt_count,
-    maxAttempts: row.max_attempts,
-    nextAttemptAt: row.next_attempt_at,
-    ...(row.receipt === null ? {} : { receipt: row.receipt }),
-    ...(row.last_error === null ? {} : { lastError: row.last_error }),
-    createdAt: row.created_at,
-    updatedAt: row.updated_at
-  };
+function isStringRecord(value: unknown): value is Readonly<Record<string, string>> {
+  return isRecord(value) && Object.values(value).every((entry) => typeof entry === "string");
 }
 
 function iso(value: string): string {

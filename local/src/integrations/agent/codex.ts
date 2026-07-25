@@ -22,11 +22,16 @@ export interface CodexRuntimeAgentOptions {
   readonly environment: Readonly<Record<string, string>>;
   readonly timeoutMilliseconds: number;
   readonly maxOutputBytes?: number;
+  readonly launchArgs?: readonly string[];
 }
 
 export class CodexRuntimeAgent implements RuntimeAgentAdapter {
   public readonly adapterId = "codex-runtime-jsonl-v1";
   public readonly workspace: string;
+  public readonly reviewCapabilities = {
+    resultSchemas: ["ReviewerResult@1", "ImplementerResult@1"],
+    workspaceAccess: ["read", "write"]
+  } as const;
   readonly #process: AgentProcessClient;
 
   public constructor(options: CodexRuntimeAgentOptions) {
@@ -34,7 +39,11 @@ export class CodexRuntimeAgent implements RuntimeAgentAdapter {
     this.#process = new AgentProcessClient({
       adapterId: this.adapterId,
       executable: options.executable,
-      args: (request) => codexArgs(request as CodexRequest, this.workspace),
+      args: (request) => codexArgs(
+        request as CodexRequest,
+        this.workspace,
+        options.launchArgs ?? []
+      ),
       environment: options.environment,
       timeoutMilliseconds: options.timeoutMilliseconds,
       maxOutputBytes: options.maxOutputBytes ?? 1_048_576,
@@ -54,17 +63,24 @@ export class CodexRuntimeAgent implements RuntimeAgentAdapter {
   }
 }
 
-function codexArgs(request: CodexRequest, projectRoot: string): string[] {
+function codexArgs(
+  request: CodexRequest,
+  projectRoot: string,
+  launchArgs: readonly string[]
+): string[] {
+  const access = request.event.type === "agent.request"
+    ? request.event.reviewInvocation?.workspaceAccess
+    : undefined;
   const options = [
     "--json",
-    "--sandbox", "read-only",
+    "--sandbox", access === "write" ? "workspace-write" : "read-only",
     "--config", "approval_policy=\"never\"",
     "--skip-git-repo-check",
     "-C", projectRoot
   ];
   return request.providerSessionId === undefined
-    ? ["exec", "--ignore-user-config", ...options, "-"]
-    : ["exec", ...options, "resume", request.providerSessionId, "-"];
+    ? ["exec", "--ignore-user-config", ...launchArgs, ...options, "-"]
+    : ["exec", ...launchArgs, ...options, "resume", request.providerSessionId, "-"];
 }
 
 const codexProtocol: AgentProcessProtocol = {
@@ -87,12 +103,29 @@ const codexProtocol: AgentProcessProtocol = {
 };
 
 function encodeRequest(request: CodexRequest): string {
+  const review = request.event.type === "agent.request"
+    ? request.event.reviewInvocation
+    : undefined;
   return [
     "You are handling one fixed-schema Rollerskate Local Runtime Event.",
-    "Follow the prompt and return the useful result as plain text.",
+    ...(request.event.type === "chat.dispatch"
+      ? ["Follow the referenced Chat prompt resource and return only its requested JSON object."]
+      : review === undefined
+      ? ["Follow the prompt and return the useful result as plain text."]
+      : [
+          `Return only JSON conforming to ${review.resultSchema}.`,
+          `Workspace access: ${review.workspaceAccess}.`,
+          ...(review.writableRoot === undefined
+            ? []
+            : [`Authorized writable root: ${review.writableRoot}.`])
+        ]),
     `Event type: ${request.event.type}`,
     `Causal root: ${request.event.causality.rootEventId}`,
     `Causal hop: ${request.event.causality.hop}`,
+    ...(request.event.type === "subscription.fire" &&
+      request.event.observation !== undefined
+      ? ["Terminal observation:", JSON.stringify(request.event.observation)]
+      : []),
     "Prompt:",
     request.event.prompt
   ].join("\n");

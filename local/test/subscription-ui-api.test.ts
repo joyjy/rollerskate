@@ -5,7 +5,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import test from "node:test";
 
-import { LocalFoundationStore } from "../src/application/local-foundation.js";
+import { LocalFoundationStore } from "../src/infrastructure/sqlite/foundation-store.js";
 import type { CreatePollSubscription } from "../src/capabilities/subscription/model.js";
 import { PollSubscriptionStore } from "../src/capabilities/subscription/store.js";
 import { startUiServer } from "../src/entrypoints/console/launcher.js";
@@ -41,42 +41,34 @@ test("loopback UI API reads durable Subscriptions and applies explicit control a
     const runtimeView = await runtimeStatus.json() as {
       status: string;
       version: string;
-      workload: { queuedExecutions: number };
-      subscriptions: { active: number };
+      controls: { pause: boolean; resume: boolean; recover: boolean };
+      workload: { state: string; ready: number };
+      failures: Array<{ owner: string }>;
     };
-    assert.equal(runtimeView.status, "degraded");
+    assert.equal(runtimeView.status, "stopped");
     assert.equal(runtimeView.version, "0.3.1");
-    assert.equal(runtimeView.subscriptions.active, 1);
-    assert.ok(runtimeView.workload.queuedExecutions >= 0);
+    assert.deepEqual(runtimeView.controls, { pause: false, resume: false, recover: false });
+    assert.ok(runtimeView.workload.ready >= 0);
+    assert.ok(runtimeView.failures.every((failure) => failure.owner !== "runtime"));
     const rejectedRuntimeControl = await fetch(`${origin}/api/runtime/pause`, { method: "POST" });
     assert.equal(rejectedRuntimeControl.status, 403);
     const pausedRuntime = await fetch(`${origin}/api/runtime/pause`, {
       method: "POST",
       headers: { "X-Rollerskate-Request": "console" }
     });
-    assert.equal(pausedRuntime.status, 200);
-    assert.equal((await pausedRuntime.json() as {
-      status: string;
-      controlResult: { kind: string };
-    }).controlResult.kind, "pause");
+    assert.equal(pausedRuntime.status, 400);
     const resumedRuntime = await fetch(`${origin}/api/runtime/resume`, {
       method: "POST",
       headers: { "X-Rollerskate-Request": "console" }
     });
-    assert.equal(resumedRuntime.status, 200);
-    assert.equal((await resumedRuntime.json() as {
-      controlResult: { kind: string };
-    }).controlResult.kind, "resume");
+    assert.equal(resumedRuntime.status, 400);
     const recoveredRuntime = await fetch(`${origin}/api/runtime/recover`, {
       method: "POST",
       headers: { "X-Rollerskate-Request": "console" }
     });
-    assert.equal(recoveredRuntime.status, 200);
-    assert.equal((await recoveredRuntime.json() as {
-      controlResult: { kind: string; status: string };
-    }).controlResult.kind, "recover");
+    assert.equal(recoveredRuntime.status, 400);
 
-    const runtimeList = await fetch(`${origin}/api/runtime/events`);
+    const runtimeList = await fetch(`${origin}/api/events`);
     assert.equal(runtimeList.status, 200);
     const audits = await runtimeList.json() as Array<{
       event: { eventId: string; type: string; destinationIds: string[] };
@@ -92,17 +84,24 @@ test("loopback UI API reads durable Subscriptions and applies explicit control a
     assert.deepEqual(requestAudit.deliveries, []);
     assert.equal(typeof requestAudit.lifecycleChangedAt, "string");
     assert.ok(requestAudit.directChildren.length >= 1);
-    const runtimeDetail = await fetch(`${origin}/api/runtime/events/${requestAudit.event.eventId}`);
+    const runtimeDetail = await fetch(`${origin}/api/events/${requestAudit.event.eventId}`);
     assert.equal(runtimeDetail.status, 200);
     assert.equal((await runtimeDetail.json() as { event: { eventId: string } }).event.eventId,
       requestAudit.event.eventId);
-    const rejectedRuntimeWrite = await fetch(`${origin}/api/runtime/events`, { method: "POST" });
+    const rejectedRuntimeWrite = await fetch(`${origin}/api/events`, { method: "POST" });
     assert.equal(rejectedRuntimeWrite.status, 405);
+    const legacyRuntimeList = await fetch(`${origin}/api/runtime/events`);
+    assert.equal(legacyRuntimeList.status, 200);
+
+    const failures = await fetch(`${origin}/api/failures`);
+    assert.equal(failures.status, 200);
+    assert.ok(Array.isArray(await failures.json()));
 
     const list = await fetch(`${origin}/api/subscriptions`);
     assert.equal(list.status, 200);
     const items = await list.json() as Array<{
       id: string;
+      title: string;
       status: string;
       owner: { agentId: string; handle: string; client: string };
       callback: {
@@ -112,16 +111,18 @@ test("loopback UI API reads durable Subscriptions and applies explicit control a
         localSessionId: string | null;
         prompt: string;
       };
-      plugin: { id: string };
+      probe: { plugin: { id: string } };
     }>;
     assert.deepEqual(items.map((item) => ({
       id: item.id,
+      title: item.title,
       status: item.status,
       owner: item.owner,
       callback: item.callback,
-      plugin: item.plugin.id
+      plugin: item.probe.plugin.id
     })), [{
       id: subscriptionId,
+      title: "Fixture pipeline",
       status: "active",
       owner: { agentId: ownerAgentId, handle: "alice", client: "codex" },
       callback: {
@@ -165,18 +166,23 @@ function subscription(
   sessionId: string
 ): CreatePollSubscription {
   return {
+    title: "Fixture pipeline",
     ownerAgentId,
-    pluginPath: join(workspaceRoot, "plugin.ts"),
-    pluginId: "fixture",
-    pluginSchemaVersion: 1,
-    pluginConfig: {},
-    policy: {
-      workspaceRoot,
-      allowedHttpOrigins: [],
-      allowedExecutables: [],
-      allowedEnvironment: [],
-      timeoutMilliseconds: 1_000,
-      maxOutputBytes: 4_096
+    probe: {
+      plugin: {
+        path: join(workspaceRoot, "plugin.ts"),
+        id: "fixture",
+        schemaVersion: 1,
+        config: {}
+      },
+      policy: {
+        workspaceRoot,
+        allowedHttpOrigins: [],
+        allowedExecutables: [],
+        allowedEnvironment: [],
+        timeoutMilliseconds: 1_000,
+        maxOutputBytes: 4_096
+      }
     },
     intervalMilliseconds: 1_000,
     maxWaitMilliseconds: 60_000,

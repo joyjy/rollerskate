@@ -1,15 +1,17 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed } from "vue";
 import { formatDateTime } from "@/utils/format";
 import type { Subscription, SubscriptionStatus } from "@/types/subscription";
 import StatusBadge from "./StatusBadge.vue";
 
 const props = defineProps<{
   subscription: Subscription;
+  busy: boolean;
+  error: string | null;
 }>();
 
 const emit = defineEmits<{
-  (e: "update", subscription: Subscription): void;
+  (e: "action", action: "pause" | "resume" | "cancel"): void;
 }>();
 
 interface Hint { title: string; body: string; variant: "" | "unknown" | "failed"; }
@@ -31,22 +33,6 @@ const hint = computed(() => hints[props.subscription.status]);
 const canPause = computed(() => props.subscription.status === "active");
 const canResume = computed(() => props.subscription.status === "paused");
 const canCancel = computed(() => ["active", "paused"].includes(props.subscription.status));
-const busy = ref(false);
-
-
-async function act(action: "pause" | "resume" | "cancel") {
-  busy.value = true;
-  try {
-    const response = await fetch(`/api/subscriptions/${encodeURIComponent(props.subscription.id)}/${action}`, {
-      method: "POST",
-      headers: { Accept: "application/json", "X-Rollerskate-Request": "console" }
-    });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    emit("update", await response.json() as Subscription);
-  } finally {
-    busy.value = false;
-  }
-}
 </script>
 
 <template>
@@ -60,6 +46,8 @@ async function act(action: "pause" | "resume" | "cancel") {
     <dl class="mini-kv">
       <dt>Status</dt>
       <dd><StatusBadge :status="subscription.status" /></dd>
+      <dt>Title</dt>
+      <dd>{{ subscription.title }}</dd>
       <dt>Owner</dt>
       <dd>@{{ subscription.owner.handle }} · {{ subscription.owner.client }}</dd>
       <dt>Provider Session</dt>
@@ -67,7 +55,7 @@ async function act(action: "pause" | "resume" | "cancel") {
       <dt>Local Session</dt>
       <dd>{{ subscription.callback.localSessionId ?? "pending terminal fire" }}</dd>
       <dt>Plugin</dt>
-      <dd>{{ subscription.plugin.id }}</dd>
+      <dd>{{ subscription.probe.plugin.id }}</dd>
       <dt>Fire Event</dt>
       <dd>{{ subscription.fireEventId ?? "pending" }}</dd>
       <dt>Updated</dt>
@@ -75,10 +63,11 @@ async function act(action: "pause" | "resume" | "cancel") {
     </dl>
 
     <div class="section-title">Actions</div>
+    <div v-if="error" class="inline-error" role="alert">{{ error }}</div>
     <div class="actions">
-      <button class="primary-button action-button" :disabled="busy || !canPause" @click="act('pause')">Pause</button>
-      <button class="secondary-button action-button" :disabled="busy || !canResume" @click="act('resume')">Resume</button>
-      <button class="secondary-button warning action-button" :disabled="busy || !canCancel" @click="act('cancel')">Cancel</button>
+      <button type="button" class="primary-button action-button" :disabled="busy || !canPause" @click="emit('action', 'pause')">Pause</button>
+      <button type="button" class="secondary-button action-button" :disabled="busy || !canResume" @click="emit('action', 'resume')">Resume</button>
+      <button type="button" class="secondary-button warning action-button" :disabled="busy || !canCancel" @click="emit('action', 'cancel')">Cancel</button>
     </div>
   </div>
 </template>

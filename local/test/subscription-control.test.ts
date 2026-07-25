@@ -4,12 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { LocalFoundationStore } from "../src/application/local-foundation.js";
-import { runtimePaths } from "../src/application/runtime-config.js";
+import { LocalFoundationStore } from "../src/infrastructure/sqlite/foundation-store.js";
+import { runtimePaths } from "../src/infrastructure/runtime/config.js";
 import {
   registerPollSubscription,
   type RegisterPollSubscriptionInput
-} from "../src/application/subscription-control.js";
+} from "../src/application/subscription/control.js";
 import { RuntimeStore } from "../src/core/runtime/store.js";
 import { runSubscriptionCommand } from "../src/entrypoints/cli/subscription.js";
 
@@ -100,9 +100,13 @@ test("Subscription CLI cleanly accepts providerSessionId and rejects sessionId",
     writeFileSync(plugin, "export default {};\n");
     const valid = join(repo, "subscription.json");
     writeFileSync(valid, JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: 2,
+      title: "Desktop continuation",
       ownerAgentId: owner.principalId,
-      plugin: { path: plugin, id: "fixture", config: {} },
+      probe: {
+        plugin: { path: plugin, id: "fixture", config: {} },
+        policy: {}
+      },
       callback: {
         providerSessionId: "desktop-provider-session",
         prompt: "Report completion."
@@ -139,9 +143,13 @@ test("Subscription CLI cleanly accepts providerSessionId and rejects sessionId",
 
     const legacy = join(repo, "legacy-subscription.json");
     writeFileSync(legacy, JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: 2,
+      title: "Legacy callback",
       ownerAgentId: owner.principalId,
-      plugin: { path: plugin, id: "fixture", config: {} },
+      probe: {
+        plugin: { path: plugin, id: "fixture", config: {} },
+        policy: {}
+      },
       callback: {
         sessionId: "ses_legacy",
         prompt: "Report completion."
@@ -175,19 +183,26 @@ function input(
   pluginPath: string
 ): RegisterPollSubscriptionInput {
   return {
+    title: "Fixture pipeline",
     ownerAgentId,
-    pluginPath,
-    pluginId: "fixture",
-    pluginConfig: {},
+    probe: {
+      plugin: {
+        path: pluginPath,
+        id: "fixture",
+        config: {}
+      },
+      policy: {
+        allowedHttpOrigins: [],
+        allowedExecutables: [],
+        allowedEnvironment: [],
+        timeoutMilliseconds: 1_000,
+        maxOutputBytes: 4_096
+      }
+    },
     callback: { providerSessionId, workspace, prompt: "Report completion." },
     intervalMilliseconds: 1_000,
     maxWaitMilliseconds: 60_000,
-    maxAttempts: 60,
-    allowedHttpOrigins: [],
-    allowedExecutables: [],
-    allowedEnvironment: [],
-    probeTimeoutMilliseconds: 1_000,
-    maxOutputBytes: 4_096
+    maxAttempts: 60
   };
 }
 

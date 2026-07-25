@@ -1,122 +1,9 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from "vue";
-import type { ConsoleView } from "@/types/subscription";
-import type { RuntimeInfo } from "@/types/runtime";
-import type { LocalSnapshot } from "@/types/local";
-import SubscriptionsView from "@/views/SubscriptionsView.vue";
-import RuntimeView from "@/views/RuntimeView.vue";
-import EventsView from "@/views/EventsView.vue";
-import AgentsView from "@/views/AgentsView.vue";
-import ChatsView from "@/views/ChatsView.vue";
-
-const routableViews: readonly ConsoleView[] = [
-  "runtime", "events", "agents", "chats", "subscriptions"
-];
-function viewFromPath(): ConsoleView | null {
-  const requestedView = window.location.pathname.split("/").filter(Boolean).at(-1);
-  return routableViews.includes(requestedView as ConsoleView)
-    ? requestedView as ConsoleView
-    : null;
-}
-
-const explicitView = viewFromPath();
-const browserAddress = window.location.host;
-const activeView = ref<ConsoleView | null>(explicitView);
-const runtimeSummary = ref<RuntimeInfo | null>(null);
-
-const views: { key: ConsoleView; label: string }[] = [
-  { key: "runtime", label: "Runtime" },
-  { key: "events", label: "Events" },
-  { key: "agents", label: "Agents" },
-  { key: "chats", label: "Chats" },
-  { key: "subscriptions", label: "Subscriptions" }
-];
-
-function setView(view: ConsoleView) {
-  activeView.value = view;
-  window.history.pushState({}, "", `/console/${view}`);
-}
-
-function syncViewFromHistory() {
-  const view = viewFromPath();
-  if (view !== null) activeView.value = view;
-}
-
-async function loadRuntimeSummary() {
-  try {
-    const response = await fetch("/api/runtime", { headers: { Accept: "application/json" } });
-    if (response.ok) runtimeSummary.value = await response.json() as RuntimeInfo;
-  } catch {
-    runtimeSummary.value = null;
-  }
-}
-
-async function selectInitialView() {
-  if (explicitView !== null) return;
-  try {
-    const response = await fetch("/api/local", { headers: { Accept: "application/json" } });
-    if (!response.ok) throw new Error(`Local HTTP ${response.status}`);
-    const local = await response.json() as LocalSnapshot;
-    activeView.value = local.agents.some((agent) => agent.status === "active")
-      ? "chats"
-      : "agents";
-  } catch {
-    activeView.value = "agents";
-  }
-  window.history.replaceState({}, "", `/console/${activeView.value}`);
-}
-
-onMounted(() => {
-  window.addEventListener("popstate", syncViewFromHistory);
-  void loadRuntimeSummary();
-  void selectInitialView();
-});
-
-onBeforeUnmount(() => {
-  window.removeEventListener("popstate", syncViewFromHistory);
-});
+import { RouterView } from "vue-router";
 </script>
 
 <template>
-  <div class="console">
-    <header>
-      <div class="header-inner">
-        <div class="brand">
-          <div class="brand-dot"></div>
-          Rollerskate Console
-        </div>
-        <nav class="console-nav">
-          <button
-            v-for="item in views"
-            :key="item.key"
-            type="button"
-            class="nav-tab"
-            :class="{ active: activeView === item.key }"
-            @click="setView(item.key)"
-          >
-            {{ item.label }}
-          </button>
-        </nav>
-      </div>
-      <div class="runtime-strip">
-        <div class="runtime-strip-inner">
-          <span>Runtime <strong>v{{ runtimeSummary?.version ?? "unknown" }}</strong></span>
-          <span>Local loop <span class="status-pill" :class="runtimeSummary?.status === 'running' ? 'ok' : 'degraded'">{{ runtimeSummary?.status ?? "unavailable" }}</span></span>
-          <span>UI <strong>{{ runtimeSummary?.consoleAddress ?? browserAddress }}</strong></span>
-          <span>Polling <span class="status-pill ok">core managed</span></span>
-        </div>
-      </div>
-    </header>
-
-    <main>
-      <div v-if="activeView === null" class="app-loading">Starting Local Console…</div>
-      <RuntimeView v-else-if="activeView === 'runtime'" />
-      <EventsView v-else-if="activeView === 'events'" />
-      <AgentsView v-else-if="activeView === 'agents'" @agent-added="setView('chats')" />
-      <ChatsView v-else-if="activeView === 'chats'" />
-      <SubscriptionsView v-else />
-    </main>
-  </div>
+  <RouterView />
 </template>
 
 <style>
@@ -213,6 +100,7 @@ header {
   cursor: pointer;
   transition: background 0.15s, color 0.15s;
   letter-spacing: 0.01em;
+  text-decoration: none;
 }
 
 .console-nav .nav-tab:hover {
@@ -524,6 +412,7 @@ main {
     width: 100%;
     min-width: 0;
     overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
   }
 }
 
@@ -541,6 +430,12 @@ main {
 
   main {
     padding: 14px 12px 28px;
+  }
+
+  input,
+  select,
+  textarea {
+    font-size: 16px;
   }
 }
 </style>

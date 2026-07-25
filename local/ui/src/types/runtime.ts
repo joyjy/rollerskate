@@ -1,8 +1,29 @@
-export type RuntimeStatus = "running" | "paused" | "degraded";
+export type RuntimeStatus = "running" | "paused" | "degraded" | "stopped";
+export type RuntimeLoopPhase = "idle" | "in_cycle";
+export type RuntimeWorkloadState = "idle" | "running" | "queued" | "retrying";
+export type RuntimeFailureOwner =
+  | "runtime"
+  | "agent"
+  | "event"
+  | "chat"
+  | "subscription"
+  | "schedule"
+  | "review"
+  | "notice";
+export type RuntimeFailureSeverity = "warning" | "error";
+export type RuntimeFailureActionKind = "inspect" | "recover" | "reconcile" | "configure";
+export type RuntimeControlAction = "pause" | "resume" | "recover";
+export type RuntimeControlStatus = "succeeded" | "failed";
+
+export interface RuntimeControlAvailability {
+  readonly pause: boolean;
+  readonly resume: boolean;
+  readonly recover: boolean;
+}
 
 export interface RuntimeControlResult {
-  readonly kind: "none" | "pause" | "resume" | "recover";
-  readonly status: "idle" | "in-progress" | "succeeded" | "failed";
+  readonly kind: RuntimeControlAction;
+  readonly status: RuntimeControlStatus;
   readonly message: string;
   readonly recovered?: number;
   readonly leftUnknown?: number;
@@ -10,92 +31,40 @@ export interface RuntimeControlResult {
 }
 
 export interface RuntimeLoopHealth {
-  readonly state: "idle" | "ticking" | "paused" | "degraded";
+  readonly phase: RuntimeLoopPhase;
   readonly totalCycles: number;
   readonly lastCycleStartAt: string | null;
   readonly lastCycleEndAt: string | null;
   readonly lastCycleDurationMs: number | null;
-  readonly nextCycleAt: string | null;
-  readonly inCycle: boolean;
   readonly currentPhaseSummary: string | null;
 }
 
 export interface RuntimeWorkload {
-  readonly queuedExecutions: number;
-  readonly runningExecutions: number;
-  readonly retryWaitExecutions: number;
-  readonly failedExecutions: number;
-  readonly agentResultSucceeded: number;
-  readonly agentResultFailed: number;
-  readonly pendingDeliveries: number;
-  readonly retryingDeliveries: number;
-  readonly failedDeliveries: number;
-}
-
-export interface RuntimeIsolation {
-  readonly occurredAt: string;
-  readonly eventId: string;
-  readonly executionId?: string;
-  readonly subscriptionId?: string;
-  readonly destinationId?: string;
-  readonly boundedError: string;
-  readonly loopContinued: boolean;
-}
-
-export interface RuntimeAgentSummary {
-  readonly registered: number;
-  readonly callable: number;
-  readonly unavailable: number;
-}
-
-export interface RuntimeEventSummary {
-  readonly lastReceivedAt: string | null;
-  readonly waiting: number;
+  readonly state: RuntimeWorkloadState;
+  readonly ready: number;
   readonly running: number;
-  readonly succeeded: number;
-  readonly failed: number;
-}
-
-export interface RuntimeSessionSummary {
-  readonly total: number;
-  readonly lastResumedAt: string | null;
-  readonly mismatched: number;
-}
-
-export interface RuntimeSubscriptionSummary {
-  readonly active: number;
-  readonly paused: number;
-  readonly expired: number;
-  readonly failedUnknown: number;
-}
-
-export interface RuntimeDestinationSummary {
-  readonly available: number;
-  readonly pending: number;
   readonly retrying: number;
-  readonly failed: number;
+  readonly total: number;
+  readonly asOf: string;
 }
 
-export interface RuntimeCapability {
-  readonly name: string;
-  readonly version: string;
+export interface RuntimeFailureAction {
+  readonly kind: RuntimeFailureActionKind;
   readonly available: boolean;
+  readonly consoleRoute?: string;
+  readonly cliHint: string;
 }
 
-export interface RuntimeIntegration {
-  readonly name: string;
-  readonly kind: "adapter" | "control-plane" | "ingress" | "delivery";
-  readonly status: "connected" | "degraded" | "disconnected";
-  readonly lastSuccessAt: string | null;
-  readonly failureReason: string | null;
-}
-
-export interface RuntimeLogEntry {
-  readonly timestamp: string;
-  readonly level: "debug" | "info" | "warn" | "error";
-  readonly subsystem: string;
-  readonly message: string;
-  readonly objectId: string | null;
+export interface RuntimeFailure {
+  readonly failureRef: string;
+  readonly owner: RuntimeFailureOwner;
+  readonly severity: RuntimeFailureSeverity;
+  readonly reason: string;
+  readonly objectRef: string;
+  readonly eventId?: string;
+  readonly relatedRef?: string;
+  readonly occurredAt: string;
+  readonly action: RuntimeFailureAction;
 }
 
 export interface RuntimeInfo {
@@ -113,16 +82,9 @@ export interface RuntimeInfo {
   readonly lastRefreshedAt: string;
   readonly stale: boolean;
   readonly loop: RuntimeLoopHealth;
+  readonly controls: RuntimeControlAvailability;
   readonly workload: RuntimeWorkload;
-  readonly recentIsolations: readonly RuntimeIsolation[];
-  readonly agents: RuntimeAgentSummary;
-  readonly events: RuntimeEventSummary;
-  readonly sessions: RuntimeSessionSummary;
-  readonly subscriptions: RuntimeSubscriptionSummary;
-  readonly destinations: RuntimeDestinationSummary;
-  readonly capabilities: readonly RuntimeCapability[];
-  readonly integrations: readonly RuntimeIntegration[];
-  readonly recentLogs: readonly RuntimeLogEntry[];
+  readonly failures: readonly RuntimeFailure[];
   readonly controlResult: RuntimeControlResult | null;
 }
 
@@ -138,10 +100,12 @@ export interface RuntimeEvent {
     | "agent.request"
     | "subscription.fire"
     | "agent.result"
+    | "review.requested"
+    | "review.decision"
     | "chat.message"
     | "chat.dispatch";
   readonly source: {
-    readonly kind: "cli" | "subscription" | "matrix" | "server" | "handler";
+    readonly kind: "cli" | "subscription" | "schedule" | "matrix" | "server" | "handler";
     readonly externalId?: string;
   };
   readonly agentId?: string;
@@ -174,11 +138,12 @@ export interface RuntimeEvent {
   };
   readonly sourceMessageEventId?: string;
   readonly targetHandleSnapshot?: string;
+  readonly promptResourceId?: string;
 }
 
 export interface RuntimeExecution {
   readonly executionId: string;
-  readonly handler: "agent" | "result";
+  readonly handler: "agent" | "result" | "review" | "chat";
   readonly status: string;
   readonly attemptCount: number;
   readonly maxAttempts: number;
@@ -238,8 +203,38 @@ export interface RuntimeAudit {
   readonly resultExecution?: RuntimeExecution;
   readonly session?: RuntimeSession;
   readonly deliveries: readonly RuntimeDelivery[];
+  readonly chat?: {
+    readonly promptResourceId?: string;
+    readonly attentionReceipts: readonly {
+      readonly sourceMessageEventId: string;
+      readonly agentId: string;
+      readonly outcome: "dispatched" | "skipped";
+      readonly reason: string;
+      readonly presenceSnapshot: {
+        readonly global: ChatPresence;
+        readonly topic: ChatPresence;
+      };
+      readonly dispatchEventId?: string;
+      readonly promptResourceId?: string;
+      readonly createdAt: string;
+    }[];
+    readonly decisionReceipt?: {
+      readonly dispatchEventId: string;
+      readonly speechAction: "reply" | "silent";
+      readonly presenceTransition: ChatPresence;
+      readonly replyEventId?: string;
+      readonly createdAt: string;
+    };
+  };
   readonly lifecycleChangedAt: string;
   readonly reasonForIntervention: string | null;
   readonly directChildren: readonly { readonly eventId: string; readonly type: string; readonly status: string }[];
   readonly causalityBoundary: "complete" | "missing-parent" | "cross-runtime" | null;
+}
+
+export interface ChatPresence {
+  readonly scope: "topic" | "global";
+  readonly mode: "available" | "snoozed";
+  readonly until?: string;
+  readonly wakeKeywords: readonly string[];
 }

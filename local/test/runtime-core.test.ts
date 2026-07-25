@@ -19,6 +19,7 @@ import {
   type RuntimeHandlerKind
 } from "../src/core/runtime/model.js";
 import { RuntimeStore } from "../src/core/runtime/store.js";
+import { MacOsNotificationAdapter } from "../src/integrations/notification/macos.js";
 
 test("each fixed Event type routes to exactly one local Handler", () => {
   assert.deepEqual(runtimeRoute("agent.request"), {
@@ -291,6 +292,107 @@ test("terminal ResultHandler failure does not recursively create result Events",
     assert.equal(resultExecution?.handler, "result");
     assert.equal(resultExecution?.status, "failed");
     assert.equal(resultExecution?.attemptCount, 3);
+  } finally {
+    store.close();
+  }
+});
+
+test("macOS notification is a one-attempt Delivery and cannot change callback outcome", async () => {
+  const store = runtimeStore();
+  try {
+    const destination = store.putDestination({
+      kind: "macos-notification",
+      address: {
+        title: "Pipeline complete",
+        subscriptionId: "sub_fixture"
+      }
+    });
+    const agent: RuntimeAgentAdapter = {
+      adapterId: "fake-agent-v1",
+      workspace: "/workspace",
+      async invoke() {
+        return {
+          providerSessionId: "provider-notification-failure",
+          outcome: { kind: "message", body: "callback persisted" }
+        };
+      }
+    };
+    const cycle = new RuntimeCycle({
+      store,
+      handlers: new Map<RuntimeHandlerKind, RuntimeEventHandler>([
+        ["agent", new AgentHandler({
+          store,
+          adapters: new Map([["agent-1", agent]])
+        })],
+        ["result", new ResultHandler(store)]
+      ]),
+      deliveryHandler: new DeliveryHandler({
+        store,
+        adapters: new Map([[
+          "macos-notification",
+          new MacOsNotificationAdapter(async () => {
+            throw new Error("notification permission denied");
+          })
+        ]])
+      })
+    });
+    const request = store.appendEvent({
+      type: "agent.request",
+      source: { kind: "cli", externalId: "notification-isolation" },
+      agentId: "agent-1",
+      prompt: "persist callback",
+      destinationIds: [destination.destinationId]
+    });
+
+    const cycleResult = await cycle.run();
+    assert.deepEqual(cycleResult.failures, []);
+    assert.equal(store.execution(request.execution.executionId)?.status, "succeeded");
+    const result = store.audit(request.event.eventId)?.resultEvent;
+    assert.equal(result?.outcome, "succeeded");
+    assert.equal(result?.output, "callback persisted");
+    const delivery = store.deliveriesForResultEvent(result!.eventId)[0];
+    assert.equal(delivery?.status, "failed");
+    assert.equal(delivery?.attemptCount, 1);
+    assert.equal(delivery?.maxAttempts, 1);
+    assert.match(delivery?.lastError ?? "", /notification permission denied/);
+  } finally {
+    store.close();
+  }
+});
+
+test("runtime recovery never retries an interrupted one-attempt notification", () => {
+  const store = runtimeStore();
+  try {
+    const destination = store.putDestination({
+      kind: "macos-notification",
+      address: { title: "Recovered", subscriptionId: "sub_recovered" }
+    });
+    store.appendEvent({
+      type: "agent.request",
+      source: { kind: "cli" },
+      agentId: "agent-1",
+      prompt: "create result",
+      destinationIds: [destination.destinationId]
+    });
+    const agentExecution = store.claimDueExecutions()[0]!;
+    const result = store.completeExecution(agentExecution.executionId, {
+      adapterId: "fake-agent-v1",
+      workspace: "/workspace",
+      providerSessionId: "provider-recovery",
+      output: "persisted"
+    });
+    assert.equal(result?.type, "agent.result");
+    const resultExecution = store.claimDueExecutions().find(
+      (execution) => execution.handler === "result"
+    )!;
+    store.completeResultExecution(resultExecution.executionId);
+    const claimed = store.claimDueDeliveries()[0]!;
+    assert.equal(claimed.status, "delivering");
+    assert.equal(claimed.attemptCount, 1);
+
+    assert.equal(store.reconcileInterrupted(), 1);
+    assert.equal(store.delivery(claimed.deliveryId)?.status, "failed");
+    assert.deepEqual(store.claimDueDeliveries(), []);
   } finally {
     store.close();
   }

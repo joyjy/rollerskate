@@ -1,3 +1,5 @@
+import type { LocalAgentClient } from "./local";
+
 export type SubscriptionStatus =
   | "active"
   | "paused"
@@ -11,11 +13,12 @@ export type SubscriptionStatus =
 
 export interface Subscription {
   readonly id: string;
+  readonly title: string;
   readonly status: SubscriptionStatus;
   readonly owner: {
     readonly agentId: string;
     readonly handle: string;
-    readonly client: "codex";
+    readonly client: LocalAgentClient;
   };
   readonly callback: {
     readonly providerSessionId: string;
@@ -24,7 +27,20 @@ export interface Subscription {
     readonly localSessionId: string | null;
     readonly prompt: string;
   };
-  readonly plugin: { readonly id: string; readonly path: string; readonly schemaVersion: number };
+  readonly probe: {
+    readonly plugin: {
+      readonly id: string;
+      readonly path: string;
+      readonly schemaVersion: number;
+    };
+    readonly policy: {
+      readonly allowedHttpOrigins: readonly string[];
+      readonly allowedExecutables: readonly string[];
+      readonly allowedEnvironment: readonly string[];
+      readonly timeoutMilliseconds: number;
+      readonly maxOutputBytes: number;
+    };
+  };
   readonly schedule: {
     readonly intervalMilliseconds: number;
     readonly maxWaitMilliseconds: number;
@@ -33,17 +49,17 @@ export interface Subscription {
     readonly deadlineAt: string;
     readonly nextPollAt: string;
   };
-  readonly executionPolicy: {
-    readonly allowedHttpOrigins: readonly string[];
-    readonly allowedExecutables: readonly string[];
-    readonly allowedEnvironment: readonly string[];
-    readonly timeoutMilliseconds: number;
-    readonly maxOutputBytes: number;
-  };
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly fireEventId: string | null;
   readonly latestError: string | null;
 }
 
-export type ConsoleView = "runtime" | "agents" | "subscriptions" | "events" | "chats";
+export type ConsoleView =
+  | "runtime"
+  | "events"
+  | "agents"
+  | "chats"
+  | "reviews"
+  | "schedules"
+  | "subscriptions";

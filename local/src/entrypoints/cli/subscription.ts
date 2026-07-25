@@ -6,8 +6,8 @@ import {
   listPollSubscriptions,
   registerPollSubscription,
   type RegisterPollSubscriptionInput
-} from "../../application/subscription-control.js";
-import type { PollSubscriptionInspection } from "../../application/subscription-control.js";
+} from "../../application/subscription/control.js";
+import type { PollSubscriptionInspection } from "../../application/subscription/control.js";
 
 interface Output {
   readonly write: (text: string) => void;
@@ -62,9 +62,15 @@ export function runSubscriptionCommand(
 }
 
 function publicInspection(inspection: PollSubscriptionInspection): unknown {
-  const { pluginConfig: _pluginConfig, ...subscription } = inspection.subscription;
+  const { config: _config, ...plugin } = inspection.subscription.probe.plugin;
   return {
-    subscription,
+    subscription: {
+      ...inspection.subscription,
+      probe: {
+        ...inspection.subscription.probe,
+        plugin
+      }
+    },
     owner: {
       agentId: inspection.owner.principalId,
       handle: inspection.owner.handle,
@@ -89,31 +95,62 @@ function parseAdd(
   }
   const root = record(parsed, "subscription file");
   exactKeys(root, [
-    "schemaVersion", "ownerAgentId", "plugin", "callback", "schedule", "executionPolicy"
+    "schemaVersion", "title", "ownerAgentId", "probe", "callback", "schedule"
   ], "subscription file");
-  if (root.schemaVersion !== 1) {
-    throw new Error("subscription file schemaVersion must be 1");
+  if (root.schemaVersion !== 2) {
+    throw new Error("subscription file schemaVersion must be 2");
   }
-  const plugin = record(root.plugin, "plugin");
-  exactKeys(plugin, ["path", "id", "config"], "plugin");
+  const probe = record(root.probe, "probe");
+  exactKeys(probe, ["plugin", "policy"], "probe");
+  const plugin = record(probe.plugin, "probe.plugin");
+  exactKeys(plugin, ["path", "id", "config"], "probe.plugin");
   const callback = record(root.callback, "callback");
   exactKeys(callback, ["providerSessionId", "prompt"], "callback");
   const schedule = record(root.schedule, "schedule");
   exactKeys(schedule, [
     "intervalMilliseconds", "maxWaitMilliseconds", "maxAttempts"
   ], "schedule");
-  const policy = root.executionPolicy === undefined
+  const policy = probe.policy === undefined
     ? {}
-    : record(root.executionPolicy, "executionPolicy");
+    : record(probe.policy, "probe.policy");
   exactKeys(policy, [
     "allowedHttpOrigins", "allowedExecutables", "allowedEnvironment",
     "timeoutMilliseconds", "maxOutputBytes"
-  ], "executionPolicy");
+  ], "probe.policy");
   return {
+    title: text(root.title, "title"),
     ownerAgentId: text(root.ownerAgentId, "ownerAgentId"),
-    pluginPath: text(plugin.path, "plugin.path"),
-    pluginId: text(plugin.id, "plugin.id"),
-    pluginConfig: plugin.config,
+    probe: {
+      plugin: {
+        path: text(plugin.path, "probe.plugin.path"),
+        id: text(plugin.id, "probe.plugin.id"),
+        config: plugin.config
+      },
+      policy: {
+        timeoutMilliseconds: optionalInteger(
+          policy.timeoutMilliseconds,
+          "probe.policy.timeoutMilliseconds",
+          30_000
+        ),
+        maxOutputBytes: optionalInteger(
+          policy.maxOutputBytes,
+          "probe.policy.maxOutputBytes",
+          1_048_576
+        ),
+        allowedHttpOrigins: stringArray(
+          policy.allowedHttpOrigins,
+          "probe.policy.allowedHttpOrigins"
+        ),
+        allowedExecutables: stringArray(
+          policy.allowedExecutables,
+          "probe.policy.allowedExecutables"
+        ),
+        allowedEnvironment: stringArray(
+          policy.allowedEnvironment,
+          "probe.policy.allowedEnvironment"
+        )
+      }
+    },
     callback: {
       providerSessionId: text(
         callback.providerSessionId,
@@ -124,29 +161,7 @@ function parseAdd(
     },
     intervalMilliseconds: integer(schedule.intervalMilliseconds, "schedule.intervalMilliseconds"),
     maxWaitMilliseconds: integer(schedule.maxWaitMilliseconds, "schedule.maxWaitMilliseconds"),
-    maxAttempts: integer(schedule.maxAttempts, "schedule.maxAttempts"),
-    probeTimeoutMilliseconds: optionalInteger(
-      policy.timeoutMilliseconds,
-      "executionPolicy.timeoutMilliseconds",
-      30_000
-    ),
-    maxOutputBytes: optionalInteger(
-      policy.maxOutputBytes,
-      "executionPolicy.maxOutputBytes",
-      1_048_576
-    ),
-    allowedHttpOrigins: stringArray(
-      policy.allowedHttpOrigins,
-      "executionPolicy.allowedHttpOrigins"
-    ),
-    allowedExecutables: stringArray(
-      policy.allowedExecutables,
-      "executionPolicy.allowedExecutables"
-    ),
-    allowedEnvironment: stringArray(
-      policy.allowedEnvironment,
-      "executionPolicy.allowedEnvironment"
-    )
+    maxAttempts: integer(schedule.maxAttempts, "schedule.maxAttempts")
   };
 }
 

@@ -11,11 +11,16 @@ test("Codex preserves user config only when resuming an existing provider Sessio
   const workspace = mkdtempSync(join(tmpdir(), "rollerskate-codex-runtime-"));
   const executable = join(workspace, "codex-fixture");
   const invocations = join(workspace, "invocations.jsonl");
-  writeFileSync(executable, `#!${process.execPath}
+writeFileSync(executable, `#!${process.execPath}
 const fs = require("node:fs");
+let input = "";
+process.stdin.on("data", (chunk) => { input += chunk; });
 process.stdin.resume();
 process.stdin.on("end", () => {
-  fs.appendFileSync(${JSON.stringify(invocations)}, JSON.stringify(process.argv.slice(2)) + "\\n");
+  fs.appendFileSync(${JSON.stringify(invocations)}, JSON.stringify({
+    args: process.argv.slice(2),
+    input
+  }) + "\\n");
   process.stdout.write([
     JSON.stringify({ type: "thread.started", thread_id: "provider-session" }),
     JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "done" } })
@@ -27,24 +32,27 @@ process.stdin.on("end", () => {
     executable,
     projectRoot: workspace,
     environment: {},
-    timeoutMilliseconds: 1_000
+    timeoutMilliseconds: 3_000
   });
 
   await agent.invoke({ event: event("evt_019f92c9-0000-7000-8000-000000000001") });
   await agent.invoke({
-    event: event("evt_019f92c9-0000-7000-8000-000000000002"),
+    event: subscriptionEvent("evt_019f92c9-0000-7000-8000-000000000002"),
     providerSessionId: "desktop-session"
   });
 
   const [fresh, resumed] = readFileSync(invocations, "utf8")
     .trim()
     .split("\n")
-    .map((line) => JSON.parse(line) as string[]);
-  assert.ok(fresh!.includes("--ignore-user-config"));
-  assert.ok(!resumed!.includes("--ignore-user-config"));
-  assert.deepEqual(resumed!.slice(-3), ["resume", "desktop-session", "-"]);
-  assert.ok(resumed!.includes("approval_policy=\"never\""));
-  assert.ok(resumed!.includes("read-only"));
+    .map((line) => JSON.parse(line) as { args: string[]; input: string });
+  assert.ok(fresh!.args.includes("--ignore-user-config"));
+  assert.ok(!resumed!.args.includes("--ignore-user-config"));
+  assert.deepEqual(resumed!.args.slice(-3), ["resume", "desktop-session", "-"]);
+  assert.ok(resumed!.args.includes("approval_policy=\"never\""));
+  assert.ok(resumed!.args.includes("read-only"));
+  assert.match(resumed!.input, /Terminal observation:/);
+  assert.match(resumed!.input, /"terminal":"success"/);
+  assert.match(resumed!.input, /"status":"passed"/);
 });
 
 function event(eventId: string): AgentInputEvent {
@@ -57,5 +65,19 @@ function event(eventId: string): AgentInputEvent {
     causality: { rootEventId: eventId, hop: 0 },
     prompt: "respond",
     createdAt: "2026-07-24T00:00:00.000Z"
+  };
+}
+
+function subscriptionEvent(eventId: string): AgentInputEvent {
+  return {
+    ...event(eventId),
+    type: "subscription.fire",
+    source: { kind: "subscription", externalId: "sub_fixture" },
+    observation: {
+      version: "pipeline-1:passed",
+      facts: { status: "passed" },
+      terminal: "success",
+      summary: "Pipeline passed"
+    }
   };
 }

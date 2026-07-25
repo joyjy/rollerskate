@@ -4,14 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { runtimePaths } from "../src/application/runtime-config.js";
+import { runtimePaths } from "../src/infrastructure/runtime/config.js";
 import {
   addAgentToRoom,
   createRoom,
   inviteHuman,
   joinRoom,
   listAgentRoomBindings
-} from "../src/application/room-control.js";
+} from "../src/application/room/control.js";
 
 const now = "2026-07-20T00:00:00.000Z";
 const roomId = "room-three-clients";

@@ -19,12 +19,13 @@ timestamp: 2026-07-17
 | Matrix room、thread、sender、message history | Matrix | Adapter 保存最小 transport reference 与 delivery evidence。 |
 | 产品 identity、Agent、placement、Room/membership/binding 与产品 Event projection | Server | Client 和 Local 只保存当前操作需要的投影与引用。 |
 | Local `chat.message`/`chat.dispatch` history、Topic ID、dispatch receipt、Execution/Session/Delivery | Local Runtime SQLite | 对唯一 `Local` Chat/Topic 与本机执行恢复权威；远端产品/聊天历史仍不在此复制。 |
+| Local ScheduleDefinition/ScheduleRevision/ScheduledRun、next occurrence 与 run decision | Local Runtime SQLite | Runtime core loop 独占 admission；Server 或 provider scheduler 不能替代本机 time/policy/recovery 决定。 |
 | Agent sandbox workspace | Local filesystem / owner | 是本地执行空间，不是 Server、Matrix 或 provider 数据的副本；Runtime 保存 canonical root 与授权引用。 |
 | 额外 path、secret grant、pause/stop decision | Local Runtime / owner | Server 可请求，不能自行授予或读取值。 |
 | Agent provider session/tool execution | Agent provider | Runtime 保存 invocation state、receipt 与必要摘要。 |
 | Local Chat 聊天展示 | Local immutable Event projection | Owner/system/Agent message 直接从 SQLite Event 投影，不存在可修改 message record。 |
 | Server Room 聊天展示与待投递消息 | Server projection + Matrix transport | Local 仅保存执行所需 reference、result 与 delivery receipt。 |
-| 当前架构事实 | `docs/architecture/` + source | Active plan 不能覆盖已实现事实。 |
+| 当前架构事实 | `docs/architecture/` + source | 内部计划不能覆盖已实现事实；公开快照不分发未实现计划。 |
 
 ## Data movement limits
 

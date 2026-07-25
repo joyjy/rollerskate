@@ -26,21 +26,35 @@ fixed ingress
 
 Event 是所有本地执行的唯一输入事实。CLI request、Subscription terminal fire 与 Matrix projection 在进入核心前都必须 Event 化；未来 Server 直接提供同一 canonical Event。
 
+## Local Review 主链
+
+```text
+review.requested -> ReviewHandler -> Reviewer agent.request
+  -> agent.result -> ResultHandler review continuation
+  -> review.decision
+       passed | blocked -> terminal projection
+       findings -> ReviewHandler -> Implementer agent.request
+         -> agent.result -> next review.requested
+```
+
+Review continuation 只识别源码生成的 `review-invocation@1`，校验固定 JSON result、subject/evidence/artifact revision 和 role authority，再事务性 admission 下一条 Event。ResultHandler 不直接调用 Agent，Review Capability 不运行第二个 loop。
+
 ## Local Chat 主链
 
 ```text
-owner chat.message
-  -> mention 时 admission 解析 principalId + handle snapshot
-  -> 无 mention 时 loop 追加 system chat.message + dispatch card
-  -> 单选 active Agent
-  -> exactly-once chat.dispatch
-  -> Agent Execution
-  -> message: agent chat.message
-     silent: terminal Execution only
-     failure: terminal Execution audit facts
+owner | agent chat.message
+  -> ChatHandler
+  -> 对每个 Local Agent 应用 scoped presence 与 attention 状态机
+     dispatch -> chat.dispatch -> AgentHandler -> ChatDecision@1
+       reply -> agent chat.message -> ChatHandler
+       silent -> terminal decision receipt
+       available | topic/global snoozed -> durable presence
+     skip -> durable attention receipt
 ```
 
-Owner、system 与 Agent message 都是 immutable Event。Local Chat 固定为 `Local`，没有 CRUD 或 membership；候选集合来自 active Local Agent。`local_chat_dispatches.source_message_event_id` 唯一约束保证重复点击、并发请求、重启或 replay 不能创建第二个 Agent Execution。card 投影在 dispatch 后显示只读 receipt。
+Owner、system 与 Agent message 都是 immutable Event。Local Chat 固定为 `Local`，没有 CRUD 或独立 membership；ChatHandler 在 dispatch 时读取全部 Local Agent，并为每个 Agent 原子写入 dispatched/skipped attention receipt。明确 target 只 dispatch 对应 Agent；未指定 target 时所有 available Agent 都能自主判断 reply 或 silent。Presence 是 `Agent × (Global | Topic)` 的 current state，不是 Topic 配置；Agent decision 与 Owner CLI 都能更新，后写入者生效。active Global snooze 优先于 Topic，直接 mention、匹配的 literal wake keyword 与到期时间可以触发一次重新决策。旧 dispatch card Event 仍可读取，但新消息不再创建 card。
+
+Chat 行为约束来自独立资源 `prompt.chat.free-turn`。每条新 `chat.dispatch` 保存稳定的 `promptResourceId`；attention receipt、decision receipt、presence transition、Session 与可选 reply 都进入 durable audit，不依赖 UI。
 
 Route 不是房间、地址或 transport。它只保存 `Event.type → Handler kind`，不返回数组、不 fanout，也没有 Observer。Matrix Room 属于 ingress binding 和 Destination。
 

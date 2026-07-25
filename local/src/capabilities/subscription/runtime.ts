@@ -58,16 +58,20 @@ export class PollSubscriptionRuntime {
             deadlineAt: subscription.deadlineAt
           };
           const probe = await this.#pluginRunner.plan(
-            subscription.pluginPath,
-            subscription.pluginId,
-            subscription.pluginConfig,
+            subscription.probe.plugin.path,
+            subscription.probe.plugin.id,
+            subscription.probe.plugin.config,
             context
           );
-          const probeResult = await this.#probeExecutor.execute(probe, subscription.policy, signal);
+          const probeResult = await this.#probeExecutor.execute(
+            probe,
+            subscription.probe.policy,
+            signal
+          );
           const observation = await this.#pluginRunner.evaluate(
-            subscription.pluginPath,
-            subscription.pluginId,
-            subscription.pluginConfig,
+            subscription.probe.plugin.path,
+            subscription.probe.plugin.id,
+            subscription.probe.plugin.config,
             context,
             probeResult
           );

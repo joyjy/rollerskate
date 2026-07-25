@@ -15,7 +15,11 @@ import { createServer } from "node:net";
 import test from "node:test";
 
 import { roomAgentEnvironment, runLocalApp } from "../src/entrypoints/cli/main.js";
-import { loadLocalRuntime } from "../src/application/runtime-config.js";
+import {
+  loadLocalRuntime,
+  runtimePaths
+} from "../src/infrastructure/runtime/config.js";
+import { RuntimeStore } from "../src/core/runtime/store.js";
 
  test("setup command accepts non-interactive environment without leaking its token", async () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-app-cli-"));
@@ -61,7 +65,11 @@ test("repo-local script resolves Rollerskate independently of caller cwd", () =>
     assert.match(result.stdout, /scripts\/rs --help/);
     assert.match(result.stdout, /--runtime <absolute-path>/);
     assert.match(result.stdout, /subscription add <json-file>/);
+    assert.match(result.stdout, /schedule create\|update\|list\|inspect/);
+    assert.match(result.stdout, /review create\|list\|inspect\|trace\|recover/);
     assert.match(result.stdout, /agent rename <handle> <new-handle>/);
+    assert.match(result.stdout, /notice list \[--limit <1-1000>\]/);
+    assert.match(result.stdout, /notice mark-read\|ack <notice-id>/);
     assert.doesNotMatch(result.stdout, /workspace set|room create|device login|subscription.*revoke/);
   } finally {
     rmSync(caller, { recursive: true, force: true });
@@ -135,7 +143,7 @@ test("Local Agent CLI requires an explicit client", async () => {
     ]), /--client/);
     const code = await runLocalApp(repo, [
       "--runtime", runtime,
-      "agent", "create", "alice", "--client", "codex"
+      "agent", "create", "alice", "--client", "claude-code"
     ], {}, {
       write: (text) => {
         output += text;
@@ -143,11 +151,313 @@ test("Local Agent CLI requires an explicit client", async () => {
     });
     assert.equal(code, 0);
     assert.match(output, /Agent: @alice/);
-    assert.match(output, /Client: codex/);
+    assert.match(output, /Client: claude-code/);
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }
 });
+
+test("Local Agent CLI persists, replaces and clears per-Agent launch args", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "rollerskate-agent-launch-args-cli-"));
+  const runtime = join(repo, "runtime");
+  let output = "";
+  try {
+    assert.equal(await runLocalApp(repo, [
+      "--runtime", runtime,
+      "agent", "create", "kimi",
+      "--client", "kimi-code",
+      "--launch-arg", "--model",
+      "--launch-arg", "kimi-code/kimi-for-coding"
+    ], {}, { write(text) { output += text; } }), 0);
+    assert.match(output, /Client: kimi-code/);
+    assert.match(output, /Launch args: \["--model","kimi-code\/kimi-for-coding"\]/);
+
+    output = "";
+    assert.equal(await runLocalApp(repo, [
+      "--runtime", runtime,
+      "agent", "configure", "kimi",
+      "--launch-arg", "--agent",
+      "--launch-arg", "researcher"
+    ], {}, { write(text) { output += text; } }), 0);
+    assert.match(output, /Launch args: \["--agent","researcher"\]/);
+
+    output = "";
+    assert.equal(await runLocalApp(repo, [
+      "--runtime", runtime, "agent", "configure", "kimi"
+    ], {}, { write(text) { output += text; } }), 0);
+    assert.match(output, /Launch args: \[\]/);
+
+    await assert.rejects(() => runLocalApp(repo, [
+      "--runtime", runtime,
+      "agent", "configure", "kimi",
+      "--launch-arg", "--session=ses_foreign"
+    ]), /controlled by the kimi-code adapter/);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("notice CLI lists and inspects durable macOS notification history", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "rollerskate-notice-cli-"));
+  const runtime = join(repo, "runtime");
+  const store = new RuntimeStore(runtimePaths(repo, runtime).database);
+  let output = "";
+  try {
+    const destination = store.putDestination({
+      kind: "macos-notification",
+      address: {
+        title: "Pipeline complete",
+        subscriptionId: "sub_fixture"
+      },
+      at: "2026-07-25T01:00:00.000Z"
+    });
+    const request = store.appendEvent({
+      type: "agent.request",
+      source: { kind: "cli", externalId: "notice-history" },
+      agentId: "agent-1",
+      prompt: "persist a result",
+      destinationIds: [destination.destinationId],
+      createdAt: "2026-07-25T01:00:01.000Z"
+    });
+    const agentExecution = store.claimDueExecutions(
+      1,
+      "2026-07-25T01:00:02.000Z"
+    )[0]!;
+    const result = store.completeExecution(agentExecution.executionId, {
+      adapterId: "fixture",
+      workspace: repo,
+      providerSessionId: "provider-notice",
+      output: `saved ${"x".repeat(200)}`
+    }, "2026-07-25T01:00:03.000Z");
+    assert.equal(result?.type, "agent.result");
+    const resultExecution = store.claimDueExecutions(
+      1,
+      "2026-07-25T01:00:04.000Z"
+    )[0]!;
+    const delivery = store.completeResultExecution(
+      resultExecution.executionId,
+      "2026-07-25T01:00:05.000Z"
+    )[0]!;
+    const claimed = store.claimDueDeliveries(
+      1,
+      "2026-07-25T01:00:06.000Z"
+    )[0]!;
+    store.deliverySucceeded(
+      claimed.deliveryId,
+      "macos-notification:fixture",
+      "2026-07-25T01:00:07.000Z"
+    );
+    store.close();
+
+    assert.equal(await runLocalApp(repo, [
+      "--runtime", runtime, "notice", "list", "--limit", "1"
+    ], {}, { write(text) { output += text; } }), 0);
+    const history = JSON.parse(output) as Array<{
+      noticeId: string;
+      title: string;
+      summary: string;
+      outcome: string;
+      deliveryStatus: string;
+      references: { deliveryId: string };
+    }>;
+    assert.equal(history.length, 1);
+    assert.equal(history[0]?.noticeId, `ntc1_${delivery.deliveryId}`);
+    assert.equal(history[0]?.references.deliveryId, delivery.deliveryId);
+    assert.equal(history[0]?.deliveryStatus, "delivered");
+    assert.equal(history[0]?.title, "Pipeline complete");
+    assert.equal(history[0]?.outcome, "succeeded");
+    assert.equal(history[0]?.summary, `saved ${"x".repeat(200)}`);
+
+    output = "";
+    assert.equal(await runLocalApp(repo, [
+      "--runtime", runtime, "notice", "inspect", `ntc1_${delivery.deliveryId}`
+    ], {}, { write(text) { output += text; } }), 0);
+    const inspected = JSON.parse(output) as {
+      summary: {
+        noticeId: string;
+        readAt: string | null;
+        availableActions: { markRead: boolean; acknowledge: boolean };
+      };
+    };
+    assert.equal(inspected.summary.noticeId, `ntc1_${delivery.deliveryId}`);
+    assert.equal(inspected.summary.readAt, null);
+    assert.deepEqual(inspected.summary.availableActions, {
+      markRead: true,
+      acknowledge: true
+    });
+
+    output = "";
+    assert.equal(await runLocalApp(repo, [
+      "--runtime", runtime, "notice", "ack", `ntc1_${delivery.deliveryId}`
+    ], {}, { write(text) { output += text; } }), 0);
+    const acknowledged = JSON.parse(output) as {
+      summary: {
+        readAt: string | null;
+        acknowledgedAt: string | null;
+        availableActions: { markRead: boolean; acknowledge: boolean };
+      };
+    };
+    assert.ok(acknowledged.summary.readAt);
+    assert.ok(acknowledged.summary.acknowledgedAt);
+    assert.deepEqual(acknowledged.summary.availableActions, {
+      markRead: false,
+      acknowledge: false
+    });
+
+    output = "";
+    assert.equal(await runLocalApp(repo, [
+      "--runtime", runtime, "notice", "rebuild"
+    ], {}, { write(text) { output += text; } }), 0);
+    assert.deepEqual(JSON.parse(output), {
+      projected: 1,
+      preservedStates: 1
+    });
+    await assert.rejects(() => runLocalApp(repo, [
+      "--runtime", runtime, "notice", "list", "--limit", "0"
+    ]), /between 1 and 1000/);
+    await assert.rejects(() => runLocalApp(repo, [
+      "--runtime", runtime, "notice", "inspect", delivery.deliveryId
+    ]), /deterministic Delivery Notice ID/);
+    assert.equal(request.status, "accepted");
+  } finally {
+    try {
+      store.close();
+    } catch {
+      // The main path closes before CLI opens the same database.
+    }
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("Chat CLI posts messages, controls scoped presence, reads status, and rotates a Session",
+  async () => {
+    const repo = mkdtempSync(join(tmpdir(), "rollerskate-chat-cli-"));
+    const runtime = join(repo, "runtime");
+    let output = "";
+    try {
+      await runLocalApp(repo, [
+        "--runtime", runtime, "agent", "create", "alice", "--client", "codex"
+      ], {}, { write() {} });
+      assert.equal(await runLocalApp(repo, [
+        "--runtime", runtime, "chat", "post", "@alice inspect this"
+      ], {}, { write(text) { output += text; } }), 0);
+      const posted = JSON.parse(output) as {
+        eventId: string;
+        status: string;
+        target: { handleSnapshot: string };
+      };
+      assert.equal(posted.status, "queued");
+      assert.equal(posted.target.handleSnapshot, "alice");
+
+      output = "";
+      assert.equal(await runLocalApp(repo, [
+        "--runtime", runtime, "chat", "history"
+      ], {}, { write(text) { output += text; } }), 0);
+      const history = JSON.parse(output) as {
+        topicId: string;
+        items: Array<{ eventId: string; body: string }>;
+        hasEarlier: boolean;
+      };
+      assert.ok(history.items.some(
+        (event) => event.eventId === posted.eventId && event.body === "@alice inspect this"
+      ));
+      assert.equal(history.hasEarlier, false);
+      await assert.rejects(() => runLocalApp(repo, [
+        "--runtime", runtime, "chat", "history", "--limit", "201"
+      ]), /between 1 and 200/u);
+
+      output = "";
+      assert.equal(await runLocalApp(repo, [
+        "--runtime", runtime, "chat", "status"
+      ], {}, { write(text) { output += text; } }), 0);
+      const status = JSON.parse(output) as {
+        agents: Array<{ handle: string; status: string }>;
+      };
+      assert.deepEqual(status.agents.map(
+        (agent) => ({ handle: agent.handle, status: agent.status })
+      ), [{ handle: "alice", status: "active" }]);
+
+      output = "";
+      assert.equal(await runLocalApp(repo, [
+        "--runtime", runtime,
+        "chat", "presence", "set", "alice",
+        "--scope", "global",
+        "--mode", "snoozed",
+        "--until", "2030-07-25T02:00:00.000Z",
+        "--wake-keyword", "urgent",
+        "--wake-keyword", "review"
+      ], {}, { write(text) { output += text; } }), 0);
+      const configured = JSON.parse(output) as {
+        agentId: string;
+        handle: string;
+        presence: {
+          scope: string;
+          mode: string;
+          until: string;
+          wakeKeywords: string[];
+        };
+      };
+      assert.match(configured.agentId, /^prn_/);
+      assert.equal(configured.handle, "alice");
+      assert.deepEqual(configured.presence, {
+        scope: "global",
+        mode: "snoozed",
+        until: "2030-07-25T02:00:00.000Z",
+        wakeKeywords: ["urgent", "review"]
+      });
+
+      output = "";
+      assert.equal(await runLocalApp(repo, [
+        "--runtime", runtime, "chat", "status"
+      ], {}, { write(text) { output += text; } }), 0);
+      const snoozed = JSON.parse(output) as {
+        agents: Array<{ handle: string; global: { mode: string; wakeKeywords: string[] } }>;
+      };
+      assert.deepEqual(snoozed.agents[0]?.global, {
+        scope: "global",
+        mode: "snoozed",
+        until: "2030-07-25T02:00:00.000Z",
+        wakeKeywords: ["urgent", "review"]
+      });
+
+      output = "";
+      assert.equal(await runLocalApp(repo, [
+        "--runtime", runtime,
+        "chat", "presence", "set", "alice",
+        "--scope", "global",
+        "--mode", "available"
+      ], {}, { write(text) { output += text; } }), 0);
+      await assert.rejects(() => runLocalApp(repo, [
+        "--runtime", runtime,
+        "chat", "presence", "set", "alice",
+        "--scope", "topic",
+        "--mode", "snoozed"
+      ]), /requires --until/);
+
+      output = "";
+      assert.equal(await runLocalApp(repo, [
+        "--runtime", runtime, "chat", "session", "new", "alice"
+      ], {}, { write(text) { output += text; } }), 0);
+      const rotated = JSON.parse(output) as {
+        agentId: string;
+        handle: string;
+        generation: number;
+        currentSessionId: null;
+      };
+      assert.match(rotated.agentId, /^prn_/);
+      assert.deepEqual({
+        handle: rotated.handle,
+        generation: rotated.generation,
+        currentSessionId: rotated.currentSessionId
+      }, {
+        handle: "alice",
+        generation: 2,
+        currentSessionId: null
+      });
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
 
 test("device login is a zero-argument authentication command", async () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-device-login-cli-"));

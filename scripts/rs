@@ -20,7 +20,8 @@ elif find "$PROTOCOL_ROOT/src" "$PROTOCOL_ROOT/package.json" "$PROTOCOL_ROOT/tsc
 fi
 
 if [ "$NEEDS_BUILD" = true ]; then
-  npm --prefix "$LOCAL_ROOT" run --silent build
+  npm --prefix "$PROTOCOL_ROOT" run --silent build
+  npm --prefix "$LOCAL_ROOT" run --silent build:runtime
 fi
 
 ROLLERSKATE_REPO_ROOT="$REPO_ROOT" exec node \

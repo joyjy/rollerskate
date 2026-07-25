@@ -7,12 +7,13 @@ import test from "node:test";
 
 import {
   addLocalAgent,
+  configureLocalAgent,
   localRuntimeSnapshot,
   renameLocalAgent,
   resumeLocalAgent,
   suspendLocalAgent
-} from "../src/application/local-agent-control.js";
-import { runtimePaths } from "../src/application/runtime-config.js";
+} from "../src/application/agent/control.js";
+import { runtimePaths } from "../src/infrastructure/runtime/config.js";
 
 test("default runtime is global and ignores a repo-local legacy runtime", () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-global-runtime-"));
@@ -50,12 +51,30 @@ test("fresh local runtime bootstraps infrastructure and durable Agent lifecycle"
     assert.deepEqual(fresh.agents, []);
 
     const alice = addLocalAgent(repo, "Alice", "codex", options);
-    const bob = addLocalAgent(repo, "bob-2", "codex", options);
+    const bob = addLocalAgent(repo, "bob-2", "claude-code", options);
+    const claude = addLocalAgent(
+      repo,
+      "claude",
+      "claude-code",
+      options,
+      ["--model", "claude-sonnet-4-6"]
+    );
+    const kimi = addLocalAgent(repo, "kimi", "kimi-code", options);
     assert.match(alice.principalId, /^prn_.+-7/);
     assert.match(bob.principalId, /^prn_.+-7/);
     assert.notEqual(alice.principalId, fresh.foundation.owner.principalId);
     assert.equal(alice.handle, "Alice");
-    assert.equal(bob.client, "codex");
+    assert.equal(bob.client, "claude-code");
+    assert.deepEqual(claude.executionConfig.launchArgs, [
+      "--model",
+      "claude-sonnet-4-6"
+    ]);
+    assert.equal(kimi.client, "kimi-code");
+    assert.deepEqual(
+      configureLocalAgent(repo, kimi.principalId, ["--model", "kimi-code/k2.5"], options)
+        .executionConfig.launchArgs,
+      ["--model", "kimi-code/k2.5"]
+    );
     assert.throws(() => addLocalAgent(repo, "alice", "codex", options), /already in use/);
     assert.throws(() => addLocalAgent(repo, "bad handle", "codex", options), /1-32/);
 
@@ -70,7 +89,9 @@ test("fresh local runtime bootstraps infrastructure and durable Agent lifecycle"
     assert.equal(restarted.foundation.owner.principalId, fresh.foundation.owner.principalId);
     assert.deepEqual(restarted.agents.map(({ handle, status }) => ({ handle, status })), [
       { handle: "bob-2", status: "active" },
-      { handle: "helper", status: "active" }
+      { handle: "claude", status: "active" },
+      { handle: "helper", status: "active" },
+      { handle: "kimi", status: "active" }
     ]);
 
     const database = new DatabaseSync(join(runtime, "runtime.db"), { readOnly: true });
@@ -79,8 +100,11 @@ test("fresh local runtime bootstraps infrastructure and durable Agent lifecycle"
         SELECT COUNT(*) AS count FROM local_foundation
       `).get() as { count: number }).count, 1);
       assert.equal((database.prepare(`
-        SELECT COUNT(*) AS count FROM local_principals
-      `).get() as { count: number }).count, 3);
+        SELECT COUNT(*) AS count FROM agents
+      `).get() as { count: number }).count, 4);
+      assert.equal((database.prepare(`
+        SELECT owner_handle FROM local_foundation WHERE singleton = 1
+      `).get() as { owner_handle: string }).owner_handle, "owner");
     } finally {
       database.close();
     }

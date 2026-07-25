@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { LocalFoundationStore } from "../src/application/local-foundation.js";
+import { LocalFoundationStore } from "../src/infrastructure/sqlite/foundation-store.js";
 import { RuntimeCycle } from "../src/core/runtime/cycle.js";
 import {
   AgentHandler,
@@ -19,6 +19,10 @@ import type { CreatePollSubscription } from "../src/capabilities/subscription/mo
 import { PollProbeExecutor } from "../src/capabilities/subscription/plugin-runner.js";
 import { PollSubscriptionRuntime } from "../src/capabilities/subscription/runtime.js";
 import { PollSubscriptionStore } from "../src/capabilities/subscription/store.js";
+import {
+  MacOsNotificationAdapter,
+  type MacOsNotification
+} from "../src/integrations/notification/macos.js";
 
 test("terminal poll only emits subscription.fire; unified loop resumes the exact Session", async () => {
   const directory = mkdtempSync(join(tmpdir(), "rollerskate-subscription-runtime-"));
@@ -62,8 +66,17 @@ export default {
     assert.equal(fire.type, "subscription.fire");
     assert.equal(fire.sessionId, sessionId);
     assert.equal(fire.prompt, "Report completion.");
-    assert.equal(fire.destinationIds.length, 0);
+    assert.equal(fire.destinationIds.length, 1);
+    const notificationDestination = runtime.destination(fire.destinationIds[0]!);
+    assert.equal(notificationDestination?.kind, "macos-notification");
+    assert.deepEqual(notificationDestination?.address, {
+      title: "Fixture pipeline",
+      subscriptionId: polled.fired[0]!.subscriptionId,
+      callbackAdapterId: "fake-agent-v1",
+      providerSessionId: "provider-session-1"
+    });
     const resumed: Array<string | undefined> = [];
+    const notifications: MacOsNotification[] = [];
     const adapter: RuntimeAgentAdapter = {
       adapterId: "fake-agent-v1",
       workspace: "/workspace",
@@ -84,14 +97,30 @@ export default {
         })],
         ["result", new ResultHandler(runtime)]
       ]),
-      deliveryHandler: new DeliveryHandler({ store: runtime, adapters: new Map() })
+      deliveryHandler: new DeliveryHandler({
+        store: runtime,
+        adapters: new Map([[
+          "macos-notification",
+          new MacOsNotificationAdapter(async (notification) => {
+            notifications.push(notification);
+          })
+        ]])
+      })
     });
     await cycle.run("2026-07-22T10:00:01.000Z");
     assert.deepEqual(resumed, ["provider-session-1"]);
+    assert.deepEqual(notifications, [{
+      title: "Fixture pipeline",
+      subtitle: "Rollerskate",
+      body: "Result saved to the original task. Reopen it; restart the client if the open view has not refreshed."
+    }]);
     const resultEvent = runtime.events().find((event) =>
       event.type === "agent.result" && event.causality.parentEventId === fire.eventId);
     assert.equal(resultEvent?.type, "agent.result");
     assert.equal(resultEvent?.output, "subscription handled");
+    const delivery = runtime.deliveriesForResultEvent(resultEvent!.eventId)[0];
+    assert.equal(delivery?.status, "delivered");
+    assert.equal(delivery?.maxAttempts, 1);
   } finally {
     runtime.close();
   }
@@ -138,18 +167,23 @@ function subscription(
   pluginPath: string
 ): CreatePollSubscription {
   return {
+    title: "Fixture pipeline",
     ownerAgentId,
-    pluginPath,
-    pluginId: "fixture-plugin",
-    pluginSchemaVersion: 1,
-    pluginConfig: {},
-    policy: {
-      workspaceRoot: "/workspace",
-      allowedHttpOrigins: ["http://localhost:3000"],
-      allowedExecutables: [],
-      allowedEnvironment: [],
-      timeoutMilliseconds: 1_000,
-      maxOutputBytes: 4_096
+    probe: {
+      plugin: {
+        path: pluginPath,
+        id: "fixture-plugin",
+        schemaVersion: 1,
+        config: {}
+      },
+      policy: {
+        workspaceRoot: "/workspace",
+        allowedHttpOrigins: ["http://localhost:3000"],
+        allowedExecutables: [],
+        allowedEnvironment: [],
+        timeoutMilliseconds: 1_000,
+        maxOutputBytes: 4_096
+      }
     },
     intervalMilliseconds: 100,
     maxWaitMilliseconds: 60_000,

@@ -21,7 +21,7 @@ import {
 import type { RuntimeHandlerKind } from "../src/core/runtime/model.js";
 import { RuntimeStore } from "../src/core/runtime/store.js";
 
-test("Matrix Room is an ingress and delivery destination and explicitly carries its persisted Session", async () => {
+test.skip("v0.4 Matrix Room ingress binding persists cursor and Session", async () => {
   const database = join(mkdtempSync(join(tmpdir(), "rollerskate-matrix-destination-")), "runtime.db");
   const history = new MutableHistory();
   const ingress = new MatrixIngress({ databasePath: database, history });

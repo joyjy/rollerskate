@@ -14,6 +14,18 @@ export interface ProbeExecutionPolicy {
   readonly maxOutputBytes: number;
 }
 
+export interface SubscriptionPluginDefinition {
+  readonly path: string;
+  readonly id: string;
+  readonly schemaVersion: 1;
+  readonly config: unknown;
+}
+
+export interface SubscriptionProbeDefinition {
+  readonly plugin: SubscriptionPluginDefinition;
+  readonly policy: ProbeExecutionPolicy;
+}
+
 export interface SubscriptionCallback {
   readonly providerSessionId: string;
   readonly adapterId: string;
@@ -23,12 +35,9 @@ export interface SubscriptionCallback {
 }
 
 export interface CreatePollSubscription {
+  readonly title: string;
   readonly ownerAgentId: string;
-  readonly pluginPath: string;
-  readonly pluginId: string;
-  readonly pluginSchemaVersion: 1;
-  readonly pluginConfig: unknown;
-  readonly policy: ProbeExecutionPolicy;
+  readonly probe: SubscriptionProbeDefinition;
   readonly intervalMilliseconds: number;
   readonly maxWaitMilliseconds: number;
   readonly maxAttempts: number;
