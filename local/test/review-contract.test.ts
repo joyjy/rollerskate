@@ -16,13 +16,12 @@ import {
   createReviewArtifact,
   readReviewArtifact,
   reviewArtifactRef,
-  writeReviewArtifact
+  writeReviewArtifact,
+  type LegacyImplementerResult,
+  type LegacyReviewerResult
 } from "../src/capabilities/review/artifact-schema.js";
-import {
-  parseImplementerResult,
-  parseReviewerResult
-} from "../src/capabilities/review/result-contract.js";
 import { workspaceRevision } from "../src/capabilities/review/workspace-revision.js";
+import { workspaceRevision as genericWorkspaceRevision } from "../src/infrastructure/workspace/revision.js";
 
 test("mrsf.review@1 applies Reviewer and Implementer mutations under capability ownership", () => {
   const root = mkdtempSync(join(tmpdir(), "rollerskate-review-artifact-"));
@@ -34,13 +33,11 @@ test("mrsf.review@1 applies Reviewer and Implementer mutations under capability 
     subjectRevision: "sub_1",
     rootReviewId: "evt_root"
   });
-  const reviewer = parseReviewerResult(JSON.stringify({
-    schemaVersion: "ReviewerResult@1",
-    decision: "findings",
+  const reviewer = {
     boundedSummary: "One release gate is missing.",
     revisionsRead: {
       subject: "sub_1",
-      evidence: [{ kind: "workspace", ref: root, revision: "wrk1_a" }]
+      evidence: [{ revision: "wrk1_a" }]
     },
     artifactMutation: {
       addFindings: [{
@@ -50,37 +47,24 @@ test("mrsf.review@1 applies Reviewer and Implementer mutations under capability 
       }],
       resolveFindingIds: []
     }
-  }));
+  } satisfies LegacyReviewerResult;
   const reviewed = applyReviewerResult(initial, reviewer, "prn_reviewer", 0);
   assert.equal(reviewed.findings.length, 1);
   assert.equal(reviewed.findings[0]!.status, "open");
   writeReviewArtifact(artifactPath, reviewed);
   assert.deepEqual(readReviewArtifact(artifactPath), reviewed);
 
-  const implementer = parseImplementerResult(JSON.stringify({
-    schemaVersion: "ImplementerResult@1",
-    boundedSummary: "Added the gate.",
+  const implementer = {
     findingReplies: [{
       findingId: reviewed.findings[0]!.findingId,
       summary: "The verification now runs in CI.",
       evidenceRefs: ["ci.yml"]
-    }],
-    implementationRevision: "wrk1_b"
-  }));
+    }]
+  } satisfies LegacyImplementerResult;
   const implemented = applyImplementerResult(reviewed, implementer, "prn_implementer");
   assert.equal(implemented.findings[0]!.status, "open");
   assert.equal(implemented.findings[0]!.implementerReplies.length, 1);
   assert.notEqual(implemented.artifactRevision, reviewed.artifactRevision);
-});
-
-test("review contracts reject unknown schema and unbounded prose fallback", () => {
-  assert.throws(
-    () => parseReviewerResult(JSON.stringify({
-      schemaVersion: "ReviewerResult@2"
-    })),
-    /ReviewerResult@1/
-  );
-  assert.throws(() => parseImplementerResult("done"), /valid JSON/);
 });
 
 test("review artifact refuses symlink indirection", () => {
@@ -107,6 +91,7 @@ test("workspace-revision-v1 distinguishes clean, tracked dirty and untracked sta
   writeFileSync(join(root, "plan.md.review.yaml"), "{}\n");
   writeFileSync(join(root, "plan.md.review.yaml.tmp-crash"), "{}\n");
   assert.equal(workspaceRevision(root).revision, clean.revision);
+  assert.notEqual(genericWorkspaceRevision(root).revision, clean.revision);
 
   writeFileSync(join(root, "tracked.txt"), "two\n");
   const tracked = workspaceRevision(root);

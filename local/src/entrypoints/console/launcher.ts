@@ -50,10 +50,8 @@ import {
 } from "../../application/chat/control.js";
 import {
   inspectReviewView,
-  listReviewViews,
-  reviewDetailView
+  listReviewViews
 } from "../../application/review/query.js";
-import { recoverReview } from "../../application/review/control.js";
 import {
   inspectScheduleView,
   listScheduledRunViews,
@@ -77,6 +75,16 @@ import {
   markNoticeRead,
   rebuildNoticeIndex
 } from "../../application/notice/control.js";
+import {
+  inspectAgentRunView,
+  latestAgentRunView,
+  listAgentRunViews
+} from "../../application/agent-run/query.js";
+import {
+  cancelAgentRun,
+  startAgentRun,
+  type StartAgentRunInput
+} from "../../application/agent-run/control.js";
 
 export interface UiServerOptions {
   readonly repoRoot: string;
@@ -216,6 +224,16 @@ async function startSourceServer(options: SourceStartOptions): Promise<UiServerH
           options.repoRoot,
           options.runtimeDirectory,
           request.method ?? "GET",
+          url,
+          response
+        );
+        return;
+      }
+      if (url.pathname === "/api/runs" || url.pathname.startsWith("/api/runs/")) {
+        void serveAgentRunApi(
+          options.repoRoot,
+          options.runtimeDirectory,
+          request,
           request.headers["x-rollerskate-request"],
           url,
           response
@@ -410,7 +428,6 @@ function serveReviewApi(
   repoRoot: string,
   runtimeDirectory: string | undefined,
   method: string,
-  requestMarker: string | readonly string[] | undefined,
   url: URL,
   response: import("node:http").ServerResponse
 ): void {
@@ -433,14 +450,69 @@ function serveReviewApi(
       json(response, 200, inspectReviewView(repoRoot, rootEventId, runtimeDirectory));
       return;
     }
-    if (parts.length === 4 && parts[3] === "recover" && method === "POST") {
+    json(response, method === "GET" ? 404 : 405, {
+      error: method === "GET" ? "not_found" : "method_not_allowed"
+    });
+  } catch (error) {
+    json(response, 400, { error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function serveAgentRunApi(
+  repoRoot: string,
+  runtimeDirectory: string | undefined,
+  request: import("node:http").IncomingMessage,
+  requestMarker: string | readonly string[] | undefined,
+  url: URL,
+  response: import("node:http").ServerResponse
+): Promise<void> {
+  const method = request.method ?? "GET";
+  try {
+    const parts = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+    if (parts.length === 2 && method === "GET") {
+      const limitValue = url.searchParams.get("limit");
+      const limit = limitValue === null
+        ? 100
+        : parseBoundedQueryInteger(limitValue, "run limit", 1, 200);
+      json(response, 200, listAgentRunViews(repoRoot, runtimeDirectory, limit));
+      return;
+    }
+    if (parts.length === 2 && method === "POST") {
       if (requestMarker !== "console") {
         json(response, 403, { error: "console_request_marker_required" });
         return;
       }
-      json(response, 200, reviewDetailView(
-        recoverReview(repoRoot, rootEventId, runtimeDirectory)
+      const body = await readJsonBody(request);
+      json(response, 200, startAgentRun(
+        repoRoot,
+        agentRunInput(body),
+        runtimeDirectory
       ));
+      return;
+    }
+    if (parts.length === 3 && parts[2] === "latest") {
+      if (method !== "GET") {
+        json(response, 405, { error: "method_not_allowed" });
+        return;
+      }
+      json(response, 200, latestAgentRunView(repoRoot, runtimeDirectory));
+      return;
+    }
+    const runId = parts[2];
+    if (runId === undefined) {
+      json(response, 404, { error: "not_found" });
+      return;
+    }
+    if (parts.length === 3 && method === "GET") {
+      json(response, 200, inspectAgentRunView(repoRoot, runId, runtimeDirectory));
+      return;
+    }
+    if (parts.length === 4 && parts[3] === "cancel" && method === "POST") {
+      if (requestMarker !== "console") {
+        json(response, 403, { error: "console_request_marker_required" });
+        return;
+      }
+      json(response, 200, cancelAgentRun(repoRoot, runId, runtimeDirectory));
       return;
     }
     json(response, method === "GET" ? 404 : 405, {
@@ -449,6 +521,48 @@ function serveReviewApi(
   } catch (error) {
     json(response, 400, { error: error instanceof Error ? error.message : String(error) });
   }
+}
+
+function agentRunInput(
+  body: Readonly<Record<string, unknown>>
+): StartAgentRunInput {
+  const workspaceValue = body.workspace;
+  let workspace: StartAgentRunInput["workspace"];
+  if (workspaceValue !== undefined) {
+    if (typeof workspaceValue !== "object" ||
+      workspaceValue === null ||
+      Array.isArray(workspaceValue)) {
+      throw new Error("workspace must be an object");
+    }
+    const record = workspaceValue as Readonly<Record<string, unknown>>;
+    const access = record.access;
+    if (access !== "read" && access !== "write") {
+      throw new Error("workspace.access must be read or write");
+    }
+    workspace = {
+      root: requireString(record, "root"),
+      access
+    };
+  }
+  return {
+    requestId: requireString(body, "requestId"),
+    steward: requireString(body, "steward"),
+    ...(typeof body.objective === "string"
+      ? { objective: body.objective }
+      : {}),
+    ...(typeof body.workflowRef === "string"
+      ? { workflowRef: body.workflowRef }
+      : {}),
+    ...(body.inputs !== undefined
+      ? { inputs: body.inputs as Readonly<Record<string, unknown>> }
+      : {}),
+    ...(workspace === undefined ? {} : { workspace }),
+    ...(typeof body.maxSteps === "number" ? { maxSteps: body.maxSteps } : {}),
+    ...(typeof body.maxDepth === "number" ? { maxDepth: body.maxDepth } : {}),
+    ...(typeof body.deadlineAt === "string"
+      ? { deadlineAt: body.deadlineAt }
+      : {})
+  };
 }
 
 async function serveScheduleApi(

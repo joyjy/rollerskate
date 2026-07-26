@@ -22,14 +22,14 @@ rollerskate/
 ├── local/
 │   ├── src/
 │   │   ├── core/                 # canonical Event、execution kernel、唯一 loop
-│   │   ├── application/          # 按业务域组织的 control、query 与 Runtime handler
-│   │   ├── modules/              # Local 产品模型与纯策略
+│   │   ├── application/          # 按业务域组织的 control、query 与 application module
+│   │   ├── modules/              # Local 产品模型与纯状态策略
 │   │   ├── capabilities/         # 随源码发布的第一方能力
 │   │   ├── integrations/         # Agent、Matrix、Server 适配
 │   │   ├── infrastructure/       # SQLite/file persistence 与运行资源加载
 │   │   ├── entrypoints/          # CLI 与 loopback HTTP 转换
 │   │   └── bootstrap/            # 固定 runtime composition 与 migration
-│   ├── resources/                # 随 build 发布的稳定 prompt 等运行资源
+│   ├── resources/                # 随 build 发布的 prompt 与 versioned workflow
 │   ├── scripts/                  # Local package build helper
 │   ├── ui/src/                   # 由 Local product 内置 Vite 实时提供的 Vue Console 源码
 │   └── test/                     # Local Runtime 公共边界验证
@@ -45,13 +45,16 @@ rollerskate/
 ├── assets/                       # 人类入口视觉资产
 └── docs/
     ├── architecture/             # 当前架构、ownership 与 ADR
-    └── runbook/                  # 安装、运行与故障处理
+    ├── plan/                     # 尚未完成验收的 release plans
+    ├── runbook/                  # 安装、运行与故障处理
+    └── verification/             # 版本验收范围与外部证据
 ```
 
 ## Boundary Notes
 
 - 顶层依赖方向是 `protocol <- local`、`protocol <- server`；Local 与 Server 不直接相互导入，也不把各自内部状态放进 protocol。
 - `core/` 拥有唯一长期运行的 loop；`capabilities/` 和 `integrations/` 提供行为与适配，`bootstrap/` 只做固定装配，三者都不能建立第二个 loop。
+- 一个 application vertical 以 `control.ts`、`query.ts` 为公共边界，纯 transition policy 放入 `modules/<domain>/state-machine.ts`，SQLite/file 细节放入 `infrastructure/`，CLI/HTTP/UI 只做转换。源码内第一方 vertical 在各 composition boundary 通过一条显式 manifest registration 接入；不依赖运行时扫描任意源码文件，也不把业务分支塞进 core 或 Agent adapter。
 - `entrypoints/` 只把 CLI/HTTP 转成 application control/query，并在同一 loopback HTTP server 上挂载 Vite middleware；`local/ui/src/` 是 Console 产品运行源，只走 loopback API，两者都不直接访问 store。
 - `examples/plugins/` 只能实现 Capability 预留的沙箱 strategy slot，不能注册 Capability、Event、Route、Handler 或 loop；`examples/probes/` 和 `examples/commands/` 只演示 host-owned probe 与外部进程 receipt 边界，不属于 Runtime 产品源码。
 - `scripts/`、`dev/` 和 `assets/` 不拥有产品行为；`dev/secrets/` 是 ignored 本地状态。
@@ -59,7 +62,7 @@ rollerskate/
 ## Architecture And Validation
 
 - `packages/protocol/`：[System topology](./system-topology.md)、[Event and Handler flow](./event-and-chat-flow.md)；`npm run verify -w @rollerskate/protocol`。
-- `local/src/` 与 `local/ui/src/`：[Local Runtime](./local-runtime.md)、[State and recovery](./state-and-recovery.md)、[Poll Subscription](./poll-subscription.md)；`npm run verify -w @rollerskate/local`、`npm --prefix local/ui test`、`npm --prefix local/ui run type-check`、`npm --prefix local/ui run build`。
+- `local/src/` 与 `local/ui/src/`：[Local Runtime](./local-runtime.md)、[State and recovery](./state-and-recovery.md)、[Poll Subscription](./poll-subscription.md)、[Local Agent Run And Review Workflow](./local-review.md)；`npm run verify -w @rollerskate/local`、`npm --prefix local/ui test`、`npm --prefix local/ui run type-check`、`npm --prefix local/ui run build`。
 - `server/src/`：[Server foundation](./server-foundation.md)、[Room control plane](./room-control-plane.md)；`npm run verify -w @rollerskate/server`。
 - `examples/`：[ADR 0005](./adrs/0005-capability-and-plugin-boundary.md)、[Poll Subscription](./poll-subscription.md)；随 Local 验证。
 - 全仓编排与 helper：[Architecture index](./index.md)、[State and recovery](./state-and-recovery.md)；`npm run verify`、`npm run dev:init`。
@@ -76,17 +79,21 @@ rollerskate/
 - `local/src/application/event/query.ts`：Events list/trace 的共同 CLI/Console 语义出口；Runtime 兼容入口只能委托它。
 - `local/src/infrastructure/sqlite/chat-store.ts`：唯一 `Local` Chat 的 SQLite projection、Owner message admission 与 current Session pointer。
 - `local/src/core/loop.ts`：唯一长期运行 loop、phase 调度和顶层异常隔离的事实源。
-- `local/src/core/runtime/model.ts`：Local Route 与 durable execution facts 的事实源。
+- `local/src/core/runtime/model.ts`：Local Route、durable execution、generic result-contract routing context 与 completion callback primitive 的事实源；Core 不拥有具体 Agent result schema。
 - `local/src/capabilities/subscription/plugin-contract.ts`：用户 Subscription Plugin 唯一允许实现的 strategy slot contract。
 - `local/src/capabilities/scheduled-task/model.ts`、`time.ts` 与 `store.ts`：Schedule/ScheduledRun、one-shot/cron/timezone 与 durable admission 的事实源。
-- `local/src/capabilities/review/artifact-schema.ts`、`result-contract.ts`、`workspace-revision.ts` 与 `store.ts`：MRSF、结构化 Agent result、workspace revision 与 durable Review chain 的事实源。
+- `local/src/application/agent-run/` 与 `local/src/modules/agent-run/`：Agent Run control/query、module manifest、`AgentTurnResult@1`、纯状态机、mandate/workflow admission 与 callback policy 的事实源；Steward 只是 Run 中被指定的 Agent role。
+- `local/src/infrastructure/sqlite/agent-run-store.ts`：`agent_runs` lifecycle、CAS、run-scoped Session binding、cancel 与 transactional continuation persistence。
+- `local/src/infrastructure/workspace/revision.ts`：external Git workspace canonicalization 与 generic `workspace-revision-v1` 计算；业务 workflow 不得在此加入自己的 sidecar/exclusion 语义。
+- `local/resources/workflows/`：versioned Agent workflow 资源；`review@1` 定义审查与 Agent 协作规约，不拥有 Runtime engine。
+- `local/src/capabilities/review/` 与 `local/src/application/review/`：只保留 schema v43 及更早 legacy Review history parser/query，以及兼容旧 Review sidecar 的 revision wrapper；不再 admission 新 Review。
 - `local/src/infrastructure/runtime/config.ts`：Local runtime paths 与 config schema 的事实源。
-- `local/src/infrastructure/sqlite/local-schema.ts`：Local SQLite v43 的完整 DDL、组合 schema version 与上一正式版本 migration 的唯一事实源；`schema.ts` 和 `runtime-schema.ts` 是薄入口，`runtime-mappers.ts` 持有 Runtime row mapping。
+- `local/src/infrastructure/sqlite/local-schema.ts`：Local SQLite v44 的完整 DDL、组合 schema version、兼容 migration 与 projection trigger 的唯一事实源；`schema.ts` 和 `runtime-schema.ts` 是薄入口，`runtime-mappers.ts` 持有 Runtime row mapping。
 - `local/src/infrastructure/sqlite/runtime-operations-query.ts`：Runtime Workload、Failure 与 recovery precondition 的只读 SQLite facts adapter，不拥有 durable object 或 projection table。
 - `local/src/application/notice/` 与 `local/src/infrastructure/sqlite/notice-store.ts`：Notice list/inspect/read/ack/rebuild 的共同 application contract，以及可重建 projection 与 authoritative user state adapter；RuntimeStore 不拥有 Notice query/control。
 - `local/src/entrypoints/console/launcher.ts` 与 `local/ui/`：同源 loopback API、Vite source runtime、Vue Console 和 HMR lifecycle 的事实源；`scripts/rs start` 不从 `local/ui/dist/` 提供产品 UI。
 - `server/src/adapter/persistence/mysql/migrations.ts`：Server MySQL schema migration 的事实源。
-- 根 `package.json`：npm workspace、全仓 build/test/verify 的事实源。
+- 根 `package.json`：Protocol/Local/Server npm workspace 与全仓 build/test/verify 的事实源；嵌套的 `local/ui/` 由自己的 manifest/lockfile 管理，root `postinstall` 负责 clean install，避免把父 package 与子目录声明成重叠 workspace。
 
 ## Generated Artifacts
 
@@ -102,9 +109,9 @@ rollerskate/
 
 - `docs/architecture/`：当前架构、ownership、ADR、稳定不变量和 change guidance。
 - `docs/runbook/`：安装、运行、控制与故障处理步骤。
-- `README.md`：人类项目入口和当前公开功能摘要，不复制完整 source map。
+- `README.md`：人类项目入口，不复制完整 source map。
 
-公开快照不分发内部 plan、verification、独立 `doc/` API 生成输入层或 `knowledge/` 长期领域知识层；不要为了满足模板预建空目录。
+仓库当前没有独立 `doc/` API 生成输入层或 `knowledge/` 长期领域知识层；不要为了满足模板预建空目录。
 
 ## Change Guidance
 

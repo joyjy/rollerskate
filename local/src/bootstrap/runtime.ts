@@ -10,8 +10,9 @@ import { PollProbeExecutor } from "../capabilities/subscription/plugin-runner.js
 import { PollSubscriptionRuntime } from "../capabilities/subscription/runtime.js";
 import { ScheduledTaskRuntime } from "../capabilities/scheduled-task/runtime.js";
 import { ScheduledTaskStore } from "../capabilities/scheduled-task/store.js";
-import { ReviewRuntime } from "../capabilities/review/runtime.js";
-import { ReviewStore } from "../capabilities/review/store.js";
+import { AgentRunModule } from "../application/agent-run/module.js";
+import { AgentRunStore } from "../infrastructure/sqlite/agent-run-store.js";
+import { openRuntimeDatabase } from "../infrastructure/sqlite/database.js";
 import {
   AgentHandler,
   DeliveryHandler,
@@ -110,12 +111,16 @@ export async function startRuntime(
             resources.scheduledTaskStore.close();
           } finally {
             try {
-              resources.reviewStore.close();
+              resources.agentRunStore.close();
             } finally {
               try {
-                resources.localChat.close();
+                resources.runtimeDatabase.close();
               } finally {
-                resources.foundationStore.close();
+                try {
+                  resources.localChat.close();
+                } finally {
+                  resources.foundationStore.close();
+                }
               }
             }
           }
@@ -133,9 +138,10 @@ async function assembleRuntime(options: RuntimeStartOptions) {
   const registry = new LocalAgentRegistryStore(paths.database);
   const foundationStore = new LocalFoundationStore(paths.database);
   const localChat = new LocalChatStore(paths.database);
-  const runtimeStore = new RuntimeStore(paths.database);
+  const runtimeDatabase = openRuntimeDatabase(paths.database);
+  const runtimeStore = new RuntimeStore(runtimeDatabase);
   const scheduledTaskStore = new ScheduledTaskStore(paths.database);
-  const reviewStore = new ReviewStore(paths.database);
+  const agentRunStore = new AgentRunStore(runtimeDatabase);
   let handedOff = false;
   try {
     const device = deviceStore.current();
@@ -296,25 +302,28 @@ async function assembleRuntime(options: RuntimeStartOptions) {
       }
       return runtimeAgents.get(agentId);
     };
-    const reviews = new ReviewRuntime({
-      store: reviewStore,
-      runtime: runtimeStore,
-      adapterForAgent: (agentId, workspace) => adapterForAgent(agentId, workspace)
+    const agentRun = new AgentRunModule({
+      runs: agentRunStore,
+      runtime: runtimeStore
     });
+    const modules = [agentRun.manifest()];
     const runtimeCycle = new RuntimeCycle({
       store: runtimeStore,
       handlers: new Map<RuntimeHandlerKind, RuntimeEventHandler>([
         ["agent", new AgentHandler({
           store: runtimeStore,
           adapterForAgent,
+          executionGuards: modules.flatMap((module) => module.executionGuards),
           chatHistory: ({ topicId, beforeEventId, limit }) =>
             boundedChatPromptHistory(chatTimelineFromStore(localChat, topicId, {
               beforeEventId,
               limit
             }))
         })],
-        ["result", new ResultHandler(runtimeStore, reviews)],
-        ["review", reviews],
+        ["result", new ResultHandler(
+          runtimeStore,
+          modules.flatMap((module) => module.resultContinuations)
+        )],
         ["chat", new ChatHandler({
           store: runtimeStore,
           chat: localChat,
@@ -339,7 +348,8 @@ async function assembleRuntime(options: RuntimeStartOptions) {
       matrixDelivery,
       subscriptions,
       scheduledTaskStore,
-      reviewStore,
+      agentRunStore,
+      runtimeDatabase,
       runtimeStore,
       localChat,
       foundationStore,
@@ -354,8 +364,9 @@ async function assembleRuntime(options: RuntimeStartOptions) {
   } finally {
     if (!handedOff) {
       scheduledTaskStore.close();
-      reviewStore.close();
+      agentRunStore.close();
       runtimeStore.close();
+      runtimeDatabase.close();
     }
     registry.close();
     deviceStore.close();

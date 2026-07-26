@@ -99,5 +99,42 @@ export interface LocalChatView {
   readonly chat: { readonly topicId: string; readonly handle: "local" };
   readonly agents: readonly LocalAgent[];
   readonly events: readonly RuntimeEvent[];
+  readonly messages: LocalChatMessagePage;
   readonly sessions: readonly LocalChatSession[];
+}
+
+export interface LocalChatMessage {
+  readonly eventId: string;
+  readonly createdAt: string;
+  readonly sender: {
+    readonly kind: "owner" | "agent" | "system";
+    readonly principalId?: string;
+    readonly handleSnapshot: string;
+  };
+  readonly body: string;
+  readonly target?: {
+    readonly principalId: string;
+    readonly handleSnapshot: string;
+  };
+  readonly readProgress?: ChatReadProgress;
+}
+
+export interface ChatReadProgress {
+  readonly schema: "ChatReadProgress@1";
+  readonly total: number;
+  readonly read: number;
+  readonly agents: readonly {
+    readonly agentId: string;
+    readonly handleSnapshot: string;
+    readonly state: "unread" | "reading" | "read" | "failed";
+    readonly reason: string;
+    readonly failureReason?: string;
+  }[];
+}
+
+export interface LocalChatMessagePage {
+  readonly topicId: string;
+  readonly items: readonly LocalChatMessage[];
+  readonly hasEarlier: boolean;
+  readonly beforeEventId?: string;
 }

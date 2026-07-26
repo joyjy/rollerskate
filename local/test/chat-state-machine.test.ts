@@ -92,7 +92,7 @@ test("available Agents dispatch while sender, non-target, and suspended Agents s
       { agentId: "agent-a", outcome: "skip", reason: "sender" },
       { agentId: "agent-b", outcome: "dispatch", reason: "direct-mention" },
       { agentId: "agent-c", outcome: "skip", reason: "not-target" },
-      { agentId: "agent-d", outcome: "skip", reason: "not-target" }
+      { agentId: "agent-d", outcome: "skip", reason: "agent-suspended" }
     ]
   );
 });

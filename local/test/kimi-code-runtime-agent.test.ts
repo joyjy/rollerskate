@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { agentRunTurnPrompt } from "../src/application/agent-run/prompt.js";
 import type { AgentInputEvent } from "../src/core/event/model.js";
 import { KimiCodeRuntimeAgent } from "../src/integrations/agent/kimi-code.js";
 
@@ -64,13 +65,9 @@ process.stdin.on("end", () => {
   assert.equal(request.input, "");
   assert.equal(result.providerSessionId, "ses_kimi");
   assert.deepEqual(result.outcome, { kind: "message", body: "checking\ndone" });
-  assert.deepEqual(agent.reviewCapabilities, {
-    resultSchemas: ["ImplementerResult@1"],
-    workspaceAccess: ["write"]
-  });
 });
 
-test("Kimi Code maps a Review Implementer invocation to the fixed result contract", async () => {
+test("Kimi Code receives the generic Agent Run contract and workspace grant", async () => {
   const workspace = mkdtempSync(join(tmpdir(), "rollerskate-kimi-code-review-"));
   writeFileSync(join(workspace, "tracked.txt"), "initial\n");
   git(workspace, ["init"]);
@@ -89,10 +86,12 @@ process.stdout.write([
   JSON.stringify({
     role: "assistant",
     content: JSON.stringify({
-      schemaVersion: "ImplementerResult@1",
-      boundedSummary: "updated",
-      findingReplies: [],
-      implementationRevision: "runtime"
+      schemaVersion: "AgentTurnResult@1",
+      action: "complete",
+      outcome: "succeeded",
+      summary: "updated",
+      artifactRefs: [],
+      observedWorkspaceRevision: "agent-observed"
     })
   }),
   JSON.stringify({
@@ -116,14 +115,14 @@ process.stdout.write([
     args: string[];
   };
   const prompt = request.args[request.args.indexOf("--prompt") + 1]!;
-  assert.match(prompt, /Return only JSON conforming to ImplementerResult@1/);
-  assert.match(prompt, /Workspace access: write/);
-  assert.match(prompt, /implementationRevision to the literal "runtime"/);
-  assert.match(prompt, new RegExp(`Authorized writable root: ${escapeRegExp(workspace)}`));
-  assert.notEqual(
+  assert.match(prompt, /AgentTurnResult@1/);
+  assert.match(prompt, /Invocation context:/);
+  assert.match(prompt, /"access":"write"/);
+  assert.match(prompt, new RegExp(escapeRegExp(workspace)));
+  assert.equal(
     JSON.parse(result.outcome.kind === "message" ? result.outcome.body : "{}")
-      .implementationRevision,
-    "runtime"
+      .observedWorkspaceRevision,
+    "agent-observed"
   );
 });
 
@@ -136,31 +135,24 @@ function event(workspace?: string): AgentInputEvent {
     agentId: "prn_019f92c9-0000-7000-8000-000000000011",
     destinationIds: [],
     causality: { rootEventId: eventId, hop: 0 },
-    prompt: "use Kimi",
+    prompt: workspace === undefined
+      ? "use Kimi"
+      : agentRunTurnPrompt("use Kimi", []),
     ...(workspace === undefined
       ? {}
       : {
-          reviewInvocation: {
-            schemaVersion: "review-invocation@1",
-            role: "implementer",
-            rootEventId: eventId,
-            cycleIndex: 0,
-            subject: {
-              kind: "acceptance",
-              ref: join(workspace, "plan.md"),
-              revision: "sub_1"
-            },
-            artifactRef: join(workspace, "plan.md.review.yaml"),
-            artifactRevision: "art_1",
-            evidence: [{
-              kind: "workspace",
-              ref: workspace,
+          runContext: {
+            schemaVersion: "AgentRunContext@1",
+            resultContractId: "agent-turn-result@1",
+            runId: "run_019f92c9-0000-7000-8000-000000000011",
+            stepId: "stp_019f92c9-0000-7000-8000-000000000011",
+            depth: 0,
+            workspaceGrant: {
+              schemaVersion: "ExternalWorkspaceGrant@1",
+              root: workspace,
+              access: "write",
               revision: "wrk1_initial"
-            }],
-            implementationRevision: "wrk1_initial",
-            workspaceAccess: "write",
-            writableRoot: workspace,
-            resultSchema: "ImplementerResult@1"
+            }
           }
         }),
     createdAt: "2026-07-25T00:00:00.000Z"

@@ -3,6 +3,7 @@ import { isAbsolute } from "node:path";
 
 import type { AgentInputEvent, ChatDispatchEvent } from "../../core/event/model.js";
 import type { RuntimeAgentAdapter } from "../../core/runtime/handlers.js";
+import { runtimeAgentEventPrompt } from "./event-prompt.js";
 import { AgentProcessClient, type AgentProcessProtocol } from "./process-client.js";
 
 interface ClaudeCodeRequest {
@@ -31,10 +32,6 @@ export interface ClaudeCodeRuntimeAgentOptions {
 export class ClaudeCodeRuntimeAgent implements RuntimeAgentAdapter {
   public readonly adapterId = "claude-code-runtime-json-v1";
   public readonly workspace: string;
-  public readonly reviewCapabilities = {
-    resultSchemas: ["ReviewerResult@1", "ImplementerResult@1"],
-    workspaceAccess: ["read", "write"]
-  } as const;
   readonly #process: AgentProcessClient;
 
   public constructor(options: ClaudeCodeRuntimeAgentOptions) {
@@ -71,7 +68,7 @@ function claudeCodeArgs(
   launchArgs: readonly string[]
 ): string[] {
   const access = request.event.type === "agent.request"
-    ? request.event.reviewInvocation?.workspaceAccess
+    ? request.event.runContext?.workspaceGrant?.access
     : undefined;
   const options = [
     ...launchArgs,
@@ -88,7 +85,7 @@ function claudeCodeArgs(
 
 const claudeCodeProtocol: AgentProcessProtocol = {
   encodeRequest(request: unknown): string {
-    return encodeRequest(request as ClaudeCodeRequest);
+    return runtimeAgentEventPrompt((request as ClaudeCodeRequest).event);
   },
   decodeResponse(output: string): Awaited<ReturnType<RuntimeAgentAdapter["invoke"]>> {
     const parsed = JSON.parse(output) as ClaudeCodeResult;
@@ -107,35 +104,6 @@ const claudeCodeProtocol: AgentProcessProtocol = {
     };
   }
 };
-
-function encodeRequest(request: ClaudeCodeRequest): string {
-  const review = request.event.type === "agent.request"
-    ? request.event.reviewInvocation
-    : undefined;
-  return [
-    "You are handling one fixed-schema Rollerskate Local Runtime Event.",
-    ...(request.event.type === "chat.dispatch"
-      ? ["Follow the referenced Chat prompt resource and return only its requested JSON object."]
-      : review === undefined
-      ? ["Follow the prompt and return the useful result as plain text."]
-      : [
-          `Return only JSON conforming to ${review.resultSchema}.`,
-          `Workspace access: ${review.workspaceAccess}.`,
-          ...(review.writableRoot === undefined
-            ? []
-            : [`Authorized writable root: ${review.writableRoot}.`])
-        ]),
-    `Event type: ${request.event.type}`,
-    `Causal root: ${request.event.causality.rootEventId}`,
-    `Causal hop: ${request.event.causality.hop}`,
-    ...(request.event.type === "subscription.fire" &&
-      request.event.observation !== undefined
-      ? ["Terminal observation:", JSON.stringify(request.event.observation)]
-      : []),
-    "Prompt:",
-    request.event.prompt
-  ].join("\n");
-}
 
 function workspace(projectRoot: string): string {
   if (!isAbsolute(projectRoot)) throw new Error("projectRoot must be absolute");

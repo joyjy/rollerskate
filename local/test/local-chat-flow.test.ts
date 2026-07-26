@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   addLocalAgent,
   localRuntimeSnapshot,
+  suspendLocalAgent,
 } from "../src/application/agent/control.js";
 import {
   localChatView,
@@ -122,6 +123,111 @@ test("Local Chat autonomously dispatches a mention and resumes the per-Agent Ses
   }
 });
 
+test("Chat message projection keeps a fixed eligible-Agent denominator and advances read state", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "rollerskate-chat-progress-repo-"));
+  const runtimeDirectory = mkdtempSync(join(tmpdir(), "rollerskate-chat-progress-runtime-"));
+  const options = { runtimeDirectory };
+  try {
+    const alice = addLocalAgent(repo, "alice", "codex", options);
+    const bob = addLocalAgent(repo, "bob", "codex", options);
+    const carol = addLocalAgent(repo, "carol", "codex", options);
+    const suspended = addLocalAgent(repo, "suspended", "codex", options);
+    suspendLocalAgent(repo, suspended.principalId, options);
+
+    const posted = postLocalChatMessage(repo, "@alice take this", options);
+    const runtime = new RuntimeStore(join(runtimeDirectory, "runtime.db"));
+    try {
+      dispatchNextMessage(
+        runtime,
+        [alice, bob, carol, { ...suspended, status: "suspended" }],
+        runtimeDirectory
+      );
+      const reading = localChatView(repo, options).messages.items.find(
+        (message) => message.eventId === posted.message.eventId
+      )?.readProgress;
+      assert.equal(reading?.total, 3);
+      assert.equal(reading?.read, 0);
+      assert.deepEqual(
+        reading?.agents.map(({ handleSnapshot, state }) => ({ handleSnapshot, state })),
+        [
+          { handleSnapshot: "alice", state: "reading" },
+          { handleSnapshot: "bob", state: "unread" },
+          { handleSnapshot: "carol", state: "unread" }
+        ]
+      );
+
+      const execution = runtime.claimDueExecutions()[0]!;
+      const handler = new AgentHandler({
+        store: runtime,
+        adapters: new Map([[alice.principalId, {
+          adapterId: "read-progress-agent",
+          workspace: join(runtimeDirectory, "workspace"),
+          async invoke() {
+            return {
+              providerSessionId: "read-progress-session",
+              outcome: { kind: "message", body: decision("silent") }
+            };
+          }
+        }]])
+      });
+      assert.equal(await handler.handle(execution), undefined);
+
+      const read = localChatView(repo, options).messages.items.find(
+        (message) => message.eventId === posted.message.eventId
+      )?.readProgress;
+      assert.equal(read?.total, 3);
+      assert.equal(read?.read, 1);
+      assert.deepEqual(
+        read?.agents.map(({ handleSnapshot, state }) => ({ handleSnapshot, state })),
+        [
+          { handleSnapshot: "alice", state: "read" },
+          { handleSnapshot: "bob", state: "unread" },
+          { handleSnapshot: "carol", state: "unread" }
+        ]
+      );
+
+      const projection = new LocalChatStore(join(runtimeDirectory, "runtime.db"));
+      try {
+        assert.deepEqual(projection.rebuildProjection(), {
+          messages: 1,
+          withReadProgress: 1
+        });
+      } finally {
+        projection.close();
+      }
+      assert.equal(
+        localChatView(repo, options).messages.items.find(
+          (message) => message.eventId === posted.message.eventId
+        )?.readProgress?.read,
+        1
+      );
+
+      postLocalChatMessage(repo, "legacy prompt source", options);
+      const legacy = new LocalChatStore(join(runtimeDirectory, "runtime.db"));
+      try {
+        assert.equal(legacy.promptPending(
+          posted.message.topicId,
+          [{ principalId: alice.principalId, handle: alice.handle }]
+        ).length, 1);
+      } finally {
+        legacy.close();
+      }
+      const view = localChatView(repo, options);
+      assert.ok(view.events.some(
+        (event) => event.type === "chat.message" && event.dispatchCard !== undefined
+      ));
+      assert.ok(!view.messages.items.some(
+        (message) => message.body === "Who should receive this message?"
+      ));
+    } finally {
+      runtime.close();
+    }
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(runtimeDirectory, { recursive: true, force: true });
+  }
+});
+
 test("foreground Local loop completes an unmentioned message without legacy dispatch cards", async () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-chat-loop-repo-"));
   const runtimeDirectory = mkdtempSync(join(tmpdir(), "rollerskate-chat-loop-runtime-"));
@@ -163,7 +269,7 @@ test("silent and failed Local Agent outcomes terminate without agent.result rela
   const options = { runtimeDirectory };
   try {
     const agent = addLocalAgent(repo, "worker", "codex", options);
-    postLocalChatMessage(repo, "@worker stay silent", options);
+    const silentMessage = postLocalChatMessage(repo, "@worker stay silent", options);
     const runtime = new RuntimeStore(join(runtimeDirectory, "runtime.db"));
     try {
       const handler = new AgentHandler({
@@ -181,8 +287,24 @@ test("silent and failed Local Agent outcomes terminate without agent.result rela
       assert.equal(await handler.handle(silentExecution), undefined);
       assert.equal(runtime.execution(silentExecution.executionId)?.status, "succeeded");
       assert.equal(runtime.events().filter((event) => event.type === "agent.result").length, 0);
+      assert.deepEqual(
+        localChatView(repo, options).messages.items.find(
+          (message) => message.eventId === silentMessage.message.eventId
+        )?.readProgress,
+        {
+          schema: "ChatReadProgress@1",
+          total: 1,
+          read: 1,
+          agents: [{
+            agentId: agent.principalId,
+            handleSnapshot: "worker",
+            state: "read",
+            reason: "direct-mention"
+          }]
+        }
+      );
 
-      postLocalChatMessage(repo, "@worker fail", options);
+      const failedMessage = postLocalChatMessage(repo, "@worker fail", options);
       dispatchNextMessage(
         runtime,
         [agent],
@@ -213,6 +335,23 @@ test("silent and failed Local Agent outcomes terminate without agent.result rela
       assert.equal(failed.execution.status, "failed");
       assert.equal(failed.resultEvent, undefined);
       assert.equal(runtime.events().filter((event) => event.type === "agent.result").length, 0);
+      assert.deepEqual(
+        localChatView(repo, options).messages.items.find(
+          (message) => message.eventId === failedMessage.message.eventId
+        )?.readProgress,
+        {
+          schema: "ChatReadProgress@1",
+          total: 1,
+          read: 0,
+          agents: [{
+            agentId: agent.principalId,
+            handleSnapshot: "worker",
+            state: "failed",
+            reason: "direct-mention",
+            failureReason: "provider unavailable"
+          }]
+        }
+      );
     } finally {
       runtime.close();
     }

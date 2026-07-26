@@ -63,7 +63,7 @@ import { startRuntime } from "../../bootstrap/runtime.js";
 import { startUiServer } from "../console/launcher.js";
 import { runSubscriptionCommand } from "./subscription.js";
 import { runScheduleCommand } from "./schedule.js";
-import { runReviewCommand } from "./review.js";
+import { runAgentRunCommand } from "./run.js";
 import {
   localChatPresenceView,
   postLocalChatMessage,
@@ -133,7 +133,7 @@ const HELP = [
   "  scripts/rs subscription list|inspect|pause|resume|cancel ...",
   "  scripts/rs schedule create|update|list|inspect ...",
   "  scripts/rs schedule pause|resume|cancel|run-now|runs|trace|resolve ...",
-  "  scripts/rs review create|list|inspect|trace|recover ...",
+  "  scripts/rs run start|list|inspect|trace|cancel ...",
   "",
   "Runtime: ~/.rollerskate, or the path selected with --runtime"
 ].join("\n");
@@ -270,8 +270,8 @@ export async function runLocalApp(
         output,
         global.runtimeDirectory
       );
-    case "review":
-      return runReviewCommand(
+    case "run":
+      return runAgentRunCommand(
         repoRoot,
         rest,
         output,

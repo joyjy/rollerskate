@@ -3,7 +3,7 @@ type: Architecture
 title: Event and Handler Flow
 description: canonical Event、immutable Local Chat、typed outcome、唯一 Handler 与 Destination 的当前主链。
 tags: [rollerskate, event, route, handler, delivery]
-timestamp: 2026-07-23
+timestamp: 2026-07-26
 ---
 
 # Event and Handler Flow
@@ -26,18 +26,20 @@ fixed ingress
 
 Event 是所有本地执行的唯一输入事实。CLI request、Subscription terminal fire 与 Matrix projection 在进入核心前都必须 Event 化；未来 Server 直接提供同一 canonical Event。
 
-## Local Review 主链
+## Agent Run / completion callback 主链
 
 ```text
-review.requested -> ReviewHandler -> Reviewer agent.request
-  -> agent.result -> ResultHandler review continuation
-  -> review.decision
-       passed | blocked -> terminal projection
-       findings -> ReviewHandler -> Implementer agent.request
-         -> agent.result -> next review.requested
+run start -> agent_runs + Steward agent.request [runId, stepId]
+  -> agent.result [AgentTurnResult@1]
+       complete -> Run terminal
+       delegate one Agent
+         -> child agent.request [parentStepId + fixed callback Session]
+         -> child agent.result
+         -> AgentStepCompletion@1 callback agent.request
+         -> caller Session resumes in the same Run
 ```
 
-Review continuation 只识别源码生成的 `review-invocation@1`，校验固定 JSON result、subject/evidence/artifact revision 和 role authority，再事务性 admission 下一条 Event。ResultHandler 不直接调用 Agent，Review Capability 不运行第二个 loop。
+Agent Run 不新增 `steward.*` Event 或专用 Handler。generic ResultHandler 只按 parent request 的 `resultContractId` 选择唯一 continuation；Agent Run continuation 校验 `AgentTurnResult@1`，并在同一 transaction 内完成当前 result Execution、推进 `agent_runs` CAS、建立唯一 child request 或 terminal state。child terminal success/failure 通过 host-owned callback binding 返回准确 caller Session；Agent 不选择 callback target。`review@1` 只是 versioned workflow resource，legacy `review.requested/review.decision` 保持可查但新 Runtime 不注册可写 ReviewHandler。
 
 ## Local Chat 主链
 
@@ -56,6 +58,8 @@ Owner、system 与 Agent message 都是 immutable Event。Local Chat 固定为 `
 
 Chat 行为约束来自独立资源 `prompt.chat.free-turn`。每条新 `chat.dispatch` 保存稳定的 `promptResourceId`；attention receipt、decision receipt、presence transition、Session 与可选 reply 都进入 durable audit，不依赖 UI。
 
+Chats timeline 只显示 `chat.message`。`chat_messages` projection 从 message Event、attention receipt 与 dispatch Execution 计算固定 Agent 分母和 `read | reading | unread | failed`；read 表示对应 Agent Execution 成功处理，reply 与 silent 等价，不是用户 read cursor。`chat.dispatch` 和 legacy dispatch card 不进入 timeline，但仍可从 canonical Event trace 检查。
+
 Route 不是房间、地址或 transport。它只保存 `Event.type → Handler kind`，不返回数组、不 fanout，也没有 Observer。Matrix Room 属于 ingress binding 和 Destination。
 
 ## ID 与幂等
@@ -68,7 +72,7 @@ Route 不是房间、地址或 transport。它只保存 `Event.type → Handler 
 
 ## Result Event 边界
 
-`agent.result` 是尚未由程序建模、但仍需交给 ResultHandler/Destination 的 fallback，不是所有 invocation 的通用中转层。Local Chat message outcome 直接追加 typed `chat.message`；silent 与 failure 不生成聊天 relay。`agent.result` 通过 Route 只进入 `ResultHandler`；ResultHandler 负责把 Event 上的显式 Destination 转成 Delivery，不调用 Agent。
+`agent.result` 是传统 Agent request、Subscription callback 与 Agent Run step 的 typed terminal fact，不是 Local Chat 的通用中转层。Local Chat message outcome 直接追加 typed `chat.message`；silent 与 failure 不生成聊天 relay。`agent.result` 通过 Route 只进入 generic `ResultHandler`；ResultHandler 负责显式 Destination Delivery，或根据 run context 的 contract ID 委托已注册 continuation，不解析结果 schema，也不包含 workflow 或角色分支。single delegate/completion callback admission 属于 Agent Run continuation。
 
 传统 Agent Execution 达到上限后生成 outcome=`failed` 的 `agent.result` Event；`chat.dispatch` 达到上限后只保留 failed Execution。ResultHandler 自己的 Execution同样有限重试，但最终失败不再生成 result Event，避免递归。Execution/Delivery 的异常按记录隔离，不能终止 Local Runtime loop。
 

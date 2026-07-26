@@ -6,7 +6,8 @@ import type {
 import type { ChatMessageEvent } from "../../core/event/model.js";
 import {
   LocalChatStore,
-  type ChatMessagePage
+  type ChatMessagePage,
+  type ChatReadProgress
 } from "../../infrastructure/sqlite/chat-store.js";
 import { runtimePaths } from "../../infrastructure/runtime/config.js";
 import {
@@ -17,6 +18,17 @@ import {
 export interface ChatTimelineOptions {
   readonly beforeEventId?: string;
   readonly limit?: number;
+}
+
+export interface ChatMessageView extends ChatMessageSummary {
+  readonly readProgress?: ChatReadProgress;
+}
+
+export interface ChatMessageViewPage {
+  readonly topicId: string;
+  readonly items: readonly ChatMessageView[];
+  readonly hasEarlier: boolean;
+  readonly beforeEventId?: string;
 }
 
 export function localChatTimeline(
@@ -39,6 +51,28 @@ export function chatTimelineFromStore(
   options: ChatTimelineOptions = {}
 ): ChatTimeline {
   return mapTimeline(topicId, store.messagePage(topicId, options));
+}
+
+export function chatMessageViewsFromStore(
+  store: Pick<LocalChatStore, "messagePage" | "readProgressForMessages">,
+  topicId: string,
+  options: ChatTimelineOptions = {}
+): ChatMessageViewPage {
+  const page = store.messagePage(topicId, options);
+  const visibleItems = page.items.filter((item) => item.dispatchCard === undefined);
+  const progress = store.readProgressForMessages(visibleItems.map((item) => item.eventId));
+  return {
+    topicId,
+    items: visibleItems.map((message) => {
+      const readProgress = progress.get(message.eventId);
+      return {
+        ...messageSummary(message),
+        ...(readProgress === undefined ? {} : { readProgress })
+      };
+    }),
+    hasEarlier: page.hasEarlier,
+    ...(page.beforeEventId === undefined ? {} : { beforeEventId: page.beforeEventId })
+  };
 }
 
 export function boundedChatPromptHistory(
@@ -67,9 +101,10 @@ export function boundedChatPromptHistory(
 }
 
 function mapTimeline(topicId: string, page: ChatMessagePage): ChatTimeline {
+  const visibleItems = page.items.filter((item) => item.dispatchCard === undefined);
   return {
     topicId,
-    items: page.items.map(messageSummary),
+    items: visibleItems.map(messageSummary),
     hasEarlier: page.hasEarlier,
     ...(page.beforeEventId === undefined ? {} : { beforeEventId: page.beforeEventId })
   };

@@ -107,20 +107,6 @@ async function send(body: string) {
   pending.value = null;
 }
 
-async function dispatch(sourceMessageEventId: string, principalId: string) {
-  if (pending.value) return;
-  pending.value = sourceMessageEventId;
-  const result = await mutation.execute({
-    path: `/api/chat/messages/${encodeURIComponent(sourceMessageEventId)}/dispatch`,
-    body: { principalId }
-  });
-  if (result !== null) {
-    await nextTick();
-    chatTimelineRef.value?.scrollToBottom();
-  }
-  pending.value = null;
-}
-
 async function newSession(agent: LocalAgent) {
   if (pending.value) return;
   pending.value = agent.principalId;
@@ -171,11 +157,8 @@ async function setPresence(
         <ChatTimeline
           ref="chatTimelineRef"
           :chat="selectedChat"
-          :events="chatView?.events ?? []"
-          :agents="chatView?.agents ?? []"
+          :messages="chatView?.messages.items ?? []"
           :active-agents="activeAgents"
-          :pending="pending"
-          @dispatch="dispatch"
         />
         <ChatComposer
           v-model="composer"

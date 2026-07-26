@@ -126,7 +126,7 @@ function actionFor(
       available: true,
       consoleRoute:
         `/console/reviews?reviewId=${encodeURIComponent(fact.objectRef)}`,
-      cliHint: `scripts/rs review inspect ${fact.objectRef}`
+      cliHint: `scripts/rs event trace ${fact.eventId ?? fact.objectRef}`
     };
   }
   if (owner === "notice") {

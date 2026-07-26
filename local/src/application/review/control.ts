@@ -1,32 +1,15 @@
 import { realpathSync } from "node:fs";
-import { relative, sep } from "node:path";
 
 import {
   readReviewArtifact,
-  reviewArtifactRef,
   type ReviewArtifact
 } from "../../capabilities/review/artifact-schema.js";
-import {
-  ReviewStore,
-  type CreateReviewReceipt
-} from "../../capabilities/review/store.js";
-import {
-  fileRevision,
-  workspaceRevision,
-  type WorkspaceRevision
-} from "../../capabilities/review/workspace-revision.js";
+import { ReviewStore } from "../../capabilities/review/store.js";
+import { workspaceRevision, type WorkspaceRevision } from "../../capabilities/review/workspace-revision.js";
 import { RuntimeStore, type RuntimeAudit } from "../../core/runtime/store.js";
 import { LocalFoundationStore } from "../../infrastructure/sqlite/foundation-store.js";
 import type { LocalAgent } from "../../modules/foundation/model.js";
 import { runtimePaths } from "../../infrastructure/runtime/config.js";
-
-export interface CreateReviewControlInput {
-  readonly subjectRef: string;
-  readonly reviewer: string;
-  readonly implementer: string;
-  readonly reworkLimit: number;
-  readonly requestId: string;
-}
 
 export interface ReviewInspection {
   readonly projection: import("../../capabilities/review/model.js").ReviewChainProjection;
@@ -43,51 +26,6 @@ export interface ReviewInspection {
   readonly artifact?: ReviewArtifact;
   readonly artifactError?: string;
   readonly audit: readonly RuntimeAudit[];
-}
-
-export interface CreateReviewControlReceipt extends CreateReviewReceipt {
-  readonly review: ReviewInspection;
-}
-
-export function createReview(
-  repoRoot: string,
-  input: CreateReviewControlInput,
-  runtimeDirectory?: string,
-  at = new Date().toISOString()
-): CreateReviewControlReceipt {
-  return withStores(repoRoot, runtimeDirectory, (stores) => {
-    const reviewer = requireActiveAgent(stores.foundation, input.reviewer);
-    const implementer = requireActiveAgent(stores.foundation, input.implementer);
-    if (reviewer.principalId === implementer.principalId) {
-      throw new Error("Reviewer and Implementer must be different Local Agents");
-    }
-    const subjectRef = realpathSync(input.subjectRef);
-    requireInside(stores.workspace, subjectRef, "subject");
-    const implementation = workspaceRevision(stores.workspace);
-    const receipt = stores.reviews.create({
-      requestId: input.requestId,
-      subject: {
-        kind: "acceptance",
-        ref: subjectRef,
-        revision: fileRevision(subjectRef)
-      },
-      artifactRef: reviewArtifactRef(subjectRef),
-      evidence: [{
-        kind: "workspace",
-        ref: stores.workspace,
-        revision: implementation.revision
-      }],
-      implementationRevision: implementation.revision,
-      reviewerAgentId: reviewer.principalId,
-      implementerAgentId: implementer.principalId,
-      reworkLimit: input.reworkLimit,
-      createdAt: at
-    });
-    return {
-      ...receipt,
-      review: inspection(receipt.rootEventId, stores)
-    };
-  });
 }
 
 export function listReviews(
@@ -109,18 +47,6 @@ export function inspectReview(
   return withStores(repoRoot, runtimeDirectory, (stores) =>
     inspection(rootEventId, stores)
   );
-}
-
-export function recoverReview(
-  repoRoot: string,
-  rootEventId: string,
-  runtimeDirectory?: string,
-  at = new Date().toISOString()
-): ReviewInspection {
-  return withStores(repoRoot, runtimeDirectory, (stores) => {
-    stores.reviews.recover(rootEventId, at);
-    return inspection(rootEventId, stores);
-  });
 }
 
 interface Stores {
@@ -196,17 +122,4 @@ function attempt<T>(callback: () => T): {
       error: (error instanceof Error ? error.message : String(error)).slice(0, 4_096)
     };
   }
-}
-
-function requireActiveAgent(foundation: LocalFoundationStore, handle: string): LocalAgent {
-  const agent = foundation.agentByHandle(handle);
-  if (agent === undefined) throw new Error(`Local Agent not found: ${handle}`);
-  if (agent.status !== "active") throw new Error(`Local Agent is not active: ${handle}`);
-  return agent;
-}
-
-function requireInside(root: string, path: string, field: string): void {
-  const child = relative(root, path);
-  if (child === "" || (!child.startsWith(`..${sep}`) && child !== "..")) return;
-  throw new Error(`${field} must be inside the Local workspace`);
 }

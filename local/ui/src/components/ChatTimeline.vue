@@ -1,47 +1,25 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from "vue";
 import { formatDateTime } from "@/utils/format";
-import DispatchCard from "./DispatchCard.vue";
+import ChatReadProgress from "./ChatReadProgress.vue";
 import type { ChatListItem } from "@/types/chat";
-import type { LocalAgent } from "@/types/local";
-import type { RuntimeEvent } from "@/types/runtime";
+import type { LocalAgent, LocalChatMessage } from "@/types/local";
 
 const props = defineProps<{
   chat: ChatListItem | null;
-  events: readonly RuntimeEvent[];
-  agents: readonly LocalAgent[];
+  messages: readonly LocalChatMessage[];
   activeAgents: readonly LocalAgent[];
-  pending: string | null;
-}>();
-
-const emit = defineEmits<{
-  (e: "dispatch", sourceMessageEventId: string, principalId: string): void;
 }>();
 
 type TimelineItem =
-  | { kind: "message"; event: RuntimeEvent }
-  | { kind: "system"; event: RuntimeEvent }
-  | { kind: "dispatch"; event: RuntimeEvent };
+  | { kind: "message"; message: LocalChatMessage }
+  | { kind: "system"; message: LocalChatMessage };
 
 const timelineItems = computed<TimelineItem[]>(() => {
-  const items: TimelineItem[] = [];
-  const inlineSourceIds = new Set<string>();
-
-  for (const event of props.events) {
-    if (event.type === "chat.message") {
-      const isSystem = event.sender?.kind === "system";
-      items.push({ kind: isSystem ? "system" : "message", event });
-      if (event.dispatchCard) {
-        inlineSourceIds.add(event.dispatchCard.sourceMessageEventId);
-      }
-    } else if (event.type === "chat.dispatch") {
-      const sourceId = event.sourceMessageEventId;
-      if (!sourceId || !inlineSourceIds.has(sourceId)) {
-        items.push({ kind: "dispatch", event });
-      }
-    }
-  }
-  return items;
+  return props.messages.map((message) => ({
+    kind: message.sender.kind === "system" ? "system" : "message",
+    message
+  }));
 });
 
 const timeline = ref<HTMLElement | null>(null);
@@ -58,7 +36,7 @@ function isNearBottom() {
   return el.scrollHeight - el.scrollTop - el.clientHeight < 80;
 }
 
-watch(() => props.events.length, async () => {
+watch(() => props.messages.length, async () => {
   await nextTick();
   if (isNearBottom()) scrollToBottom();
 });
@@ -80,48 +58,34 @@ defineExpose({ scrollToBottom });
     </div>
   </div>
 
-  <div v-if="events.length === 0" class="state">
+  <div v-if="messages.length === 0" class="state">
     <strong>Local is ready.</strong>
-    <div>Mention an Agent, or send without a mention and choose from the dispatch card.</div>
+    <div>Mention an Agent, or send freely to the Agents who are listening.</div>
   </div>
   <div v-else ref="timeline" class="timeline" aria-live="polite">
-    <template v-for="item in timelineItems" :key="item.event.eventId">
-      <article v-if="item.kind === 'message'" class="message" :class="item.event.sender?.kind">
-        <div class="avatar">{{ item.event.sender?.handleSnapshot.slice(0, 1).toUpperCase() }}</div>
+    <template v-for="item in timelineItems" :key="item.message.eventId">
+      <article v-if="item.kind === 'message'" class="message" :class="item.message.sender.kind">
+        <div class="avatar">{{ item.message.sender.handleSnapshot.slice(0, 1).toUpperCase() }}</div>
         <div class="message-content">
           <div class="message-head">
-            <strong>{{ item.event.sender?.kind === "owner" ? "You" : item.event.sender?.handleSnapshot }}</strong>
-            <span>{{ formatDateTime(item.event.createdAt) }}</span>
+            <strong>{{ item.message.sender.kind === "owner" ? "You" : item.message.sender.handleSnapshot }}</strong>
+            <div class="message-meta">
+              <span>{{ formatDateTime(item.message.createdAt) }}</span>
+              <ChatReadProgress
+                v-if="item.message.sender.kind === 'owner' && item.message.readProgress"
+                :progress="item.message.readProgress"
+              />
+            </div>
           </div>
-          <p>{{ item.event.body }}</p>
-          <div v-if="item.event.target" class="target-chip">to @{{ item.event.target.handleSnapshot }}</div>
-          <DispatchCard
-            :event="item.event"
-            :events="events"
-            :agents="agents"
-            :pending="pending"
-            @dispatch="(sourceId, principalId) => emit('dispatch', sourceId, principalId)"
-          />
-
+          <p>{{ item.message.body }}</p>
+          <div v-if="item.message.target" class="target-chip">to @{{ item.message.target.handleSnapshot }}</div>
         </div>
       </article>
 
       <div v-else-if="item.kind === 'system'" class="system-message">
         <div class="system-card">
-          <span>{{ item.event.body }}</span>
+          <span>{{ item.message.body }}</span>
         </div>
-        <DispatchCard
-          :event="item.event"
-          :events="events"
-          :agents="agents"
-          :compact="true"
-          :pending="pending"
-          @dispatch="(sourceId, principalId) => emit('dispatch', sourceId, principalId)"
-        />
-      </div>
-
-      <div v-else-if="item.kind === 'dispatch'" class="system-card">
-        Dispatched to <strong>@{{ item.event.targetHandleSnapshot }}</strong>
       </div>
     </template>
   </div>
@@ -154,8 +118,9 @@ defineExpose({ scrollToBottom });
   border-radius: 8px; background: var(--muted-soft); color: var(--text-secondary); font-weight: 800;
 }
 .message.agent .avatar { background: var(--success-soft); color: var(--success); }
-.message-head { display: flex; align-items: baseline; gap: 8px; }
+.message-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .message-head span { color: var(--text-dim); font-size: 11px; }
+.message-meta { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .message p { margin: 3px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .target-chip {
   display: inline-block;

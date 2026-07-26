@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import type { AgentRunContext } from "../runtime/model.js";
 
 export const eventTypes = [
   "agent.request",
@@ -49,6 +50,7 @@ export interface AgentRequestEvent extends EventBase {
   readonly agentId: string;
   readonly prompt: string;
   readonly reviewInvocation?: ReviewAgentInvocation;
+  readonly runContext?: AgentRunContext;
 }
 
 export interface ReviewReference {
@@ -179,6 +181,7 @@ export interface CreateEvent {
   readonly agentId: string;
   readonly prompt: string;
   readonly reviewInvocation?: ReviewAgentInvocation;
+  readonly runContext?: AgentRunContext;
   readonly sessionId?: string;
   readonly destinationIds?: readonly string[];
   readonly parent?: {

@@ -10,7 +10,6 @@ import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { createReview } from "../src/application/review/control.js";
 import { listReviewViews } from "../src/application/review/query.js";
 import { listRuntimeFailures } from "../src/application/runtime/failure-query.js";
 import {
@@ -18,6 +17,8 @@ import {
   runScheduleNow
 } from "../src/application/schedule/control.js";
 import { listScheduleViews } from "../src/application/schedule/query.js";
+import { startAgentRun } from "../src/application/agent-run/control.js";
+import { latestAgentRunView } from "../src/application/agent-run/query.js";
 import { ScheduledTaskStore } from "../src/capabilities/scheduled-task/store.js";
 import { startUiServer } from "../src/entrypoints/console/launcher.js";
 import {
@@ -27,7 +28,7 @@ import {
 import { runtimePaths } from "../src/infrastructure/runtime/config.js";
 import { initializeRuntimeSchema } from "../src/infrastructure/sqlite/schema.js";
 
-test("Review and Schedule Console APIs reuse application views and guarded controls", async () => {
+test("Legacy Review is read-only while Schedule Console controls remain guarded", async () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-operations-ui-repo-"));
   const runtimeDirectory = mkdtempSync(
     join(tmpdir(), "rollerskate-operations-ui-runtime-")
@@ -46,18 +47,21 @@ test("Review and Schedule Console APIs reuse application views and guarded contr
     git(paths.workspace, ["commit", "-m", "acceptance"]);
 
     const foundation = new LocalFoundationStore(paths.database);
-    foundation.addAgent("reviewer", "codex", "2026-07-25T00:00:00.000Z");
-    foundation.addAgent("implementer", "kimi-code", "2026-07-25T00:00:00.000Z");
     foundation.addAgent("scheduler", "codex", "2026-07-25T00:00:00.000Z");
+    foundation.addAgent("steward", "codex", "2026-07-25T00:00:00.000Z");
+    foundation.addAgent("reviewer", "codex", "2026-07-25T00:00:00.000Z");
+    foundation.addAgent("implementer", "codex", "2026-07-25T00:00:00.000Z");
     foundation.close();
-
-    const review = createReview(repo, {
-      subjectRef: subject,
-      reviewer: "reviewer",
-      implementer: "implementer",
-      reworkLimit: 2,
-      requestId: "operations-ui-review"
+    const agentRun = startAgentRun(repo, {
+      objective: `Review ${subject}`,
+      steward: "steward",
+      requestId: "operations-ui-run",
+      workspace: {
+        root: paths.workspace,
+        access: "read"
+      }
     }, runtimeDirectory, "2026-07-25T00:01:00.000Z");
+
     const schedule = createSchedule(repo, {
       agent: "scheduler",
       kind: "once",
@@ -94,49 +98,37 @@ test("Review and Schedule Console APIs reuse application views and guarded contr
       const origin = new URL(server.url).origin;
       const reviewResponse = await fetch(`${origin}/api/reviews`);
       assert.equal(reviewResponse.status, 200);
+      const reviewViews = await reviewResponse.json();
       assert.deepEqual(
-        await reviewResponse.json(),
+        reviewViews,
         listReviewViews(repo, runtimeDirectory)
       );
-      const reviewDetail = await fetch(
-        `${origin}/api/reviews/${review.rootEventId}`
+      assert.deepEqual(reviewViews, []);
+      const latestRunResponse = await fetch(`${origin}/api/runs/latest`);
+      assert.equal(latestRunResponse.status, 200);
+      assert.deepEqual(
+        await latestRunResponse.json(),
+        latestAgentRunView(repo, runtimeDirectory)
       );
-      assert.equal(reviewDetail.status, 200);
-      const reviewView = await reviewDetail.json() as {
-        summary: {
-          phase: string;
-          findings: { open: number };
-          availableActions: { recover: boolean };
-          failure: null | { failureRef: string };
-        };
-        audit: Array<{
-          execution: {
-            firstStartedAt: string | null;
-            lastAttemptAt: string | null;
-            completedAt: string | null;
-          } | null;
-          lifecycleChangedAt: string;
-          reasonForIntervention: string | null;
-          directChildren: unknown[];
-          causalityBoundary: string | null;
-        }>;
-      };
-      assert.equal(reviewView.summary.phase, "reviewing");
-      assert.equal(reviewView.summary.findings.open, 0);
-      assert.equal(reviewView.summary.availableActions.recover, false);
-      assert.equal(reviewView.summary.failure, null);
-      assert.equal(reviewView.audit[0]?.execution?.firstStartedAt, null);
-      assert.equal(reviewView.audit[0]?.execution?.lastAttemptAt, null);
-      assert.equal(reviewView.audit[0]?.execution?.completedAt, null);
+      const runResponse = await fetch(
+        `${origin}/api/runs/${agentRun.run.runId}`
+      );
+      assert.equal(runResponse.status, 200);
+      assert.equal((await runResponse.json() as {
+        summary: { runId: string; status: string };
+      }).summary.runId, agentRun.run.runId);
+      const missingReviewMutation = await fetch(
+        `${origin}/api/reviews/evt_019f0000-0000-7000-8000-000000000099/recover`,
+        {
+          method: "POST",
+          headers: { "X-Rollerskate-Request": "console" }
+        }
+      );
+      assert.equal(missingReviewMutation.status, 405);
       assert.equal(
-        reviewView.audit[0]?.lifecycleChangedAt,
-        "2026-07-25T00:01:00.000Z"
+        (await missingReviewMutation.json() as { error: string }).error,
+        "method_not_allowed"
       );
-      const rejectedReviewRecover = await fetch(
-        `${origin}/api/reviews/${review.rootEventId}/recover`,
-        { method: "POST" }
-      );
-      assert.equal(rejectedReviewRecover.status, 403);
 
       const scheduleResponse = await fetch(`${origin}/api/schedules`);
       assert.equal(scheduleResponse.status, 200);

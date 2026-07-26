@@ -15,7 +15,9 @@ import {
 } from "../../infrastructure/sqlite/chat-store.js";
 import { runtimePaths } from "../../infrastructure/runtime/config.js";
 import {
+  chatMessageViewsFromStore,
   chatTimelineFromStore,
+  type ChatMessageViewPage,
   type ChatTimelineOptions
 } from "./query.js";
 
@@ -27,6 +29,7 @@ export interface LocalChatView {
   readonly agents: readonly LocalAgent[];
   readonly events: ReturnType<LocalChatStore["events"]>;
   readonly timeline: ChatTimeline;
+  readonly messages: ChatMessageViewPage;
   readonly sessions: readonly {
     readonly principalId: string;
     readonly currentSessionId?: string;
@@ -61,6 +64,7 @@ export function localChatView(
       agents: snapshot.agents,
       events: chat.events(snapshot.foundation.topicId),
       timeline: chatTimelineFromStore(chat, snapshot.foundation.topicId, timelineOptions),
+      messages: chatMessageViewsFromStore(chat, snapshot.foundation.topicId, timelineOptions),
       sessions: snapshot.agents.map((agent) => {
         const current = chat.currentSession(agent.principalId);
         return {

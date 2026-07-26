@@ -30,6 +30,11 @@ test("Local source layers preserve the core and Capability dependency boundary",
   assertLayerImports("modules", new Set([
     "modules"
   ]));
+  assertLayerImports("integrations", new Set([
+    "core",
+    "integrations",
+    "protocol.js"
+  ]));
   assertLayerImports("entrypoints", new Set([
     "application",
     "bootstrap",
@@ -44,6 +49,25 @@ test("Local source layers preserve the core and Capability dependency boundary",
     "modules",
     "protocol.js"
   ]));
+});
+
+test("Core and Agent adapters do not own application result schemas", () => {
+  for (const file of sourceFiles(resolve(sourceRoot, "core"))) {
+    const source = readFileSync(file, "utf8");
+    assert.doesNotMatch(
+      source,
+      /AgentTurnResult@1/,
+      `${relative(sourceRoot, file)} cannot own the Agent Run result schema`
+    );
+  }
+  for (const file of sourceFiles(resolve(sourceRoot, "integrations/agent"))) {
+    const source = readFileSync(file, "utf8");
+    assert.doesNotMatch(
+      source,
+      /AgentTurnResult@1|ReviewerResult@1|ImplementerResult@1/,
+      `${relative(sourceRoot, file)} cannot own an application result schema`
+    );
+  }
 });
 
 test("Local core owns the only long-running loop", () => {

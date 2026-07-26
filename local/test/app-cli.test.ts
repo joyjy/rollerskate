@@ -66,7 +66,8 @@ test("repo-local script resolves Rollerskate independently of caller cwd", () =>
     assert.match(result.stdout, /--runtime <absolute-path>/);
     assert.match(result.stdout, /subscription add <json-file>/);
     assert.match(result.stdout, /schedule create\|update\|list\|inspect/);
-    assert.match(result.stdout, /review create\|list\|inspect\|trace\|recover/);
+    assert.match(result.stdout, /run start\|list\|inspect\|trace\|cancel/);
+    assert.doesNotMatch(result.stdout, /scripts\/rs (?:steward|review) /);
     assert.match(result.stdout, /agent rename <handle> <new-handle>/);
     assert.match(result.stdout, /notice list \[--limit <1-1000>\]/);
     assert.match(result.stdout, /notice mark-read\|ack <notice-id>/);

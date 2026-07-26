@@ -6,10 +6,10 @@
   "workspaces": [
     "packages/*",
     "local",
-    "local/ui",
     "server"
   ],
   "scripts": {
+    "postinstall": "npm ci --prefix local/ui",
     "build": "npm run build -w @rollerskate/protocol && npm run build -w @rollerskate/local && npm run build -w @rollerskate/server",
     "dev:init": "node dev/init-secrets.mjs",
     "dev:up": "npm run dev:init && docker compose --env-file dev/.env -f dev/compose.yaml up --build",

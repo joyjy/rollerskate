@@ -248,6 +248,45 @@ test("RuntimeCycle isolates one handler exception and continues later Executions
   }
 });
 
+test("RuntimeCycle leaves Handler completion time live unless a test pins it", async () => {
+  const store = runtimeStore();
+  try {
+    let observedAt: string | undefined = "not-called";
+    const cycle = new RuntimeCycle({
+      store,
+      handlers: new Map<RuntimeHandlerKind, RuntimeEventHandler>([
+        ["agent", {
+          kind: "agent" as const,
+          handle(execution, at) {
+            observedAt = at;
+            store.failExecution(
+              execution.executionId,
+              "terminal fixture",
+              new Date().toISOString(),
+              1
+            );
+          }
+        }],
+        ["result", new ResultHandler(store)]
+      ]),
+      deliveryHandler: new DeliveryHandler({ store, adapters: new Map() })
+    });
+    store.appendEvent({
+      type: "agent.request",
+      source: { kind: "cli" },
+      agentId: "agent-1",
+      prompt: "live timestamp",
+      maxAttempts: 1
+    });
+
+    await cycle.run();
+
+    assert.equal(observedAt, undefined);
+  } finally {
+    store.close();
+  }
+});
+
 test("terminal ResultHandler failure does not recursively create result Events", async () => {
   const store = runtimeStore();
   try {

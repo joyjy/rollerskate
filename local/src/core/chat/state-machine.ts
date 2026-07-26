@@ -44,12 +44,12 @@ export function planChatAttention(input: {
     if (input.message.sender.principalId === candidate.agentId) {
       return skipped(candidate, "sender", snapshot);
     }
+    if (candidate.status !== "active") {
+      return skipped(candidate, "agent-suspended", snapshot);
+    }
     const targeted = input.message.target?.principalId;
     if (targeted !== undefined && targeted !== candidate.agentId) {
       return skipped(candidate, "not-target", snapshot);
-    }
-    if (candidate.status !== "active") {
-      return skipped(candidate, "agent-suspended", snapshot);
     }
     const mentioned = targeted === candidate.agentId ||
       includesMention(input.message.body, candidate.handle);

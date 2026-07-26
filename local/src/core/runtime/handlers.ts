@@ -28,10 +28,6 @@ import { RuntimeStore } from "./store.js";
 export interface RuntimeAgentAdapter {
   readonly adapterId: string;
   readonly workspace: string;
-  readonly reviewCapabilities?: {
-    readonly resultSchemas: readonly ("ReviewerResult@1" | "ImplementerResult@1")[];
-    readonly workspaceAccess: readonly ("read" | "write")[];
-  };
   invoke(input: {
     readonly event: AgentInputEvent | ChatDispatchEvent;
     readonly providerSessionId?: string;
@@ -43,13 +39,19 @@ export interface RuntimeAgentAdapter {
   }>;
 }
 
-export interface RuntimeReviewContinuation {
+export interface RuntimeAgentResultContinuation {
+  readonly resultContractId: string;
   handleAgentResult(
     execution: RuntimeExecution,
     result: AgentResultEvent,
     request: import("../event/model.js").AgentRequestEvent,
     at: string
   ): boolean;
+}
+
+export interface RuntimeAgentExecutionGuard {
+  readonly moduleId: string;
+  canInvoke(event: import("../event/model.js").AgentRequestEvent): boolean;
 }
 
 export interface ChatHistoryPageInput {
@@ -67,6 +69,7 @@ export class AgentHandler {
   readonly #store: RuntimeStore;
   readonly #retryBaseMilliseconds: number;
   readonly #chatHistory: ((input: ChatHistoryPageInput) => ChatPromptHistory) | undefined;
+  readonly #executionGuards: readonly RuntimeAgentExecutionGuard[];
 
   public constructor(options: {
     readonly store: RuntimeStore;
@@ -76,6 +79,7 @@ export class AgentHandler {
       workspace?: string
     ) => RuntimeAgentAdapter | undefined;
     readonly chatHistory?: (input: ChatHistoryPageInput) => ChatPromptHistory;
+    readonly executionGuards?: readonly RuntimeAgentExecutionGuard[];
     readonly retryBaseMilliseconds?: number;
   }) {
     this.#store = options.store;
@@ -88,12 +92,13 @@ export class AgentHandler {
     this.#adapterForAgent = options.adapterForAgent ??
       ((agentId) => options.adapters!.get(agentId));
     this.#chatHistory = options.chatHistory;
+    this.#executionGuards = options.executionGuards ?? [];
     this.#retryBaseMilliseconds = options.retryBaseMilliseconds ?? 1_000;
   }
 
   public async handle(
     execution: RuntimeExecution,
-    at = new Date().toISOString()
+    at?: string
   ): Promise<AgentResultEvent | ChatMessageEvent | undefined> {
     if (execution.handler !== "agent" || execution.status !== "running") {
       throw new Error(`AgentHandler cannot process Execution: ${execution.executionId}`);
@@ -103,20 +108,25 @@ export class AgentHandler {
     if (!isAgentInputEvent(event)) {
       throw new Error(`AgentHandler requires an Agent input Event: ${event.eventId}`);
     }
+    if (event.type === "agent.request" && !this.#canInvoke(event)) {
+      return this.#store.forceTerminalAgentFailure(
+        execution.executionId,
+        "agent_run_cancelled",
+        at ?? new Date().toISOString()
+      ).resultEvent;
+    }
     try {
       const sessionId = event.sessionId ??
         (event.type === "chat.dispatch"
           ? this.#store.currentLocalAgentSession(event.agentId)?.sessionId
           : undefined);
       const session = sessionId === undefined ? undefined : this.#session(sessionId);
-      const reviewWorkspace = event.type === "agent.request"
-        ? event.reviewInvocation?.evidence.find(
-            (evidence) => evidence.kind === "workspace"
-          )?.ref
+      const controlledWorkspace = event.type === "agent.request"
+        ? event.runContext?.workspaceGrant?.root
         : undefined;
       const adapter = this.#adapterForAgent(
         event.agentId,
-        reviewWorkspace ?? session?.workspace
+        controlledWorkspace ?? session?.workspace
       );
       if (adapter === undefined) throw new Error(`Agent adapter not available: ${event.agentId}`);
       if (session !== undefined && (session.agentId !== event.agentId ||
@@ -139,11 +149,12 @@ export class AgentHandler {
           receipt
         );
       }
+      const completedAt = at ?? new Date().toISOString();
       const chatDecision = event.type === "chat.dispatch"
         ? receipt.outcome.kind === "message"
           ? event.promptResourceId === chatMentionPromptResourceId
             ? parseChatMentionDecision(receipt.outcome.body)
-            : parseChatDecision(receipt.outcome.body, at)
+            : parseChatDecision(receipt.outcome.body, completedAt)
           : event.promptResourceId === chatMentionPromptResourceId
             ? silentChatMentionDecision()
             : availableChatDecision()
@@ -157,15 +168,26 @@ export class AgentHandler {
           ? { output: receipt.outcome.body }
           : {}),
         ...(chatDecision === undefined ? {} : { chatDecision })
-      }, at);
+      }, completedAt);
     } catch (error) {
+      if (event.type === "agent.request" && !this.#canInvoke(event)) {
+        return this.#store.forceTerminalAgentFailure(
+          execution.executionId,
+          "agent_run_cancelled",
+          at ?? new Date().toISOString()
+        ).resultEvent;
+      }
       return this.#store.failExecution(
         execution.executionId,
         message(error),
-        at,
+        at ?? new Date().toISOString(),
         this.#retryBaseMilliseconds
       ).resultEvent;
     }
+  }
+
+  #canInvoke(event: import("../event/model.js").AgentRequestEvent): boolean {
+    return this.#executionGuards.every((guard) => guard.canInvoke(event));
   }
 
   #session(sessionId: string): RuntimeSession {
@@ -247,14 +269,21 @@ export class AgentHandler {
 export class ResultHandler {
   public readonly kind = "result" as const;
   readonly #store: RuntimeStore;
-  readonly #review: RuntimeReviewContinuation | undefined;
+  readonly #continuations = new Map<string, RuntimeAgentResultContinuation>();
 
   public constructor(
     store: RuntimeStore,
-    review?: RuntimeReviewContinuation
+    continuations: readonly RuntimeAgentResultContinuation[] = []
   ) {
     this.#store = store;
-    this.#review = review;
+    for (const continuation of continuations) {
+      if (this.#continuations.has(continuation.resultContractId)) {
+        throw new Error(
+          `Duplicate result continuation contract: ${continuation.resultContractId}`
+        );
+      }
+      this.#continuations.set(continuation.resultContractId, continuation);
+    }
   }
 
   public handle(
@@ -271,9 +300,16 @@ export class ResultHandler {
     const parentEventId = event.causality.parentEventId;
     if (parentEventId !== undefined) {
       const request = this.#store.event(parentEventId);
-      if (request?.type === "agent.request" && request.reviewInvocation !== undefined &&
-        this.#review?.handleAgentResult(execution, event, request, at) === true) {
-        return [];
+      if (request?.type === "agent.request" && request.runContext !== undefined) {
+        const contractId = request.runContext.resultContractId;
+        const continuation = this.#continuations.get(contractId);
+        if (continuation === undefined) {
+          throw new Error(`Result continuation is not registered: ${contractId}`);
+        }
+        if (continuation.handleAgentResult(execution, event, request, at)) {
+          return [];
+        }
+        throw new Error(`Result continuation declined registered contract: ${contractId}`);
       }
     }
     return this.#store.completeResultExecution(execution.executionId, at);
@@ -312,7 +348,7 @@ export class DeliveryHandler {
 
   public async handle(
     delivery: RuntimeDelivery,
-    at = new Date().toISOString()
+    at?: string
   ): Promise<RuntimeDelivery> {
     if (delivery.status !== "delivering") {
       throw new Error(`DeliveryHandler cannot process Delivery: ${delivery.deliveryId}`);
@@ -337,12 +373,16 @@ export class DeliveryHandler {
         throw new Error(`Destination adapter not available: ${destination.kind}`);
       }
       const receipt = await adapter.deliver({ delivery, destination, resultEvent, requestEvent });
-      return this.#store.deliverySucceeded(delivery.deliveryId, receipt.receipt, at);
+      return this.#store.deliverySucceeded(
+        delivery.deliveryId,
+        receipt.receipt,
+        at ?? new Date().toISOString()
+      );
     } catch (error) {
       return this.#store.deliveryFailed(
         delivery.deliveryId,
         message(error),
-        at,
+        at ?? new Date().toISOString(),
         this.#retryBaseMilliseconds
       );
     }

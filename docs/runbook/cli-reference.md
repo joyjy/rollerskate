@@ -44,7 +44,7 @@ scripts/rs resume
 - `event list/trace` 是 Events application query 的正式 CLI；顶层 `trace` 是同一 `event trace` query 的兼容 shortcut。
 - `workload status` 输出 Core Loop 当前负责推进的 ready、running、retrying 与 total canonical work unit；已经关联 Execution 的 ScheduledRun 不重复计数。
 - `failure list/inspect` 输出影响 Runtime readiness、workload 或需要 Owner 介入的 bounded projection，并给出稳定 object/Event reference 与下钻提示。
-- `recover` 仅在 Runtime 已停止且确实存在 interrupted durable work 时可用。普通 `running` Execution 和 retryable Delivery 回到有限重试；已经进入 provider invocation 的 ScheduledRun 改为 `unknown` 并停止对应 Execution，避免盲目重放可能已有 side effect 的请求。Review 再使用自己的 `review recover` 校验 projection 与 expected Execution。
+- `recover` 仅在 Runtime 已停止且确实存在 interrupted durable work 时可用。普通 `running` Execution 和 retryable Delivery 回到有限重试；已经进入 provider invocation 的 ScheduledRun 改为 `unknown` 并停止对应 Execution，避免盲目重放可能已有 side effect 的请求。Agent Run 复用 Execution recovery 与 generic ResultHandler continuation，没有专用 `steward recover`。
 - `pause` 与 `resume` 使用与 Console 相同的 structured availability guard，控制后续 Runtime cycle claim，不删除 durable state，也不取消已开始的 provider invocation。
 
 全部 canonical Event 与 Runtime log event 见 [Event Reference](../architecture/event-reference.md)。
@@ -64,7 +64,7 @@ scripts/rs agent request <handle> [--session <ses_uuidv7>] <prompt...>
 
 `handle` 是用户填写的短名称；Principal ID 由系统生成。创建时必须选择 `codex`、`claude-code` 或 `kimi-code` adapter。`--launch-arg` 可重复，每次保存一个原始 argv 元素，不经过 shell 解析；例如 `--launch-arg --model --launch-arg claude-sonnet-4-6`。`agent configure` 原子替换该 Agent 的整组启动参数，不带 `--launch-arg` 时清空；下一次调用自动使用新 adapter 配置。
 
-Session、structured output、workspace 与 permission/sandbox 参数由 adapter 控制，不能通过启动参数覆盖。Codex 与 Claude Code 支持 Review 的 read/write profile；受信任本机上的 Kimi Code 只声明 `ImplementerResult@1 + workspace write`，可以承担 Implementer，但不具备 Reviewer read profile。Kimi 仍使用自身 auto permission；这不是与 Codex `workspace-write` 等价的进程级 sandbox 保证。`agent request` 直接向 Agent 发起一次请求，省略 `--session` 时由 Runtime 管理 Session。
+Session、structured output、workspace 与 permission/sandbox 参数由 adapter 控制，不能通过启动参数覆盖。Agent Run 的 external workspace grant 对所有 client 使用同一 `read | write` contract：Codex 与 Claude Code adapter 会把它转换为进程权限参数；受信任本机上的 Kimi Code 目前只在 prompt 中接收 grant，仍使用自身 auto permission，并不提供与 Codex `read-only` / `workspace-write` 等价的进程级 sandbox。`agent request` 直接向 Agent 发起一次请求，省略 `--session` 时由 Runtime 管理 Session。
 
 `scripts/rs start` 默认在 `PATH` 中发现 `codex`、`claude` 与 `kimi`。需要固定 executable 时分别设置 `ROLLERSKATE_CODEX_EXECUTABLE`、`ROLLERSKATE_CLAUDE_CODE_EXECUTABLE` 或 `ROLLERSKATE_KIMI_CODE_EXECUTABLE`。
 
@@ -79,7 +79,7 @@ scripts/rs chat session new <handle>
 ```
 
 - `post` 追加 immutable Owner `chat.message` 并返回 queued Event ID；Runtime loop 在线时，ChatHandler 会对每个 Local Agent 应用 target 与 presence 状态机。写 `@handle` 只唤起该 Agent；不写 target 时所有 available Agent 都能自主 reply 或 silent。
-- `history` 输出 Local Topic 的 message/dispatch Event 与各 Agent current Session pointer。
+- `history` 输出 Local Topic 的稳定 message timeline cursor page；内部 `chat.dispatch` 只在 Event trace 中查看。
 - `status` 输出每个 Agent 的 lifecycle status 以及已有的 Global/Topic presence。未出现 presence 表示尚未做过显式 decision，运行时按 available 处理。
 - `presence set` 由 Owner 覆盖一个 Agent 的当前 scoped presence。`available` 不接受 `--until` 或 wake keyword；`snoozed` 必须提供未来的 `--until`，`--wake-keyword` 可重复。它修改的是 `Agent × (Global | 当前 Topic)` 状态，不是 Topic 配置，也不改变 Agent lifecycle。
 - `session new` 清空该 Agent 的 current Session pointer并增加 generation，不删除历史。
@@ -199,28 +199,40 @@ update 文件比 create 多一个 `expectedRevision`，其余字段是完整的�
 
 Console 的 `/console/schedules` 使用与以上 query/control 相同的 application view。页面只显示当前状态允许的 pause/resume/cancel/run-now/resolve，并要求 loopback Console request marker；不是绕过 CLI policy 的独立控制面。
 
-## Local Review
+## Agent Run 与 `review@1`
 
 创建文件使用 `schemaVersion: 1`：
 
 ```json
 {
   "schemaVersion": 1,
-  "subject": "/absolute/runtime/workspace/plan.md",
-  "reviewer": "reviewer",
-  "implementer": "implementer",
-  "reworkLimit": 2
+  "steward": "steward",
+  "workflowRef": "review@1",
+  "inputs": {
+    "plan": "/absolute/workspace/plan.md",
+    "acceptance": "/absolute/workspace/acceptance.md"
+  },
+  "workspace": {
+    "root": "/absolute/workspace",
+    "access": "write"
+  },
+  "maxSteps": 12,
+  "maxDepth": 4
 }
 ```
 
 ```text
-scripts/rs review create <json-file> --request-id <idempotency-key>
-scripts/rs review list [--limit <count>]
-scripts/rs review inspect <root-event-id>
-scripts/rs review trace <root-event-id>
-scripts/rs review recover <root-event-id>
+scripts/rs run start <json-file> --request-id <idempotency-key>
+scripts/rs run list [--limit <count>]
+scripts/rs run inspect <run-id>
+scripts/rs run trace <run-id>
+scripts/rs run cancel <run-id>
 ```
 
-subject 必须位于 Git-backed Local workspace；Reviewer 和 Implementer 必须是两个不同的 active Local Agent，但可以使用相同 client adapter。Runtime 自动固定 subject/workspace revision、派生 `<subject>.review.yaml`、限制 read/write authority 并维护有限 rework。完整状态机、sidecar 和恢复说明见 [Local Review runbook](./reviews.md)。
+Run 必须二选一提供 `objective` 或 `workflowRef`；`inputs` 只与 workflow 一起使用。Steward 必须是 active Local Agent。可选 external workspace grant 要求绝对、真实、Git-backed directory，并在 admission 时固定 canonical root、`read | write` 与 revision。相同 request ID 返回同一 Run；同一 canonical workspace 允许多个 read Run，但同时最多一条 non-terminal write Run。
 
-Console 的 `/console/reviews` 使用与 `review list/inspect/trace/recover` 相同的 application view。页面不提供 cancel 或 force-pass；只有 query 返回 `availableActions.recover=true` 时才显示 Recover。
+每个 Agent turn 只返回 `AgentTurnResult@1`：完成当前 step，或顺序委派一个 child Agent。Runtime 固定 callback 到准确的 caller Session；Agent 不能选择 callback target。Console 的 Latest Agent Run 使用同一 application query 展示 mandate、Steward、workspace grant、turn/depth budget、Agent exchanges 与 terminal summary，并允许取消活动 Run。完整状态机与恢复说明见 [Agent Run runbook](./reviews.md)。
+
+## Legacy Review history
+
+schema v43 及更早 terminal Review 只保留在 `/console/reviews` 和 loopback read API 中检查。legacy `review`/`steward` CLI 已整体移除；新审查通过通用 Agent Run 的 `review@1` workflow 执行。

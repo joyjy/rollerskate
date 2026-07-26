@@ -3,14 +3,14 @@ type: Architecture
 title: Rollerskate Architecture
 description: Rollerskate 当前系统形状、默认阅读路径、稳定边界和按工作域组织的架构入口。
 tags: [rollerskate, architecture, local-runtime, server]
-timestamp: 2026-07-25
+timestamp: 2026-07-26
 ---
 
 # Rollerskate Architecture
 
 ## 30 秒架构
 
-Rollerskate 当前是 Local-first Agent proactive system。每台电脑运行一个 Local Runtime，拥有本机 identity、workspace、Chat、Agent、durable state 和唯一 core loop；首次启动不依赖 Server、OIDC 或 Device enrollment。Server 与 Matrix 的既有代码不接管本机 workspace、权限、执行与停止权；schema v43 已移除旧 Local binding/ingress state，新的 Server Agent authentication、Topic/TransportBinding 与 cursor/session persistence 在 v0.4 重建。
+Rollerskate 当前是 Local-first Agent proactive system。每台电脑运行一个 Local Runtime，拥有本机 identity、workspace、Chat、Agent、durable state 和唯一 core loop；首次启动不依赖 Server、OIDC 或 Device enrollment。Server 与 Matrix 的既有代码不接管本机 workspace、权限、执行与停止权；schema v44 已移除旧 Local binding/ingress state，并加入 generic Agent Run 与 Chat message projection，新的 Server Agent authentication、Topic/TransportBinding 与 cursor/session persistence 在 v0.4 重建。
 
 ```text
 Owner / Console / fixed ingress
@@ -24,7 +24,7 @@ Optional remote control
   -> Server BFF -> Matrix -> Local Runtime admission
 ```
 
-当前架构记录已实现到 v0.3.10 的事实。公开源码快照只包含已实现源码、architecture 与 runbook，不分发内部 plan 和 release verification。
+当前架构记录已实现到 v0.3.11 的公开事实；未实现的私有 roadmap 与 release evidence 不进入分发副本。
 
 ## 默认阅读路径
 
@@ -48,7 +48,7 @@ ADR、Source map 和 Event Reference 都是按需材料，不是理解系统的�
 
 - [Poll Subscription](./poll-subscription.md)：轮询、受限 probe Plugin slot、durable one-shot fire 与控制面。
 - [Local Scheduled Task](./scheduled-task.md)：Schedule revision、cron/timezone、misfire/overlap、Session policy 与 unknown recovery。
-- [Local Multi-Client Review](./local-review.md)：versioned subject/evidence、MRSF、双 Agent authority、durable projection 与有限返修。
+- [Local Agent Run And Review Workflow](./local-review.md)：通用 Run、run-scoped Session、单 child callback、external workspace grant 与 versioned `review@1` workflow。
 
 只在修改对应 Capability 时读取该专题；它们不是默认架构阅读路径。
 
@@ -62,7 +62,7 @@ ADR、Source map 和 Event Reference 都是按需材料，不是理解系统的�
 
 - [Source map](./source-map.md)：workspace、源码 root、ownership、共享 contract、生成关系与验证入口。
 - [Event Reference](./event-reference.md)：Local canonical Event、Runtime object 与 Server/Matrix EventEnvelope。
-- [Database Reference](./db-reference.md)：Event / index / object 建模规范，以及 Local SQLite schema v43 的 13 张物理 table、ownership、authority 与迁移规则。
+- [Database Reference](./db-reference.md)：Event / index / object 建模规范，以及 Local SQLite schema v44 的 15 张物理 table、ownership、authority 与迁移规则。
 
 Source map 只在修改 source root、ownership、共享 contract、生成关系或验证入口时读取；Event Reference 只在查询或修改 Event schema/type 与 Runtime object 时读取；Database Reference 在设计或修改 Local SQLite table、migration、materialized index/projection 或 durable object/state 时读取。
 
@@ -81,6 +81,7 @@ Source map 只在修改 source root、ownership、共享 contract、生成关系
 - 每台电脑最多运行一个 Local Runtime；本机 workspace、授权、执行状态与停止权始终由 Local/Owner 掌握。
 - 所有 ingress 先成为 canonical Event，再按 `Event.type` 进入唯一 Handler；transport adapter 不拥有产品处理语义。
 - `core/loop.ts` 拥有唯一长期运行 loop；Capability 和 integration 不能建立平行 daemon 或 execution core。
+- application vertical 通过 control/query、纯状态机和低频 manifest registration 接入；业务语义不得随 vertical 数量扩散进 core、ResultHandler 或 Agent adapter。
 - Local 只保存本机执行、恢复和 bounded working set 所需事实，不复制 Server、Matrix 或 provider 的完整信息。
 - 网络身份不等于执行权限；每种固定 ingress 必须建立自己的 admission 边界，不能开放 generic Event write。
 - 一个 Server deployment 是单 team 的身份、Room 可见性和数据隔离边界；public Room 只在该 deployment 内公开。
@@ -93,5 +94,5 @@ Source map 只在修改 source root、ownership、共享 contract、生成关系
 - 改 durable state、retry、lease、shutdown、recovery 或 Capability 状态机：更新 [State and recovery](./state-and-recovery.md) 与对应 Capability 专题，并保留 crash/restart/duplicate/unknown 证据。
 - 改 Capability/Plugin 信任边界：检查对应 Capability 专题与 [ADR 0005](./adrs/0005-capability-and-plugin-boundary.md)。
 - 改 source root、ownership、共享 contract、生成关系或验证入口：同步 [Source map](./source-map.md)。
-- 新增产品能力：只有实现并通过项目验证后，才把当前事实迁入本 bundle。
-- 用户操作和排障步骤属于 [runbook](../runbook/quickstart.md)；实现过程和内部 release evidence 不回填到公开架构入口。
+- 新增产品能力只有在实现并验证后才迁入本 bundle；公开架构入口不保存私有 roadmap 或实施过程。
+- 用户操作和排障步骤属于 [runbook](../runbook/quickstart.md)，实现过程不回填到架构入口。

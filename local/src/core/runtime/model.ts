@@ -1,7 +1,12 @@
 import { randomBytes } from "node:crypto";
 import type { EventType } from "../event/model.js";
 
-export const runtimeHandlerKinds = ["agent", "result", "review", "chat"] as const;
+export const runtimeHandlerKinds = [
+  "agent",
+  "result",
+  "review",
+  "chat"
+] as const;
 export type RuntimeHandlerKind = (typeof runtimeHandlerKinds)[number];
 
 export interface RuntimeRoute {
@@ -28,7 +33,8 @@ export type RuntimeExecutionStatus =
   | "running"
   | "retry_wait"
   | "succeeded"
-  | "failed";
+  | "failed"
+  | "cancelled";
 
 export interface RuntimeExecution {
   readonly executionId: string;
@@ -48,11 +54,52 @@ export interface RuntimeExecution {
 export interface RuntimeSession {
   readonly sessionId: string;
   readonly agentId: string;
+  readonly runId?: string;
   readonly adapterId: string;
   readonly providerSessionId: string;
   readonly workspace: string;
   readonly createdAt: string;
   readonly updatedAt: string;
+}
+
+export interface ExternalWorkspaceGrant {
+  readonly schemaVersion: "ExternalWorkspaceGrant@1";
+  readonly root: string;
+  readonly access: "read" | "write";
+  readonly revision: string;
+}
+
+export interface AgentCompletionBinding {
+  readonly schemaVersion: "AgentCompletionBinding@1";
+  readonly callerAgentId: string;
+  readonly callerSessionId: string;
+  readonly callerStepId: string;
+  readonly callerRequestEventId: string;
+}
+
+export interface AgentStepCompletion {
+  readonly schemaVersion: "AgentStepCompletion@1";
+  readonly childAgentId: string;
+  readonly childStepId: string;
+  readonly childRequestEventId: string;
+  readonly childResultEventId: string;
+  readonly childExecutionId: string;
+  readonly outcome: "succeeded" | "failed" | "needs_human";
+  readonly summary: string;
+  readonly artifactRefs: readonly string[];
+  readonly observedWorkspaceRevision?: string;
+}
+
+export interface AgentRunContext {
+  readonly schemaVersion: "AgentRunContext@1";
+  readonly resultContractId: string;
+  readonly runId: string;
+  readonly stepId: string;
+  readonly depth: number;
+  readonly parentStepId?: string;
+  readonly workspaceGrant?: ExternalWorkspaceGrant;
+  readonly completionBinding?: AgentCompletionBinding;
+  readonly stepCompletion?: AgentStepCompletion;
 }
 
 export interface RuntimeDestination {

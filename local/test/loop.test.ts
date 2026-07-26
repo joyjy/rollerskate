@@ -181,7 +181,7 @@ process.stdin.on("end", () => {
       try {
         assert.equal((schemaVersion.prepare(`
           SELECT value FROM schema_meta WHERE key = 'schema_version'
-        `).get() as { value: string }).value, "43");
+        `).get() as { value: string }).value, "44");
       } finally {
         schemaVersion.close();
       }

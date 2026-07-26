@@ -28,7 +28,7 @@ test("runtime schema rejects unsupported direct migration instead of dropping ol
 
     assert.throws(
       () => initializeRuntimeSchema(databasePath),
-      /schema 20 cannot migrate directly to 43/
+      /schema 20 cannot migrate directly to 44/
     );
     const preserved = new DatabaseSync(databasePath, { readOnly: true });
     const rows = preserved.prepare("SELECT * FROM deliveries").all() as unknown as

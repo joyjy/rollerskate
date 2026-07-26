@@ -3,7 +3,7 @@ type: Architecture
 title: Rollerskate State And Recovery
 description: Local Runtime 的统一 durable facts、有限重试、异常隔离与恢复边界。
 tags: [rollerskate, sqlite, recovery, event, reliability]
-timestamp: 2026-07-23
+timestamp: 2026-07-26
 ---
 
 # State And Recovery
@@ -14,16 +14,16 @@ Local Runtime 使用 Node 内置 SQLite 与 WAL。SQLite 是本机执行事实�
 
 ## Durable domains
 
-- canonical Event：统一 ID、type/source、Agent、Session/Destination snapshot 与 causality；输入 Event 携带 prompt，`agent.result` 携带 outcome/output/error。
+- canonical Event：统一 ID、type/source、Agent、Session/Destination snapshot 与 causality；输入 Event 携带 prompt 与可选 generic run context，`agent.result` 只携带 outcome、Core 不透明处理的 output/error。具体 result contract 由注册的 application continuation 解释。
 - Local foundation：generated LocalDevice、唯一 LocalWorkspace/Local Chat、Local Topic、嵌入的 Owner identity 与创建时间。
 - LocalAgent：短 handle、active/suspended、client、execution config 与 current Session pointer。
-- Local Chat：immutable `chat.message`/`chat.dispatch`、Execution 上的 versioned attention/decision receipt、Topic/Global presence、prompt resource ID 与 handle snapshot。
+- Local Chat：immutable `chat.message`/`chat.dispatch`、Execution 上的 versioned attention/decision receipt、Topic/Global presence、prompt resource ID 与 handle snapshot；`chat_messages` 只提供可删除重建的 Timeline/read-progress projection。
 - Execution：唯一 Event、唯一 Handler、attempt/max attempts、next retry、terminal status和 bounded versioned receipt。
-- Session：Agent、adapter、workspace 与 provider Session ID。
+- Session：Agent、adapter、workspace、provider Session ID 与可选 Run binding；Chat current Session 与 run-scoped Session 不共享。
 - Delivery：稳定 delivery ID、immutable Destination kind/address snapshot、attempt、retry 与外部 receipt；当前 kind 为 Matrix 或 macOS notification。
 - Poll Subscription：title、owner Agent、Plugin/config/policy、interval/deadline/max attempts、next poll、固定 provider Session/adapter/workspace/prompt snapshot、terminal 时 lazy materialize 的本地 Session、唯一 fire Event ID 与 notification Destination。
 - Local Scheduled Task：Schedule current definition/revision/next occurrence，以及按 occurrence 唯一、固定 immutable definition snapshot、可关联 Event/Execution/Session/result 的 ScheduledRun。
-- Review：bounded aggregate 保存 current phase、两个 role Session 与 transition receipts。
+- Agent Run：durable coordination object 保存 mandate/workflow snapshot、Steward Session、current step、budget、external workspace grant、CAS、cancel 与 terminal outcome；step transcript 留在 Event/Execution，legacy `reviews` 只读。
 - Notice：derived projection 与 authoritative read/ack 同表；rebuild 只覆盖 derived columns。
 - Server connection/binding 不属于当前 Local schema；v0.4 按真实远端 identity/authentication 生命周期重新建立。
 - Matrix outbound 可以消费已经 admission 的 Destination snapshot；Matrix ingress binding/cursor/Session persistence 等 v0.4 按 Server Topic/TransportBinding 生命周期重建。
@@ -39,6 +39,10 @@ Local Runtime 使用 Node 内置 SQLite 与 WAL。SQLite 是本机执行事实�
 - 每个 Event type 只有一个 Handler，不 fanout。
 - Agent Execution 使用有限指数退火；传统 input 达到 max attempts 后产生一个 failed `agent.result` Event，`chat.dispatch` failure 不产生 relay。
 - `agent.result` 只由 ResultHandler Execution 处理；Delivery retry 不重跑 Handler，ResultHandler terminal failure 不递归创建 Event。
+- Agent Run 一次 turn 只能 `complete` 或 delegate 一个 child；Agent Run continuation 完成当前 result、更新 Run CAS 与 admission child/callback 必须在同一 transaction 内。generic ResultHandler 只负责 contract routing。callback target 是 host-owned caller Session，provider retry 期间不 callback。
+- 同一 `(runId, agentId)` 只有一个 run-scoped Session；不同 Run、Chat 与 Run 不共享 Session。nested delegate 使用 `stepId/parentStepId` 形成 durable async call stack。
+- cancel 幂等并阻止 queued work、retry、delegate、child 与 callback；已经 running 的 provider process不强杀，late result 只能留下审计事实。
+- 相同 canonical external workspace 允许多个 read Run，但最多一个 non-terminal write Run；数据库唯一约束不声称隔离外部进程修改，每个 step 必须记录观察到的 revision/drift。
 - Matrix Delivery 使用稳定 delivery ID 作为 transaction ID。
 - terminal Subscription 与 `subscription.fire` Event/Execution 原子建立；非 terminal poll 不创建 Event。
 - terminal callback 的 macOS notification Delivery 最多尝试一次；Delivery failure 不修改 callback outcome。
@@ -52,11 +56,15 @@ Local Runtime loop 串行推进 Subscription、Local Chat、Scheduled Task 与 R
 
 启动恢复把普通中断的 `running` Execution 与 retryable `delivering` Delivery 放回有限重试；Subscription 恢复中断 poll 并遵守剩余 deadline/attempt。ScheduledRun 已经进入 provider invocation 时，run 转为 `unknown`，对应 Execution 终止，直到用户根据 provider evidence 使用 CLI resolve；不会自动重放可能已有 side effect 的请求。SIGINT/SIGTERM 停止接收新 cycle，并通过 AbortSignal 取消可取消的 probe。
 
+Agent Run 恢复先读取 Run terminal/cancel 状态，再处理关联 Execution。active/waiting Run 复用既有 queued/retry Execution；ResultHandler 使用 deterministic continuation key 重放未完成 transaction。Run 已 cancelled 或 terminal 时不再恢复 child/callback；current step、Execution 或 Session binding 无法一致解释时 fail closed 为 `needs_human`，不猜测下一位 Agent。
+
+provider invocation 与外部 Delivery 使用实际完成/失败时刻写 terminal fact；只有显式传入测试时钟时才固定整轮时间。这样 deadline 判断不会因一次长 provider call 复用 cycle-start timestamp。具体 result contract 对 immutable output 的确定性校验失败不重试：owning continuation 原子 terminalize 对象并记录 bounded receipt。
+
 Scheduled Task 声称 exactly-once 的边界是本地 occurrence/Event/Execution admission，不是 provider side effect。provider outcome 无法确认时保持 `unknown`；其他 capability 若要改变默认 Runtime retry，也必须先定义自己的 unknown/receipt/reconciliation 契约。
 
 ## Schema cutover
 
-schema v43 把 v42 的 29 张业务表收敛为 13 张物理表：`schema_meta`、`local_foundation`、`agents`、`agent_sessions`、`events`、`executions`、`deliveries`、`chat_presence`、`subscriptions`、`schedules`、`scheduled_runs`、`reviews`、`notices`。v42 → v43 migration 在单一 transaction 内保存 canonical facts、retry state、Session continuity、Capability current state/已发生 snapshot、Review transition 和 Notice read/ack，并删除没有当前产品生命周期的 legacy Chat、enrollment 与 Server binding 表。完整 authority 和映射见 [Database Reference](./db-reference.md)。默认 Runtime 完全忽略旧 repo-local `.rollerskate/`，不迁移也不删除；只有用户显式选择某个 runtime 时才执行其 schema migration。
+schema v44 在 v43 的 13 张 compacted 表上增加 `agent_runs` 与 `chat_messages`，并给 `agent_sessions` 增加可选 Run binding，共 15 张物理表。v42/v43 → v44 migration 在单一 transaction 内保存 canonical facts、retry state、Session continuity、Capability current state/已发生 snapshot、terminal legacy Review 和 Notice read/ack，并从 canonical facts backfill Chat projection。non-terminal legacy Review 阻止升级，避免新旧两个 Review engine 同时可写；migration 只接受已发布的旧 schema shape。完整 authority 和映射见 [Database Reference](./db-reference.md)。默认 Runtime 完全忽略旧 repo-local `.rollerskate/`，不迁移也不删除；只有用户显式选择某个 runtime 时才执行其 schema migration。
 
 ## Change guidance
 

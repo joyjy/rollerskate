@@ -1,10 +1,12 @@
 import type { DatabaseSync } from "node:sqlite";
 
-export const LOCAL_SCHEMA_VERSION = 43;
+export const LOCAL_SCHEMA_VERSION = 44;
 
 const TARGET_TABLES = [
   "agent_sessions",
+  "agent_runs",
   "agents",
+  "chat_messages",
   "chat_presence",
   "deliveries",
   "events",
@@ -55,6 +57,7 @@ export function migrateLocalDatabase(database: DatabaseSync): void {
     );
   }
   if (isCurrentSchema(database)) {
+    dropChatProjectionObjects(database);
     createSchema(database);
     return;
   }
@@ -62,6 +65,7 @@ export function migrateLocalDatabase(database: DatabaseSync): void {
     throw new Error(`Local database schema ${LOCAL_SCHEMA_VERSION} is incomplete`);
   }
   if (declaredVersion !== undefined && declaredVersion !== 42 &&
+    declaredVersion !== 43 &&
     hasAnyProductTable(database)) {
     throw new Error(
       `Local database schema ${declaredVersion} cannot migrate directly to ${LOCAL_SCHEMA_VERSION}`
@@ -73,6 +77,37 @@ export function migrateLocalDatabase(database: DatabaseSync): void {
   }
   createSchema(database);
   writeSchemaVersion(database);
+}
+
+export function rebuildChatMessageProjection(database: DatabaseSync): {
+  readonly messages: number;
+  readonly withReadProgress: number;
+} {
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    database.exec("DELETE FROM chat_messages");
+    backfillChatMessages(database);
+    const messages = rowCount(database, "chat_messages");
+    const canonicalMessages = scalarCount(database, `
+      SELECT COUNT(*) AS count FROM events WHERE type = 'chat.message'
+    `);
+    if (messages !== canonicalMessages) {
+      throw new Error(
+        `Chat projection rebuild did not preserve every message: ` +
+        `${canonicalMessages} -> ${messages}`
+      );
+    }
+    const withReadProgress = scalarCount(database, `
+      SELECT COUNT(*) AS count
+      FROM chat_messages
+      WHERE read_progress_json IS NOT NULL
+    `);
+    database.exec("COMMIT");
+    return { messages, withReadProgress };
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
 }
 
 function isCurrentSchema(database: DatabaseSync): boolean {
@@ -95,6 +130,17 @@ function hasAnyProductTable(database: DatabaseSync): boolean {
 }
 
 function migrateLegacySchema(database: DatabaseSync): void {
+  if (tableExists(database, "reviews")) {
+    const activeLegacyReviews = scalarCount(database, `
+      SELECT COUNT(*) AS count FROM reviews WHERE phase != 'terminal'
+    `);
+    if (activeLegacyReviews > 0) {
+      throw new Error(
+        `Local database has ${activeLegacyReviews} active legacy Review(s); ` +
+        "finish or recover them with the previous Runtime before upgrading"
+      );
+    }
+  }
   database.exec("PRAGMA foreign_keys = OFF");
   database.exec("BEGIN IMMEDIATE");
   try {
@@ -102,6 +148,7 @@ function migrateLegacySchema(database: DatabaseSync): void {
       DROP TRIGGER IF EXISTS notice_project_delivery_insert;
       DROP TRIGGER IF EXISTS notice_project_delivery_update;
       DROP TRIGGER IF EXISTS notice_project_destination_update;
+      ${dropChatProjectionObjectsSql()}
     `);
     const renamed = new Map<string, string>();
     for (const table of TARGET_TABLES) {
@@ -113,6 +160,7 @@ function migrateLegacySchema(database: DatabaseSync): void {
     }
     createSchema(database);
     const copiedCurrentShape = copyLegacyData(database, renamed);
+    backfillChatMessages(database);
     verifyLegacyCopy(database, renamed, copiedCurrentShape);
     for (const table of LEGACY_TABLES) {
       if (tableExists(database, table)) database.exec(`DROP TABLE "${table}"`);
@@ -132,6 +180,20 @@ function migrateLegacySchema(database: DatabaseSync): void {
   } finally {
     database.exec("PRAGMA foreign_keys = ON");
   }
+}
+
+function dropChatProjectionObjects(database: DatabaseSync): void {
+  database.exec(dropChatProjectionObjectsSql());
+}
+
+function dropChatProjectionObjectsSql(): string {
+  return `
+    DROP TRIGGER IF EXISTS chat_message_project_event_insert;
+    DROP TRIGGER IF EXISTS chat_message_project_attention_update;
+    DROP TRIGGER IF EXISTS chat_message_project_read_progress_attention;
+    DROP TRIGGER IF EXISTS chat_message_project_read_progress_dispatch;
+    DROP VIEW IF EXISTS chat_message_read_progress_v1;
+  `;
 }
 
 function verifyLegacyCopy(
@@ -266,6 +328,16 @@ function verifyLegacyCopy(
       throw new Error(`Local database migration found Notice state without a projection`);
     }
   }
+  const chatEventCount = scalarCount(database, `
+    SELECT COUNT(*) AS count FROM events WHERE type = 'chat.message'
+  `);
+  const chatProjectionCount = rowCount(database, "chat_messages");
+  if (chatEventCount !== chatProjectionCount) {
+    throw new Error(
+      `Local database migration did not project Chat messages: ` +
+      `${chatEventCount} -> ${chatProjectionCount}`
+    );
+  }
 }
 
 function copyLegacyData(
@@ -300,10 +372,10 @@ function copyLegacyData(
   if (!copiedCurrentShape.has("agent_sessions") && oldSessions !== undefined) {
     database.exec(`
       INSERT INTO agent_sessions (
-        session_id, agent_id, adapter_id, provider_session_id, workspace,
+        session_id, agent_id, run_id, adapter_id, provider_session_id, workspace,
         created_at, updated_at
       )
-      SELECT session_id, agent_id, adapter_id, provider_session_id, workspace,
+      SELECT session_id, agent_id, NULL, adapter_id, provider_session_id, workspace,
         created_at, updated_at
       FROM "${oldSessions}";
     `);
@@ -611,6 +683,55 @@ function copyCurrentShapeData(
   return copied;
 }
 
+function backfillChatMessages(database: DatabaseSync): void {
+  database.exec(`
+    INSERT INTO chat_messages (
+      event_id, topic_id, sender_kind, sender_principal_id,
+      sender_handle_snapshot, body, target_principal_id,
+      target_handle_snapshot, created_at, attention_json,
+      read_progress_json, projected_at
+    )
+    SELECT
+      event.event_id,
+      json_extract(event.payload_json, '$.topicId'),
+      json_extract(event.payload_json, '$.sender.kind'),
+      json_extract(event.payload_json, '$.sender.principalId'),
+      json_extract(event.payload_json, '$.sender.handleSnapshot'),
+      json_extract(event.payload_json, '$.body'),
+      json_extract(event.payload_json, '$.target.principalId'),
+      json_extract(event.payload_json, '$.target.handleSnapshot'),
+      event.created_at,
+      CASE
+        WHEN json_extract(execution.receipt_json, '$.schema') =
+          'ChatAttentionReceiptList@1'
+        THEN execution.receipt_json
+        ELSE NULL
+      END,
+      NULL,
+      COALESCE(execution.updated_at, event.created_at)
+    FROM events AS event
+    LEFT JOIN executions AS execution ON execution.event_id = event.event_id
+    WHERE event.type = 'chat.message'
+    ON CONFLICT(event_id) DO UPDATE SET
+      topic_id = excluded.topic_id,
+      sender_kind = excluded.sender_kind,
+      sender_principal_id = excluded.sender_principal_id,
+      sender_handle_snapshot = excluded.sender_handle_snapshot,
+      body = excluded.body,
+      target_principal_id = excluded.target_principal_id,
+      target_handle_snapshot = excluded.target_handle_snapshot,
+      created_at = excluded.created_at,
+      attention_json = excluded.attention_json,
+      projected_at = excluded.projected_at;
+    UPDATE chat_messages
+    SET read_progress_json = (
+      SELECT progress_json
+      FROM chat_message_read_progress_v1
+      WHERE event_id = chat_messages.event_id
+    );
+  `);
+}
+
 function legacyRowCount(database: DatabaseSync, target: string): number {
   const source = {
     agent_sessions: "sessions",
@@ -733,6 +854,7 @@ function createSchema(database: DatabaseSync): void {
     CREATE TABLE IF NOT EXISTS agent_sessions (
       session_id TEXT PRIMARY KEY,
       agent_id TEXT NOT NULL,
+      run_id TEXT REFERENCES agent_runs(run_id),
       adapter_id TEXT NOT NULL,
       provider_session_id TEXT NOT NULL,
       workspace TEXT NOT NULL,
@@ -740,6 +862,8 @@ function createSchema(database: DatabaseSync): void {
       updated_at TEXT NOT NULL,
       UNIQUE(adapter_id, provider_session_id)
     );
+    CREATE UNIQUE INDEX IF NOT EXISTS agent_sessions_run_agent
+      ON agent_sessions(run_id, agent_id) WHERE run_id IS NOT NULL;
     CREATE TABLE IF NOT EXISTS local_foundation (
       singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
       device_id TEXT NOT NULL UNIQUE,
@@ -771,7 +895,8 @@ function createSchema(database: DatabaseSync): void {
       event_id TEXT PRIMARY KEY,
       type TEXT NOT NULL CHECK(type IN (
         'agent.request', 'subscription.fire', 'agent.result',
-        'review.requested', 'review.decision', 'chat.message', 'chat.dispatch'
+        'review.requested', 'review.decision',
+        'chat.message', 'chat.dispatch'
       )),
       source_kind TEXT NOT NULL CHECK(source_kind IN (
         'cli', 'subscription', 'schedule', 'matrix', 'server', 'handler'
@@ -803,7 +928,8 @@ function createSchema(database: DatabaseSync): void {
           AND error IS NULL AND (payload_json IS NULL OR json_valid(payload_json)))
         OR
         (type = 'agent.result' AND agent_id IS NOT NULL AND prompt IS NULL
-          AND outcome IS NOT NULL AND payload_json IS NULL
+          AND outcome IS NOT NULL
+          AND (payload_json IS NULL OR json_valid(payload_json))
           AND ((outcome = 'succeeded' AND output IS NOT NULL AND error IS NULL)
             OR (outcome = 'failed' AND output IS NULL AND error IS NOT NULL)))
         OR
@@ -833,9 +959,11 @@ function createSchema(database: DatabaseSync): void {
     CREATE TABLE IF NOT EXISTS executions (
       execution_id TEXT PRIMARY KEY,
       event_id TEXT NOT NULL UNIQUE REFERENCES events(event_id),
-      handler TEXT NOT NULL CHECK(handler IN ('agent', 'result', 'review', 'chat')),
+      handler TEXT NOT NULL CHECK(handler IN (
+        'agent', 'result', 'review', 'chat'
+      )),
       status TEXT NOT NULL CHECK(status IN (
-        'queued', 'running', 'retry_wait', 'succeeded', 'failed'
+        'queued', 'running', 'retry_wait', 'succeeded', 'failed', 'cancelled'
       )),
       attempt_count INTEGER NOT NULL CHECK(attempt_count >= 0),
       max_attempts INTEGER NOT NULL CHECK(max_attempts >= 1),
@@ -851,6 +979,212 @@ function createSchema(database: DatabaseSync): void {
     );
     CREATE INDEX IF NOT EXISTS executions_due
       ON executions(status, next_attempt_at);
+    CREATE TABLE IF NOT EXISTS agent_runs (
+      run_id TEXT PRIMARY KEY,
+      root_event_id TEXT NOT NULL UNIQUE REFERENCES events(event_id),
+      owner_request_id TEXT NOT NULL UNIQUE,
+      owner_principal_id TEXT NOT NULL,
+      steward_agent_id TEXT NOT NULL REFERENCES agents(principal_id),
+      mandate_snapshot_json TEXT NOT NULL CHECK(
+        json_valid(mandate_snapshot_json)
+        AND length(mandate_snapshot_json) <= 65536
+      ),
+      workspace_grant_json TEXT CHECK(
+        workspace_grant_json IS NULL OR (
+          json_valid(workspace_grant_json)
+          AND length(workspace_grant_json) <= 16384
+        )
+      ),
+      status TEXT NOT NULL CHECK(status IN (
+        'active', 'waiting', 'succeeded', 'failed', 'needs_human', 'cancelled'
+      )),
+      active_step_id TEXT,
+      active_execution_id TEXT REFERENCES executions(execution_id),
+      step_count INTEGER NOT NULL CHECK(step_count >= 1),
+      max_steps INTEGER NOT NULL CHECK(max_steps BETWEEN 1 AND 1000),
+      max_depth INTEGER NOT NULL CHECK(max_depth BETWEEN 0 AND 100),
+      deadline_at TEXT,
+      terminal_summary TEXT,
+      cancelled_at TEXT,
+      version INTEGER NOT NULL DEFAULT 1 CHECK(version >= 1),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      CHECK(
+        (
+          status IN ('active', 'waiting')
+          AND active_step_id IS NOT NULL
+          AND active_execution_id IS NOT NULL
+          AND terminal_summary IS NULL
+          AND cancelled_at IS NULL
+        )
+        OR
+        (
+          status IN ('succeeded', 'failed', 'needs_human')
+          AND active_step_id IS NULL
+          AND active_execution_id IS NULL
+          AND terminal_summary IS NOT NULL
+          AND cancelled_at IS NULL
+        )
+        OR
+        (
+          status = 'cancelled'
+          AND active_step_id IS NULL
+          AND active_execution_id IS NULL
+          AND terminal_summary IS NOT NULL
+          AND cancelled_at IS NOT NULL
+        )
+      )
+    );
+    CREATE INDEX IF NOT EXISTS agent_runs_status_updated
+      ON agent_runs(status, updated_at DESC, run_id DESC);
+    CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_active_write_workspace
+      ON agent_runs(json_extract(workspace_grant_json, '$.root'))
+      WHERE status IN ('active', 'waiting')
+        AND json_extract(workspace_grant_json, '$.access') = 'write';
+    CREATE TABLE IF NOT EXISTS chat_messages (
+      event_id TEXT PRIMARY KEY REFERENCES events(event_id),
+      topic_id TEXT NOT NULL,
+      sender_kind TEXT NOT NULL CHECK(sender_kind IN ('owner', 'agent', 'system')),
+      sender_principal_id TEXT,
+      sender_handle_snapshot TEXT NOT NULL,
+      body TEXT NOT NULL,
+      target_principal_id TEXT,
+      target_handle_snapshot TEXT,
+      created_at TEXT NOT NULL,
+      attention_json TEXT CHECK(
+        attention_json IS NULL OR (
+          json_valid(attention_json) AND length(attention_json) <= 65536
+        )
+      ),
+      read_progress_json TEXT CHECK(
+        read_progress_json IS NULL OR (
+          json_valid(read_progress_json) AND length(read_progress_json) <= 65536
+        )
+      ),
+      projected_at TEXT NOT NULL,
+      CHECK(
+        (target_principal_id IS NULL AND target_handle_snapshot IS NULL)
+        OR (target_principal_id IS NOT NULL AND target_handle_snapshot IS NOT NULL)
+      )
+    );
+    CREATE INDEX IF NOT EXISTS chat_messages_topic_cursor
+      ON chat_messages(topic_id, created_at DESC, event_id DESC);
+    CREATE TRIGGER IF NOT EXISTS chat_message_project_event_insert
+    AFTER INSERT ON events
+    WHEN NEW.type = 'chat.message'
+    BEGIN
+      INSERT INTO chat_messages (
+        event_id, topic_id, sender_kind, sender_principal_id,
+        sender_handle_snapshot, body, target_principal_id,
+        target_handle_snapshot, created_at, projected_at
+      ) VALUES (
+        NEW.event_id,
+        json_extract(NEW.payload_json, '$.topicId'),
+        json_extract(NEW.payload_json, '$.sender.kind'),
+        json_extract(NEW.payload_json, '$.sender.principalId'),
+        json_extract(NEW.payload_json, '$.sender.handleSnapshot'),
+        json_extract(NEW.payload_json, '$.body'),
+        json_extract(NEW.payload_json, '$.target.principalId'),
+        json_extract(NEW.payload_json, '$.target.handleSnapshot'),
+        NEW.created_at,
+        NEW.created_at
+      )
+      ON CONFLICT(event_id) DO NOTHING;
+    END;
+    CREATE VIEW IF NOT EXISTS chat_message_read_progress_v1 AS
+    SELECT
+      state.event_id,
+      json_object(
+        'schema', 'ChatReadProgress@1',
+        'total', COUNT(*),
+        'read', COALESCE(SUM(CASE WHEN state.read_state = 'read' THEN 1 ELSE 0 END), 0),
+        'agents', json_group_array(json_object(
+          'agentId', state.agent_id,
+          'handleSnapshot', state.handle_snapshot,
+          'state', state.read_state,
+          'reason', state.reason,
+          'failureReason', state.failure_reason
+        ))
+      ) AS progress_json
+    FROM (
+      SELECT
+        message.event_id,
+        CAST(receipt.key AS INTEGER) AS receipt_index,
+        json_extract(receipt.value, '$.agentId') AS agent_id,
+        COALESCE(
+          json_extract(receipt.value, '$.handleSnapshot'),
+          agent.handle,
+          json_extract(receipt.value, '$.agentId')
+        ) AS handle_snapshot,
+        json_extract(receipt.value, '$.reason') AS reason,
+        CASE
+          WHEN dispatch_execution.status = 'failed'
+          THEN dispatch_execution.last_error
+          ELSE NULL
+        END AS failure_reason,
+        CASE
+          WHEN json_extract(receipt.value, '$.outcome') = 'skipped' THEN 'unread'
+          WHEN dispatch_execution.status = 'succeeded' THEN 'read'
+          WHEN dispatch_execution.status = 'failed' THEN 'failed'
+          ELSE 'reading'
+        END AS read_state
+      FROM chat_messages AS message
+      JOIN json_each(message.attention_json, '$.receipts') AS receipt
+      LEFT JOIN agents AS agent
+        ON agent.principal_id = json_extract(receipt.value, '$.agentId')
+      LEFT JOIN executions AS dispatch_execution
+        ON dispatch_execution.event_id =
+          json_extract(receipt.value, '$.dispatchEventId')
+      WHERE json_extract(receipt.value, '$.reason') != 'agent-suspended'
+      ORDER BY message.event_id, CAST(receipt.key AS INTEGER)
+    ) AS state
+    GROUP BY state.event_id;
+    CREATE TRIGGER IF NOT EXISTS chat_message_project_read_progress_attention
+    AFTER UPDATE OF receipt_json ON executions
+    WHEN EXISTS (
+      SELECT 1 FROM events
+      WHERE event_id = NEW.event_id AND type = 'chat.message'
+    )
+    BEGIN
+      UPDATE chat_messages
+      SET attention_json = CASE
+          WHEN json_extract(NEW.receipt_json, '$.schema') =
+            'ChatAttentionReceiptList@1'
+          THEN NEW.receipt_json
+          ELSE attention_json
+        END
+      WHERE event_id = NEW.event_id;
+      UPDATE chat_messages
+      SET read_progress_json = (
+          SELECT progress_json
+          FROM chat_message_read_progress_v1
+          WHERE event_id = NEW.event_id
+        ),
+        projected_at = NEW.updated_at
+      WHERE event_id = NEW.event_id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS chat_message_project_read_progress_dispatch
+    AFTER UPDATE OF status, receipt_json ON executions
+    WHEN EXISTS (
+      SELECT 1 FROM events
+      WHERE event_id = NEW.event_id AND type = 'chat.dispatch'
+    )
+    BEGIN
+      UPDATE chat_messages
+      SET read_progress_json = (
+          SELECT progress_json
+          FROM chat_message_read_progress_v1
+          WHERE event_id = json_extract(
+            (SELECT payload_json FROM events WHERE event_id = NEW.event_id),
+            '$.sourceMessageEventId'
+          )
+        ),
+        projected_at = NEW.updated_at
+      WHERE event_id = json_extract(
+        (SELECT payload_json FROM events WHERE event_id = NEW.event_id),
+        '$.sourceMessageEventId'
+      );
+    END;
     CREATE TABLE IF NOT EXISTS deliveries (
       delivery_id TEXT PRIMARY KEY,
       result_event_id TEXT NOT NULL REFERENCES events(event_id),

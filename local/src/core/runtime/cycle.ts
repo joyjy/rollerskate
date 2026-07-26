@@ -35,14 +35,17 @@ export class RuntimeCycle {
     this.#deliveryHandler = options.deliveryHandler;
   }
 
-  public async run(at = new Date().toISOString()): Promise<RuntimeCycleResult> {
+  public async run(at?: string): Promise<RuntimeCycleResult> {
     const executions: string[] = [];
     const deliveries: string[] = [];
     const failures: RuntimeCycleFailure[] = [];
 
     let remainingExecutions = 100;
     while (remainingExecutions > 0) {
-      const claimed = this.#store.claimDueExecutions(Math.min(20, remainingExecutions), at);
+      const claimed = this.#store.claimDueExecutions(
+        Math.min(20, remainingExecutions),
+        at ?? new Date().toISOString()
+      );
       if (claimed.length === 0) break;
       remainingExecutions -= claimed.length;
       for (const execution of claimed) {
@@ -60,7 +63,11 @@ export class RuntimeCycle {
         } catch (error) {
           const failure = message(error);
           try {
-            this.#store.failExecution(execution.executionId, failure, at);
+            this.#store.failExecution(
+              execution.executionId,
+              failure,
+              at ?? new Date().toISOString()
+            );
           } catch {
             // The handler may already have moved the Execution to a durable terminal state.
           }
@@ -68,14 +75,21 @@ export class RuntimeCycle {
         }
       }
     }
-    for (const delivery of this.#store.claimDueDeliveries(100, at)) {
+    for (const delivery of this.#store.claimDueDeliveries(
+      100,
+      at ?? new Date().toISOString()
+    )) {
       try {
         await this.#deliveryHandler.handle(delivery, at);
         deliveries.push(delivery.deliveryId);
       } catch (error) {
         const failure = message(error);
         try {
-          this.#store.deliveryFailed(delivery.deliveryId, failure, at);
+          this.#store.deliveryFailed(
+            delivery.deliveryId,
+            failure,
+            at ?? new Date().toISOString()
+          );
         } catch {
           // The handler may already have moved the Delivery to a durable terminal state.
         }

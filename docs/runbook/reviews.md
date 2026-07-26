@@ -1,80 +1,108 @@
 ---
 type: Runbook
-title: Local Review Runbook
-description: 使用 CLI 或 Console 检查、追踪和恢复双 Agent acceptance Review。
-tags: [rollerskate, local, review, cli, console, recovery]
-timestamp: 2026-07-24
+title: Local Agent Run And Review Workflow Runbook
+description: 使用 CLI 启动、检查、追踪和取消通用 Agent Run，并通过 review@1 执行审查协作。
+tags: [rollerskate, local, agent-run, steward, review, workflow, cli, console]
+timestamp: 2026-07-26
 ---
 
-# Local Review Runbook
+# Local Agent Run And Review Workflow Runbook
 
-Local Review 不依赖 Server 或 Matrix。开始前保持前台 Runtime 可运行，并在同一个 Local workspace 中准备 Git repo、acceptance subject、Reviewer 与 Implementer；Console 是同一 application query/control 的视觉入口，不拥有第二套状态机。
+Agent Run 不依赖 Server 或 Matrix。Owner 选择一个 active Local Agent 作为本 Run 的 Steward；Steward 是临时角色，不是 Agent 类型。Runtime 为每个参与 Agent 建立 Run 专属 Session，并在 child terminal 后恢复准确的 caller Session。
 
 ## 1. 准备 Agent
 
 ```bash
-scripts/rs agent create reviewer --client codex
-scripts/rs agent create implementer --client claude-code
+scripts/rs agent create steward --client codex
+scripts/rs agent create reviewer --client claude-code
+scripts/rs agent create implementer --client kimi-code
 ```
 
-两个 role 必须是不同 Local Agent；client 可以相同。Reviewer 只获得 read profile，Implementer 只获得 Local workspace 的 write profile。Codex 与 Claude Code 可以承担这两个 role；受信任本机上的 Kimi Code 只可承担 Implementer，不能承担 Reviewer。Kimi prompt mode 使用自身 auto permission，当前支持边界是功能可用，不代表与 Codex `workspace-write` 等价的进程级 sandbox。
+Agent Run 不固定 Reviewer/Implementer 名单，也不限制某种 client 只能承担某种角色。Steward 或 workflow 可以顺序委派任意 active Local Agent；每轮最多一个 child，首版没有 fan-out/join。
 
-## 2. 创建 request 文件
+## 2. 创建 Run 文件
+
+内联 objective：
 
 ```json
 {
   "schemaVersion": 1,
-  "subject": "/absolute/runtime/workspace/plan.md",
-  "reviewer": "reviewer",
-  "implementer": "implementer",
-  "reworkLimit": 2
+  "steward": "steward",
+  "objective": "检查当前实现是否满足计划，并给出可验证结论。",
+  "workspace": {
+    "root": "/absolute/path/to/git-worktree",
+    "access": "read"
+  },
+  "maxSteps": 12,
+  "maxDepth": 4,
+  "deadlineAt": "2030-07-26T18:00:00+08:00"
 }
 ```
 
-- `subject` 必须是 Local workspace 内的真实文件；首版固定为 acceptance subject。
-- workspace 必须是 Git repo。Runtime 自动计算 subject、workspace 和 implementation revision，用户不手填 hash。
-- `reworkLimit` 是 0–20 的语义返修上限，与单次 provider retry 无关。
+使用 `review@1`：
 
-## 3. 创建并运行
+```json
+{
+  "schemaVersion": 1,
+  "steward": "steward",
+  "workflowRef": "review@1",
+  "inputs": {
+    "plan": "/absolute/path/to/plan.md",
+    "acceptance": "验证实现、测试和边界"
+  },
+  "workspace": {
+    "root": "/absolute/path/to/git-worktree",
+    "access": "write"
+  }
+}
+```
+
+`objective` 与 `workflowRef` 必须二选一；`inputs` 只与 workflow 一起使用。`workspace` 可省略；提供时 root 必须是绝对、真实、Git-backed directory。Runtime 在 admission 固定 canonical root、`read | write` 与 Git revision，Agent output 不能扩大权限。相同 root 可以并发多个 read Run，但同时最多一个 non-terminal write Run。
+
+## 3. 启动与推进
 
 ```bash
-scripts/rs review create /absolute/path/to/review.json --request-id release-acceptance-1
+scripts/rs run start /absolute/path/to/run.json --request-id acceptance-1
 scripts/rs start --no-open
 ```
 
-`request-id` 是本地幂等键；相同键重复 create 返回原 root Event，不建立第二条链。Runtime 首次处理 request 时创建 `<subject>.review.yaml`，之后由 Capability 原子维护。
+`request-id` 是本地幂等键；相同键重复 start 返回原 Run。每个 turn 必须返回一个 `AgentTurnResult@1`：
 
-Implementer 可以修改 workspace，但不能编辑 sidecar。Reviewer 复核通过、明确 blocked 或达到 rework limit 后，chain 进入 terminal。
+- `complete`：以 `succeeded | failed | needs_human` 完成当前 step；
+- `delegate`：指定一个 child Agent，并给出 bounded objective 或 workflow invocation。
 
-同一 workspace 首版一次只允许一条 active Review；terminal 后才能创建下一条，避免两条链互相改变 implementation revision。
+Agent 不填写 callback target。Runtime 从 caller 的 Run Session 固定 callback binding；child provider retry 不 callback，child terminal 后只恢复一次 caller。A → B → C 会形成 durable async call stack，B 的完成先回 B 的 caller，再由 B 决定如何回 A。
 
-## 4. 查看与追踪
+## 4. 查询与取消
 
 ```bash
-scripts/rs review list
-scripts/rs review list --limit 20
-scripts/rs review inspect <root-event-id>
-scripts/rs review trace <root-event-id>
+scripts/rs run list
+scripts/rs run list --limit 20
+scripts/rs run inspect <run-id>
+scripts/rs run trace <run-id>
+scripts/rs run cancel <run-id>
 ```
 
-`inspect` 与 `trace` 当前返回同一完整 JSON：`summary`、当前 workspace revision、MRSF artifact 和按 causality 排序的规范化 Event/Execution/Session audit。常用终态字段是 `summary.terminalDecision` 与 `summary.terminalReason`；可执行恢复以 `summary.availableActions.recover` 为准。
+`inspect` 与 `trace` 返回同一 application detail：Run summary/projection、participants、Run Sessions、delegate/callback exchanges、directional counts、完整 Event trace，以及 external workspace 当前 revision。Runtime Console 显示最近一条 Agent Run，并可取消 `active | waiting` Run。
 
-打开 `http://localhost:4300/console/reviews` 可以查看同一 list/detail。blocked Review 会显示稳定 `failure:review:<root-event-id>`，可下钻 Runtime Failure；Runtime Failure 的 Inspect trace 会返回同一个 Review。
+`cancel` 幂等地停止尚未开始的 work、retry、delegate、child 和 callback admission；不会强杀已经运行的 provider process。late result 只保留审计，不能恢复 cancelled Run。
 
-## 5. 恢复
-
-先停止前台 loop，再恢复 interrupted Runtime work：
+Crash recovery 使用通用 Runtime 入口：
 
 ```bash
 scripts/rs recover
-scripts/rs review recover <root-event-id>
 scripts/rs start --no-open
 ```
 
-`review recover` 不 replay 或跳过 decision。expected Execution 仍 queued/retry-wait 时保持原链；failed 或与 projection 不一致时终止为 blocked，等待人处理 subject/workspace 后新建 Review。
+Run continuation、child/callback admission 与 Result Execution completion在同一 SQLite transaction 中提交；duplicate result、ResultHandler retry 或 restart 不能建立第二个后继。
 
-## 限制
+## 5. Legacy Review
 
-- 当前没有 cancel、force-pass、换 Agent、提高既有 rework limit、自动 commit/push/MR 或 Server trigger。
-- sidecar 是 JSON-compatible YAML；只能通过 Capability 更新。
-- Review 只授权 Local workspace；repo 外文件、ignored secrets 和 symlink-untracked 内容不能作为自动 acceptance evidence。
+schema v43 及更早的 terminal Review history 只保留在 `/console/reviews` 与 loopback read API 中。legacy `review`/`steward` CLI 和全部 mutation 已移除；新审查使用 `scripts/rs run start` + `review@1`。
+
+## 当前限制
+
+- 一轮只允许一个 child；没有 fan-out、join 或 Chat 自动升级为 Run。
+- external workspace 是显式 Owner grant，不是 Chat sandbox；多个 workspace 或自动 worktree provisioning 尚未实现。
+- workflow 是源码内 versioned resource，不是用户可安装的任意 Workflow DSL。
+- Run 不自动 commit、push、创建 MR 或扩大 filesystem/network/process 权限。

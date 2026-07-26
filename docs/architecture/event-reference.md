@@ -3,7 +3,7 @@ type: Reference
 title: Rollerskate Event Reference
 description: Local canonical Event、Runtime object 与 Server/Matrix EventEnvelope 的完整当前清单和边界。
 tags: [rollerskate, event, runtime, chat, topic, room, server, matrix]
-timestamp: 2026-07-25
+timestamp: 2026-07-26
 ---
 
 # Rollerskate Event Reference
@@ -28,7 +28,7 @@ Event type、Runtime work object、Capability object 与产品 read model 不属
 
 | 对象 | 分类 | 持久化与可变性 | Owner | 与 Event 的关系 |
 |---|---|---|---|---|
-| `agent.request`、`subscription.fire`、`agent.result`、`review.requested`、`review.decision`、`chat.message`、`chat.dispatch` | Local canonical Event | `events` 表中的 immutable fact | `core/event` | 因果链的稳定节点，通过固定 Route 驱动后续处理 |
+| `agent.request`、`subscription.fire`、`agent.result`、`review.requested`、`review.decision`、`chat.message`、`chat.dispatch` | Local canonical Event | `events` 表中的 immutable fact | `core/event` | 因果链的稳定节点；当前新工作由除 legacy Review 两种类型外的固定 Route 驱动 |
 | Runtime structured log event | 运行日志 | stdout/log sink，不进入 `events` 表 | `core/loop`、`bootstrap/runtime` | 描述运行过程，不参与 canonical Event route |
 | Server/Matrix `EventEnvelope` | 远端 transport envelope | Server Room history | `packages/protocol`、Server event module | 可被 Local ingress 投影成新的 Local Event，但不是同一对象 |
 | `RuntimeExecution` | Runtime work index | `executions` 表中的 mutable lifecycle | `core/runtime` | 每个 routed Event 对应一次 Handler work；记录 claim、retry 与终态 |
@@ -37,8 +37,10 @@ Event type、Runtime work object、Capability object 与产品 read model 不属
 | `RuntimeDelivery` | Runtime work index | `deliveries` 表中的 mutable lifecycle和 immutable Destination snapshot | `core/runtime` | `agent.result` 按 Event snapshot 建立 Delivery；Loop 驱动投递与重试 |
 | `RuntimeRoute`、Handler | 静态规则与行为组件 | 源码固定，不是业务数据 | `core/runtime`、application/Capability handler | 把 Event type 映射到唯一 Handler |
 | Loop、Cycle | Runtime orchestrator | 只有进程生命周期状态 | `core/loop` | 驱动 Execution、Delivery 与第一方 Capability，不是 Event 或 index object |
-| Subscription、Schedule、ScheduledRun、ReviewChainProjection | Capability domain/work/projection object | 各 Capability 的 durable mutable state | `capabilities/*` | 可产生或消费固定 Event，但不加入全局 Event type 列表 |
+| Subscription、Schedule、ScheduledRun、legacy Review projection | Capability domain/work/projection object | 各 Capability 的 durable mutable state | `capabilities/*` | 可产生或消费固定 Event，但不加入全局 Event type 列表 |
+| AgentRun | application/runtime coordination object | `agent_runs` 的 durable lifecycle；transcript 留在 Event/Execution | `application/agent-run` | 以 generic `agent.request/result` 和 completion callback 推进，不增加 Run 专用 Event type |
 | ChatPresence、attention receipt、decision receipt | Chat policy/index object | Presence 在 `chat_presence`；两个 receipt 使用对应 `executions.receipt_json` 的 versioned schema | `core/chat`、`core/runtime` | 由 `chat.message`/`chat.dispatch` 处理更新，不是 Chat Event |
+| ChatMessage projection、read progress | Application projection | `chat_messages` 可从 Event、attention receipt 与 dispatch Execution 完整重建 | `application/chat`、`infrastructure/sqlite/chat-store` | 不拥有 message content 或用户 read cursor；只解释 Agent processing progress |
 | RuntimeAudit、Console view | Application read model | 查询时组装，不是独立 canonical fact | `application/*/query` | 只读取 Event 和 Runtime/Capability object，不参与 route |
 | Notice projection、Notice state | Application projection + authoritative user state | `notices` 的 derived columns 可重建；read/ack columns 不可从 Event 重建 | `application/notice`、`infrastructure/sqlite/notice-store` | 从 `agent.result` 与 Delivery snapshot 投影，通过稳定 reference 与 Runtime Failure/Subscription/Event 互相下钻，不参与 route |
 
@@ -46,11 +48,11 @@ Event type、Runtime work object、Capability object 与产品 read model 不属
 
 | Canonical Event type | Route | 主要派生或更新的对象 |
 |---|---|---|
-| `agent.request` | AgentHandler | Execution、Session，最终产生子 `agent.result` |
+| `agent.request` | AgentHandler | Execution、Session，最终产生子 `agent.result`；带 run context 时属于一个 Agent Run step |
 | `subscription.fire` | AgentHandler | Execution、Session，最终产生子 `agent.result` |
-| `agent.result` | ResultHandler | Execution；按 `destinationIds` 建立 Delivery |
-| `review.requested` | ReviewHandler | Execution、ReviewChainProjection、Reviewer `agent.request` |
-| `review.decision` | ReviewHandler | Execution、ReviewChainProjection，可产生 Implementer `agent.request` 或下一轮 `review.requested` |
+| `agent.result` | ResultHandler | Execution；按 `destinationIds` 建立 Delivery；按 generic run context 建立唯一 delegate/callback 或 terminal Run state |
+| `review.requested` | legacy Review route（新 Runtime 不注册 Handler） | 只保留既有 terminal Review Event trace；不再 admission 新工作 |
+| `review.decision` | legacy Review route（新 Runtime 不注册 Handler） | 只保留既有 terminal Review Event trace；不再 admission 新工作 |
 | `chat.message` | ChatHandler | Execution、attention receipt，可产生零个或多个 `chat.dispatch` |
 | `chat.dispatch` | AgentHandler | Execution、Session、decision receipt，可产生 Agent `chat.message` |
 
@@ -82,13 +84,14 @@ Notice 不是 Event type。`application/notice` 通过 `notices` 读取由 `agen
 
 ## `agent.request`
 
-向一个 Agent 发起传统的一次请求。
+向一个 Agent 发起一次请求。普通 CLI/Schedule/Subscription request 可以独立存在；Agent Run step 复用同一 Event type。
 
-- 特有字段：`agentId`、`prompt`，可选 `sessionId`。
-- Review 生成的 request 还带固定 `reviewInvocation`：role、root/cycle、subject/artifact/evidence revision、workspace access 与 result schema。该字段不能由普通 CLI request 自由提交。
+- 特有字段：`agentId`、`prompt`，可选 `sessionId` 与 host-owned `runContext`。
+- `AgentRunContext@1` 只包含通用协调信息：`runId`、`stepId`、可选 `parentStepId`、`AgentTurnResult@1` contract、effective workspace grant snapshot，以及可选 immutable completion callback binding。它不包含 workflow、Reviewer/Implementer 或其他领域字段。
+- callback request 还携带 bounded `AgentStepCompletion@1`，记录 child request/result/Execution、terminal outcome、summary、artifact references 与 observed workspace revision；它恢复 admission 时固定的 caller Session。
 - 当前生产者：`scripts/rs agent request`、Local Scheduled Task。旧 Matrix ingress binding 已随 schema v43 cutover 移除；v0.4 transport ingress 通过 Server-assigned canonical Event 进入。
 - Route：`AgentHandler`。
-- 成功结果：创建子 `agent.result`，包含 output 和 Session。
+- 成功结果：创建子 `agent.result`，包含不透明 output 和 Session；存在 result contract 时由注册 continuation 后续校验。
 - 最终失败：创建失败的子 `agent.result`。
 - 外部投递：输入携带的 `destinationIds` 复制到 `agent.result`，再由 ResultHandler 建立 Delivery。
 
@@ -108,33 +111,31 @@ Poll Subscription 得到 terminal observation 后发起固定 callback。
 
 ## `agent.result`
 
-传统 Agent input 的 typed 执行结果。
+Agent input 的 typed terminal result。
 
-- 特有字段：`agentId`、`outcome`；成功时有 `output`，失败时有 `error`，可带 `sessionId`。
+- 特有字段：`agentId`、`outcome`；成功时有不透明 `output`，失败时有 `error`，可带 `sessionId`。Core 不把 Agent Run 的 `AgentTurnResult@1` 解析结果复制到 Event payload。
 - `source.kind`：`handler`。
 - Parent：对应的 `agent.request` 或 `subscription.fire`。
 - Route：`ResultHandler`。
-- 作用：根据 `destinationIds` 建立零个或多个 Delivery。Matrix 默认最多重试五次；macOS notification 只尝试一次，失败不修改 `agent.result`。
+- 作用：根据 `destinationIds` 建立零个或多个 Delivery。存在 run context 时，generic ResultHandler 根据 `resultContractId` 路由唯一 continuation；Agent Run continuation 解析 `complete | delegate`、原子更新 `agent_runs`，并建立最多一个 child request 或 callback。Core 和 ResultHandler 都不解释 workflow-specific output。Matrix 默认最多重试五次；macOS notification 只尝试一次，失败不修改 `agent.result`。
 
 `agent.result` 不承载 Local Chat 的 Agent 回复。程序已明确接管的 Chat outcome 直接写成 `chat.message`；silent 或最终失败只保留 Execution/audit fact。
 
 ## `review.requested`
 
-请求 Reviewer 针对一个固定 acceptance subject 与 workspace evidence 执行检查。
+legacy Review 请求 Event。schema v44 保留其完整历史读取和 typed parser，但新 Runtime 不注册 ReviewHandler，CLI/Console 也不再提供 create/recover。
 
 - 特有字段：`cycleIndex`、subject ref/revision、artifact ref/可选 revision、evidence、implementation revision、Reviewer/Implementer Agent ID 与 rework limit。
 - 首次 `source.kind` 为 `cli`；返修后的下一轮为 `handler`。
-- Route：固定 ReviewHandler。
-- 作用：验证 subject/artifact/workspace revision 与两个 adapter 的 result/authority 能力，再事务性建立 Reviewer `agent.request`。
+- Route：静态 registry 仍保留 `review` handler kind 以解释历史；active Runtime assembly 不注册可写 Handler。
 
 ## `review.decision`
 
-Reviewer 结构化 result 经 Capability 校验和 MRSF mutation 后形成的固定 decision。
+legacy Reviewer 结构化 decision Event；只用于既有 terminal chain 的 inspection/trace。
 
 - 特有字段：cycle、对应 request/result Event、`passed | findings | blocked`、bounded summary、实际读取的 revisions、artifact revision、open finding count 与可选 blocked reason。
 - `source.kind`：`handler`。
-- Route：固定 ReviewHandler。
-- `passed` 或 `blocked` 终止 projection；`findings` 在 rework limit 内事务性建立 Implementer `agent.request`，否则终止为 blocked。
+- Route：新 Runtime 不处理；既有 payload 保持可读。
 
 ## `chat.message`
 
@@ -148,6 +149,8 @@ Reviewer 结构化 result 经 Capability 校验和 MRSF mutation 后形成的固
 - Agent message 可带 `agentId` 与 `sessionId`，并以对应 `chat.dispatch` 为 Parent。
 
 每条新的 Owner 或 Agent message 都创建一个 `ChatHandler` Execution。ChatHandler 对全部 Local Agent 应用 target、sender、lifecycle status 和 Topic/Global presence，原子写入每个 Agent 的 attention receipt，并为 dispatched Agent 建立 `chat.dispatch`。明确 `@handle` 在 admission 时解析为稳定 target snapshot；未指定 target 时不会要求 Owner 单选，available Agent 各自决定是否发言。
+
+`chat_messages` 只是上述 Event 与 Execution 的 rebuildable application projection。Owner message 上的 read progress 表示对应 Agent Execution 是否成功处理，不是 Human/Agent 用户 read cursor；完整 authority 和 rebuild 规则见 [Database Reference](./db-reference.md)。
 
 ## `chat.dispatch`
 
@@ -183,6 +186,18 @@ review.requested
   -> review.decision
   -> Implementer agent.request -> agent.result -> next review.requested
   -> review.decision passed | blocked
+```
+
+该链只解释 schema v43 及更早历史；schema v44 的新审查走通用 Agent Run：
+
+```text
+run start -> Steward agent.request [runId, stepId]
+  -> agent.result [AgentTurnResult@1]
+       complete -> succeeded | failed | needs_human
+       delegate -> one child agent.request
+         -> child agent.result
+         -> AgentStepCompletion@1 callback agent.request to caller Session
+         -> next complete or single delegate
 ```
 
 Local Chat：
@@ -255,13 +270,13 @@ Server `EventEnvelope.type` 当前没有封闭的 Rollerskate 产品类型注册
 - `subscription.probe`：用户 Plugin strategy slot kind。
 - `reply`、`silent`、`request_history`、`compact`：Agent/Room action contract。
 - `thread.started`、`item.completed`、`turn.completed`：provider adapter 读取的外部进程 JSONL record。
-- Execution、Session、Destination snapshot、Delivery、Subscription、Schedule、ScheduledRun、Review aggregate、MRSF artifact 与 Agent lifecycle status：独立 durable object/state，不是 Event type。
+- Execution、Session、Destination snapshot、Delivery、Subscription、Schedule、ScheduledRun、AgentRun、legacy Review aggregate、ChatMessage projection、workflow/artifact 与 Agent lifecycle status：独立 durable object/state，不是 Event type。
 
 ## 查看与变更
 
-- Events UI：查看七种 Local canonical Event 及其 Execution、Result、Session、Delivery 和因果关系；v0.3.5 只扩展既有 schema/filter，没有新增 Review 页面或 mutation。
+- Events UI：查看七种 Local canonical Event 及其 Execution、Result、Session、Delivery 和因果关系。
 - Runtime UI：查看 loop health、workload 与 isolation；structured log 当前输出到 loop stdout，不代替 Event history。
-- Chats UI：只投影 `Local` 的 `chat.message` 与 `chat.dispatch`。
-- CLI：`scripts/rs trace <event-id>` 查看一个 canonical Event 的审计链；`scripts/rs schedule trace <run-id>` 从 ScheduledRun 查看同一 audit；`scripts/rs review trace <root-event-id>` 查看完整 Review chain；完整命令见 [CLI Command Reference](../runbook/cli-reference.md)。
+- Chats UI：只显示 `chat.message`；`chat.dispatch` 留在 Event trace，并以 Owner message 上的 Agent processing progress ring 表达 read/reading/unread/failed。
+- CLI：`scripts/rs trace <event-id>` 查看一个 canonical Event 的审计链；`scripts/rs schedule trace <run-id>` 从 ScheduledRun 查看同一 audit；`scripts/rs run trace <run-id>` 查看完整 Agent request/result/callback chain。legacy Review history 只保留在 Console/loopback read API；完整命令见 [CLI Command Reference](../runbook/cli-reference.md)。
 
 新增 canonical Event type 时，必须同时修改 Event model、SQLite constraint、唯一 Route、Handler/typed outcome、UI type、测试与本文。新增 Runtime log event 不得混入 canonical Event type registry。

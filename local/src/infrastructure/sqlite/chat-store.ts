@@ -7,8 +7,10 @@ import {
   type ChatMessageEvent
 } from "../../core/event/model.js";
 import { chatPromptResourceId } from "../../core/chat/model.js";
+import type { ChatAttentionReason } from "../../core/chat/state-machine.js";
 import { runtimeId } from "../../core/runtime/model.js";
 import { openRuntimeDatabase } from "./database.js";
+import { rebuildChatMessageProjection } from "./local-schema.js";
 
 export interface ChatAgentChoice {
   readonly principalId: string;
@@ -28,6 +30,19 @@ export interface ChatMessagePage {
   readonly items: readonly ChatMessageEvent[];
   readonly hasEarlier: boolean;
   readonly beforeEventId?: string;
+}
+
+export interface ChatReadProgress {
+  readonly schema: "ChatReadProgress@1";
+  readonly total: number;
+  readonly read: number;
+  readonly agents: readonly {
+    readonly agentId: string;
+    readonly handleSnapshot: string;
+    readonly state: "unread" | "reading" | "read" | "failed";
+    readonly reason: ChatAttentionReason;
+    readonly failureReason?: string;
+  }[];
 }
 
 export class LocalChatStore {
@@ -207,10 +222,9 @@ export class LocalChatStore {
       ? undefined
       : this.#database.prepare(`
           SELECT event_id, created_at
-          FROM events
+          FROM chat_messages
           WHERE event_id = ?
-            AND type = 'chat.message'
-            AND json_extract(payload_json, '$.topicId') = ?
+            AND topic_id = ?
         `).get(options.beforeEventId, topicId) as {
           event_id: string;
           created_at: string;
@@ -220,9 +234,8 @@ export class LocalChatStore {
     }
     const rows = this.#database.prepare(`
       SELECT event_id
-      FROM events
-      WHERE type = 'chat.message'
-        AND json_extract(payload_json, '$.topicId') = ?
+      FROM chat_messages
+      WHERE topic_id = ?
         ${before === undefined
           ? ""
           : "AND (created_at < ? OR (created_at = ? AND event_id < ?))"}
@@ -246,6 +259,36 @@ export class LocalChatStore {
         ? { beforeEventId: items[0].eventId }
         : {})
     };
+  }
+
+  public readProgressForMessages(
+    eventIds: readonly string[]
+  ): ReadonlyMap<string, ChatReadProgress> {
+    if (eventIds.length === 0) return new Map();
+    if (eventIds.length > 200) {
+      throw new Error("Chat read progress query accepts at most 200 messages");
+    }
+    const placeholders = eventIds.map(() => "?").join(", ");
+    const rows = this.#database.prepare(`
+      SELECT event_id, read_progress_json
+      FROM chat_messages
+      WHERE event_id IN (${placeholders})
+        AND read_progress_json IS NOT NULL
+    `).all(...eventIds) as unknown as Array<{
+      event_id: string;
+      read_progress_json: string;
+    }>;
+    return new Map(rows.map((row) => [
+      row.event_id,
+      parseReadProgress(row.read_progress_json, row.event_id)
+    ]));
+  }
+
+  public rebuildProjection(): {
+    readonly messages: number;
+    readonly withReadProgress: number;
+  } {
+    return rebuildChatMessageProjection(this.#database);
   }
 
   public newSession(principalId: string, at = new Date().toISOString()): number {
@@ -534,4 +577,61 @@ function bounded(value: number, minimum: number, maximum: number): number {
 
 function isUniqueConstraint(error: unknown): boolean {
   return error instanceof Error && /UNIQUE constraint failed/.test(error.message);
+}
+
+function parseReadProgress(value: string, eventId: string): ChatReadProgress {
+  const parsed: unknown = JSON.parse(value);
+  if (!isRecord(parsed) || parsed.schema !== "ChatReadProgress@1" ||
+    !Number.isInteger(parsed.total) || (parsed.total as number) < 0 ||
+    !Number.isInteger(parsed.read) || (parsed.read as number) < 0 ||
+    (parsed.read as number) > (parsed.total as number) ||
+    !Array.isArray(parsed.agents) ||
+    parsed.agents.length !== parsed.total) {
+    throw new Error(`Chat read progress is malformed: ${eventId}`);
+  }
+  const agents = parsed.agents.map((agent) => {
+    if (!isRecord(agent) ||
+      typeof agent.agentId !== "string" || agent.agentId.trim() === "" ||
+      typeof agent.handleSnapshot !== "string" || agent.handleSnapshot.trim() === "" ||
+      (agent.state !== "unread" && agent.state !== "reading" &&
+        agent.state !== "read" && agent.state !== "failed") ||
+      !isAttentionReason(agent.reason)) {
+      throw new Error(`Chat read progress Agent is malformed: ${eventId}`);
+    }
+    const state = agent.state as ChatReadProgress["agents"][number]["state"];
+    return {
+      agentId: agent.agentId,
+      handleSnapshot: agent.handleSnapshot,
+      state,
+      reason: agent.reason,
+      ...(typeof agent.failureReason === "string" && agent.failureReason.trim() !== ""
+        ? { failureReason: agent.failureReason }
+        : {})
+    };
+  });
+  if (agents.filter((agent) => agent.state === "read").length !== parsed.read) {
+    throw new Error(`Chat read progress count is inconsistent: ${eventId}`);
+  }
+  return {
+    schema: "ChatReadProgress@1",
+    total: parsed.total as number,
+    read: parsed.read as number,
+    agents
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isAttentionReason(value: unknown): value is ChatAttentionReason {
+  return value === "available" ||
+    value === "direct-mention" ||
+    value === "global-wake-keyword" ||
+    value === "topic-wake-keyword" ||
+    value === "sender" ||
+    value === "not-target" ||
+    value === "agent-suspended" ||
+    value === "global-snoozed" ||
+    value === "topic-snoozed";
 }

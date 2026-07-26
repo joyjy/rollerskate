@@ -353,6 +353,42 @@ export const localChatViewSchema = v.object({
   }),
   agents: v.array(localAgentSchema),
   events: v.array(runtimeEventSchema),
+  messages: v.object({
+    topicId: v.string(),
+    items: v.array(v.object({
+      eventId: v.string(),
+      createdAt: v.string(),
+      sender: v.object({
+        kind: v.union([v.literal("owner"), v.literal("agent"), v.literal("system")]),
+        principalId: optionalString,
+        handleSnapshot: v.string()
+      }),
+      body: v.string(),
+      target: v.optional(v.object({
+        principalId: v.string(),
+        handleSnapshot: v.string()
+      })),
+      readProgress: v.optional(v.object({
+        schema: v.literal("ChatReadProgress@1"),
+        total: v.number(),
+        read: v.number(),
+        agents: v.array(v.object({
+          agentId: v.string(),
+          handleSnapshot: v.string(),
+          state: v.union([
+            v.literal("unread"),
+            v.literal("reading"),
+            v.literal("read"),
+            v.literal("failed")
+          ]),
+          reason: v.string(),
+          failureReason: optionalString
+        }))
+      }))
+    })),
+    hasEarlier: v.boolean(),
+    beforeEventId: optionalString
+  }),
   sessions: v.array(v.object({
     principalId: v.string(),
     currentSessionId: optionalString,
@@ -369,6 +405,98 @@ export const localChatPresenceViewSchema = v.object({
     global: v.optional(chatPresenceSchema),
     topic: v.optional(chatPresenceSchema)
   }))
+});
+
+const agentRunAgentReferenceSchema = v.object({
+  principalId: v.string(),
+  handle: v.string(),
+  client: v.union([
+    v.literal("codex"),
+    v.literal("claude-code"),
+    v.literal("kimi-code")
+  ]),
+  status: v.union([v.literal("active"), v.literal("suspended")])
+});
+
+const agentRunStatusSchema = v.union([
+  v.literal("active"),
+  v.literal("waiting"),
+  v.literal("succeeded"),
+  v.literal("failed"),
+  v.literal("needs_human"),
+  v.literal("cancelled")
+]);
+
+export const latestAgentRunViewSchema = v.nullable(v.object({
+  summary: v.object({
+    runId: v.string(),
+    rootEventId: v.string(),
+    mandate: v.object({
+      kind: v.union([v.literal("objective"), v.literal("workflow")]),
+      label: v.string(),
+      workflowRef: nullableString
+    }),
+    steward: agentRunAgentReferenceSchema,
+    workspace: v.nullable(v.object({
+      root: v.string(),
+      access: v.union([v.literal("read"), v.literal("write")]),
+      admittedRevision: v.string()
+    })),
+    progress: v.object({
+      steps: v.number(),
+      maxSteps: v.number(),
+      maxDepth: v.number()
+    }),
+    status: agentRunStatusSchema,
+    terminalSummary: nullableString,
+    updatedAt: v.string()
+  }),
+  projection: v.looseObject({
+    runId: v.string(),
+    status: agentRunStatusSchema,
+    activeStepId: optionalString,
+    stepCount: v.number(),
+    maxSteps: v.number(),
+    maxDepth: v.number()
+  }),
+  participants: v.array(agentRunAgentReferenceSchema),
+  sessions: v.array(v.looseObject({
+    sessionId: v.string(),
+    agentId: v.string(),
+    runId: optionalString,
+    adapterId: v.string(),
+    providerSessionId: v.string(),
+    workspace: v.string(),
+    createdAt: v.string(),
+    updatedAt: v.string()
+  })),
+  exchanges: v.array(v.object({
+    fromAgentId: v.string(),
+    toAgentId: v.string(),
+    kind: v.union([v.literal("delegate"), v.literal("callback")]),
+    requestEventId: v.string(),
+    stepId: v.string(),
+    createdAt: v.string()
+  })),
+  exchangeCounts: v.array(v.object({
+    fromAgentId: v.string(),
+    toAgentId: v.string(),
+    delegates: v.number(),
+    callbacks: v.number(),
+    total: v.number()
+  })),
+  timeline: v.array(v.unknown()),
+  currentWorkspaceRevision: v.nullable(v.unknown()),
+  workspaceRevisionError: nullableString,
+}));
+
+export const cancelAgentRunReceiptSchema = v.looseObject({
+  status: v.union([v.literal("cancelled"), v.literal("already_terminal")]),
+  cancelledExecutions: v.number(),
+  run: v.looseObject({
+    runId: v.string(),
+    status: agentRunStatusSchema
+  })
 });
 
 export const subscriptionSchema = v.object({
@@ -712,6 +840,7 @@ export type RuntimeInfoOutput = v.InferOutput<typeof runtimeInfoSchema>;
 export type RuntimeAuditOutput = v.InferOutput<typeof runtimeAuditSchema>;
 export type LocalSnapshotOutput = v.InferOutput<typeof localSnapshotSchema>;
 export type LocalChatViewOutput = v.InferOutput<typeof localChatViewSchema>;
+export type LatestAgentRunViewOutput = v.InferOutput<typeof latestAgentRunViewSchema>;
 export type AgentConsoleItemOutput = v.InferOutput<typeof agentConsoleItemSchema>;
 export type SubscriptionOutput = v.InferOutput<typeof subscriptionSchema>;
 export type ReviewSummaryViewOutput = v.InferOutput<typeof reviewSummaryViewSchema>;

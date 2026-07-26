@@ -116,16 +116,27 @@ export interface RuntimeAudit {
 
 export class RuntimeStore {
   readonly #database: DatabaseSync;
+  readonly #ownsDatabase: boolean;
   readonly #destinationCache = new Map<string, RuntimeDestination>();
 
-  public constructor(databasePath: string) {
-    const absolutePath = resolve(databasePath);
-    mkdirSync(dirname(absolutePath), { recursive: true });
-    this.#database = openRuntimeDatabase(absolutePath);
+  public constructor(database: string | DatabaseSync) {
+    if (typeof database === "string") {
+      const absolutePath = resolve(database);
+      mkdirSync(dirname(absolutePath), { recursive: true });
+      this.#database = openRuntimeDatabase(absolutePath);
+      this.#ownsDatabase = true;
+    } else {
+      this.#database = database;
+      this.#ownsDatabase = false;
+    }
     migrateRuntimeDatabase(this.#database);
   }
 
   public appendEvent(input: CreateEvent): AppendRuntimeEventReceipt {
+    return this.withImmediateTransaction(() => this.appendEventInTransaction(input));
+  }
+
+  public appendEventInTransaction(input: CreateEvent): AppendRuntimeEventReceipt {
     validateCreateEvent(input);
     const createdAt = iso(input.createdAt ?? new Date().toISOString());
     const maxAttempts = bounded(input.maxAttempts ?? 3, 1, 20, "maxAttempts");
@@ -153,42 +164,45 @@ export class RuntimeStore {
       requireRuntimeId(rootEventId, "evt", "parent.rootEventId");
     }
 
+    if (input.source.externalId !== undefined) {
+      const existing = this.#database.prepare(`
+        SELECT event_id FROM events WHERE source_kind = ? AND source_external_id = ?
+      `).get(input.source.kind, input.source.externalId) as { event_id: string } | undefined;
+      if (existing !== undefined) {
+        return this.#receipt(existing.event_id, "duplicate");
+      }
+    }
+    const payload = input.runContext ?? input.reviewInvocation;
+    this.#database.prepare(`
+      INSERT INTO events (
+        event_id, type, source_kind, source_external_id, agent_id, prompt,
+        outcome, output, error, payload_json, session_id, destination_ids_json,
+        destination_snapshots_json, root_event_id, parent_event_id, causal_hop,
+        created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      eventId, input.type, input.source.kind, input.source.externalId ?? null,
+      input.agentId, input.prompt,
+      payload === undefined ? null : JSON.stringify(payload),
+      input.sessionId ?? null, JSON.stringify(destinations),
+      JSON.stringify(destinationSnapshots),
+      rootEventId, parentEventId ?? null, hop, createdAt
+    );
+    this.#database.prepare(`
+      INSERT INTO executions (
+        execution_id, event_id, handler, status, attempt_count, max_attempts,
+        next_attempt_at, created_at, updated_at
+      ) VALUES (?, ?, ?, 'queued', 0, ?, ?, ?, ?)
+    `).run(executionId, eventId, route.handler, maxAttempts, createdAt, createdAt, createdAt);
+    return this.#receipt(eventId, "accepted");
+  }
+
+  public withImmediateTransaction<T>(callback: () => T): T {
     this.#database.exec("BEGIN IMMEDIATE");
     try {
-      if (input.source.externalId !== undefined) {
-        const existing = this.#database.prepare(`
-          SELECT event_id FROM events WHERE source_kind = ? AND source_external_id = ?
-        `).get(input.source.kind, input.source.externalId) as { event_id: string } | undefined;
-        if (existing !== undefined) {
-          const receipt = this.#receipt(existing.event_id, "duplicate");
-          this.#database.exec("COMMIT");
-          return receipt;
-        }
-      }
-      this.#database.prepare(`
-        INSERT INTO events (
-          event_id, type, source_kind, source_external_id, agent_id, prompt,
-          outcome, output, error, payload_json, session_id, destination_ids_json,
-          destination_snapshots_json, root_event_id, parent_event_id, causal_hop,
-          created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        eventId, input.type, input.source.kind, input.source.externalId ?? null,
-        input.agentId, input.prompt,
-        input.reviewInvocation === undefined ? null : JSON.stringify(input.reviewInvocation),
-        input.sessionId ?? null, JSON.stringify(destinations),
-        JSON.stringify(destinationSnapshots),
-        rootEventId, parentEventId ?? null, hop, createdAt
-      );
-      this.#database.prepare(`
-        INSERT INTO executions (
-          execution_id, event_id, handler, status, attempt_count, max_attempts,
-          next_attempt_at, created_at, updated_at
-        ) VALUES (?, ?, ?, 'queued', 0, ?, ?, ?, ?)
-      `).run(executionId, eventId, route.handler, maxAttempts, createdAt, createdAt, createdAt);
-      const receipt = this.#receipt(eventId, "accepted");
+      const result = callback();
       this.#database.exec("COMMIT");
-      return receipt;
+      return result;
     } catch (error) {
       this.#database.exec("ROLLBACK");
       throw error;
@@ -546,14 +560,19 @@ export class RuntimeStore {
         event.sessionId !== receipt.sessionId) {
         throw new Error(`Execution Session changed while handling Event: ${event.eventId}`);
       }
+      const runId = event.type === "agent.request"
+        ? event.runContext?.runId
+        : undefined;
       const sessionId = event.sessionId ?? receipt.sessionId;
       let session: RuntimeSession;
       if (sessionId === undefined) {
-        session = this.#createSession(event.agentId, receipt, timestamp);
+        session = this.#createSession(event.agentId, runId, receipt, timestamp);
       } else {
         session = this.#requireSession(sessionId);
         if (session.agentId !== event.agentId || session.adapterId !== receipt.adapterId ||
-          session.workspace !== receipt.workspace || session.providerSessionId !== receipt.providerSessionId) {
+          session.workspace !== receipt.workspace ||
+          session.providerSessionId !== receipt.providerSessionId ||
+          session.runId !== runId) {
           throw new Error(`Session changed while handling Event: ${sessionId}`);
         }
         this.#database.prepare("UPDATE agent_sessions SET updated_at = ? WHERE session_id = ?")
@@ -662,49 +681,113 @@ export class RuntimeStore {
     executionId: string,
     at = new Date().toISOString()
   ): RuntimeDelivery[] {
+    return this.withImmediateTransaction(
+      () => this.completeResultExecutionInTransaction(executionId, at)
+    );
+  }
+
+  public completeResultExecutionInTransaction(
+    executionId: string,
+    at = new Date().toISOString()
+  ): RuntimeDelivery[] {
     const timestamp = iso(at);
-    this.#database.exec("BEGIN IMMEDIATE");
-    try {
+    const execution = this.#requireExecution(executionId);
+    if (execution.status !== "running" || execution.handler !== "result") {
+      throw new Error(`result execution is not running: ${executionId}`);
+    }
+    const resultEvent = this.#requireEvent(execution.eventId);
+    if (resultEvent.type !== "agent.result") {
+      throw new Error(`ResultHandler requires agent.result: ${resultEvent.eventId}`);
+    }
+    for (const destination of this.#destinationSnapshots(resultEvent.eventId)) {
+      const maxAttempts = destination.kind === "macos-notification" ? 1 : 5;
+      this.#database.prepare(`
+        INSERT INTO deliveries (
+          delivery_id, result_event_id, destination_id, destination_kind,
+          destination_address_json, status, attempt_count, max_attempts,
+          next_attempt_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)
+        ON CONFLICT(result_event_id, destination_id) DO NOTHING
+      `).run(
+        runtimeId("del"),
+        resultEvent.eventId,
+        destination.destinationId,
+        destination.kind,
+        JSON.stringify(destination.address),
+        maxAttempts,
+        timestamp,
+        timestamp,
+        timestamp
+      );
+    }
+    this.#database.prepare(`
+      UPDATE executions SET status = 'succeeded', completed_at = ?, updated_at = ?,
+        last_error = NULL WHERE execution_id = ?
+    `).run(timestamp, timestamp, executionId);
+    return this.deliveriesForResultEvent(resultEvent.eventId);
+  }
+
+  public cancelQueuedExecutionsForRootInTransaction(
+    rootEventId: string,
+    at = new Date().toISOString()
+  ): number {
+    const timestamp = iso(at);
+    return Number(this.#database.prepare(`
+      UPDATE executions
+      SET status = 'cancelled', completed_at = ?, updated_at = ?,
+        last_error = 'agent_run_cancelled'
+      WHERE event_id IN (
+        SELECT event_id FROM events WHERE root_event_id = ?
+      ) AND status IN ('queued', 'retry_wait')
+    `).run(timestamp, timestamp, requireEventId(rootEventId, "rootEventId")).changes);
+  }
+
+  public recordExecutionReceiptInTransaction(
+    executionId: string,
+    receipt: Readonly<Record<string, unknown>>
+  ): void {
+    const encoded = JSON.stringify(receipt);
+    if (Buffer.byteLength(encoded, "utf8") > 65_536) {
+      throw new Error("Execution receipt exceeds 65536 bytes");
+    }
+    const changed = this.#database.prepare(`
+      UPDATE executions SET receipt_json = ? WHERE execution_id = ?
+    `).run(encoded, requireRuntimeId(executionId, "exe", "executionId"));
+    if (changed.changes !== 1) throw new Error(`Execution not found: ${executionId}`);
+  }
+
+  public forceTerminalAgentFailure(
+    executionId: string,
+    error: string,
+    at = new Date().toISOString()
+  ): { readonly execution: RuntimeExecution; readonly resultEvent?: AgentResultEvent } {
+    const failure = requireText(error, "error").slice(0, 4_096);
+    const timestamp = iso(at);
+    return this.withImmediateTransaction(() => {
       const execution = this.#requireExecution(executionId);
-      if (execution.status !== "running" || execution.handler !== "result") {
-        throw new Error(`result execution is not running: ${executionId}`);
-      }
-      const resultEvent = this.#requireEvent(execution.eventId);
-      if (resultEvent.type !== "agent.result") {
-        throw new Error(`ResultHandler requires agent.result: ${resultEvent.eventId}`);
-      }
-      for (const destination of this.#destinationSnapshots(resultEvent.eventId)) {
-        const maxAttempts = destination.kind === "macos-notification" ? 1 : 5;
-        this.#database.prepare(`
-          INSERT INTO deliveries (
-            delivery_id, result_event_id, destination_id, destination_kind,
-            destination_address_json, status, attempt_count, max_attempts,
-            next_attempt_at, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)
-          ON CONFLICT(result_event_id, destination_id) DO NOTHING
-        `).run(
-          runtimeId("del"),
-          resultEvent.eventId,
-          destination.destinationId,
-          destination.kind,
-          JSON.stringify(destination.address),
-          maxAttempts,
-          timestamp,
-          timestamp,
-          timestamp
-        );
+      if (execution.status !== "running" || execution.handler !== "agent") {
+        throw new Error(`agent execution is not running: ${executionId}`);
       }
       this.#database.prepare(`
-        UPDATE executions SET status = 'succeeded', completed_at = ?, updated_at = ?,
-          last_error = NULL WHERE execution_id = ?
-      `).run(timestamp, timestamp, executionId);
-      const deliveries = this.deliveriesForResultEvent(resultEvent.eventId);
-      this.#database.exec("COMMIT");
-      return deliveries;
-    } catch (error) {
-      this.#database.exec("ROLLBACK");
-      throw error;
-    }
+        UPDATE executions SET status = 'failed', last_error = ?,
+          completed_at = ?, updated_at = ? WHERE execution_id = ?
+      `).run(failure, timestamp, timestamp, executionId);
+      const event = this.#requireEvent(execution.eventId);
+      const resultEvent = isAgentInputEvent(event) && event.type !== "chat.dispatch"
+        ? this.#createResultEvent({
+            execution,
+            event,
+            outcome: "failed",
+            ...(event.sessionId === undefined ? {} : { sessionId: event.sessionId }),
+            error: failure,
+            at: timestamp
+          })
+        : undefined;
+      return {
+        execution: this.#requireExecution(executionId),
+        ...(resultEvent === undefined ? {} : { resultEvent })
+      };
+    });
   }
 
   public session(sessionId: string): RuntimeSession | undefined {
@@ -722,6 +805,19 @@ export class RuntimeStore {
     `).get(
       requireText(adapterId, "adapterId"),
       requireText(providerSessionId, "providerSessionId")
+    ) as SessionRow | undefined;
+    return row === undefined ? undefined : mapSession(row);
+  }
+
+  public sessionForRunAgent(
+    runId: string,
+    agentId: string
+  ): RuntimeSession | undefined {
+    const row = this.#database.prepare(`
+      SELECT * FROM agent_sessions WHERE run_id = ? AND agent_id = ?
+    `).get(
+      requireText(runId, "runId"),
+      requireText(agentId, "agentId")
     ) as SessionRow | undefined;
     return row === undefined ? undefined : mapSession(row);
   }
@@ -933,7 +1029,7 @@ export class RuntimeStore {
   }
 
   public close(): void {
-    this.#database.close();
+    if (this.#ownsDatabase) this.#database.close();
   }
 
   #receipt(eventId: string, status: AppendRuntimeEventReceipt["status"]): AppendRuntimeEventReceipt {
@@ -946,16 +1042,26 @@ export class RuntimeStore {
 
   #createSession(
     agentId: string,
+    runId: string | undefined,
     receipt: CompleteRuntimeExecution,
     timestamp: string
   ): RuntimeSession {
     const sessionId = runtimeId("ses");
     this.#database.prepare(`
       INSERT INTO agent_sessions (
-        session_id, agent_id, adapter_id, provider_session_id, workspace, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(sessionId, agentId, receipt.adapterId, receipt.providerSessionId,
-      receipt.workspace, timestamp, timestamp);
+        session_id, agent_id, run_id, adapter_id, provider_session_id,
+        workspace, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      sessionId,
+      agentId,
+      runId ?? null,
+      receipt.adapterId,
+      receipt.providerSessionId,
+      receipt.workspace,
+      timestamp,
+      timestamp
+    );
     return this.#requireSession(sessionId);
   }
 
@@ -1018,10 +1124,10 @@ export class RuntimeStore {
     this.#database.prepare(`
       INSERT INTO events (
         event_id, type, source_kind, source_external_id, agent_id, prompt,
-        outcome, output, error, session_id, destination_ids_json,
+        outcome, output, error, payload_json, session_id, destination_ids_json,
         destination_snapshots_json,
         root_event_id, parent_event_id, causal_hop, created_at
-      ) VALUES (?, 'agent.result', 'handler', ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, 'agent.result', 'handler', ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       eventId,
       input.execution.executionId,
@@ -1029,6 +1135,7 @@ export class RuntimeStore {
       input.outcome,
       input.output ?? null,
       input.error ?? null,
+      null,
       input.sessionId ?? null,
       JSON.stringify(input.event.destinationIds),
       JSON.stringify(this.#destinationSnapshots(input.event.eventId)),
@@ -1169,11 +1276,52 @@ function validateCreateEvent(input: CreateEvent): void {
   }
   requireText(input.agentId, "agentId");
   requireText(input.prompt, "prompt");
+  if (input.reviewInvocation !== undefined && input.runContext !== undefined) {
+    throw new Error("agent.request accepts reviewInvocation or runContext, not both");
+  }
   if (input.reviewInvocation !== undefined) {
     validateReviewInvocation(input.reviewInvocation, input.agentId);
   }
+  if (input.runContext !== undefined) validateAgentRunContext(input.runContext);
   if (input.source.externalId !== undefined) requireText(input.source.externalId, "source.externalId");
   if (input.parent !== undefined) bounded(input.parent.hop, 0, 1_000, "parent.hop");
+}
+
+function validateAgentRunContext(
+  context: import("./model.js").AgentRunContext
+): void {
+  if (context.schemaVersion !== "AgentRunContext@1") {
+    throw new Error("runContext schema is unsupported");
+  }
+  requireText(context.resultContractId, "runContext.resultContractId");
+  requireText(context.runId, "runContext.runId");
+  requireText(context.stepId, "runContext.stepId");
+  bounded(context.depth, 0, 100, "runContext.depth");
+  if (context.parentStepId !== undefined) {
+    requireText(context.parentStepId, "runContext.parentStepId");
+  }
+  if (context.workspaceGrant !== undefined) {
+    requireText(context.workspaceGrant.root, "runContext.workspaceGrant.root");
+    requireText(context.workspaceGrant.revision, "runContext.workspaceGrant.revision");
+    if (context.workspaceGrant.schemaVersion !== "ExternalWorkspaceGrant@1" ||
+      (context.workspaceGrant.access !== "read" &&
+        context.workspaceGrant.access !== "write")) {
+      throw new Error("runContext workspace grant is malformed");
+    }
+  }
+  if (context.completionBinding !== undefined) {
+    const binding = context.completionBinding;
+    if (binding.schemaVersion !== "AgentCompletionBinding@1") {
+      throw new Error("runContext completion binding is malformed");
+    }
+    requireText(binding.callerAgentId, "completionBinding.callerAgentId");
+    requireText(binding.callerSessionId, "completionBinding.callerSessionId");
+    requireText(binding.callerStepId, "completionBinding.callerStepId");
+    requireEventId(binding.callerRequestEventId, "completionBinding.callerRequestEventId");
+  }
+  if (Buffer.byteLength(JSON.stringify(context), "utf8") > 65_536) {
+    throw new Error("runContext exceeds 65536 bytes");
+  }
 }
 
 function validateAddress(address: Readonly<Record<string, string>>): void {
@@ -1200,6 +1348,7 @@ function chatAttentionReceipt(
   return {
     sourceMessageEventId,
     agentId: plan.agentId,
+    handleSnapshot: plan.handle,
     outcome: plan.outcome === "dispatch" ? "dispatched" : "skipped",
     reason: plan.reason,
     presenceSnapshot: plan.presenceSnapshot,
@@ -1220,6 +1369,8 @@ function parseChatAttentionReceiptList(value: string | null): ChatAttentionRecei
     if (!isRecord(entry) ||
       typeof entry.sourceMessageEventId !== "string" ||
       typeof entry.agentId !== "string" ||
+      (entry.handleSnapshot !== undefined &&
+        typeof entry.handleSnapshot !== "string") ||
       (entry.outcome !== "dispatched" && entry.outcome !== "skipped") ||
       typeof entry.reason !== "string" ||
       !isRecord(entry.presenceSnapshot) ||
@@ -1229,6 +1380,9 @@ function parseChatAttentionReceiptList(value: string | null): ChatAttentionRecei
     return {
       sourceMessageEventId: entry.sourceMessageEventId,
       agentId: entry.agentId,
+      handleSnapshot: typeof entry.handleSnapshot === "string"
+        ? entry.handleSnapshot
+        : entry.agentId,
       outcome: entry.outcome,
       reason: entry.reason as ChatAttentionReason,
       presenceSnapshot: entry.presenceSnapshot as ChatAttentionPlan["presenceSnapshot"],

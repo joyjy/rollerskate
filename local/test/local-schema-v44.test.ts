@@ -7,8 +7,8 @@ import test from "node:test";
 
 import { initializeRuntimeSchema } from "../src/infrastructure/sqlite/schema.js";
 
-test("schema v43 atomically compacts a v42 database into 13 product tables", () => {
-  const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v43-"));
+test("schema v44 atomically compacts a v42 database into 15 product tables", () => {
+  const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v44-"));
   const databasePath = join(directory, "runtime.db");
   try {
     const legacy = new DatabaseSync(databasePath);
@@ -17,11 +17,13 @@ test("schema v43 atomically compacts a v42 database into 13 product tables", () 
 
     const diagnostics = initializeRuntimeSchema(databasePath);
     const repeated = initializeRuntimeSchema(databasePath);
-    assert.equal(diagnostics.schemaVersion, 43);
+    assert.equal(diagnostics.schemaVersion, 44);
     assert.deepEqual(repeated, diagnostics);
     assert.deepEqual(diagnostics.tables, [
+      "agent_runs",
       "agent_sessions",
       "agents",
+      "chat_messages",
       "chat_presence",
       "deliveries",
       "events",
@@ -99,6 +101,8 @@ test("schema v43 atomically compacts a v42 database into 13 product tables", () 
         migrated.prepare("PRAGMA foreign_key_check").all(),
         []
       );
+      assert.equal(count(migrated, "chat_messages"), 1);
+      assert.equal(count(migrated, "agent_runs"), 0);
     } finally {
       migrated.close();
     }
@@ -107,8 +111,8 @@ test("schema v43 atomically compacts a v42 database into 13 product tables", () 
   }
 });
 
-test("schema v43 preserves already compacted tables still declared as v42", () => {
-  const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v43-hybrid-"));
+test("schema v44 preserves already compacted tables still declared as v42", () => {
+  const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v44-hybrid-"));
   const databasePath = join(directory, "runtime.db");
   try {
     const legacy = new DatabaseSync(databasePath);
@@ -137,8 +141,8 @@ test("schema v43 preserves already compacted tables still declared as v42", () =
     hybrid.close();
 
     const diagnostics = initializeRuntimeSchema(databasePath);
-    assert.equal(diagnostics.schemaVersion, 43);
-    assert.equal(diagnostics.tables.length, 13);
+    assert.equal(diagnostics.schemaVersion, 44);
+    assert.equal(diagnostics.tables.length, 15);
 
     const migrated = new DatabaseSync(databasePath, { readOnly: true });
     try {
@@ -158,10 +162,10 @@ test("schema v43 preserves already compacted tables still declared as v42", () =
   }
 });
 
-test("schema v43 fails closed for newer or incomplete declared schemas", () => {
+test("schema v44 fails closed for newer or incomplete declared schemas", () => {
   for (const [version, expected] of [
-    ["44", /newer than supported 43/],
-    ["43", /schema 43 is incomplete/]
+    ["45", /newer than supported 44/],
+    ["44", /schema 44 is incomplete/]
   ] as const) {
     const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-version-"));
     const databasePath = join(directory, "runtime.db");
@@ -176,6 +180,134 @@ test("schema v43 fails closed for newer or incomplete declared schemas", () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
+  }
+});
+
+test("schema v44 upgrades terminal v43 state and rebuilds Chat projection", () => {
+  const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v44-from-v43-"));
+  const databasePath = join(directory, "runtime.db");
+  try {
+    initializeRuntimeSchema(databasePath);
+    const legacy = new DatabaseSync(databasePath);
+    legacy.exec(`
+      INSERT INTO events (
+        event_id, type, source_kind, source_external_id, agent_id, prompt,
+        outcome, output, error, payload_json, session_id, destination_ids_json,
+        destination_snapshots_json, root_event_id, parent_event_id, causal_hop,
+        created_at
+      ) VALUES (
+        'evt_019f0000-0000-7000-8000-000000000090',
+        'chat.message', 'cli', 'v43-chat', NULL, NULL, NULL, NULL, NULL,
+        '{"topicId":"top_019f0000-0000-7000-8000-000000000091","sender":{"kind":"owner","handleSnapshot":"owner"},"body":"preserve me"}',
+        NULL, '[]', '[]',
+        'evt_019f0000-0000-7000-8000-000000000090', NULL, 0,
+        '2026-07-25T00:00:00.000Z'
+      );
+      DROP TRIGGER IF EXISTS chat_message_project_event_insert;
+      DROP TRIGGER IF EXISTS chat_message_project_attention_update;
+      DROP TRIGGER IF EXISTS chat_message_project_read_progress_attention;
+      DROP TRIGGER IF EXISTS chat_message_project_read_progress_dispatch;
+      DROP VIEW IF EXISTS chat_message_read_progress_v1;
+      DROP TABLE chat_messages;
+      DROP TABLE agent_runs;
+      UPDATE schema_meta SET value = '43' WHERE key = 'schema_version';
+    `);
+    legacy.close();
+
+    const diagnostics = initializeRuntimeSchema(databasePath);
+    assert.equal(diagnostics.schemaVersion, 44);
+    const upgraded = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      assert.equal(count(upgraded, "chat_messages"), 1);
+      assert.equal(count(upgraded, "agent_runs"), 0);
+      const message = upgraded.prepare(`
+        SELECT body FROM chat_messages
+        WHERE event_id = 'evt_019f0000-0000-7000-8000-000000000090'
+      `).get() as { body: string };
+      assert.equal(message.body, "preserve me");
+    } finally {
+      upgraded.close();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("schema v44 fails closed while v43 has an active legacy Review", () => {
+  const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v44-active-review-"));
+  const databasePath = join(directory, "runtime.db");
+  try {
+    initializeRuntimeSchema(databasePath);
+    const legacy = new DatabaseSync(databasePath);
+    legacy.exec(`
+      INSERT INTO events (
+        event_id, type, source_kind, source_external_id, agent_id, prompt,
+        outcome, output, error, payload_json, session_id, destination_ids_json,
+        destination_snapshots_json, root_event_id, parent_event_id, causal_hop,
+        created_at
+      ) VALUES (
+        'evt_019f0000-0000-7000-8000-000000000092',
+        'review.requested', 'cli', 'active-review', NULL, NULL, NULL, NULL, NULL,
+        '{"cycleIndex":0,"subject":{"kind":"acceptance","ref":"/tmp/plan.md","revision":"file1_test"},"artifactRef":"/tmp/plan.md.review.yaml","evidence":[{"kind":"workspace","ref":"/tmp/workspace","revision":"wrk1_test"}],"implementationRevision":"wrk1_test","reviewerAgentId":"reviewer","implementerAgentId":"implementer","reworkLimit":1}',
+        NULL, '[]', '[]',
+        'evt_019f0000-0000-7000-8000-000000000092', NULL, 0,
+        '2026-07-25T00:00:00.000Z'
+      );
+      INSERT INTO executions (
+        execution_id, event_id, handler, status, attempt_count, max_attempts,
+        next_attempt_at, created_at, updated_at
+      ) VALUES (
+        'exe_019f0000-0000-7000-8000-000000000093',
+        'evt_019f0000-0000-7000-8000-000000000092',
+        'review', 'queued', 0, 3,
+        '2026-07-25T00:00:00.000Z',
+        '2026-07-25T00:00:00.000Z',
+        '2026-07-25T00:00:00.000Z'
+      );
+      INSERT INTO reviews (
+        root_event_id, subject_ref, workspace_ref, phase, cycle_index,
+        expected_event_id, active_execution_id, subject_revision,
+        artifact_revision, implementation_revision, rework_count, rework_limit,
+        terminal_decision, terminal_reason, reviewer_session_id,
+        implementer_session_id, transitions_json, updated_at
+      ) VALUES (
+        'evt_019f0000-0000-7000-8000-000000000092',
+        '/tmp/plan.md', '/tmp/workspace', 'reviewing', 0,
+        'evt_019f0000-0000-7000-8000-000000000092',
+        'exe_019f0000-0000-7000-8000-000000000093',
+        'file1_test', NULL, 'wrk1_test', 0, 1,
+        NULL, NULL, NULL, NULL, '[]',
+        '2026-07-25T00:00:00.000Z'
+      );
+      DROP TRIGGER IF EXISTS chat_message_project_event_insert;
+      DROP TRIGGER IF EXISTS chat_message_project_attention_update;
+      DROP TRIGGER IF EXISTS chat_message_project_read_progress_attention;
+      DROP TRIGGER IF EXISTS chat_message_project_read_progress_dispatch;
+      DROP VIEW IF EXISTS chat_message_read_progress_v1;
+      DROP TABLE chat_messages;
+      DROP TABLE agent_runs;
+      UPDATE schema_meta SET value = '43' WHERE key = 'schema_version';
+    `);
+    legacy.close();
+
+    assert.throws(
+      () => initializeRuntimeSchema(databasePath),
+      /1 active legacy Review.*previous Runtime/
+    );
+    const preserved = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      assert.equal(count(preserved, "reviews"), 1);
+      assert.equal(
+        (preserved.prepare(`
+          SELECT value FROM schema_meta WHERE key = 'schema_version'
+        `).get() as { value: string }).value,
+        "43"
+      );
+    } finally {
+      preserved.close();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 

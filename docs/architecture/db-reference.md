@@ -1,16 +1,16 @@
 ---
 type: Reference
 title: Rollerskate Local Database Reference
-description: Local SQLite 的 Event / index / object 建模规范，以及 schema v43 的 13 张物理表、ownership、authority 与迁移规则。
+description: Local SQLite 的 Event / index / object 建模规范，以及 schema v44 的 15 张物理表、ownership、authority 与迁移规则。
 tags: [rollerskate, local, sqlite, database, schema]
-timestamp: 2026-07-25
+timestamp: 2026-07-26
 ---
 
 # Rollerskate Local Database Reference
 
 [返回 architecture index](./index.md)
 
-`local/src/infrastructure/sqlite/local-schema.ts` 是 Local SQLite DDL、组合版本与兼容迁移的唯一事实源；`schema.ts` 只负责打开数据库并调用它，各 Store 不再各自创建业务表。schema v43 只有下文登记的 13 张产品表，不包含 SQLite 内部表。
+`local/src/infrastructure/sqlite/local-schema.ts` 是 Local SQLite DDL、组合版本与兼容迁移的唯一事实源；`schema.ts` 只负责打开数据库并调用它，各 Store 不再各自创建业务表。schema v44 只有下文登记的 15 张产品表，不包含 SQLite 内部表。
 
 ## 物理建模总则：默认聚合，按生命周期拆分
 
@@ -61,46 +61,52 @@ snapshot/receipt 必须满足：
 
 Event type、Route 与 causality 的完整清单由 [Event Reference](./event-reference.md) 维护。本页只登记数据库建模和物理表。
 
-## Chat history 与 Notice Center
+## Chat message projection 与 Notice Center
 
-Chat history 保持 Event-only，不建立 `chat_index` 或 `chat_messages`：
+schema v43 的 Chat history 保持 Event-only；schema v44 因 Owner message 需要跨 attention receipt、`chat.dispatch` 与 Agent Execution 形成稳定的 per-Agent processing progress，增加 `chat_messages` rebuildable projection：
 
-- `chat.message` 已用稳定 `event_id` 保存 Topic、sender、body、target、causality 与时间。
-- timeline 只是同一种 immutable Event 的 Topic 过滤和稳定排序，不产生新的产品 identity。
-- cursor pagination 由 `events_chat_topic_cursor` 支持，不需要物化第二份 message row。
-- 如果未来增加 Telegram 式 per-user unread/read label，该状态拥有独立用户、游标和生命周期，届时再建立 Chat read state；不能写回 immutable message Event。
+- `events` 中的 `chat.message` 仍唯一拥有 Topic、sender、body、target、causality 与产品时间；`chat_messages` 没有独立修改入口。
+- projection 以 `event_id` 为稳定键，复制 timeline 所需 snapshot，并用 `ChatAttentionReceiptList@1` 固定该消息处理时的 active Agent 分母。suspended Agent 不进入分母；后续新增、suspend、resume 或 rename 不改历史 snapshot。
+- `ChatReadProgress@1` 只解释 Runtime processing：对应 Agent Execution `succeeded` 为 `read`，queued/running/retry 为 `reading`，terminal failure 为 `failed`，target/presence/policy skip 为 `unread`。reply 与 silent 都在 Execution 成功后计入 read。
+- `chat_messages_topic_cursor(topic_id, created_at DESC, event_id DESC)` 服务 Timeline；`events_chat_topic_cursor` 继续支持 canonical Event 诊断查询。
+- Event admission、attention receipt 与 Execution transition 通过 trigger/同一 SQLite transaction 增量更新 projection。`LocalChatStore.rebuildProjection()` 可以先清空 projection，再从 Event、Execution receipt 和 dispatch Execution 完整重建并核对 row count。
+- `projected_at` 只诊断 freshness，不成为 cursor 或产品时间 authority。
 
-Notice Center 需要独立物理表，因为 Notice 除了 Delivery/Event 派生摘要，还拥有不能从事实重建的 read/ack。schema v43 将两类 authority 放在同一张 `notices` 表：
+这里的 read 不是 Telegram/飞书意义上的“用户看过”。v0.3.11 明确不承载 Owner/成员 read cursor、unread inbox、手工 mark-read 或 `chat_read_receipts`；未来若增加 per-user read label，该状态拥有独立用户、游标和生命周期，必须另建 authoritative Chat state，不能写回 Event 或复用 `ChatReadProgress@1`。
+
+Notice Center 需要独立物理表，因为 Notice 除了 Delivery/Event 派生摘要，还拥有不能从事实重建的 read/ack。schema v44 延续两类 authority 放在同一张 `notices` 表：
 
 - `title`、`summary`、`outcome`、Delivery 状态和 reference/time 字段是 derived projection。
 - `read_at`、`acknowledged_at`、`state_updated_at` 是 authoritative user state。
 - Delivery trigger 或显式 rebuild 只 upsert derived columns；不能覆盖用户状态。
 
-因此 Chat 不建 projection table，而 Notice 建表的区别不是“都要显示列表”，而是 Notice 拥有独立产品 identity、跨事实 snapshot 和用户生命周期状态。
+因此 `chat_messages` 可以整表删除重建，而 `notices` 不能丢弃 read/ack 后整表重建。两者都提供独立视图，但只有 Notice 同时拥有不可重建的用户状态。
 
-## schema v43：13 张物理表
+## schema v44：15 张物理表
 
 | Table | Classification / owner | 主键与职责 |
 |---|---|---|
 | `schema_meta` | schema composition / `infrastructure/sqlite/local-schema` | `key`；保存组合 schema version。 |
 | `local_foundation` | durable singleton / Foundation | `singleton=1`；保存 Device、Workspace、Local Topic 与嵌入的 Owner identity。 |
 | `agents` | durable object / Foundation | `principal_id`；保存 Agent identity、client/config 和 current Session pointer。 |
-| `agent_sessions` | durable continuity / Runtime | `session_id`；保存 adapter/provider Session 与 workspace binding。 |
+| `agent_sessions` | durable continuity / Runtime | `session_id`；保存 adapter/provider Session、workspace binding 与可选 Agent Run binding。 |
 | `events` | immutable Event / `core/event` | `event_id`；保存七种 canonical Event、causality、typed payload 和 Destination snapshots。 |
 | `executions` | durable work / `core/runtime` | `execution_id`；保存 Handler claim/retry/终态与 bounded versioned receipt。 |
+| `agent_runs` | durable coordination object / `application/agent-run` | `run_id`；保存 mandate/workflow snapshot、Steward Session、current step、budget、CAS、cancel 与 terminal outcome。 |
+| `chat_messages` | rebuildable projection / `application/chat` | `event_id`；保存 Timeline snapshot、attention denominator 与 Agent Execution-driven read progress，不拥有消息或用户 read state。 |
 | `deliveries` | durable work / `core/runtime` | `delivery_id`；保存一次 result 投递、Destination snapshot、retry 与外部 receipt。 |
 | `chat_presence` | durable policy / `core/chat` | `(agent_id, scope_kind, scope_id)`；保存 scoped available/snoozed 状态。 |
 | `subscriptions` | durable object / Poll Subscription | `subscription_id`；保存 probe policy、callback binding、poll lifecycle 与 terminal Event pointer。 |
 | `schedules` | durable current object / Scheduled Task | `schedule_id`；保存 current definition、current revision 和 next occurrence。 |
 | `scheduled_runs` | durable occurrence / Scheduled Task | `run_id`；保存 occurrence lifecycle 和 bounded immutable definition snapshot。 |
-| `reviews` | bounded aggregate / Review | `root_event_id`；保存 current phase、两个 role Session 与 bounded transition receipts。 |
+| `reviews` | legacy read-only aggregate / Review | `root_event_id`；仅保留 schema v43 及更早 terminal Review 的查询历史；新 Review 作为 `review@1` workflow 运行在 `agent_runs`。 |
 | `notices` | projection + authoritative state / `application/notice` | `notice_id`；保存 derived Notice snapshot 与 read/ack。 |
 
 ### Foundation 与 Agent continuity
 
 `local_foundation` 嵌入唯一 Owner，因为 Local Runtime 没有独立 Principal roster 控制面。`agents` 合并旧 Agent principal、profile 与 current-session pointer；`agent_sessions` 保持独立，因为它是会持续增长的 provider continuity history。
 
-`agents.current_session_id` 只表示当前 pointer，`agent_sessions` row 才是 Session identity。一个 Session 可以跨多次 Execution 使用，不能与 `executions` 合并。
+`agents.current_session_id` 只表示 Chat/普通 Agent request 的 current pointer，`agent_sessions` row 才是 Session identity。一个 Session 可以跨多次 Execution 使用，不能与 `executions` 合并。run-scoped Session 使用可选 `run_id`，并由 partial unique index 保证同一个 `(run_id, agent_id)` 只有一个 Session；它不写回 `agents.current_session_id`，也不与 Chat Session 共用。
 
 ### Event、Execution 与 receipt
 
@@ -110,6 +116,24 @@ Notice Center 需要独立物理表，因为 Notice 除了 Delivery/Event 派生
 - `ChatDecisionReceipt@1` 属于 `chat.dispatch` 的 Agent Execution。
 
 receipt 写入必须经过对应 versioned runtime parser，当前列上限为 64 KiB。新增 Handler receipt 需要定义独立 schema，不能复用任意 JSON。
+
+Agent Run 的 `AgentTurnResult@1` 是 encoded in `agent.result.output` 的 bounded、versioned module contract；Core 将 output 作为不透明字符串保存，不再把解析结果复制进 `events.payload_json`。注册的 Agent Run continuation 负责 strict parsing。`AgentStepCompletion@1` 保存于 callback `agent.request` 的 run context，`AgentRunContinuationReceipt@1` 保存于对应 ResultHandler Execution receipt；workflow-specific finding、role 或 transcript 不复制进 `executions` 或 `agent_runs`。
+
+同一 immutable output 的 contract validation failure 不是 retryable work。Agent Run continuation 将 Run terminalize 为 `failed`，并在 ResultHandler Execution 写 `AgentRunContinuationReceipt@1 { outcome: "invalid_result", error }`；该 receipt 是 bounded diagnosis，不成为第二份结果事实源。
+
+### Agent Run lifecycle
+
+`agent_runs` 命中独立 identity、cancel、CAS/recovery、budget 和 external workspace write exclusion，因此不能塞进 Event 或 Execution receipt。`run_id` 绑定 root `agent.request`；`active_step_id`、`active_execution_id` 与 `version` 共同守住 restart/duplicate continuation。status 为 `active | waiting | succeeded | failed | needs_human | cancelled`，terminal Run 保留供 CLI、Console 与 Event trace 查询。
+
+`mandate_snapshot_json` 是 bounded、versioned `RunMandateSnapshot@1`：保存内联 objective，或 workflow ID/version、validated inputs 与 rendered instruction snapshot。可选 `workspace_grant_json` 保存 Owner admission 的 canonical external root、`read | write` 与初始 revision；它不是 Agent 自行修改的配置。deadline、max steps、max depth 和 step count 是 Run current state。
+
+每个 `agent.request.prompt` 保存该 turn 的 active delegate roster 和 exact `AgentTurnResult@1` shape；roster 是 immutable Event prompt snapshot，不进入 `agent_runs` current state，也不建立 Agent membership 表。Store 读取 mandate/workspace JSON 时必须重新校验 schemaVersion、exact fields、类型与大小，不能只依赖 `json_valid` 或 TypeScript cast。
+
+Run transcript 不复制到 JSON 或 `agent_run_steps`：所有 request、result 和 callback 都在 `events/executions` 中共享 `runId`，并用 `stepId/parentStepId` 还原调用链。每次 continuation 在同一 transaction 内完成 ResultHandler Execution、更新 Run CAS，并建立最多一个 child/callback Event 与 Execution。deterministic continuation key 保证 retry、duplicate result 和 restart 不重复 admission。
+
+跨 owner transaction 不等于复制 ownership：bootstrap/application unit of work 把同一 `DatabaseSync` transaction 交给 RuntimeStore 与 AgentRunStore；RuntimeStore 仍唯一写 Event/Execution/Session，AgentRunStore 只写 `agent_runs` 和 Run-specific constraint。AgentRunStore 不复制 Event mapper、Execution claim/retry 或 child admission SQL，RuntimeStore 也不增加 `agent_runs` column/transition 方法。
+
+相同 canonical external workspace 可以并行多个 read Run，但 partial unique index只允许一个 non-terminal write Run。cancel 原子写入 terminal state并取消 queued Execution；已经 running 的 provider result可以写入审计 Event，但 trigger/ResultHandler 在读取 cancelled Run 后不得创建 retry、child 或 callback。
 
 ### Destination snapshot 与 Delivery
 
@@ -125,11 +149,9 @@ Event admission 把每个 Destination 的 `destinationId/kind/address/createdAt/
 
 这避免为了未发生的配置版本维护独立 revision 表，同时保证已经 admission 的 run 在 Schedule 修改后仍能准确恢复。需要完整 Schedule 配置审计历史时，应先证明产品查询与 retention 需求，再重新引入 revision log。
 
-### Review aggregate
+### Legacy Review aggregate
 
-Review rework 有明确上限，因此 `reviews` 是 bounded aggregate。Reviewer/Implementer Session 使用独立列并禁止相同；transition receipt 使用 versioned、bounded JSON，current phase 和 active Execution 仍是关系字段并通过 transaction/CAS 推进。
-
-如果未来 Review 允许无界 cycle、逐 transition 独立检索或长期 retention，再把 transition 提升为独立历史对象；当前不为猜测需求关系化。
+`reviews` 只为既有 terminal Review 保留 read-only inspection。schema v44 不注册 ReviewHandler，不允许 application/CLI/Console create/recover；新审查通过 versioned `review@1` workflow 启动 generic Agent Run。升级时如果发现 non-terminal legacy Review 会 fail closed，要求先用上一版本完成或恢复，避免同时存在两个可写引擎。
 
 ### Notice authority
 
@@ -144,6 +166,10 @@ Delivery insert/update trigger 定向 upsert derived columns。显式 rebuild �
 | `events_causal` | `events` | 按 root、hop、created time 读取 causality。 |
 | `events_chat_topic_cursor` | `events` | 按 Topic 与 `(created_at, event_id)` 稳定分页 Chat history。 |
 | `executions_due` | `executions` | claim queued/retry-wait Handler work。 |
+| `agent_runs_status_updated` | `agent_runs` | 按 status 与更新时间分页查询并行 Run。 |
+| `agent_runs_active_write_workspace` | `agent_runs` | 保证同一 canonical external workspace 最多一条 non-terminal write Run。 |
+| `agent_sessions_run_agent` | `agent_sessions` | 保证一个 Run 内每个 Agent 只有一个 run-scoped Session。 |
+| `chat_messages_topic_cursor` | `chat_messages` | 按 Topic 与 `(created_at, event_id)` 稳定分页 Chat Timeline。 |
 | `deliveries_due` | `deliveries` | claim pending/retry-wait Delivery。 |
 | `subscriptions_due` | `subscriptions` | 查询到期 Subscription。 |
 | `schedules_due` | `schedules` | 查询到期 Schedule。 |
@@ -151,17 +177,19 @@ Delivery insert/update trigger 定向 upsert derived columns。显式 rebuild �
 | `reviews_active_subject`、`reviews_active_workspace` | `reviews` | 保证 active Review 的 subject/workspace 排他性。 |
 | `notices_timeline` | `notices` | 稳定读取 Notice Center timeline。 |
 
-## v42 → v43 migration
+## v42/v43 → v44 migration
 
 升级在一个 `BEGIN IMMEDIATE` transaction 内完成，临时关闭 FK enforcement，完成复制、校验形状、删除旧表、写入 schema version 后再提交并恢复 FK。
 
 - Owner 嵌入 `local_foundation`；Agent principal/profile/pointer 合入 `agents`；`sessions` 改为 `agent_sessions`。
 - Destination 定义固化到 Event/Delivery snapshots，随后删除旧 `destinations`。
-- Chat attention/decision receipts 转换为 versioned Execution receipts；legacy Chat helper tables 删除。
+- Chat attention/decision receipts 转换为 versioned Execution receipts；legacy Chat helper tables 删除；随后从 `chat.message`、attention receipt 与 dispatch Execution backfill `chat_messages`。
 - Subscription、Schedule、Review 与 Notice 按上文模型收敛。
 - Server connection/binding、Matrix ingress binding 与旧 Device/Agent enrollment 不属于当前 Local foundation，迁移后删除；Server Agent authentication、Topic/TransportBinding 与 cursor/session persistence 在 v0.4 按真实 control-plane lifecycle 重建。
 
-若数据库仍声明 v42，但部分同名 target table 已经具有完整 v43 列并保存数据，迁移把非空 current-shaped table 视为该 aggregate 的优先来源，逐列原样复制 snapshot、receipt 与 user state；只有 current-shaped source 为空且对应 legacy source 非空时才回退到 legacy transformation。该兼容分支仍在同一 transaction 内执行并接受 exact row count 与 foreign-key verification，避免中间版本写出的混合 schema 丢失 Foundation、Agent 或 Capability state。
+若数据库仍声明 v42，但部分同名 target table 已经具有完整 compacted 列并保存数据，迁移把非空 current-shaped table 视为该 aggregate 的优先来源，逐列原样复制 snapshot、receipt 与 user state；只有 current-shaped source 为空且对应 legacy source 非空时才回退到 legacy transformation。该兼容分支仍在同一 transaction 内执行并接受 exact row count 与 foreign-key verification，避免中间版本写出的混合 schema 丢失 Foundation、Agent 或 Capability state。
+
+v43 → v44 增加 `agent_runs`、`agent_sessions.run_id` 与 `chat_messages`。terminal legacy Review 原样保留为只读历史；non-terminal legacy Review 阻止升级。`chat_messages` 不复制旧 projection，而是始终由 canonical facts 幂等 backfill；migration 以及显式 rebuild 都核对 `chat.message` 与 projection exact row count。正式 migration 只接受 schema v43 和更早已发布形状，不把同版本未知 table shape 当作兼容来源。
 
 迁移必须保留 canonical Event、Execution/Delivery retry state、Session continuity、Capability current state/已发生 snapshot、Review transition、Notice read/ack，并通过 `PRAGMA foreign_key_check`。
 

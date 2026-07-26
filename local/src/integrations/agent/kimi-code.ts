@@ -3,7 +3,7 @@ import { isAbsolute } from "node:path";
 
 import type { AgentInputEvent, ChatDispatchEvent } from "../../core/event/model.js";
 import type { RuntimeAgentAdapter } from "../../core/runtime/handlers.js";
-import { workspaceRevision } from "../../capabilities/review/workspace-revision.js";
+import { runtimeAgentEventPrompt } from "./event-prompt.js";
 import { AgentProcessClient, type AgentProcessProtocol } from "./process-client.js";
 
 interface KimiCodeRequest {
@@ -30,10 +30,6 @@ export interface KimiCodeRuntimeAgentOptions {
 export class KimiCodeRuntimeAgent implements RuntimeAgentAdapter {
   public readonly adapterId = "kimi-code-runtime-jsonl-v1";
   public readonly workspace: string;
-  public readonly reviewCapabilities = {
-    resultSchemas: ["ImplementerResult@1"],
-    workspaceAccess: ["write"]
-  } as const;
   readonly #process: AgentProcessClient;
 
   public constructor(options: KimiCodeRuntimeAgentOptions) {
@@ -61,33 +57,7 @@ export class KimiCodeRuntimeAgent implements RuntimeAgentAdapter {
         ? {}
         : { providerSessionId: input.providerSessionId })
     } satisfies KimiCodeRequest);
-    const response = result.response as Awaited<ReturnType<RuntimeAgentAdapter["invoke"]>>;
-    const review = input.event.type === "agent.request"
-      ? input.event.reviewInvocation
-      : undefined;
-    if (review?.role !== "implementer" || response.outcome.kind !== "message") {
-      return response;
-    }
-    let structured: unknown;
-    try {
-      structured = JSON.parse(response.outcome.body) as unknown;
-    } catch {
-      return response;
-    }
-    if (!isRecord(structured) || structured.schemaVersion !== "ImplementerResult@1" ||
-      structured.implementationRevision !== "runtime") {
-      return response;
-    }
-    return {
-      ...response,
-      outcome: {
-        kind: "message",
-        body: JSON.stringify({
-          ...structured,
-          implementationRevision: workspaceRevision(this.workspace).revision
-        })
-      }
-    };
+    return result.response as Awaited<ReturnType<RuntimeAgentAdapter["invoke"]>>;
   }
 }
 
@@ -97,7 +67,7 @@ function kimiCodeArgs(
 ): string[] {
   return [
     ...launchArgs,
-    "--prompt", encodeRequest(request),
+    "--prompt", runtimeAgentEventPrompt(request.event),
     "--output-format", "stream-json",
     ...(request.providerSessionId === undefined
       ? []
@@ -131,45 +101,6 @@ const kimiCodeProtocol: AgentProcessProtocol = {
     };
   }
 };
-
-function encodeRequest(request: KimiCodeRequest): string {
-  const review = request.event.type === "agent.request"
-    ? request.event.reviewInvocation
-    : undefined;
-  return [
-    "You are handling one Rollerskate Local Runtime Event.",
-    request.event.type === "chat.dispatch"
-      ? "Follow the referenced Chat prompt resource and return only its requested JSON object."
-      : review === undefined
-      ? "Follow the prompt and return the useful result as plain text."
-      : [
-          `Return only JSON conforming to ${review.resultSchema}.`,
-          `Workspace access: ${review.workspaceAccess}.`,
-          ...(review.role === "implementer"
-            ? [
-                "Set ImplementerResult@1 implementationRevision to the literal \"runtime\"; " +
-                "the trusted adapter replaces it with the verified workspace revision."
-              ]
-            : []),
-          ...(review.writableRoot === undefined
-            ? []
-            : [`Authorized writable root: ${review.writableRoot}.`])
-        ].join("\n"),
-    `Event type: ${request.event.type}`,
-    `Causal root: ${request.event.causality.rootEventId}`,
-    `Causal hop: ${request.event.causality.hop}`,
-    ...(request.event.type === "subscription.fire" &&
-      request.event.observation !== undefined
-      ? ["Terminal observation:", JSON.stringify(request.event.observation)]
-      : []),
-    "Prompt:",
-    request.event.prompt
-  ].join("\n");
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function workspace(projectRoot: string): string {
   if (!isAbsolute(projectRoot)) throw new Error("projectRoot must be absolute");

@@ -8,8 +8,6 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 
-import type { ImplementerResult, ReviewerResult } from "./result-contract.js";
-
 export const REVIEW_ARTIFACT_SCHEMA_VERSION = "mrsf.review@1" as const;
 const MAX_ARTIFACT_BYTES = 1_048_576;
 
@@ -45,6 +43,31 @@ export interface ReviewFinding {
     readonly summary: string;
     readonly revisionsRead: readonly string[];
     readonly at: string;
+  }[];
+}
+
+export interface LegacyReviewerResult {
+  readonly boundedSummary: string;
+  readonly revisionsRead: {
+    readonly subject: string;
+    readonly artifact?: string;
+    readonly evidence: readonly { readonly revision: string }[];
+  };
+  readonly artifactMutation: {
+    readonly resolveFindingIds: readonly string[];
+    readonly addFindings: readonly {
+      readonly anchor: { readonly ref: string; readonly line?: number };
+      readonly severity: ReviewFinding["severity"];
+      readonly summary: string;
+    }[];
+  };
+}
+
+export interface LegacyImplementerResult {
+  readonly findingReplies: readonly {
+    readonly findingId: string;
+    readonly summary: string;
+    readonly evidenceRefs: readonly string[];
   }[];
 }
 
@@ -90,7 +113,7 @@ export function createReviewArtifact(input: {
 
 export function applyReviewerResult(
   artifact: ReviewArtifact,
-  result: ReviewerResult,
+  result: LegacyReviewerResult,
   reviewerAgentId: string,
   cycleIndex: number,
   at = new Date().toISOString()
@@ -152,7 +175,7 @@ export function applyReviewerResult(
 
 export function applyImplementerResult(
   artifact: ReviewArtifact,
-  result: ImplementerResult,
+  result: LegacyImplementerResult,
   implementerAgentId: string,
   at = new Date().toISOString()
 ): ReviewArtifact {

@@ -58,6 +58,7 @@ export interface ExecutionRow {
 export interface SessionRow {
   session_id: string;
   agent_id: string;
+  run_id: string | null;
   adapter_id: string;
   provider_session_id: string;
   workspace: string;
@@ -124,6 +125,7 @@ export interface ChatDecisionReceiptRow {
 export interface ChatAttentionReceipt {
   readonly sourceMessageEventId: string;
   readonly agentId: string;
+  readonly handleSnapshot: string;
   readonly outcome: "dispatched" | "skipped";
   readonly reason: ChatAttentionReason;
   readonly presenceSnapshot: ChatAttentionPlan["presenceSnapshot"];
@@ -377,14 +379,19 @@ export function mapEvent(row: EventRow): Event {
     };
   }
   if (row.prompt === null) throw new Error(`Input Event has no prompt: ${row.event_id}`);
+  const invocationPayload = row.payload_json === null
+    ? undefined
+    : reviewPayload(row);
   return {
     ...common,
     type: row.type,
     agentId: row.agent_id!,
     prompt: row.prompt,
-    ...(row.payload_json === null
+    ...(invocationPayload === undefined
       ? {}
-      : { reviewInvocation: reviewInvocation(row) })
+      : invocationPayload.schemaVersion === "AgentRunContext@1"
+        ? { runContext: agentRunContext(invocationPayload, row.event_id) }
+        : { reviewInvocation: reviewInvocation(row) })
   };
 }
 
@@ -479,6 +486,159 @@ function reviewInvocation(
   };
   validateReviewInvocation(invocation, row.agent_id ?? "");
   return invocation;
+}
+
+function agentRunContext(
+  value: Readonly<Record<string, unknown>>,
+  eventId: string
+): import("../../core/runtime/model.js").AgentRunContext {
+  if (value.schemaVersion !== "AgentRunContext@1") {
+    throw new Error(`Agent Run context schema is unsupported: ${eventId}`);
+  }
+  const completionBinding = value.completionBinding;
+  const stepCompletion = value.stepCompletion;
+  const workspaceGrant = value.workspaceGrant;
+  return {
+    schemaVersion: "AgentRunContext@1",
+    resultContractId: requirePayloadText(
+      value.resultContractId,
+      eventId,
+      "resultContractId"
+    ),
+    runId: requirePayloadText(value.runId, eventId, "runId"),
+    stepId: requirePayloadText(value.stepId, eventId, "stepId"),
+    depth: payloadInteger(value.depth, eventId, "depth", 0),
+    ...(value.parentStepId === undefined
+      ? {}
+      : {
+          parentStepId: requirePayloadText(
+            value.parentStepId,
+            eventId,
+            "parentStepId"
+          )
+        }),
+    ...(workspaceGrant === undefined
+      ? {}
+      : { workspaceGrant: externalWorkspaceGrant(workspaceGrant, eventId) }),
+    ...(completionBinding === undefined
+      ? {}
+      : { completionBinding: completion(completionBinding, eventId) }),
+    ...(stepCompletion === undefined
+      ? {}
+      : { stepCompletion: stepCompletionValue(stepCompletion, eventId) })
+  };
+}
+
+function externalWorkspaceGrant(
+  value: unknown,
+  eventId: string
+): import("../../core/runtime/model.js").ExternalWorkspaceGrant {
+  if (!isRecord(value) || value.schemaVersion !== "ExternalWorkspaceGrant@1") {
+    throw new Error(`External workspace grant is malformed: ${eventId}`);
+  }
+  return {
+    schemaVersion: "ExternalWorkspaceGrant@1",
+    root: requirePayloadText(value.root, eventId, "workspaceGrant.root"),
+    access: payloadOneOf(
+      value.access,
+      ["read", "write"] as const,
+      eventId,
+      "workspaceGrant.access"
+    ),
+    revision: requirePayloadText(
+      value.revision,
+      eventId,
+      "workspaceGrant.revision"
+    )
+  };
+}
+
+function completion(
+  value: unknown,
+  eventId: string
+): import("../../core/runtime/model.js").AgentCompletionBinding {
+  if (!isRecord(value) || value.schemaVersion !== "AgentCompletionBinding@1") {
+    throw new Error(`Agent completion binding is malformed: ${eventId}`);
+  }
+  return {
+    schemaVersion: "AgentCompletionBinding@1",
+    callerAgentId: requirePayloadText(
+      value.callerAgentId,
+      eventId,
+      "completionBinding.callerAgentId"
+    ),
+    callerSessionId: requirePayloadText(
+      value.callerSessionId,
+      eventId,
+      "completionBinding.callerSessionId"
+    ),
+    callerStepId: requirePayloadText(
+      value.callerStepId,
+      eventId,
+      "completionBinding.callerStepId"
+    ),
+    callerRequestEventId: requirePayloadText(
+      value.callerRequestEventId,
+      eventId,
+      "completionBinding.callerRequestEventId"
+    )
+  };
+}
+
+function stepCompletionValue(
+  value: unknown,
+  eventId: string
+): import("../../core/runtime/model.js").AgentStepCompletion {
+  if (!isRecord(value) || value.schemaVersion !== "AgentStepCompletion@1" ||
+    !Array.isArray(value.artifactRefs) ||
+    value.artifactRefs.some((item) => typeof item !== "string")) {
+    throw new Error(`Agent step completion is malformed: ${eventId}`);
+  }
+  return {
+    schemaVersion: "AgentStepCompletion@1",
+    childAgentId: requirePayloadText(
+      value.childAgentId,
+      eventId,
+      "stepCompletion.childAgentId"
+    ),
+    childStepId: requirePayloadText(
+      value.childStepId,
+      eventId,
+      "stepCompletion.childStepId"
+    ),
+    childRequestEventId: requirePayloadText(
+      value.childRequestEventId,
+      eventId,
+      "stepCompletion.childRequestEventId"
+    ),
+    childResultEventId: requirePayloadText(
+      value.childResultEventId,
+      eventId,
+      "stepCompletion.childResultEventId"
+    ),
+    childExecutionId: requirePayloadText(
+      value.childExecutionId,
+      eventId,
+      "stepCompletion.childExecutionId"
+    ),
+    outcome: payloadOneOf(
+      value.outcome,
+      ["succeeded", "failed", "needs_human"] as const,
+      eventId,
+      "stepCompletion.outcome"
+    ),
+    summary: requirePayloadText(value.summary, eventId, "stepCompletion.summary"),
+    artifactRefs: value.artifactRefs as string[],
+    ...(value.observedWorkspaceRevision === undefined
+      ? {}
+      : {
+          observedWorkspaceRevision: requirePayloadText(
+            value.observedWorkspaceRevision,
+            eventId,
+            "stepCompletion.observedWorkspaceRevision"
+          )
+        })
+  };
 }
 
 function reviewSubject(
@@ -606,6 +766,7 @@ export function mapChatAttentionReceipt(row: ChatAttentionReceiptRow): ChatAtten
   return {
     sourceMessageEventId: row.source_message_event_id,
     agentId: row.agent_id,
+    handleSnapshot: row.agent_id,
     outcome: row.outcome,
     reason: row.reason,
     presenceSnapshot: snapshot,
@@ -662,6 +823,7 @@ export function mapSession(row: SessionRow): RuntimeSession {
   return {
     sessionId: row.session_id,
     agentId: row.agent_id,
+    ...(row.run_id === null ? {} : { runId: row.run_id }),
     adapterId: row.adapter_id,
     providerSessionId: row.provider_session_id,
     workspace: row.workspace,
