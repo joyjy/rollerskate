@@ -52,7 +52,7 @@ function applyFilters() { page.value = 1; }
       <input v-model="query" type="search" placeholder="Event ID or external ID" class="search-input" @input="applyFilters" />
       <select v-model="filterType" class="filter-select" @change="applyFilters">
         <option value="all">All types</option>
-        <option v-for="type in ['agent.request', 'subscription.fire', 'agent.result', 'review.requested', 'review.decision', 'chat.message', 'chat.dispatch']" :key="type" :value="type">{{ type }}</option>
+        <option v-for="type in ['agent.request', 'subscription.fire', 'agent.result', 'chat.message', 'chat.dispatch']" :key="type" :value="type">{{ type }}</option>
       </select>
       <select v-model="filterSource" class="filter-select" @change="applyFilters">
         <option value="all">All sources</option>

@@ -81,5 +81,31 @@ export async function handleAgentApi(
     return true;
   }
 
+  const rotateCredential = matchPath(
+    url.pathname,
+    /^\/api\/agents\/([^/]+)\/credentials\/rotate$/
+  );
+  if (rotateCredential !== undefined && request.method === "POST") {
+    const authentication = await dependencies.devices.authenticateDevice(bearerToken(request));
+    writeJson(response, 201, await dependencies.agents.rotateCredential(
+      authentication,
+      rotateCredential
+    ));
+    return true;
+  }
+
+  const revokeCredential = matchPath(
+    url.pathname,
+    /^\/api\/agents\/([^/]+)\/credentials\/revoke$/
+  );
+  if (revokeCredential !== undefined && request.method === "POST") {
+    const authentication = await dependencies.devices.authenticateDevice(bearerToken(request));
+    writeJson(response, 200, await dependencies.agents.revokeCredentials(
+      authentication,
+      revokeCredential
+    ));
+    return true;
+  }
+
   return false;
 }

@@ -4,12 +4,14 @@ import type {
   AgentCreateRequest,
   AgentCreateResponse,
   AgentCredentialIssuance,
+  AgentCredentialRevocation,
   AgentSummary
 } from "@rollerskate/protocol";
 
 import { ServerError } from "../shared/error.js";
 import type { CredentialService } from "../shared/credentials.js";
 import type {
+  AgentAggregate,
   AgentAuthenticationRecord,
   AgentCredentialRecord,
   AgentRecord,
@@ -81,9 +83,7 @@ export class AgentService {
       now: timestamp
     });
     if (!outcome.ok) {
-      const status = outcome.reason === "name_taken" ? 409
-        : outcome.reason === "different_device" ? 409
-        : outcome.reason === "verifier_mismatch" ? 409
+      const status = outcome.reason === "verifier_mismatch" ? 409
         : 403;
       throw new ServerError(
         `agent_${outcome.reason}`,
@@ -150,6 +150,53 @@ export class AgentService {
       .map(toAgentSummary);
   }
 
+  public async rotateCredential(
+    authentication: DeviceAuthenticationRecord,
+    agentId: string
+  ): Promise<AgentCredentialIssuance> {
+    const aggregate = await this.#ownedAgent(authentication, agentId);
+    if (aggregate.agent.status !== "active" || aggregate.placement.state !== "active") {
+      throw new ServerError("agent_inactive", 409, "Agent placement is not active");
+    }
+    const timestamp = now(this.#options);
+    const id = randomUUID();
+    const secret = this.#options.credentials.generateSecret();
+    const credential = await this.#repository.rotateAgentCredential(
+      agentId,
+      aggregate.placement.id,
+      {
+        id,
+        agentId,
+        placementId: aggregate.placement.id,
+        secretHash: await this.#options.credentials.hashSecret(secret),
+        status: "active",
+        createdAt: timestamp
+      },
+      timestamp
+    );
+    if (credential === undefined) {
+      throw new ServerError("agent_inactive", 409, "Agent placement is not active");
+    }
+    return {
+      credentialId: credential.id,
+      credential: `${credential.id}.${secret}`,
+      agent: toAgentSummary((await this.#repository.getAgentAggregateById(agentId))!)
+    };
+  }
+
+  public async revokeCredentials(
+    authentication: DeviceAuthenticationRecord,
+    agentId: string
+  ): Promise<AgentCredentialRevocation> {
+    await this.#ownedAgent(authentication, agentId);
+    const timestamp = now(this.#options);
+    return {
+      agentId,
+      revokedCount: await this.#repository.revokeAgentCredentials(agentId, timestamp),
+      revokedAt: timestamp
+    };
+  }
+
   public async getAgentByName(
     authentication: DeviceAuthenticationRecord,
     name: string
@@ -197,5 +244,18 @@ export class AgentService {
 
   public agentSummary(authentication: AgentAuthenticationRecord): AgentSummary {
     return toAgentSummary(authentication);
+  }
+
+  async #ownedAgent(
+    authentication: DeviceAuthenticationRecord,
+    agentId: string
+  ): Promise<AgentAggregate> {
+    const aggregate = await this.#repository.getAgentAggregateById(agentId);
+    if (aggregate === undefined) throw new ServerError("agent_not_found", 404,
+      "Agent was not found");
+    if (aggregate.owner.id !== authentication.human.id) {
+      throw new ServerError("forbidden", 403, "Only the Agent owner can manage credentials");
+    }
+    return aggregate;
   }
 }

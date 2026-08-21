@@ -23,9 +23,21 @@ export class MacOsNotificationAdapter implements RuntimeDestinationAdapter {
   public async deliver(
     input: Parameters<RuntimeDestinationAdapter["deliver"]>[0]
   ): Promise<{ readonly receipt: string }> {
+    const payloadTitle = input.delivery.payload.title;
+    const payloadBody = input.delivery.payload.body;
+    if (typeof payloadTitle === "string" && typeof payloadBody === "string") {
+      await this.#notify({
+        title: payloadTitle,
+        subtitle: typeof input.delivery.payload.subtitle === "string"
+          ? input.delivery.payload.subtitle
+          : "Rollerskate",
+        body: payloadBody
+      });
+      return { receipt: `macos-notification:${input.delivery.deliveryId}` };
+    }
     const title = input.destination.address.title;
     const subscriptionId = input.destination.address.subscriptionId;
-    if (title === undefined || subscriptionId === undefined) {
+    if (title === undefined || subscriptionId === undefined || input.resultEvent === undefined) {
       throw new Error(
         `macOS notification destination address is incomplete: ` +
         input.destination.destinationId

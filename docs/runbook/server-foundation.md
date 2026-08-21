@@ -1,7 +1,7 @@
 ---
 type: Runbook
 title: Rollerskate Server Foundation Runbook
-description: 安装、配置并启动 Phase 1–3 Server，执行 migration、Matrix Application Service、Local Device login 和 Agent enrollment。
+description: 安装、配置并启动 Server，执行 migration、Local Device login 和 Agent enrollment，并说明可选 legacy Matrix 验证路径。
 tags: [rollerskate, server, mysql, migration, runbook]
 timestamp: 2026-07-19
 ---
@@ -17,7 +17,7 @@ npm run verify
 
 ## 一键开发环境
 
-开发与验收使用 `dev/compose.yaml` 启动 MySQL 8.4、Synapse、Server migration 和 Rollerskate Server。它不包含本地 OIDC Provider，也不代表生产部署拓扑；Server 直接接入正式企业 OIDC，Local Runtime 与 Agent CLI 继续运行在宿主机。
+开发与验收使用 `dev/compose.yaml` 启动 MySQL 8.4、Server migration 和原生 Topic Server。默认拓扑不启动 Matrix/Synapse，也不包含本地 OIDC Provider，更不代表生产部署拓扑；Server 直接接入正式企业 OIDC，Local Runtime 与 Agent CLI 继续运行在宿主机。Local Console 登录使用 Authorization Code + PKCE，CLI `device login` 才使用 Device Authorization Grant。
 
 首次启动先准备未受 Git 管理的真实配置：
 
@@ -25,17 +25,16 @@ npm run verify
 cp dev/.env.example dev/.env
 ```
 
-在 `dev/.env` 中填写正式 OIDC discovery URL、client ID 与可选 client secret。CLI Device login 从 discovery 读取 `device_authorization_endpoint`，不使用 callback；真正的 Web session 保留 Authorization Code + PKCE，如果 provider 要求后端 POST 初始化 Web 授权，再设置 `ROLLERSKATE_OIDC_AUTHORIZATION_REQUEST_METHOD=post`。只有启用 Web 登录时才需要注册 `http://localhost:4100/auth/callback`；如果调整 `ROLLERSKATE_DEV_SERVER_PORT`，Web callback 端口必须同步调整。
+在 `dev/.env` 中填写正式 OIDC discovery URL、client ID 与可选 client secret。CLI Device login 从 discovery 读取 `device_authorization_endpoint`，不使用 callback；Local Console 通过 Server Web session 使用 Authorization Code + PKCE，浏览器以 GET 直接进入 discovery 声明的 `authorization_endpoint`，从而由 Provider 在自己的域内建立登录 Cookie。使用 Local Console 登录时必须注册 `http://localhost:4100/auth/callback`；如果调整 `ROLLERSKATE_DEV_SERVER_PORT`，Web callback 端口必须同步调整。
 
 随后一条命令构建并启动完整 Server 依赖：
 
 ```bash
 npm run dev:up
 curl http://localhost:4100/healthz
-curl http://localhost:4200/_matrix/client/versions
 ```
 
-Matrix 健康检查中的宿主机端口应与 `ROLLERSKATE_DEV_MATRIX_PORT` 一致；上例使用模板默认值 4200。`npm run dev:up` 会先调用 `npm run dev:init`，在 Git 忽略的 `dev/secrets/` 下生成或复用 mode-0600 的 AS/HS token。Compose 通过文件 secret 将同一对 token 提供给 Synapse 与 Server，等待 MySQL 健康、执行幂等 migration、生成 Synapse 配置和 Application Service registration，再启动 Server。空数据库上的第一个成功 OIDC 登录会在数据库事务内认领 deployment admin，后续 identity 必须先进入 allowlist。`npm run dev:down` 停止容器但保留 MySQL、Synapse named volume 与开发 secrets；只有明确需要清空开发数据时才手动执行 `docker compose --env-file dev/.env -f dev/compose.yaml down --volumes`。
+Compose 等待 MySQL 健康、执行幂等 migration，再启动 Server。4100 只提供 API；要操作 Server profile、Topic 和 enrollment，另在宿主机运行 `ROLLERSKATE_SERVER_URL=http://localhost:4100 scripts/rs start --no-open --ui-port 4300`，然后打开 `http://localhost:4300/console/network`。点击 `Connect Server` 创建 browser pairing，并在新标签页经 Server 发起 OIDC Authorization Code + PKCE 登录；Human 显式批准设备后，Local 后端轮询 pairing、兑换并保存 credential。已有旧绑定时按钮显示 `Reconnect Server`，只有新配对成功后才替换 Local credential。空数据库上的第一个成功 OIDC 登录会在数据库事务内认领 deployment admin，后续 identity 必须先进入 allowlist。`npm run dev:down` 停止容器但保留 MySQL named volume；只有明确需要清空开发数据时才手动执行 `docker compose --env-file dev/.env -f dev/compose.yaml down --volumes`。
 
 ## 启动 Server
 
@@ -47,17 +46,13 @@ ROLLERSKATE_DATABASE_URL='mysql://user:password@127.0.0.1:3306/rollerskate' \
 ROLLERSKATE_OIDC_ISSUER=https://identity.example.com \
 ROLLERSKATE_OIDC_CLIENT_ID=rollerskate \
 ROLLERSKATE_OIDC_CLIENT_SECRET='<secret>' \
-ROLLERSKATE_MATRIX_HOMESERVER_URL=https://matrix.example.com \
-ROLLERSKATE_MATRIX_SERVER_NAME=matrix.example.com \
-ROLLERSKATE_MATRIX_AS_TOKEN='<as-token>' \
-ROLLERSKATE_MATRIX_HS_TOKEN='<hs-token>' \
 npm --prefix server start
 curl http://127.0.0.1:4100/healthz
 ```
 
 CLI Device login 要求 discovery 同时声明 `device_authorization_endpoint` 与 `urn:ietf:params:oauth:grant-type:device_code`。Web 登录才要求 OIDC provider 注册 `${ROLLERSKATE_PUBLIC_URL}/auth/callback`。生产环境的 public URL 与 OIDC endpoint 必须使用 HTTPS；HTTP 只允许 localhost 开发。空数据库上的第一个成功 OIDC 登录会认领 deployment admin；该认领由数据库 singleton row 串行化，不能产生两个首次管理员。
 
-Matrix homeserver 必须注册一个指向 `${ROLLERSKATE_PUBLIC_URL}` 的 Application Service，并使用与 Server 环境完全相同的 `as_token`、`hs_token`。namespace 至少独占 Server 生成的 `@rs_h_<32 hex>:<server-name>` 与 `@rs_a_<32 hex>:<server-name>` virtual user；homeserver 必须能访问 `PUT /_matrix/app/v1/transactions/:txnId`。token 只能放在 Server secret 配置，不得写入浏览器、本地 Runtime 配置、URL 或日志。
+原生 Topic 主路径不需要 Matrix 配置。legacy Room/Matrix compatibility smoke 仍可在隔离环境显式提供 Matrix 环境变量运行，但不属于默认 v0.4 开发拓扑。
 
 ## 执行 Server migration
 

@@ -7,7 +7,7 @@ Rollerskate 是一个 npm monorepo。仓库根目录只负责 workspace 编排�
 - [Source Map](docs/architecture/source-map.md) 是 package、source root、ownership、generated artifact 与验证入口的唯一事实源。
 - [Architecture Index](docs/architecture/index.md) 是当前产品架构、稳定不变量、ADR 与专题文档入口。
 - 新增或修改 SQLite table、migration、materialized projection/index 或 durable object/state 前，必须先读 [Database Reference](docs/architecture/db-reference.md)，完成 Event-only / index / object 分类，并明确 owner、字段事实源、事务和 rebuild/reconciliation 规则。
-- 未实现计划不能覆盖 architecture 文档和源码事实；公开源码快照不包含内部 plan 与 verification 文件。
+- 未实现计划不能覆盖 architecture 文档和源码事实；公开源码快照不包含内部规划与 release evidence。
 
 ## Hard Boundaries
 

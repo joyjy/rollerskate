@@ -13,7 +13,7 @@ describe("Console router", () => {
     "/console/events",
     "/console/agents",
     "/console/chats",
-    "/console/reviews",
+    "/console/steward",
     "/console/schedules",
     "/console/subscriptions"
   ])("preserves an explicit direct URL: %s", async (path) => {

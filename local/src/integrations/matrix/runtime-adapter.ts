@@ -111,19 +111,21 @@ export class MatrixDeliveryAdapter implements RuntimeDestinationAdapter {
     if (roomId === undefined || agentId === undefined || bindingId === undefined) {
       throw new Error(`Matrix destination address is incomplete: ${input.destination.destinationId}`);
     }
-    const body = input.resultEvent.outcome === "succeeded"
-      ? input.resultEvent.output
-      : input.resultEvent.error;
+    const body = typeof input.delivery.payload.body === "string"
+      ? input.delivery.payload.body
+      : input.resultEvent?.outcome === "succeeded"
+        ? input.resultEvent.output
+        : input.resultEvent?.error;
     if (body === undefined || body.trim() === "") {
-      throw new Error(`Result Event has no Matrix delivery body: ${input.resultEvent.eventId}`);
+      throw new Error(`Delivery has no Matrix body: ${input.delivery.deliveryId}`);
     }
     const receipt = await this.#publisher.send({
       agentId,
       roomId,
       transactionId: input.delivery.deliveryId,
       body,
-      causalChainId: input.requestEvent.causality.rootEventId,
-      causalHop: input.resultEvent.causality.hop
+      causalChainId: input.requestEvent?.causality.rootEventId ?? input.delivery.origin.id,
+      causalHop: input.resultEvent?.causality.hop ?? 0
     });
     return { receipt: receipt.eventId };
   }

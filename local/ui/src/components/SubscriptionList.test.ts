@@ -24,17 +24,21 @@ describe("SubscriptionList", () => {
 
 function fixtureSubscription(): Subscription {
   return {
+    kind: "free",
     id: "sub-1",
     title: "Fixture pipeline",
     status: "active",
     owner: { agentId: "agent-1", handle: "reviewer", client: "codex" },
-    callback: {
-      providerSessionId: "provider-1",
-      adapterId: "codex-runtime-jsonl-v1",
-      workspace: "/workspace",
-      localSessionId: null,
-      prompt: "Report completion."
+    definition: {
+      schema: "SubscriptionDefinition@3",
+      revision: "fixture-v1",
+      digest: "definition-digest",
+      callbackPhaseStatus: "pending",
+      artifactRevision: "probe-v1",
+      artifactDigest: `sha256:${"0".repeat(64)}`,
+      callbacks: []
     },
+    callbacks: [],
     probe: {
       plugin: { id: "fixture", path: "/plugin.ts", schemaVersion: 1 },
       policy: {
@@ -55,7 +59,7 @@ function fixtureSubscription(): Subscription {
     },
     createdAt: "2026-07-24T00:00:00.000Z",
     updatedAt: "2026-07-24T00:00:00.000Z",
-    fireEventId: null,
-    latestError: null
+    latestError: null,
+    terminalObservation: null
   };
 }

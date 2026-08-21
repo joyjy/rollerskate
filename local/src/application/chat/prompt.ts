@@ -1,5 +1,7 @@
 import {
+  type ConversationIntentSnapshot,
   type ChatPromptHistory,
+  type ChatProfileContext,
   chatMentionPromptResourceId,
   chatPromptResourceId
 } from "../../core/chat/model.js";
@@ -17,9 +19,34 @@ export interface ChatPromptContext {
   readonly topicId: string;
   readonly attentionReason: ChatAttentionPlan["reason"];
   readonly currentPresence: ChatAttentionPlan["presenceSnapshot"];
-  readonly latestMessage: ChatMessageEvent;
+  readonly turnMode: "reply_to_message" | "proactive_contribution";
+  readonly latestMessage?: ChatMessageEvent;
+  readonly conversationIntent: ConversationIntentSnapshot;
   readonly history: ChatPromptHistory;
+  readonly chatHistory?:
+    | {
+        readonly schema: "ChatHistoryToolsCapability@1";
+        readonly tools: readonly ["read_chat_history"];
+      }
+    | {
+        readonly schema: "ChatHistoryRequestCapability@1";
+      };
   readonly now: string;
+  readonly profileContext?: ChatProfileContext;
+  readonly clientHistory?:
+    | {
+        readonly schema: "ClientHistoryCapability@1";
+        readonly scope: "same-client-history-read";
+        readonly client: import("../../modules/agent/client-profile.js").AgentClient;
+        readonly actions: readonly ["search", "read"];
+      }
+    | {
+        readonly schema: "ClientThreadToolsCapability@1";
+        readonly scope: "same-client-history-read";
+        readonly client: "codex";
+        readonly tools: readonly ["list_client_threads", "read_client_thread"];
+        readonly timeZone: "Asia/Shanghai";
+      };
 }
 
 export interface ChatPromptResource {

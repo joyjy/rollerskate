@@ -45,6 +45,7 @@ export interface AgentCredentialRecord {
   readonly createdAt: string;
   readonly expiresAt?: string;
   readonly revokedAt?: string;
+  readonly rotatedFromCredentialId?: string;
 }
 
 export interface AgentAggregate {

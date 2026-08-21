@@ -7,6 +7,8 @@ import type {
 } from "./model.js";
 import { ScheduledTaskStore } from "./store.js";
 import { latestCronOccurrence } from "./time.js";
+import type { ExternalRefTriggerGuard } from
+  "../../modules/external-resource/trigger-binding.js";
 
 export interface ScheduledTaskCycleResult {
   readonly projected: readonly string[];
@@ -20,18 +22,21 @@ export class ScheduledTaskRuntime {
   readonly #runtime: RuntimeStore;
   readonly #store: ScheduledTaskStore;
   readonly #validateTarget: (revision: ScheduleRevision) => string | undefined;
+  readonly #externalRefGuard: ExternalRefTriggerGuard | undefined;
 
   public constructor(options: {
     readonly store: ScheduledTaskStore;
     readonly runtime: RuntimeStore;
     readonly validateTarget: (revision: ScheduleRevision) => string | undefined;
+    readonly externalRefGuard?: ExternalRefTriggerGuard;
   }) {
     this.#store = options.store;
     this.#runtime = options.runtime;
     this.#validateTarget = options.validateTarget;
+    this.#externalRefGuard = options.externalRefGuard;
   }
 
-  public runCycle(at = new Date().toISOString()): ScheduledTaskCycleResult {
+  public async runCycle(at = new Date().toISOString()): Promise<ScheduledTaskCycleResult> {
     const now = iso(at);
     const projected = this.#projectRuns(now);
     const admitted: string[] = [];
@@ -40,7 +45,7 @@ export class ScheduledTaskRuntime {
     const failed: string[] = [];
 
     for (const run of this.#store.pendingRuns()) {
-      const result = this.#admitPending(run, now);
+      const result = await this.#admitPending(run, now);
       if (result === "admitted") admitted.push(run.runId);
       if (result === "failed") failed.push(run.runId);
       if (result === "skipped") skipped.push(run.runId);
@@ -49,9 +54,10 @@ export class ScheduledTaskRuntime {
     for (const schedule of this.#store.due(now)) {
       const decision = this.#decideDue(schedule, now);
       if (decision.kind === "admit") {
-        const result = this.#admitPending(decision.run, now);
+        const result = await this.#admitPending(decision.run, now);
         if (result === "admitted") admitted.push(decision.run.runId);
         if (result === "failed") failed.push(decision.run.runId);
+        if (result === "skipped") skipped.push(decision.run.runId);
       } else if (decision.kind === "skip") {
         skipped.push(decision.run.runId);
       } else if (decision.kind === "queue") {
@@ -62,11 +68,63 @@ export class ScheduledTaskRuntime {
   }
 
   #projectRuns(at: string): string[] {
+    this.#store.reconcileCallbacks(at);
     const projected: string[] = [];
     for (const schedule of this.#store.list()) {
       for (const run of this.#store.unterminatedRuns(schedule.definition.scheduleId)) {
-        if (run.eventId === undefined) continue;
         if (run.status === "unknown") continue;
+        if (run.status === "running") {
+          const callbacks = this.#store.callbackOccurrences(run);
+          if (callbacks.length === 0 && run.eventId === undefined) {
+            this.#store.patchRun(run.runId, {
+              status: "unknown",
+              decisionReason: "callback-occurrence-missing"
+            }, at);
+            projected.push(run.runId);
+            continue;
+          }
+          if (callbacks.length > 0) {
+            const agentCallback = callbacks.find(({ eventId }) => eventId !== undefined);
+            const audit = agentCallback?.eventId === undefined
+              ? undefined
+              : this.#runtime.audit(agentCallback.eventId);
+            const active = callbacks.some(({ status }) =>
+              status === "pending" || status === "started"
+            );
+            if (active) {
+              if (agentCallback?.eventId !== undefined && run.eventId === undefined) {
+                this.#store.patchRun(run.runId, {
+                  status: "running",
+                  eventId: agentCallback.eventId,
+                  ...(audit?.execution === undefined
+                    ? {}
+                    : { executionId: audit.execution.executionId }),
+                  ...(audit?.session === undefined ? {} : { sessionId: audit.session.sessionId })
+                }, at);
+                projected.push(run.runId);
+              }
+              continue;
+            }
+            const status = callbacks.some(({ status }) => status === "unknown")
+              ? "unknown"
+              : callbacks.some(({ status }) => status === "failed" || status === "blocked")
+                ? "failed"
+                : "succeeded";
+            this.#store.patchRun(run.runId, {
+              status,
+              ...(agentCallback?.eventId === undefined ? {} : { eventId: agentCallback.eventId }),
+              ...(audit?.execution === undefined
+                ? {}
+                : { executionId: audit.execution.executionId }),
+              ...(audit?.session === undefined ? {} : { sessionId: audit.session.sessionId }),
+              decisionReason: `callbacks-${status}`,
+              completedAt: at
+            }, at);
+            projected.push(run.runId);
+            continue;
+          }
+        }
+        if (run.eventId === undefined) continue;
         const audit = this.#runtime.audit(run.eventId);
         if (audit?.execution === undefined) {
           this.#store.patchRun(run.runId, {
@@ -207,10 +265,10 @@ export class ScheduledTaskRuntime {
     return decision;
   }
 
-  #admitPending(
+  async #admitPending(
     run: ScheduledRun,
     at: string
-  ): "admitted" | "deferred" | "failed" | "skipped" {
+  ): Promise<"admitted" | "deferred" | "failed" | "skipped"> {
     const current = this.#store.requireRun(run.runId);
     if (current.status !== "queued" || current.eventId !== undefined) return "deferred";
     const schedule = this.#store.require(current.scheduleId);
@@ -244,27 +302,53 @@ export class ScheduledTaskRuntime {
       }, at);
       return "failed";
     }
-    const receipt = this.#runtime.appendEvent({
-      type: "agent.request",
-      source: {
-        kind: "schedule",
-        externalId: `scheduled-run:${current.runId}`
-      },
-      agentId: revision.agentId,
-      prompt: revision.prompt,
-      ...(revision.fixedSessionId === undefined
-        ? {}
-        : { sessionId: revision.fixedSessionId }),
-      createdAt: at
-    });
-    this.#store.patchRun(current.runId, {
-      status: projectedStatus(receipt.execution.status),
-      eventId: receipt.event.eventId,
-      executionId: receipt.execution.executionId,
-      admittedAt: current.admittedAt ?? at
-    }, at);
+    if (revision.externalRefBinding !== undefined) {
+      if (this.#externalRefGuard === undefined) {
+        this.#store.patchRun(current.runId, {
+          status: "failed",
+          decisionReason: "external-ref-trigger:guard-unavailable",
+          completedAt: at
+        }, at);
+        return "failed";
+      }
+      try {
+        const checked = await this.#externalRefGuard(revision.externalRefBinding);
+        if (checked.status === "rejected") {
+          this.#store.patchRun(current.runId, {
+            status: "skipped",
+            decisionReason: `external-ref-trigger:${checked.reason}`,
+            completedAt: at
+          }, at);
+          return "skipped";
+        }
+      } catch (error) {
+        this.#store.patchRun(current.runId, {
+          status: "failed",
+          decisionReason: `external-ref-trigger-read:${message(error)}`,
+          completedAt: at
+        }, at);
+        return "failed";
+      }
+    }
+    const admitted = this.#store.admitCallbackRun(current.runId, at);
+    const callback = this.#store.admitSingleAgentCallback(admitted, at);
+    if (callback?.eventId !== undefined) {
+      const audit = this.#runtime.audit(callback.eventId);
+      this.#store.patchRun(current.runId, {
+        status: audit?.execution === undefined
+          ? "running"
+          : projectedStatus(audit.execution.status),
+        eventId: callback.eventId,
+        ...(audit?.execution === undefined ? {} : { executionId: audit.execution.executionId }),
+        admittedAt: at
+      }, at);
+    }
     return "admitted";
   }
+}
+
+function message(error: unknown): string {
+  return (error instanceof Error ? error.message : String(error)).slice(0, 512);
 }
 
 function projectedStatus(

@@ -54,9 +54,6 @@ export interface AgentSummary {
   readonly updatedAt: string;
 }
 
-/** @deprecated Use AgentSummary. */
-export type AgentConsoleItem = AgentSummary;
-
 export function localRuntimeSnapshot(
   repoRoot: string,
   options: LocalControlOptions = {}
@@ -70,13 +67,6 @@ export function localRuntimeSnapshot(
   } finally {
     resources.store.close();
   }
-}
-
-export function agentConsoleList(
-  repoRoot: string,
-  options: LocalControlOptions = {}
-): readonly AgentSummary[] {
-  return listAgents(repoRoot, options);
 }
 
 export function listAgents(

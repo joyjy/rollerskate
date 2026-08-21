@@ -8,7 +8,9 @@ export function runtimeAgentEventPrompt(
 ): string {
   const invocationContext = event.type === "agent.request"
     ? event.runContext
-    : undefined;
+    : event.type === "subscription.fire"
+      ? event.invocation
+      : undefined;
   return [
     "You are handling one fixed-schema Rollerskate Local Runtime Event.",
     event.type === "chat.dispatch"

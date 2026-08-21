@@ -38,7 +38,6 @@ test("runtime config derives a public OIDC client from an explicit discovery URL
     ROLLERSKATE_OIDC_ISSUER: "",
     ROLLERSKATE_OIDC_DISCOVERY_URL: discoveryUrl,
     ROLLERSKATE_OIDC_CLIENT_SECRET: "",
-    ROLLERSKATE_OIDC_AUTHORIZATION_REQUEST_METHOD: "post",
     ROLLERSKATE_ALLOW_INSECURE_MATRIX_HTTP: "true"
   });
 
@@ -48,7 +47,6 @@ test("runtime config derives a public OIDC client from an explicit discovery URL
   );
   assert.equal(config.oidc.discoveryUrl, discoveryUrl);
   assert.equal(config.oidc.clientSecret, undefined);
-  assert.equal(config.oidc.authorizationRequestMethod, "post");
 });
 
 test("runtime config requires an explicit Matrix-only insecure HTTP opt-in", () => {
@@ -61,6 +59,7 @@ test("runtime config requires an explicit Matrix-only insecure HTTP opt-in", () 
     ...runtimeEnvironment,
     ROLLERSKATE_ALLOW_INSECURE_MATRIX_HTTP: "true"
   });
+  assert.ok(config.matrix);
   assert.equal(config.matrix.homeserverUrl, "http://synapse:8008");
 
   assert.throws(
@@ -89,11 +88,22 @@ test("runtime config reads Matrix secrets from mounted files", async () => {
       ROLLERSKATE_MATRIX_HS_TOKEN_FILE: hsTokenFile
     });
 
+    assert.ok(config.matrix);
     assert.equal(config.matrix.asToken, "file-as-token");
     assert.equal(config.matrix.hsToken, "file-hs-token");
   } finally {
     await rm(directory, { recursive: true });
   }
+});
+
+test("runtime config starts the native control plane without Matrix", () => {
+  const config = loadServerRuntimeConfig({
+    ROLLERSKATE_PUBLIC_URL: runtimeEnvironment.ROLLERSKATE_PUBLIC_URL,
+    ROLLERSKATE_DATABASE_URL: runtimeEnvironment.ROLLERSKATE_DATABASE_URL,
+    ROLLERSKATE_OIDC_ISSUER: runtimeEnvironment.ROLLERSKATE_OIDC_ISSUER,
+    ROLLERSKATE_OIDC_CLIENT_ID: runtimeEnvironment.ROLLERSKATE_OIDC_CLIENT_ID
+  });
+  assert.equal(config.matrix, undefined);
 });
 
 test("BFF exposes a protocol-aware health endpoint", async () => {

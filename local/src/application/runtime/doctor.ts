@@ -14,7 +14,7 @@ import {
   runtimePaths,
   type LoadedLocalRuntime
 } from "../../infrastructure/runtime/config.js";
-import { LOCAL_SCHEMA_VERSION } from "../../infrastructure/sqlite/local-schema.js";
+import { LOCAL_SCHEMA_VERSION } from "../../infrastructure/sqlite/schema/index.js";
 
 export interface LocalDoctorResult {
   readonly status: "ready";

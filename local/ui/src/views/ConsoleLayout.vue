@@ -21,8 +21,9 @@ const views = [
   { key: "runtime", label: "Runtime" },
   { key: "events", label: "Events" },
   { key: "agents", label: "Agents" },
+  { key: "network", label: "Connections" },
   { key: "chats", label: "Chats" },
-  { key: "reviews", label: "Reviews" },
+  { key: "steward", label: "Steward" },
   { key: "schedules", label: "Schedules" },
   { key: "subscriptions", label: "Subscriptions" }
 ] as const;

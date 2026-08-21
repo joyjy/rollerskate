@@ -15,6 +15,8 @@ import {
   type InsertScheduledRunReceipt
 } from "../../capabilities/scheduled-task/store.js";
 import type { RuntimeAudit, RuntimeStore } from "../../core/runtime/store.js";
+import type { RuntimeDelivery } from "../../core/runtime/model.js";
+import type { ProactiveCallbackOccurrence } from "../../modules/callback/proactive-model.js";
 import { RuntimeStore as RuntimeStoreImplementation } from "../../core/runtime/store.js";
 
 export interface ScheduleControlInput extends Omit<ScheduleRevisionInput, "agentId" | "workspace"> {
@@ -35,6 +37,10 @@ export interface ScheduleInspection {
 export interface ScheduledRunInspection {
   readonly run: ScheduledRun;
   readonly audit?: RuntimeAudit;
+  readonly callbacks: readonly {
+    readonly occurrence: ProactiveCallbackOccurrence;
+    readonly delivery?: RuntimeDelivery;
+  }[];
 }
 
 export function createSchedule(
@@ -152,7 +158,7 @@ export function listScheduledRuns(
   limit = 100
 ): ScheduledRunInspection[] {
   return withStores(repoRoot, runtimeDirectory, (stores) =>
-    stores.schedules.runs(scheduleId, limit).map((run) => runInspection(run, stores.runtime))
+    stores.schedules.runs(scheduleId, limit).map((run) => runInspection(run, stores))
   );
 }
 
@@ -162,7 +168,7 @@ export function traceScheduledRun(
   runtimeDirectory?: string
 ): ScheduledRunInspection {
   return withStores(repoRoot, runtimeDirectory, (stores) =>
-    runInspection(stores.schedules.requireRun(runId), stores.runtime)
+    runInspection(stores.schedules.requireRun(runId), stores)
   );
 }
 
@@ -174,16 +180,8 @@ export function resolveUnknownScheduledRun(
   at = new Date().toISOString()
 ): ScheduledRunInspection {
   return withStores(repoRoot, runtimeDirectory, (stores) => {
-    const run = stores.schedules.requireRun(runId);
-    if (run.status !== "unknown") {
-      throw new Error(`Scheduled run is not unknown: ${runId}`);
-    }
-    const resolved = stores.schedules.patchRun(runId, {
-      status: outcome,
-      decisionReason: `manual-resolved-${outcome}`,
-      completedAt: at
-    }, at);
-    return runInspection(resolved, stores.runtime);
+    const resolved = stores.schedules.resolveUnknownRun(runId, outcome, at);
+    return runInspection(resolved, stores);
   });
 }
 
@@ -236,16 +234,31 @@ function inspection(schedule: Schedule, stores: Stores): ScheduleInspection {
     owner,
     agent,
     runs: stores.schedules.runs(schedule.definition.scheduleId)
-      .map((run) => runInspection(run, stores.runtime))
+      .map((run) => runInspection(run, stores))
   };
 }
 
-function runInspection(run: ScheduledRun, runtime: RuntimeStore): ScheduledRunInspection {
-  const audit = run.eventId === undefined ? undefined : runtime.audit(run.eventId);
+function runInspection(run: ScheduledRun, stores: Pick<Stores, "runtime" | "schedules">): ScheduledRunInspection {
+  const audit = run.eventId === undefined ? undefined : stores.runtime.audit(run.eventId);
+  const callbacks = stores.schedules.callbackOccurrences(run).map((occurrence) => {
+    const deliveryId = callbackDeliveryId(occurrence.receipt);
+    const delivery = deliveryId === undefined ? undefined : stores.runtime.delivery(deliveryId);
+    return {
+      occurrence,
+      ...(delivery === undefined ? {} : { delivery })
+    };
+  });
   return {
     run,
-    ...(audit === undefined ? {} : { audit })
+    ...(audit === undefined ? {} : { audit }),
+    callbacks
   };
+}
+
+function callbackDeliveryId(receipt: unknown): string | undefined {
+  if (typeof receipt !== "object" || receipt === null || Array.isArray(receipt)) return undefined;
+  const deliveryId = (receipt as Record<string, unknown>).deliveryId;
+  return typeof deliveryId === "string" ? deliveryId : undefined;
 }
 
 function requireActiveAgent(foundation: LocalFoundationStore, handle: string): LocalAgent {
@@ -256,18 +269,30 @@ function requireActiveAgent(foundation: LocalFoundationStore, handle: string): L
 }
 
 function validateTarget(
-  stores: Pick<Stores, "runtime" | "workspace">,
+  stores: Pick<Stores, "runtime" | "workspace" | "foundation">,
   agent: LocalAgent,
   input: ScheduleControlInput
 ): void {
-  if (input.sessionPolicy !== "fixed") return;
-  if (input.fixedSessionId === undefined) {
-    throw new Error("fixed session policy requires fixedSessionId");
+  if (input.sessionPolicy === "fixed") {
+    if (input.fixedSessionId === undefined) {
+      throw new Error("fixed session policy requires fixedSessionId");
+    }
+    const session = stores.runtime.session(input.fixedSessionId);
+    if (session === undefined) throw new Error(`Session not found: ${input.fixedSessionId}`);
+    if (session.agentId !== agent.principalId || session.workspace !== stores.workspace) {
+      throw new Error(`Session does not belong to Agent ${agent.handle} and Local workspace`);
+    }
   }
-  const session = stores.runtime.session(input.fixedSessionId);
-  if (session === undefined) throw new Error(`Session not found: ${input.fixedSessionId}`);
-  if (session.agentId !== agent.principalId || session.workspace !== stores.workspace) {
-    throw new Error(`Session does not belong to Agent ${agent.handle} and Local workspace`);
+  for (const callback of input.callbacks ?? []) {
+    if (callback.kind !== "agent.invoke") continue;
+    const agentId = String(callback.definition.agentId);
+    const target = stores.foundation.agent(agentId);
+    if (target === undefined || target.status !== "active") {
+      throw new Error(`Schedule callback Agent is unavailable: ${agentId}`);
+    }
+    if (callback.definition.workspace !== stores.workspace) {
+      throw new Error("Schedule callback workspace must equal the Local workspace");
+    }
   }
 }
 
@@ -285,7 +310,11 @@ function revisionInput(
     sessionPolicy: input.sessionPolicy,
     ...(input.fixedSessionId === undefined ? {} : { fixedSessionId: input.fixedSessionId }),
     prompt: input.prompt,
-    workspace
+    workspace,
+    ...(input.callbacks === undefined ? {} : { callbacks: input.callbacks }),
+    ...(input.externalRefBinding === undefined
+      ? {}
+      : { externalRefBinding: input.externalRefBinding })
   };
 }
 

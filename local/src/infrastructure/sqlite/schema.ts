@@ -1,5 +1,15 @@
-import { openRuntimeDatabase, openRuntimeDatabaseReadOnly } from "./database.js";
-import { migrateLocalDatabase } from "./local-schema.js";
+import { existsSync } from "node:fs";
+
+import {
+  openInitializedRuntimeDatabase,
+  openRuntimeDatabaseReadOnly
+} from "./database.js";
+import {
+  LOCAL_SCHEMA_VERSION,
+  migrateLocalDatabase
+} from "./schema/index.js";
+import { schemaVersion } from "./schema/introspection.js";
+import { assertNoLiveRuntimeSchemaUpgrade } from "./schema/upgrade-guard.js";
 
 export interface RuntimeDiagnostics {
   readonly schemaVersion: number;
@@ -8,12 +18,8 @@ export interface RuntimeDiagnostics {
 }
 
 export function initializeRuntimeSchema(databasePath: string): RuntimeDiagnostics {
-  const writable = openRuntimeDatabase(databasePath);
-  try {
-    migrateLocalDatabase(writable);
-  } finally {
-    writable.close();
-  }
+  const writable = openInitializedRuntimeDatabase(databasePath, migrateLocalDatabase);
+  writable.close();
 
   const database = openRuntimeDatabaseReadOnly(databasePath);
   try {
@@ -33,6 +39,20 @@ export function initializeRuntimeSchema(databasePath: string): RuntimeDiagnostic
       journalMode: journal.journal_mode,
       tables: rows.map((row) => row.name)
     };
+  } finally {
+    database.close();
+  }
+}
+
+export function assertRuntimeSchemaUpgradeAllowed(databasePath: string): void {
+  if (!existsSync(databasePath)) return;
+  const database = openRuntimeDatabaseReadOnly(databasePath);
+  try {
+    assertNoLiveRuntimeSchemaUpgrade(
+      database,
+      schemaVersion(database),
+      LOCAL_SCHEMA_VERSION
+    );
   } finally {
     database.close();
   }

@@ -1,7 +1,8 @@
 import type { DatabaseSync } from "node:sqlite";
+import { withImmediateTransaction } from "./transaction.js";
 
-import { openRuntimeDatabase } from "./database.js";
-import { migrateLocalDatabase } from "./local-schema.js";
+import { openInitializedRuntimeDatabase } from "./database.js";
+import { migrateLocalDatabase } from "./schema/index.js";
 
 export type NoticeDeliveryStatus =
   | "pending"
@@ -117,13 +118,15 @@ export class NoticeStore {
   readonly #database: DatabaseSync;
 
   public constructor(databasePath: string) {
-    this.#database = openRuntimeDatabase(databasePath);
-    const needsBackfill = this.#database.prepare(`
-      SELECT 1 AS present
-      FROM sqlite_master
-      WHERE type = 'table' AND name = 'notices'
-    `).get() === undefined;
-    this.#migrate();
+    let needsBackfill = false;
+    this.#database = openInitializedRuntimeDatabase(databasePath, (database) => {
+      needsBackfill = database.prepare(`
+        SELECT 1 AS present
+        FROM sqlite_master
+        WHERE type = 'table' AND name = 'notices'
+      `).get() === undefined;
+      migrateLocalDatabase(database);
+    });
     if (needsBackfill) this.#projectAll();
   }
 
@@ -219,8 +222,7 @@ export class NoticeStore {
     readonly projected: number;
     readonly preservedStates: number;
   } {
-    this.#database.exec("BEGIN IMMEDIATE");
-    try {
+    return withImmediateTransaction(this.#database, () => {
       this.#projectAll();
       const projected = Number((this.#database.prepare(`
         SELECT COUNT(*) AS count FROM notices
@@ -229,21 +231,14 @@ export class NoticeStore {
         SELECT COUNT(*) AS count FROM notices
         WHERE read_at IS NOT NULL OR acknowledged_at IS NOT NULL
       `).get() as { count: number }).count);
-      this.#database.exec("COMMIT");
       return { projected, preservedStates };
-    } catch (error) {
-      this.#database.exec("ROLLBACK");
-      throw error;
-    }
+    });
   }
 
   #projectAll(): void {
     this.#database.prepare(PROJECT_ALL).run();
   }
 
-  #migrate(): void {
-    migrateLocalDatabase(this.#database);
-  }
 }
 
 function mapNotice(row: NoticeRow): NoticeProjection {

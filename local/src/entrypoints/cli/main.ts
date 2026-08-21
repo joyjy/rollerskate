@@ -1,96 +1,44 @@
 #!/usr/bin/env node
 
-import { accessSync, constants, createWriteStream, mkdirSync, realpathSync } from "node:fs";
-import { delimiter, dirname, join, resolve } from "node:path";
+import { realpathSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { spawn } from "node:child_process";
-import { createInterface, type Interface } from "node:readline/promises";
-import { finished } from "node:stream/promises";
 
-import { doctorLocalRuntime } from "../../application/runtime/doctor.js";
-import { inspectLocalDevice } from "../../application/device/query.js";
+import { eventTrace } from "../../application/event/query.js";
 import {
-  loginDevice,
-  logoutDevice,
-  statusDevice,
-  type LocalDeviceStatus
-} from "../../application/device/server-control.js";
-import {
-  configureAgents,
-  enqueueAgentRequest
-} from "../../application/agent/server-control.js";
-import {
-  addLocalAgent,
-  configureLocalAgent,
-  inspectAgent,
-  isAgentClient,
-  listAgents,
-  localRuntimeSnapshot,
-  renameLocalAgent,
-  resumeLocalAgent,
-  suspendLocalAgent,
-  type LocalAgent,
-  type LocalAgentClient,
-  type AgentSummary
-} from "../../application/agent/control.js";
-import { runAdminCommand, runRoomCommand } from "./room.js";
-import {
+  assertRuntimeSchemaUpgradeAllowed,
   controlRuntime,
-  runtimeLogPaths,
-  setupRuntime,
-  type SetupInput
+  setupRuntime
 } from "../../application/runtime/control.js";
-import {
-  eventTrace,
-  listEventTraces
-} from "../../application/event/query.js";
-import {
-  inspectRuntimeFailure,
-  listRuntimeFailures
-} from "../../application/runtime/failure-query.js";
+import { doctorLocalRuntime } from "../../application/runtime/doctor.js";
 import { runtimeOperationsView } from "../../application/runtime/query.js";
-import { runtimeWorkloadStatus } from "../../application/runtime/workload-query.js";
+import { runAgentCommand, runWorkspaceCommand } from "./agent.js";
+import { runChatCommand } from "./chat.js";
+import { runChannelCommand } from "./channel.js";
+import { runDeviceCommand } from "./device.js";
 import {
-  inspectNoticeView,
-  listNoticeViews
-} from "../../application/notice/query.js";
-import {
-  acknowledgeNotice,
-  markNoticeRead,
-  rebuildNoticeIndex
-} from "../../application/notice/control.js";
-import { startRuntime } from "../../bootstrap/runtime.js";
-import { startUiServer } from "../console/launcher.js";
-import { runSubscriptionCommand } from "./subscription.js";
+  runActivityCommand,
+  runEventCommand,
+  runFailureCommand,
+  runNoticeCommand,
+  runWorkloadCommand
+} from "./operations.js";
+import { runAdminCommand, runRoomCommand } from "./room.js";
+import { runStewardCommand } from "./run.js";
 import { runScheduleCommand } from "./schedule.js";
-import { runAgentRunCommand } from "./run.js";
-import {
-  localChatPresenceView,
-  postLocalChatMessage,
-  rotateLocalAgentSession,
-  setLocalChatPresence
-} from "../../application/chat/control.js";
-import {
-  localChatTimeline,
-  type ChatTimelineOptions
-} from "../../application/chat/query.js";
+import { collectSetupInput } from "./setup.js";
+import type { AppOutput, LocalAppDependencies } from "./shared.js";
+import { rejectArguments, requireCount } from "./shared.js";
+import { parseStartOptions, runStartForeground } from "./start.js";
+import { runSubscriptionCommand } from "./subscription.js";
+import { runTopicCommand } from "./topic.js";
+import { runWorkRequestCommand } from "./work-request.js";
 
-interface AppOutput {
-  readonly write: (text: string) => void;
-}
-
-export interface InteractivePrompts {
-  readonly question: (prompt: string) => Promise<string>;
-  readonly close: () => void;
-}
-
-export interface LocalAppDependencies {
-  readonly prompts?: InteractivePrompts;
-  readonly fetch?: typeof fetch;
-  readonly now?: () => Date;
-  readonly sleep?: (milliseconds: number) => Promise<void>;
-  readonly cwd?: string;
-}
+export type {
+  InteractivePrompts,
+  LocalAppDependencies
+} from "./shared.js";
+export { roomAgentEnvironment } from "./start.js";
 
 interface GlobalOptions {
   readonly argv: readonly string[];
@@ -113,18 +61,32 @@ const HELP = [
   "  scripts/rs recover        reconcile interrupted Runtime work",
   "  scripts/rs pause          pause Local Runtime cycles",
   "  scripts/rs resume         resume Local Runtime cycles",
-  "  scripts/rs agent create <handle> --client <codex|claude-code|kimi-code> [--launch-arg <arg>]...",
+  "  scripts/rs agent create <handle> --client <codex|claude-code|kimi-code|pi> [--launch-arg <arg>]...",
   "  scripts/rs agent configure <handle> [--launch-arg <arg>]...  replace launch args; omit to clear",
   "  scripts/rs agent status <handle>",
   "  scripts/rs agent list",
   "  scripts/rs agent rename <handle> <new-handle>",
   "  scripts/rs agent suspend|resume <handle>",
   "  scripts/rs agent request <name> [--session <ses_uuidv7>] <prompt...>",
+  "  scripts/rs agent profile <handle> [update <json-file>]",
+  "  scripts/rs activity access grant|status|revoke <agent-handle>",
+  "  scripts/rs topic list|history [topic-id]  inspect passive Server Topic inbox",
+  "  scripts/rs topic server-list              list Topics from the connected Server",
+  "  scripts/rs topic create <json-file>",
+  "  scripts/rs topic profile update <topic-id> <json-file>",
+  "  scripts/rs topic join <topic-id> <agent-handle>",
+  "  scripts/rs topic publish <topic-id> <agent-handle> <transaction-id> <message...>",
   "  scripts/rs chat post <message...>",
   "  scripts/rs chat history [--before <event-id>] [--limit <1-200>]",
   "  scripts/rs chat status",
+  "  scripts/rs chat governance",
+  "  scripts/rs chat pause|resume --revision <revision>",
+  "  scripts/rs chat resume-and-wake --revision <revision> --idempotency-key <key>",
+  "  scripts/rs chat participant add|remove <handle> --revision <revision>",
+  "  scripts/rs chat free status|start|continue-now|exit ...",
   "  scripts/rs chat presence set <handle> --scope <topic|global> --mode <available|snoozed> [--until <iso>] [--wake-keyword <literal>]...",
   "  scripts/rs chat session new <handle>",
+  "  scripts/rs channel bind|send|status|follow|revoke|stop ...",
   "  scripts/rs notice list [--limit <1-1000>]",
   "  scripts/rs notice inspect <notice-id>",
   "  scripts/rs notice mark-read|ack <notice-id>",
@@ -133,10 +95,18 @@ const HELP = [
   "  scripts/rs subscription list|inspect|pause|resume|cancel ...",
   "  scripts/rs schedule create|update|list|inspect ...",
   "  scripts/rs schedule pause|resume|cancel|run-now|runs|trace|resolve ...",
-  "  scripts/rs run start|list|inspect|trace|cancel ...",
+  "  scripts/rs run start|list|inspect|trace|decide|close|cancel ...",
+  "  scripts/rs work-request inspect|accept|reject|await-owner ...",
   "",
   "Runtime: ~/.rollerskate, or the path selected with --runtime"
 ].join("\n");
+
+const RUNTIME_COMMANDS = new Set([
+  "setup", "doctor", "status", "trace", "event", "workload", "failure",
+  "recover", "pause", "resume", "device", "workspace", "agent", "activity",
+  "topic", "notice", "chat", "channel", "subscription", "schedule", "run",
+  "work-request", "room", "admin"
+]);
 
 export async function runLocalApp(
   repoRoot: string,
@@ -155,6 +125,21 @@ export async function runLocalApp(
     output.write(`${HELP}\n`);
     return 0;
   }
+  if (command === "start") {
+    const { noOpen, uiPort } = parseStartOptions(rest);
+    assertRuntimeSchemaUpgradeAllowed(repoRoot, global.runtimeDirectory);
+    return runStartForeground(
+      repoRoot,
+      global.runtimeDirectory,
+      environment,
+      output,
+      { noOpen, uiPort }
+    );
+  }
+  if (!RUNTIME_COMMANDS.has(command)) {
+    throw new Error(`unknown command: ${command}`);
+  }
+  assertRuntimeSchemaUpgradeAllowed(repoRoot, global.runtimeDirectory);
   switch (command) {
     case "setup": {
       rejectArguments(rest);
@@ -193,16 +178,6 @@ export async function runLocalApp(
       ].join("\n") + "\n");
       return 0;
     }
-    case "start": {
-      const { noOpen, uiPort } = parseStartOptions(rest);
-      return runStartForeground(
-        repoRoot,
-        global.runtimeDirectory,
-        environment,
-        output,
-        { noOpen, uiPort }
-      );
-    }
     case "status": {
       rejectArguments(rest);
       const status = runtimeOperationsView(repoRoot, global.runtimeDirectory, "");
@@ -219,7 +194,11 @@ export async function runLocalApp(
     }
     case "trace":
       requireCount(rest, 1, "trace requires exactly one Event id");
-      output.write(`${JSON.stringify(eventTrace(repoRoot, rest[0]!, global.runtimeDirectory), null, 2)}\n`);
+      output.write(`${JSON.stringify(
+        eventTrace(repoRoot, rest[0]!, global.runtimeDirectory),
+        null,
+        2
+      )}\n`);
       return 0;
     case "event":
       return runEventCommand(repoRoot, rest, output, global.runtimeDirectory);
@@ -250,11 +229,25 @@ export async function runLocalApp(
     case "workspace":
       return runWorkspaceCommand(repoRoot, rest, output, global.runtimeDirectory);
     case "agent":
-      return runAgentCommand(repoRoot, rest, output, global.runtimeDirectory);
+      return runAgentCommand(repoRoot, rest, output, global.runtimeDirectory, dependencies);
+    case "activity":
+      return runActivityCommand(repoRoot, rest, output, global.runtimeDirectory);
+    case "topic":
+      return runTopicCommand(repoRoot, rest, output, {
+        ...(global.runtimeDirectory === undefined
+          ? {}
+          : { runtimeDirectory: global.runtimeDirectory }),
+        ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }),
+        ...(dependencies.cwd === undefined ? {} : { cwd: dependencies.cwd })
+      });
     case "notice":
       return runNoticeCommand(repoRoot, rest, output, global.runtimeDirectory);
     case "chat":
       return runChatCommand(repoRoot, rest, output, global.runtimeDirectory);
+    case "channel":
+      return runChannelCommand(
+        repoRoot, rest, output, global.runtimeDirectory, dependencies
+      );
     case "subscription":
       return runSubscriptionCommand(
         repoRoot,
@@ -264,18 +257,12 @@ export async function runLocalApp(
         dependencies.cwd ?? process.cwd()
       );
     case "schedule":
-      return runScheduleCommand(
-        repoRoot,
-        rest,
-        output,
-        global.runtimeDirectory
-      );
+      return runScheduleCommand(repoRoot, rest, output, global.runtimeDirectory);
     case "run":
-      return runAgentRunCommand(
-        repoRoot,
-        rest,
-        output,
-        global.runtimeDirectory
+      return runStewardCommand(repoRoot, rest, output, global.runtimeDirectory);
+    case "work-request":
+      return runWorkRequestCommand(
+        repoRoot, rest, output, global.runtimeDirectory, dependencies
       );
     case "room":
       return runRoomCommand(repoRoot, rest, output, global.runtimeDirectory);
@@ -284,1055 +271,6 @@ export async function runLocalApp(
     default:
       throw new Error(`unknown command: ${command}; run scripts/rs --help`);
   }
-}
-
-function runEventCommand(
-  repoRoot: string,
-  arguments_: readonly string[],
-  output: AppOutput,
-  runtimeDirectory?: string
-): number {
-  const [command, ...rest] = arguments_;
-  if (command === "list") {
-    rejectArguments(rest);
-    output.write(`${JSON.stringify(listEventTraces(repoRoot, runtimeDirectory), null, 2)}\n`);
-    return 0;
-  }
-  if (command === "trace") {
-    requireCount(rest, 1, "event trace requires exactly one Event id");
-    output.write(`${JSON.stringify(eventTrace(repoRoot, rest[0]!, runtimeDirectory), null, 2)}\n`);
-    return 0;
-  }
-  throw new Error("event requires list or trace");
-}
-
-function runWorkloadCommand(
-  repoRoot: string,
-  arguments_: readonly string[],
-  output: AppOutput,
-  runtimeDirectory?: string
-): number {
-  if (arguments_[0] !== "status" || arguments_.length !== 1) {
-    throw new Error("workload requires status");
-  }
-  const workload = runtimeWorkloadStatus(repoRoot, runtimeDirectory);
-  output.write([
-    `Loop workload: ${workload.state}`,
-    `Ready: ${workload.ready}`,
-    `Running: ${workload.running}`,
-    `Retrying: ${workload.retrying}`,
-    `Total: ${workload.total}`,
-    `As of: ${workload.asOf}`
-  ].join("\n") + "\n");
-  return 0;
-}
-
-function runFailureCommand(
-  repoRoot: string,
-  arguments_: readonly string[],
-  output: AppOutput,
-  runtimeDirectory?: string
-): number {
-  const [command, ...rest] = arguments_;
-  if (command === "list") {
-    rejectArguments(rest);
-    output.write(`${JSON.stringify(listRuntimeFailures(
-      repoRoot,
-      runtimeDirectory
-    ), null, 2)}\n`);
-    return 0;
-  }
-  if (command === "inspect") {
-    requireCount(rest, 1, "failure inspect requires exactly one failure ref");
-    output.write(`${JSON.stringify(inspectRuntimeFailure(
-      repoRoot,
-      rest[0]!,
-      runtimeDirectory
-    ), null, 2)}\n`);
-    return 0;
-  }
-  throw new Error("failure requires list or inspect");
-}
-
-function runChatCommand(
-  repoRoot: string,
-  arguments_: readonly string[],
-  output: AppOutput,
-  runtimeDirectory?: string
-): number {
-  const [command, ...rest] = arguments_;
-  const options = runtimeDependency(runtimeDirectory);
-  if (command === "post") {
-    const body = rest.join(" ").trim();
-    if (body === "") throw new Error("chat post requires a non-empty message");
-    const receipt = postLocalChatMessage(repoRoot, body, options);
-    output.write(`${JSON.stringify({
-      eventId: receipt.message.eventId,
-      topicId: receipt.message.topicId,
-      ...(receipt.message.target === undefined ? {} : { target: receipt.message.target }),
-      status: "queued"
-    })}\n`);
-    return 0;
-  }
-  if (command === "history") {
-    output.write(`${JSON.stringify(
-      localChatTimeline(repoRoot, options, parseChatHistoryOptions(rest)),
-      null,
-      2
-    )}\n`);
-    return 0;
-  }
-  if (command === "status") {
-    rejectArguments(rest);
-    output.write(`${JSON.stringify(localChatPresenceView(repoRoot, options), null, 2)}\n`);
-    return 0;
-  }
-  if (command === "presence") {
-    if (rest[0] !== "set") {
-      throw new Error("chat presence requires set");
-    }
-    const change = parseChatPresenceSet(rest.slice(1));
-    const agent = requireLocalAgent(repoRoot, change.handle, options);
-    const presence = setLocalChatPresence(
-      repoRoot,
-      agent.principalId,
-      change.presence,
-      options
-    );
-    output.write(`${JSON.stringify({
-      agentId: agent.principalId,
-      handle: agent.handle,
-      presence
-    }, null, 2)}\n`);
-    return 0;
-  }
-  if (command === "session") {
-    if (rest[0] !== "new" || rest.length !== 2) {
-      throw new Error("chat session new requires exactly one Agent handle");
-    }
-    const agent = requireLocalAgent(repoRoot, rest[1]!, options);
-    const generation = rotateLocalAgentSession(
-      repoRoot,
-      agent.principalId,
-      options
-    );
-    output.write(`${JSON.stringify({
-      agentId: agent.principalId,
-      handle: agent.handle,
-      generation,
-      currentSessionId: null
-    })}\n`);
-    return 0;
-  }
-  throw new Error("chat requires post, history, status, presence set or session new");
-}
-
-function parseChatHistoryOptions(arguments_: readonly string[]): ChatTimelineOptions {
-  let beforeEventId: string | undefined;
-  let limit: number | undefined;
-  for (let index = 0; index < arguments_.length; index += 2) {
-    const option = arguments_[index];
-    const value = arguments_[index + 1];
-    if (value === undefined) {
-      throw new Error("chat history options require a value");
-    }
-    if (option === "--before") {
-      if (beforeEventId !== undefined || value.trim() === "") {
-        throw new Error("chat history --before requires one non-empty Event id");
-      }
-      beforeEventId = value;
-      continue;
-    }
-    if (option === "--limit") {
-      if (limit !== undefined) throw new Error("chat history --limit may appear once");
-      limit = parseBoundedInteger(value, "chat history limit", 1, 200);
-      continue;
-    }
-    throw new Error(`unknown chat history option: ${option}`);
-  }
-  return {
-    ...(beforeEventId === undefined ? {} : { beforeEventId }),
-    ...(limit === undefined ? {} : { limit })
-  };
-}
-
-function parseChatPresenceSet(arguments_: readonly string[]): {
-  readonly handle: string;
-  readonly presence: import("../../core/chat/model.js").ChatPresence;
-} {
-  const handle = arguments_[0];
-  if (handle === undefined || handle.trim() === "") {
-    throw new Error("chat presence set requires an Agent handle");
-  }
-  let scope: "topic" | "global" | undefined;
-  let mode: "available" | "snoozed" | undefined;
-  let until: string | undefined;
-  const wakeKeywords: string[] = [];
-  for (let offset = 1; offset < arguments_.length; offset += 2) {
-    const option = arguments_[offset];
-    const value = arguments_[offset + 1];
-    if (value === undefined) throw new Error(`${option} requires a value`);
-    if (option === "--scope") {
-      if (value !== "topic" && value !== "global") {
-        throw new Error("chat presence scope must be topic or global");
-      }
-      scope = value;
-    } else if (option === "--mode") {
-      if (value !== "available" && value !== "snoozed") {
-        throw new Error("chat presence mode must be available or snoozed");
-      }
-      mode = value;
-    } else if (option === "--until") {
-      until = value;
-    } else if (option === "--wake-keyword") {
-      wakeKeywords.push(value);
-    } else {
-      throw new Error(`unexpected chat presence option: ${option}`);
-    }
-  }
-  if (scope === undefined || mode === undefined) {
-    throw new Error("chat presence set requires --scope and --mode");
-  }
-  if (mode === "available") {
-    if (until !== undefined || wakeKeywords.length !== 0) {
-      throw new Error("available presence does not accept --until or --wake-keyword");
-    }
-    return { handle, presence: { scope, mode, wakeKeywords: [] } };
-  }
-  if (until === undefined) {
-    throw new Error("snoozed presence requires --until");
-  }
-  return { handle, presence: { scope, mode, until, wakeKeywords } };
-}
-
-function runNoticeCommand(
-  repoRoot: string,
-  arguments_: readonly string[],
-  output: AppOutput,
-  runtimeDirectory?: string
-): number {
-  const [command, ...rest] = arguments_;
-  if (command === "list") {
-    let limit = 100;
-    if (rest.length !== 0) {
-      if (rest.length !== 2 || rest[0] !== "--limit") {
-        throw new Error("notice list accepts only --limit <1-1000>");
-      }
-      limit = parseBoundedInteger(rest[1]!, "notice list limit", 1, 1_000);
-    }
-    output.write(`${JSON.stringify(listNoticeViews(
-      repoRoot,
-      runtimeDirectory,
-      limit
-    ), null, 2)}\n`);
-    return 0;
-  }
-  if (command === "inspect") {
-    requireCount(rest, 1, "notice inspect requires exactly one Notice id");
-    output.write(`${JSON.stringify(inspectNoticeView(
-      repoRoot,
-      rest[0]!,
-      runtimeDirectory
-    ), null, 2)}\n`);
-    return 0;
-  }
-  if (command === "mark-read" || command === "ack") {
-    requireCount(rest, 1, `notice ${command} requires exactly one Notice id`);
-    const detail = command === "mark-read"
-      ? markNoticeRead(repoRoot, rest[0]!, runtimeDirectory)
-      : acknowledgeNotice(repoRoot, rest[0]!, runtimeDirectory);
-    output.write(`${JSON.stringify(detail, null, 2)}\n`);
-    return 0;
-  }
-  if (command === "rebuild") {
-    rejectArguments(rest);
-    output.write(`${JSON.stringify(
-      rebuildNoticeIndex(repoRoot, runtimeDirectory),
-      null,
-      2
-    )}\n`);
-    return 0;
-  }
-  throw new Error("notice requires list, inspect, mark-read, ack, or rebuild");
-}
-
-function runWorkspaceCommand(
-  repoRoot: string,
-  arguments_: readonly string[],
-  output: AppOutput,
-  runtimeDirectory?: string
-): number {
-  const [command, ...rest] = arguments_;
-  if (command !== "set" || rest.length !== 1) {
-    throw new Error("workspace set requires exactly one absolute path");
-  }
-  const config = configureAgents(repoRoot, rest[0] ?? "", runtimeDirectory);
-  output.write(`Agent workspace root configured: ${config.workspaceRoot}\n`);
-  return 0;
-}
-
-async function runInteractiveCli(
-  repoRoot: string,
-  runtimeDirectory: string | undefined,
-  environment: NodeJS.ProcessEnv,
-  output: AppOutput,
-  dependencies: LocalAppDependencies
-): Promise<number> {
-  if (dependencies.prompts === undefined && !process.stdin.isTTY) {
-    throw new Error("interactive CLI requires a terminal; use an explicit subcommand instead");
-  }
-  const prompts = dependencies.prompts ?? createInterface({
-    input: process.stdin,
-    output: process.stdout
-  });
-  let promptsClosed = false;
-  const closePrompts = (): void => {
-    if (!promptsClosed) {
-      prompts.close();
-      promptsClosed = true;
-    }
-  };
-  const networkDependencies = {
-    ...runtimeDependency(runtimeDirectory),
-    ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }),
-    ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
-    ...(dependencies.sleep === undefined ? {} : { sleep: dependencies.sleep })
-  };
-
-  try {
-    output.write("Rollerskate Local Runtime\n\n");
-    const local = localRuntimeSnapshot(repoRoot, runtimeDependency(runtimeDirectory));
-    output.write(
-      `Local Device: ${local.foundation.deviceName} (${local.foundation.deviceId})\n` +
-      `Local Chat: ${local.foundation.topicHandle}\n\n`
-    );
-
-    while (true) {
-      const action = await choose(prompts, output, "What would you like to do?", [
-        { value: "agent-create", label: "Add an Agent" },
-        { value: "agent-list", label: "List Agents" },
-        { value: "device-status", label: "Device status" },
-        { value: "start", label: "Start the Local Runtime" },
-        { value: "rooms", label: "Manage Rooms" },
-        { value: "exit", label: "Exit" }
-      ]);
-      if (action === "exit") return 0;
-      if (action === "agent-create") {
-        await createAgentInteractively(
-          repoRoot,
-          runtimeDirectory,
-          prompts,
-          output,
-          networkDependencies
-        );
-      } else if (action === "agent-list") {
-        const agents = listAgents(repoRoot, runtimeDependency(runtimeDirectory));
-        output.write(agents.length === 0
-          ? "No local Agents are registered on this Device.\n\n"
-          : `${agents.map((agent) => formatAgentSummary("Agent", agent).trimEnd())
-              .join("\n\n")}\n\n`);
-      } else if (action === "device-status") {
-        output.write(`${formatDeviceStatus(
-          "Device is active.",
-          await statusDevice(repoRoot, networkDependencies)
-        )}\n`);
-      } else if (action === "start") {
-        closePrompts();
-        return runStartForeground(repoRoot, runtimeDirectory, environment, output, {
-          noOpen: false,
-          uiPort: 4300
-        });
-      } else {
-        await manageRoomsInteractively(repoRoot, runtimeDirectory, prompts, output);
-      }
-    }
-  } finally {
-    closePrompts();
-  }
-}
-
-async function createAgentInteractively(
-  repoRoot: string,
-  runtimeDirectory: string | undefined,
-  prompts: InteractivePrompts,
-  output: AppOutput,
-  dependencies: ReturnType<typeof runtimeDependency> & {
-    readonly fetch?: typeof fetch;
-    readonly now?: () => Date;
-  }
-): Promise<void> {
-  const handle = await askText(prompts, "Agent handle");
-  const client = await choose(prompts, output, "Agent client", [
-    { value: "codex", label: "Codex" },
-    { value: "claude-code", label: "Claude Code" },
-    { value: "kimi-code", label: "Kimi Code" }
-  ]);
-  output.write(`${formatLocalAgent("Agent created.", addLocalAgent(
-    repoRoot,
-    handle,
-    client,
-    runtimeDependency(runtimeDirectory)
-  ))}\n`);
-}
-
-async function manageRoomsInteractively(
-  repoRoot: string,
-  runtimeDirectory: string | undefined,
-  prompts: InteractivePrompts,
-  output: AppOutput
-): Promise<void> {
-  while (true) {
-    const action = await choose(prompts, output, "Room management", [
-      { value: "list", label: "List Rooms" },
-      { value: "create", label: "Create a Room" },
-      { value: "join", label: "Join a Room" },
-      { value: "back", label: "Back" }
-    ]);
-    if (action === "back") return;
-    if (action === "list") {
-      await runRoomCommand(repoRoot, ["list"], output, runtimeDirectory);
-    } else if (action === "create") {
-      const name = await askText(prompts, "Room name");
-      const visibility = await choose(prompts, output, "Room visibility", [
-        { value: "private", label: "Private" },
-        { value: "public", label: "Public" }
-      ]);
-      await runRoomCommand(
-        repoRoot,
-        ["create", name, ...(visibility === "public" ? ["--public"] : [])],
-        output,
-        runtimeDirectory
-      );
-    } else {
-      await runRoomCommand(
-        repoRoot,
-        ["join", await askText(prompts, "Room ID")],
-        output,
-        runtimeDirectory
-      );
-    }
-    output.write("\n");
-  }
-}
-
-async function askText(
-  prompts: InteractivePrompts,
-  label: string,
-  defaultValue?: string
-): Promise<string> {
-  const suffix = defaultValue === undefined ? ": " : ` [${defaultValue}]: `;
-  const answer = (await prompts.question(`${label}${suffix}`)).trim();
-  const value = answer || defaultValue;
-  if (value === undefined || value === "") throw new Error(`${label} is required`);
-  return value;
-}
-
-async function choose<T extends string>(
-  prompts: InteractivePrompts,
-  output: AppOutput,
-  title: string,
-  options: readonly { readonly value: T; readonly label: string }[]
-): Promise<T> {
-  while (true) {
-    output.write(`${title}\n${options.map((option, index) =>
-      `  ${index + 1}. ${option.label}`).join("\n")}\n`);
-    const answer = Number.parseInt((await prompts.question("Select: ")).trim(), 10);
-    const selected = options[answer - 1];
-    if (selected !== undefined) return selected.value;
-    output.write("Choose one of the listed numbers.\n\n");
-  }
-}
-
-async function runAgentCommand(
-  repoRoot: string,
-  arguments_: readonly string[],
-  output: AppOutput,
-  runtimeDirectory?: string
-): Promise<number> {
-  const [command, ...rest] = arguments_;
-  const options = runtimeDependency(runtimeDirectory);
-  if (command === "create") {
-    const create = parseAgentCreate(rest);
-    const agent = addLocalAgent(
-      repoRoot,
-      create.handle,
-      create.client,
-      options,
-      create.launchArgs
-    );
-    output.write(formatAgentSummary(
-      "Agent created.",
-      inspectAgent(repoRoot, agent.principalId, options)
-    ));
-    return 0;
-  }
-  if (command === "configure") {
-    const configure = parseAgentConfigure(rest);
-    const agent = requireLocalAgent(repoRoot, configure.handle, options);
-    configureLocalAgent(repoRoot, agent.principalId, configure.launchArgs, options);
-    output.write(formatAgentSummary(
-      "Agent configured.",
-      inspectAgent(repoRoot, agent.principalId, options)
-    ));
-    return 0;
-  }
-  if (command === "list") {
-    rejectArguments(rest);
-    const agents = listAgents(repoRoot, options);
-    if (agents.length === 0) {
-      output.write("No local Agents are registered on this Device.\n");
-    } else {
-      output.write(`${agents.map((agent) => formatAgentSummary("Agent", agent).trimEnd())
-        .join("\n\n")}\n`);
-    }
-    return 0;
-  }
-  if (command === "status") {
-    requireCount(rest, 1, "agent status requires exactly one handle");
-    const agent = requireLocalAgent(repoRoot, rest[0]!, options);
-    output.write(formatAgentSummary(
-      "Agent.",
-      inspectAgent(repoRoot, agent.principalId, options)
-    ));
-    return 0;
-  }
-  if (command === "rename") {
-    requireCount(rest, 2, "agent rename requires <handle> <new-handle>");
-    const agent = requireLocalAgent(repoRoot, rest[0]!, options);
-    renameLocalAgent(repoRoot, agent.principalId, rest[1]!, options);
-    output.write(formatAgentSummary(
-      "Agent renamed.",
-      inspectAgent(repoRoot, agent.principalId, options)
-    ));
-    return 0;
-  }
-  if (command === "suspend" || command === "resume") {
-    requireCount(rest, 1, `agent ${command} requires exactly one handle`);
-    const agent = requireLocalAgent(repoRoot, rest[0]!, options);
-    if (command === "suspend") {
-      suspendLocalAgent(repoRoot, agent.principalId, options);
-    } else {
-      resumeLocalAgent(repoRoot, agent.principalId, options);
-    }
-    output.write(formatAgentSummary(
-      command === "suspend" ? "Agent suspended." : "Agent resumed.",
-      inspectAgent(repoRoot, agent.principalId, options)
-    ));
-    return 0;
-  }
-  if (command === "request") {
-    const request = parseAgentRequest(rest);
-    const receipt = enqueueAgentRequest(repoRoot, request.name, request.prompt, {
-      ...options,
-      ...(request.sessionId === undefined ? {} : { sessionId: request.sessionId })
-    });
-    output.write(`${JSON.stringify({
-      eventId: receipt.event.eventId,
-      executionId: receipt.execution.executionId,
-      status: receipt.execution.status,
-      ...(receipt.event.sessionId === undefined ? {} : { sessionId: receipt.event.sessionId })
-    })}\n`);
-    return 0;
-  }
-  throw new Error(
-    "agent requires create, configure, list, status, rename, suspend, resume or request"
-  );
-}
-
-function parseAgentCreate(arguments_: readonly string[]): {
-  readonly handle: string;
-  readonly client: LocalAgentClient;
-  readonly launchArgs: readonly string[];
-} {
-  const handle = arguments_[0];
-  if (handle === undefined || handle.trim() === "") {
-    throw new Error(
-      "agent create requires <handle> --client <codex|claude-code|kimi-code>"
-    );
-  }
-  let client: LocalAgentClient | undefined;
-  const launchArgs: string[] = [];
-  for (let offset = 1; offset < arguments_.length; offset += 1) {
-    const option = arguments_[offset]!;
-    const value = arguments_[offset + 1];
-    if (option === "--client") {
-      if (!isAgentClient(value)) {
-        throw new Error(
-          "agent client must be codex, claude-code or kimi-code"
-        );
-      }
-      if (client !== undefined) throw new Error("--client may only be specified once");
-      client = value;
-      offset += 1;
-    } else if (option === "--launch-arg") {
-      if (value === undefined) throw new Error("--launch-arg requires a value");
-      launchArgs.push(value);
-      offset += 1;
-    } else {
-      throw new Error(`unexpected agent create option: ${option}`);
-    }
-  }
-  if (client === undefined) throw new Error("agent create requires --client");
-  return { handle, client, launchArgs };
-}
-
-function parseAgentConfigure(arguments_: readonly string[]): {
-  readonly handle: string;
-  readonly launchArgs: readonly string[];
-} {
-  const handle = arguments_[0];
-  if (handle === undefined || handle.trim() === "") {
-    throw new Error("agent configure requires an Agent handle");
-  }
-  const launchArgs: string[] = [];
-  for (let offset = 1; offset < arguments_.length; offset += 2) {
-    if (arguments_[offset] !== "--launch-arg") {
-      throw new Error(`unexpected agent configure option: ${arguments_[offset]}`);
-    }
-    const value = arguments_[offset + 1];
-    if (value === undefined) throw new Error("--launch-arg requires a value");
-    launchArgs.push(value);
-  }
-  return { handle, launchArgs };
-}
-
-function parseAgentRequest(arguments_: readonly string[]): {
-  readonly name: string;
-  readonly prompt: string;
-  readonly sessionId?: string;
-} {
-  const name = arguments_[0];
-  if (name === undefined || name.trim() === "") {
-    throw new Error("agent request requires an Agent name");
-  }
-  let sessionId: string | undefined;
-  const promptParts: string[] = [];
-  for (let offset = 1; offset < arguments_.length; offset += 1) {
-    const value = arguments_[offset]!;
-    if (value === "--session") {
-      const candidate = arguments_[offset + 1];
-      if (candidate === undefined || candidate.trim() === "") {
-        throw new Error("--session requires a local Session ID");
-      }
-      sessionId = candidate;
-      offset += 1;
-    } else if (value.startsWith("--")) {
-      throw new Error(`unexpected agent request option: ${value}`);
-    } else {
-      promptParts.push(value);
-    }
-  }
-  const prompt = promptParts.join(" ").trim();
-  if (prompt === "") throw new Error("agent request requires a non-empty prompt");
-  return { name, prompt, ...(sessionId === undefined ? {} : { sessionId }) };
-}
-
-async function runDeviceCommand(
-  repoRoot: string,
-  arguments_: readonly string[],
-  environment: NodeJS.ProcessEnv,
-  output: AppOutput,
-  runtimeDirectory: string | undefined,
-  appDependencies: LocalAppDependencies
-): Promise<number> {
-  const [command, ...rest] = arguments_;
-  const dependencies = {
-    ...runtimeDependency(runtimeDirectory),
-    ...(appDependencies.fetch === undefined ? {} : { fetch: appDependencies.fetch }),
-    ...(appDependencies.now === undefined ? {} : { now: appDependencies.now }),
-    ...(appDependencies.sleep === undefined ? {} : { sleep: appDependencies.sleep })
-  };
-  if (command === "login") {
-    rejectArguments(rest);
-    const serverUrl = environment.ROLLERSKATE_SERVER_URL?.trim();
-    const result = await loginDevice(repoRoot, {
-      ...(serverUrl === undefined || serverUrl === "" ? {} : { serverUrl })
-    }, { write: (text) => output.write(text), ...dependencies });
-    output.write(formatDeviceStatus("Device paired.", result));
-    return 0;
-  }
-  if (command === "status") {
-    rejectArguments(rest);
-    output.write(formatDeviceStatus(
-      "Device is active.",
-      await statusDevice(repoRoot, dependencies)
-    ));
-    return 0;
-  }
-  if (command === "logout") {
-    rejectArguments(rest);
-    await logoutDevice(repoRoot, dependencies);
-    output.write("Device credential revoked and removed from this Local Runtime.\n");
-    return 0;
-  }
-  throw new Error("device requires login, status or logout");
-}
-
-function formatDeviceStatus(prefix: string, result: LocalDeviceStatus): string {
-  return [
-    prefix,
-    `Device: ${result.summary.name} (${result.summary.id})`,
-    `Human: ${result.summary.human.displayName} (${result.summary.human.id})`,
-    `Admin: ${result.summary.human.isAdmin ? "yes" : "no"}`,
-    `Server: ${result.metadata.serverUrl}`
-  ].join("\n") + "\n";
-}
-
-function formatLocalAgent(prefix: string, agent: LocalAgent): string {
-  return [
-    prefix,
-    `Agent: @${agent.handle} (${agent.principalId})`,
-    `Status: ${agent.status}`,
-    `Client: ${agent.client}`,
-    `Launch args: ${JSON.stringify(agent.executionConfig.launchArgs)}`
-  ].join("\n") + "\n";
-}
-
-function formatAgentSummary(prefix: string, agent: AgentSummary): string {
-  return [
-    prefix,
-    `Agent: @${agent.handle} (${agent.principalId})`,
-    `Status: ${agent.status}`,
-    `Client: ${agent.client}`,
-    `Availability: ${agent.availability.state}` +
-      (agent.availability.reason === undefined ? "" : ` (${agent.availability.reason})`),
-    `Session: ${agent.currentSession?.sessionId ?? "none"}`,
-    `Launch args: ${JSON.stringify(agent.executionConfig.launchArgs)}`
-  ].join("\n") + "\n";
-}
-
-function requireLocalAgent(
-  repoRoot: string,
-  handle: string,
-  options: { readonly runtimeDirectory?: string }
-): LocalAgent {
-  const agent = localRuntimeSnapshot(repoRoot, options).agents.find(
-    (candidate) => candidate.handle.toLocaleLowerCase("und") === handle.toLocaleLowerCase("und")
-  );
-  if (agent === undefined) throw new Error(`Local Agent not found: ${handle}`);
-  return agent;
-}
-
-async function collectSetupInput(
-  repoRoot: string,
-  environment: NodeJS.ProcessEnv
-): Promise<SetupInput> {
-  let prompts: Interface | undefined;
-  const ask = async (
-    environmentName: string,
-    label: string,
-    defaultValue?: string
-  ): Promise<string> => {
-    const configured = environment[environmentName]?.trim();
-    if (configured !== undefined && configured !== "") {
-      return configured;
-    }
-    if (!process.stdin.isTTY) {
-      throw new Error(`${environmentName} is required for non-interactive setup`);
-    }
-    prompts ??= createInterface({ input: process.stdin, output: process.stdout });
-    const suffix = defaultValue === undefined ? ": " : ` [${defaultValue}]: `;
-    const answer = (await prompts.question(`${label}${suffix}`)).trim();
-    if (answer !== "") {
-      return answer;
-    }
-    if (defaultValue !== undefined) {
-      return defaultValue;
-    }
-    throw new Error(`${label} is required`);
-  };
-
-  try {
-    const projectRoot = await ask(
-      "ROLLERSKATE_PROJECT_ROOT",
-      "Local source directory",
-      realpathSync(repoRoot)
-    );
-    const defaultCodex = findExecutable("codex", environment.PATH);
-    const codexExecutable = await ask(
-      "ROLLERSKATE_CODEX_EXECUTABLE",
-      "Codex executable",
-      defaultCodex
-    );
-    const homeserver = await ask(
-      "ROLLERSKATE_MATRIX_HOMESERVER",
-      "Matrix homeserver"
-    );
-    const roomId = await ask("ROLLERSKATE_MATRIX_ROOM_ID", "Matrix room ID");
-    const ownerUserId = await ask(
-      "ROLLERSKATE_MATRIX_OWNER_USER",
-      "Your Matrix user ID"
-    );
-    const agentUserId = await ask(
-      "ROLLERSKATE_MATRIX_AGENT_USER",
-      "Agent Matrix user ID"
-    );
-    prompts?.close();
-    prompts = undefined;
-    const configuredToken = environment.ROLLERSKATE_MATRIX_ACCESS_TOKEN?.trim();
-    const matrixAccessToken = configuredToken === undefined || configuredToken === ""
-      ? await promptSecret("Agent access token (hidden): ")
-      : configuredToken;
-    return {
-      homeserver,
-      roomId,
-      ownerUserId,
-      agentUserId,
-      matrixAccessToken,
-      projectRoot,
-      codexExecutable
-    };
-  } finally {
-    prompts?.close();
-  }
-}
-
-async function promptSecret(label: string): Promise<string> {
-  if (!process.stdin.isTTY || process.stdin.setRawMode === undefined) {
-    throw new Error(
-      "ROLLERSKATE_MATRIX_ACCESS_TOKEN is required for non-interactive setup"
-    );
-  }
-  process.stdout.write(label);
-  const wasRaw = process.stdin.isRaw;
-  process.stdin.setRawMode(true);
-  process.stdin.resume();
-  return new Promise<string>((resolvePromise, rejectPromise) => {
-    let value = "";
-    const finish = (error?: Error): void => {
-      process.stdin.off("data", onData);
-      process.stdin.setRawMode(wasRaw);
-      process.stdout.write("\n");
-      if (error !== undefined) {
-        rejectPromise(error);
-      } else if (value.trim() === "") {
-        rejectPromise(new Error("Agent access token is required"));
-      } else {
-        resolvePromise(value);
-      }
-    };
-    const onData = (chunk: Buffer): void => {
-      for (const character of chunk.toString("utf8")) {
-        if (character === "\u0003") {
-          finish(new Error("setup cancelled"));
-          return;
-        }
-        if (character === "\r" || character === "\n") {
-          finish();
-          return;
-        }
-        if (character === "\u007f" || character === "\b") {
-          value = Array.from(value).slice(0, -1).join("");
-        } else {
-          value += character;
-        }
-      }
-    };
-    process.stdin.on("data", onData);
-  });
-}
-
-interface StartOptions {
-  readonly noOpen: boolean;
-  readonly uiPort: number;
-}
-
-const GRACEFUL_SHUTDOWN_SIGNALS = [
-  "SIGINT",
-  "SIGTERM",
-  "SIGHUP"
-] as const satisfies readonly NodeJS.Signals[];
-
-async function runStartForeground(
-  repoRoot: string,
-  runtimeDirectory: string | undefined,
-  environment: NodeJS.ProcessEnv,
-  output: AppOutput,
-  startOptions: StartOptions
-): Promise<number> {
-  const codexExecutable = environment.ROLLERSKATE_CODEX_EXECUTABLE?.trim() ||
-    findExecutable("codex", environment.PATH);
-  const claudeCodeExecutable = environment.ROLLERSKATE_CLAUDE_CODE_EXECUTABLE?.trim() ||
-    findExecutable("claude", environment.PATH);
-  const kimiCodeExecutable = environment.ROLLERSKATE_KIMI_CODE_EXECUTABLE?.trim() ||
-    findExecutable("kimi", environment.PATH);
-  const paths = runtimeLogPaths(repoRoot, runtimeDirectory);
-  mkdirSync(paths.logs, { recursive: true, mode: 0o700 });
-  const log = createWriteStream(paths.daemonLog, { flags: "a", mode: 0o600 });
-  const sink: AppOutput = {
-    write(text) {
-      output.write(text);
-      log.write(text);
-    }
-  };
-  const controller = new AbortController();
-  const signalHandlers = GRACEFUL_SHUTDOWN_SIGNALS.map((signal) => {
-    const handler = (): void => {
-      sink.write(`Rollerskate received ${signal}; stopping.\n`);
-      controller.abort();
-    };
-    process.once(signal, handler);
-    return { signal, handler };
-  });
-  const removeSignalHandlers = (): void => {
-    for (const { signal, handler } of signalHandlers) {
-      process.off(signal, handler);
-    }
-  };
-  const closeLog = async (): Promise<void> => {
-    log.end();
-    await finished(log);
-  };
-  sink.write("Rollerskate starting. Press Ctrl-C to stop.\n");
-  sink.write(`Log: ${paths.daemonLog}\n`);
-
-  let uiUrl: string | undefined;
-  let uiClose: (() => Promise<void>) | undefined;
-  try {
-    const ui = await startUiServer({
-      repoRoot,
-      ...(runtimeDirectory === undefined ? {} : { runtimeDirectory }),
-      port: startOptions.uiPort,
-      signal: controller.signal,
-      output: sink
-    });
-    uiUrl = ui.url;
-    uiClose = ui.close;
-    sink.write(`Rollerskate UI: ${ui.url}\n`);
-    if (!startOptions.noOpen) {
-      openBrowser(ui.url, sink);
-    }
-  } catch (error) {
-    sink.write(`Local UI failed to start: ${error instanceof Error ? error.message : String(error)}\n`);
-    controller.abort();
-    removeSignalHandlers();
-    await closeLog();
-    return 1;
-  }
-
-  try {
-    const result = await startRuntime({
-      repoRoot,
-      ...(runtimeDirectory === undefined ? {} : { runtimeDirectory }),
-      ...(codexExecutable === undefined ? {} : { codexExecutable }),
-      ...(claudeCodeExecutable === undefined ? {} : { claudeCodeExecutable }),
-      ...(kimiCodeExecutable === undefined ? {} : { kimiCodeExecutable }),
-      environment: roomAgentEnvironment(environment),
-      output: sink
-    }, controller.signal);
-    sink.write(`Rollerskate stopped after ${result.cycles} Runtime cycle(s).\n`);
-    return 0;
-  } finally {
-    removeSignalHandlers();
-    try {
-      if (uiClose !== undefined) {
-        await uiClose();
-      }
-    } finally {
-      await closeLog();
-    }
-  }
-}
-
-function openBrowser(url: string, output: AppOutput): void {
-  const platform = process.platform;
-  const child = platform === "darwin"
-    ? spawn("open", [url], { stdio: "ignore", detached: true })
-    : platform === "win32"
-      ? spawn("cmd", ["/c", "start", url], { stdio: "ignore", detached: true })
-      : spawn("xdg-open", [url], { stdio: "ignore", detached: true });
-  child.on("error", () => {
-    output.write(`Warning: could not open browser; visit ${url} manually.\n`);
-  });
-}
-
-export function roomAgentEnvironment(
-  environment: NodeJS.ProcessEnv
-): Readonly<Record<string, string>> {
-  const home = environment.HOME?.trim();
-  if (home === undefined || home === "") throw new Error("HOME is required to start Rollerskate");
-  const path = environment.PATH?.trim();
-  if (path === undefined || path === "") throw new Error("PATH is required to start Rollerskate");
-  return {
-    HOME: home,
-    PATH: path,
-    ...(environment.CODEX_HOME === undefined ? {} : { CODEX_HOME: environment.CODEX_HOME })
-  };
-}
-
-function findExecutable(name: string, pathValue: string | undefined): string | undefined {
-  if (pathValue === undefined) {
-    return undefined;
-  }
-  for (const directory of pathValue.split(delimiter)) {
-    const candidate = join(directory, name);
-    try {
-      accessSync(candidate, constants.X_OK);
-      return realpathSync(candidate);
-    } catch {
-      // Continue through PATH entries.
-    }
-  }
-  return undefined;
-}
-
-function rejectArguments(arguments_: readonly string[]): void {
-  if (arguments_.length > 0) {
-    throw new Error(`unexpected arguments: ${arguments_.join(" ")}`);
-  }
-}
-
-function requireCount(arguments_: readonly string[], count: number, message: string): void {
-  if (arguments_.length !== count) throw new Error(message);
-}
-
-function parseBoundedInteger(
-  value: string,
-  field: string,
-  minimum: number,
-  maximum: number
-): number {
-  if (!/^[0-9]+$/u.test(value)) {
-    throw new Error(`${field} must be an integer between ${minimum} and ${maximum}`);
-  }
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) {
-    throw new Error(`${field} must be an integer between ${minimum} and ${maximum}`);
-  }
-  return parsed;
-}
-
-function runtimeDependency(runtimeDirectory: string | undefined): {
-  readonly runtimeDirectory?: string;
-} {
-  return runtimeDirectory === undefined ? {} : { runtimeDirectory };
-}
-
-function parseStartOptions(argv: readonly string[]): StartOptions {
-  let noOpen = false;
-  let uiPort = 4300;
-  let offset = 0;
-  while (offset < argv.length) {
-    const arg = argv[offset];
-    if (arg === "--no-open") {
-      noOpen = true;
-      offset += 1;
-    } else if (arg === "--ui-port") {
-      const value = argv[offset + 1];
-      if (value === undefined || value.trim() === "") {
-        throw new Error("--ui-port requires a port number");
-      }
-      const parsed = Number.parseInt(value, 10);
-      if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65_535) {
-        throw new Error("--ui-port must be an integer between 1 and 65535");
-      }
-      uiPort = parsed;
-      offset += 2;
-    } else {
-      throw new Error(`unexpected argument: ${arg}`);
-    }
-  }
-  return { noOpen, uiPort };
 }
 
 function parseGlobalOptions(

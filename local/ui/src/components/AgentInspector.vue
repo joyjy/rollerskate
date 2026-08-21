@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { formatDateTime } from "@/utils/format";
-import type { AgentConsoleItem, LocalFoundation } from "@/types/local";
+import type { AgentSummary, LocalFoundation } from "@/types/local";
 
 defineProps<{
-  agent: AgentConsoleItem | null;
+  agent: AgentSummary | null;
   foundation: LocalFoundation | null;
   error: string | null;
   pending: "add" | "configure" | "rename" | "suspend" | "resume" | null;

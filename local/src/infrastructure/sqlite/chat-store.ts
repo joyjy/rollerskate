@@ -2,19 +2,62 @@ import type { DatabaseSync } from "node:sqlite";
 
 import {
   newEventId,
+  parseChatMessageTargets,
+  requireEventId,
   type Event,
+  type EventSourceKind,
   type ChatDispatchEvent,
   type ChatMessageEvent
 } from "../../core/event/model.js";
-import { chatPromptResourceId } from "../../core/chat/model.js";
-import type { ChatAttentionReason } from "../../core/chat/state-machine.js";
+import {
+  chatPromptResourceId,
+  parseConversationIntentSnapshot
+} from "../../core/chat/model.js";
+import {
+  isChatAttentionReason,
+  type ChatAttentionReason
+} from "../../core/chat/state-machine.js";
 import { runtimeId } from "../../core/runtime/model.js";
 import { openRuntimeDatabase } from "./database.js";
-import { rebuildChatMessageProjection } from "./local-schema.js";
+import { rebuildChatMessageProjection } from "./schema/index.js";
+import { withImmediateTransaction } from "./transaction.js";
 
 export interface ChatAgentChoice {
   readonly principalId: string;
   readonly handle: string;
+}
+
+export interface ExternalOwnerChatMessageAdmission {
+  readonly source: {
+    readonly kind: EventSourceKind;
+    readonly externalId: string;
+  };
+  readonly topicId: string;
+  readonly sender: {
+    readonly principalId: string;
+    readonly handleSnapshot: string;
+  };
+  readonly body: string;
+  readonly target?: ChatAgentChoice;
+  readonly at: string;
+}
+
+export interface ExternalAgentChatMessageAdmission {
+  readonly source: {
+    readonly kind: EventSourceKind;
+    readonly externalId: string;
+  };
+  readonly topicId: string;
+  readonly sender: {
+    readonly principalId: string;
+    readonly handleSnapshot: string;
+  };
+  readonly body: string;
+  readonly activation?: {
+    readonly strategyId: "participant-message";
+    readonly turnBudget: number;
+  };
+  readonly at: string;
 }
 
 export interface ChatMessageAdmission {
@@ -56,11 +99,16 @@ export class LocalChatStore {
     this.#database.close();
   }
 
+  public message(eventId: string): ChatMessageEvent {
+    return this.#requireChatMessage(requireEventId(eventId));
+  }
+
   public postOwnerMessage(input: {
     readonly topicId: string;
     readonly ownerPrincipalId: string;
     readonly body: string;
-    readonly target?: ChatAgentChoice;
+    readonly targets?: readonly ChatAgentChoice[];
+    readonly replyToEventId?: string;
     readonly at?: string;
   }): ChatMessageAdmission {
     const body = requireBody(input.body);
@@ -74,38 +122,150 @@ export class LocalChatStore {
         handleSnapshot: "owner"
       },
       body,
+      ...(input.replyToEventId === undefined
+        ? {}
+        : { replyToEventId: requireEventId(input.replyToEventId, "replyToEventId") }),
+      conversation: {
+        strategyId: "human-message",
+        turnBudget: 8
+      },
+      ...(input.targets === undefined
+        ? {}
+        : {
+            targets: normalizedTargets(input.targets)
+          })
+    };
+    return withImmediateTransaction(this.#database, () => {
+      if (input.replyToEventId !== undefined) {
+        const referenced = this.#requireChatMessage(input.replyToEventId);
+        if (referenced.topicId !== payload.topicId) {
+          throw new Error("Reply reference must belong to the same Topic");
+        }
+      }
+      this.#insertChatMessage(messageId, payload, at);
+      return { message: this.#requireChatMessage(messageId) };
+    });
+  }
+
+  public admitExternalOwnerMessage(
+    input: ExternalOwnerChatMessageAdmission
+  ): ChatMessageAdmission & { readonly status: "accepted" | "duplicate" } {
+    const payload = {
+      topicId: requireText(input.topicId, "topicId"),
+      sender: {
+        kind: "owner",
+        principalId: requireText(input.sender.principalId, "sender.principalId"),
+        handleSnapshot: requireText(input.sender.handleSnapshot, "sender.handleSnapshot")
+      },
+      body: requireBody(input.body),
+      conversation: {
+        strategyId: "human-message",
+        turnBudget: 8
+      },
       ...(input.target === undefined
         ? {}
         : {
-            target: {
+            targets: [{
               principalId: requireText(input.target.principalId, "target.principalId"),
               handleSnapshot: requireText(input.target.handle, "target.handle")
+            }]
+          })
+    };
+    const externalId = requireText(input.source.externalId, "source.externalId");
+    return withImmediateTransaction(this.#database, () => {
+      const existing = this.#database.prepare(`
+        SELECT event_id FROM events
+        WHERE source_kind = ? AND source_external_id = ?
+      `).get(input.source.kind, externalId) as { event_id: string } | undefined;
+      if (existing !== undefined) {
+        const message = this.#requireChatMessage(existing.event_id);
+        if (message.topicId !== input.topicId || message.body !== input.body ||
+          message.sender.kind !== "owner" ||
+          message.sender.principalId !== input.sender.principalId ||
+          message.sender.handleSnapshot !== input.sender.handleSnapshot) {
+          throw new Error(`External Chat message changed during replay: ${externalId}`);
+        }
+        return { message, status: "duplicate" };
+      }
+      const messageId = newEventId();
+      this.#insertChatMessage(
+        messageId,
+        payload,
+        timestamp(input.at),
+        undefined,
+        externalId,
+        input.source.kind
+      );
+      return { message: this.#requireChatMessage(messageId), status: "accepted" };
+    });
+  }
+
+  public admitExternalAgentMessage(
+    input: ExternalAgentChatMessageAdmission
+  ): ChatMessageAdmission & { readonly status: "accepted" | "duplicate" } {
+    const payload = {
+      topicId: requireText(input.topicId, "topicId"),
+      sender: {
+        kind: "agent",
+        principalId: requireText(input.sender.principalId, "sender.principalId"),
+        handleSnapshot: requireText(input.sender.handleSnapshot, "sender.handleSnapshot")
+      },
+      body: requireBody(input.body),
+      ...(input.activation === undefined
+        ? {}
+        : {
+            conversation: {
+              strategyId: input.activation.strategyId,
+              turnBudget: bounded(input.activation.turnBudget, 1, 64)
             }
           })
     };
-    this.#database.exec("BEGIN IMMEDIATE");
-    try {
-      this.#insertChatMessage(messageId, payload, at);
-      this.#database.exec("COMMIT");
-      return { message: this.#requireChatMessage(messageId) };
-    } catch (error) {
-      this.#database.exec("ROLLBACK");
-      throw error;
-    }
+    const externalId = requireText(input.source.externalId, "source.externalId");
+    return withImmediateTransaction(this.#database, () => {
+      const existing = this.#database.prepare(`
+        SELECT event_id FROM events
+        WHERE source_kind = ? AND source_external_id = ?
+      `).get(input.source.kind, externalId) as { event_id: string } | undefined;
+      if (existing !== undefined) {
+        const message = this.#requireChatMessage(existing.event_id);
+        if (message.topicId !== input.topicId || message.body !== input.body ||
+          message.sender.kind !== "agent" ||
+          message.sender.principalId !== input.sender.principalId ||
+          message.sender.handleSnapshot !== input.sender.handleSnapshot) {
+          throw new Error(`External Chat message changed during replay: ${externalId}`);
+        }
+        return { message, status: "duplicate" };
+      }
+      const messageId = newEventId();
+      this.#insertChatMessage(
+        messageId,
+        payload,
+        timestamp(input.at),
+        undefined,
+        externalId,
+        input.source.kind,
+        input.activation !== undefined
+      );
+      return { message: this.#requireChatMessage(messageId), status: "accepted" };
+    });
+  }
+
+  public hasCanonicalEvent(eventId: string): boolean {
+    return this.#database.prepare("SELECT 1 FROM events WHERE event_id = ?")
+      .get(eventId) !== undefined;
   }
 
   public dispatch(input: {
     readonly sourceMessageEventId: string;
     readonly topicId: string;
     readonly target: ChatAgentChoice;
+    readonly admissionSnapshot?: ChatDispatchEvent["admissionSnapshot"];
     readonly at?: string;
   }): NonNullable<ChatMessageAdmission["dispatch"]> {
     const at = timestamp(input.at);
-    this.#database.exec("BEGIN IMMEDIATE");
-    try {
+    return withImmediateTransaction(this.#database, () => {
       const existing = this.#existingDispatch(input.sourceMessageEventId);
       if (existing !== undefined) {
-        this.#database.exec("COMMIT");
         return { ...existing, status: "duplicate" };
       }
       const source = this.#requireChatMessage(input.sourceMessageEventId);
@@ -117,16 +277,13 @@ export class LocalChatStore {
         source.topicId,
         source.body,
         input.target,
+        input.admissionSnapshot,
         source.causality.rootEventId,
         source.causality.hop,
         at
       );
-      this.#database.exec("COMMIT");
       return receipt;
-    } catch (error) {
-      this.#database.exec("ROLLBACK");
-      throw error;
-    }
+    });
   }
 
   public dispatchReceipt(
@@ -148,6 +305,7 @@ export class LocalChatStore {
         AND json_extract(e.payload_json, '$.topicId') = ?
         AND json_extract(e.payload_json, '$.sender.kind') = 'owner'
         AND json_type(e.payload_json, '$.target') IS NULL
+        AND json_type(e.payload_json, '$.targets') IS NULL
         AND NOT EXISTS (
           SELECT 1 FROM events dispatch
           WHERE dispatch.type = 'chat.dispatch'
@@ -179,19 +337,18 @@ export class LocalChatStore {
           candidates: candidates.map(({ principalId, handle }) => ({ principalId, handle }))
         }
       };
-      this.#database.exec("BEGIN IMMEDIATE");
       try {
-        this.#insertChatMessage(
-          promptId,
-          payload,
-          timestamp(at),
-          row.event_id,
-          `local-chat-prompt:${row.event_id}`
-        );
-        created.push(this.#requireChatMessage(promptId));
-        this.#database.exec("COMMIT");
+        created.push(withImmediateTransaction(this.#database, () => {
+          this.#insertChatMessage(
+            promptId,
+            payload,
+            timestamp(at),
+            row.event_id,
+            `local-chat-prompt:${row.event_id}`
+          );
+          return this.#requireChatMessage(promptId);
+        }));
       } catch (error) {
-        this.#database.exec("ROLLBACK");
         if (!isUniqueConstraint(error)) throw error;
       }
     }
@@ -201,11 +358,35 @@ export class LocalChatStore {
   public events(topicId: string, limit = 200): readonly Event[] {
     const rows = this.#database.prepare(`
       SELECT event_id FROM events
-      WHERE type IN ('chat.message', 'chat.dispatch')
+      WHERE type IN ('chat.activation', 'chat.message', 'chat.dispatch')
         AND json_extract(payload_json, '$.topicId') = ?
       ORDER BY created_at ASC, event_id ASC
       LIMIT ?
     `).all(topicId, bounded(limit, 1, 1_000)) as unknown as Array<{ event_id: string }>;
+    return rows.map(({ event_id }) => this.#requireChatEvent(event_id));
+  }
+
+  public eventsAfter(topicIdInput: string, afterEventId: string, limit = 200): readonly Event[] {
+    const topicId = requireText(topicIdInput, "topicId");
+    const cursor = this.#database.prepare(`
+      SELECT event_id, created_at FROM events
+      WHERE event_id = ?
+        AND type IN ('chat.activation', 'chat.message', 'chat.dispatch')
+        AND json_extract(payload_json, '$.topicId') = ?
+    `).get(afterEventId, topicId) as { event_id: string; created_at: string } | undefined;
+    if (cursor === undefined) {
+      throw new Error(`Chat follow cursor is not an Event in Topic: ${afterEventId}`);
+    }
+    const rows = this.#database.prepare(`
+      SELECT event_id FROM events
+      WHERE type IN ('chat.activation', 'chat.message', 'chat.dispatch')
+        AND json_extract(payload_json, '$.topicId') = ?
+        AND (created_at > ? OR (created_at = ? AND event_id > ?))
+      ORDER BY created_at ASC, event_id ASC LIMIT ?
+    `).all(
+      topicId, cursor.created_at, cursor.created_at, cursor.event_id,
+      bounded(limit, 1, 1_000)
+    ) as unknown as Array<{ event_id: string }>;
     return rows.map(({ event_id }) => this.#requireChatEvent(event_id));
   }
 
@@ -217,7 +398,7 @@ export class LocalChatStore {
     } = {}
   ): ChatMessagePage {
     const topicId = requireText(topicIdInput, "topicId");
-    const limit = bounded(options.limit ?? 50, 1, 200);
+    const limit = bounded(options.limit ?? 50, 1, 10_000);
     const before = options.beforeEventId === undefined
       ? undefined
       : this.#database.prepare(`
@@ -359,7 +540,9 @@ export class LocalChatStore {
     payload: Readonly<Record<string, unknown>>,
     at: string,
     parentEventId?: string,
-    sourceExternalId?: string
+    sourceExternalId?: string,
+    sourceKind?: Event["source"]["kind"],
+    continueAttention = true
   ): void {
     this.#database.prepare(`
       INSERT INTO events (
@@ -371,7 +554,7 @@ export class LocalChatStore {
         ?, ?, ?, ?)
     `).run(
       eventId,
-      (payload.sender as { kind: string }).kind === "owner" ? "cli" : "handler",
+      sourceKind ?? ((payload.sender as { kind: string }).kind === "owner" ? "cli" : "handler"),
       sourceExternalId ?? null,
       (payload.sender as { principalId?: string }).principalId ?? null,
       JSON.stringify(payload),
@@ -380,7 +563,7 @@ export class LocalChatStore {
       parentEventId === undefined ? 0 : 1,
       at
     );
-    if ((payload.sender as { kind: string }).kind !== "system") {
+    if (continueAttention && (payload.sender as { kind: string }).kind !== "system") {
       this.#database.prepare(`
         INSERT INTO executions (
           execution_id, event_id, handler, status, attempt_count, max_attempts,
@@ -395,6 +578,7 @@ export class LocalChatStore {
     topicId: string,
     prompt: string,
     target: ChatAgentChoice,
+    admissionSnapshot: ChatDispatchEvent["admissionSnapshot"] | undefined,
     rootEventId: string,
     parentHop: number,
     at: string
@@ -406,9 +590,11 @@ export class LocalChatStore {
     const current = this.currentSession(target.principalId);
     const payload = {
       topicId,
+      sourceAttentionEventId: sourceMessageEventId,
       sourceMessageEventId,
       targetHandleSnapshot: target.handle,
-      promptResourceId: chatPromptResourceId
+      promptResourceId: chatPromptResourceId,
+      ...(admissionSnapshot === undefined ? {} : { admissionSnapshot })
     };
     this.#database.prepare(`
       INSERT INTO events (
@@ -479,14 +665,14 @@ export class LocalChatStore {
     return event;
   }
 
-  #requireChatEvent(eventId: string): ChatMessageEvent | ChatDispatchEvent {
+  #requireChatEvent(eventId: string): Event {
     const row = this.#database.prepare(`
       SELECT event_id, type, source_kind, source_external_id, agent_id, prompt,
              payload_json, session_id, root_event_id, parent_event_id, causal_hop, created_at
       FROM events WHERE event_id = ?
     `).get(eventId) as {
       event_id: string;
-      type: "chat.message" | "chat.dispatch";
+      type: "chat.activation" | "chat.message" | "chat.dispatch";
       source_kind: Event["source"]["kind"];
       source_external_id: string | null;
       agent_id: string | null;
@@ -499,7 +685,8 @@ export class LocalChatStore {
       created_at: string;
     } | undefined;
     if (row === undefined || row.payload_json === null ||
-      (row.type !== "chat.message" && row.type !== "chat.dispatch")) {
+      (row.type !== "chat.activation" &&
+        row.type !== "chat.message" && row.type !== "chat.dispatch")) {
       throw new Error(`Chat Event not found: ${eventId}`);
     }
     const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
@@ -518,6 +705,32 @@ export class LocalChatStore {
       },
       createdAt: row.created_at
     };
+    if (row.type === "chat.activation") {
+      return {
+        ...common,
+        type: "chat.activation",
+        topicId: String(payload.topicId),
+        reason: payload.reason as import("../../core/event/model.js").ChatActivationReason,
+        strategyId: payload.strategyId as
+          import("../../core/event/model.js").ChatActivationStrategy,
+        strategyRevision: Number(payload.strategyRevision),
+        contextRevision: Number(payload.contextRevision),
+        conversationIntent: parseConversationIntentSnapshot(
+          payload.conversationIntent ?? {
+            schema: "ConversationIntentSnapshot@1",
+            mode: "continue_recent",
+            governanceRevision: Number(payload.contextRevision)
+          }
+        ),
+        candidateAgentIds: payload.candidateAgentIds as string[],
+        ...(payload.sequentialDispatch === true ? { sequentialDispatch: true } : {}),
+        ...(typeof payload.sourceEventId === "string"
+          ? { sourceEventId: payload.sourceEventId }
+          : {}),
+        turnBudget: Number(payload.turnBudget),
+        expiresAt: String(payload.expiresAt)
+      };
+    }
     if (row.type === "chat.dispatch") {
       if (row.agent_id === null || row.prompt === null) {
         throw new Error(`Chat dispatch is incomplete: ${eventId}`);
@@ -527,7 +740,12 @@ export class LocalChatStore {
         type: "chat.dispatch",
         agentId: row.agent_id,
         topicId: String(payload.topicId),
-        sourceMessageEventId: String(payload.sourceMessageEventId),
+        sourceAttentionEventId: String(
+          payload.sourceAttentionEventId ?? payload.sourceMessageEventId
+        ),
+        ...(typeof payload.sourceMessageEventId === "string"
+          ? { sourceMessageEventId: payload.sourceMessageEventId }
+          : {}),
         targetHandleSnapshot: String(payload.targetHandleSnapshot),
         promptResourceId: typeof payload.promptResourceId === "string"
           ? payload.promptResourceId
@@ -536,8 +754,12 @@ export class LocalChatStore {
       };
     }
     const sender = payload.sender as ChatMessageEvent["sender"];
-    const target = payload.target as ChatMessageEvent["target"] | undefined;
+    const targets = parseChatMessageTargets(payload, eventId);
+    const replyToEventId = typeof payload.replyToEventId === "string"
+      ? payload.replyToEventId
+      : undefined;
     const dispatchCard = payload.dispatchCard as ChatMessageEvent["dispatchCard"] | undefined;
+    const conversation = payload.conversation as ChatMessageEvent["conversation"] | undefined;
     return {
       ...common,
       type: "chat.message",
@@ -545,7 +767,9 @@ export class LocalChatStore {
       topicId: String(payload.topicId),
       sender,
       body: String(payload.body),
-      ...(target === undefined ? {} : { target }),
+      ...(replyToEventId === undefined ? {} : { replyToEventId }),
+      ...(conversation === undefined ? {} : { conversation }),
+      ...(targets === undefined ? {} : { targets }),
       ...(dispatchCard === undefined ? {} : { dispatchCard })
     };
   }
@@ -556,6 +780,23 @@ function requireBody(value: string): string {
   if (body === "") throw new Error("Chat message body must be non-empty");
   if (body.length > 65_536) throw new Error("Chat message body exceeds 65536 characters");
   return body;
+}
+
+function normalizedTargets(targets: readonly ChatAgentChoice[]): readonly {
+  readonly principalId: string;
+  readonly handleSnapshot: string;
+}[] {
+  if (targets.length === 0 || targets.length > 64) {
+    throw new Error("Chat message targets must contain between 1 and 64 Agents");
+  }
+  const normalized = targets.map((target) => ({
+    principalId: requireText(target.principalId, "target.principalId"),
+    handleSnapshot: requireText(target.handle, "target.handle")
+  }));
+  if (new Set(normalized.map((target) => target.principalId)).size !== normalized.length) {
+    throw new Error("Chat message targets must be unique");
+  }
+  return normalized;
 }
 
 function requireText(value: string, field: string): string {
@@ -595,7 +836,7 @@ function parseReadProgress(value: string, eventId: string): ChatReadProgress {
       typeof agent.handleSnapshot !== "string" || agent.handleSnapshot.trim() === "" ||
       (agent.state !== "unread" && agent.state !== "reading" &&
         agent.state !== "read" && agent.state !== "failed") ||
-      !isAttentionReason(agent.reason)) {
+      !isChatAttentionReason(agent.reason)) {
       throw new Error(`Chat read progress Agent is malformed: ${eventId}`);
     }
     const state = agent.state as ChatReadProgress["agents"][number]["state"];
@@ -622,16 +863,4 @@ function parseReadProgress(value: string, eventId: string): ChatReadProgress {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isAttentionReason(value: unknown): value is ChatAttentionReason {
-  return value === "available" ||
-    value === "direct-mention" ||
-    value === "global-wake-keyword" ||
-    value === "topic-wake-keyword" ||
-    value === "sender" ||
-    value === "not-target" ||
-    value === "agent-suspended" ||
-    value === "global-snoozed" ||
-    value === "topic-snoozed";
 }

@@ -39,6 +39,7 @@ export type PollProbeResult = HttpProbeResult | CommandProbeResult;
 
 export interface PollObservation {
   readonly version: string;
+  readonly occurrenceKey?: string;
   readonly facts: Readonly<Record<string, unknown>>;
   readonly terminal: "success" | "failure" | "cancelled" | null;
   readonly summary?: string;
@@ -48,7 +49,7 @@ export interface PollPluginContext {
   readonly subscriptionId: string;
   readonly attempt: number;
   readonly startedAt: string;
-  readonly deadlineAt: string;
+  readonly deadlineAt?: string;
   readonly previousObservation?: PollObservation;
 }
 

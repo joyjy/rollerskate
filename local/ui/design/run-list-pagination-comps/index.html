@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Rollerskate Steward Run list — pagination/search comparison</title>
+<style>
+:root {
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --surface-2: #f8f9fb;
+  --text: #1f2329;
+  --text-secondary: #5f6b7a;
+  --text-dim: #9aa3b2;
+  --border: #e1e4e8;
+  --primary: #2563eb;
+  --primary-soft: #eff6ff;
+  --success: #16a34a;
+  --success-soft: #f0fdf4;
+  --warning: #d97706;
+  --warning-soft: #fffbeb;
+  --danger: #dc2626;
+  --danger-soft: #fef2f2;
+  --muted: #6b7280;
+  --muted-soft: #f3f4f6;
+  --shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  --shadow-lg: 0 10px 25px rgba(0, 0, 0, 0.1);
+  --radius: 10px;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html { overflow-y: scroll; scrollbar-gutter: stable; }
+html, body { margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.55;
+  font-size: 14px;
+}
+header {
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+.header-inner {
+  max-width: 1500px;
+  margin: 0 auto;
+  padding: 12px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 32px;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 700;
+  font-size: 17px;
+  flex-shrink: 0;
+}
+.brand-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--success);
+  box-shadow: 0 0 0 3px var(--success-soft);
+}
+.console-nav {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 4px;
+}
+.console-nav .nav-tab {
+  padding: 9px 20px;
+  border: 0;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-secondary);
+  background: transparent;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  letter-spacing: 0.01em;
+  text-decoration: none;
+}
+.console-nav .nav-tab:hover { background: var(--bg); color: var(--text); }
+.console-nav .nav-tab.active { background: var(--primary); color: #fff; box-shadow: 0 2px 6px rgba(37, 99, 235, 0.35); }
+.runtime-strip {
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+}
+.runtime-strip-inner {
+  max-width: 1500px;
+  margin: 0 auto;
+  padding: 8px 24px;
+  display: flex;
+  gap: 22px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  flex-wrap: wrap;
+}
+.runtime-strip-inner span strong { color: var(--text); font-weight: 600; }
+.status-pill { display: inline-flex; align-items: center; gap: 5px; }
+.status-pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.status-pill.ok::before { background: var(--success); }
+main { padding: 14px 24px 40px; }
+
+.comparison-chrome { max-width: 1500px; margin: 0 auto 14px; }
+.variant-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+.variant-tab {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-secondary);
+  padding: 8px 18px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.variant-tab:hover { background: var(--surface-2); color: var(--text); }
+.variant-tab.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+.legend {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 16px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+.legend strong { color: var(--text); }
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.panel-header {
+  padding: 12px 16px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.panel-header .count { margin-left: auto; color: var(--text-dim); width: 72px; text-align: right; flex-shrink: 0; white-space: nowrap; }
+.panel-header-right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+
+.state { padding: 28px 18px; color: var(--text-secondary); text-align: center; }
+.state.error { color: var(--danger); }
+.empty-inline { padding: 12px; border: 1px dashed var(--border); border-radius: 8px; color: var(--text-secondary); }
+.mono { font-family: var(--mono); font-size: 12px; }
+.dim { color: var(--text-dim); font-size: 12px; }
+
+.search-input {
+  appearance: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 12px;
+  font-size: 13px;
+  min-width: 180px;
+  background: var(--surface);
+  color: var(--text);
+}
+.search-input:focus { outline: 2px solid var(--primary-soft); border-color: var(--primary); }
+.search-input::placeholder { color: var(--text-dim); }
+
+.operations-view {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.8fr) minmax(0, 2fr);
+  gap: 12px;
+  min-width: 0;
+  height: 952px;
+  min-height: 600px;
+}
+.operations-list, .operations-detail { min-width: 0; display: flex; flex-direction: column; }
+.operations-list { height: 100%; }
+.operations-detail { overflow: auto; }
+
+.list-body { flex: 1 1 0; display: flex; flex-direction: column; min-height: 0; }
+.operation-rows {
+  flex: 1 1 0;
+  display: grid;
+  grid-template-rows: repeat(10, minmax(0, 1fr));
+  gap: 6px;
+  padding: 8px;
+  min-height: 0;
+  overflow: auto;
+}
+.operation-rows > .state { grid-row: 1 / -1; align-self: center; justify-self: center; }
+.operation-row {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  width: 100%;
+  min-height: 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+}
+.operation-row:hover, .operation-row.active { border-color: var(--primary); }
+.operation-row.active { outline: 2px solid var(--primary-soft); }
+.row-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: nowrap; }
+.compact-ref, .row-meta { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row-top strong { font-size: 13px; }
+.row-meta, .detail-label { color: var(--text-secondary); font-size: 12px; }
+.compact-ref { overflow-wrap: anywhere; color: var(--text-dim); }
+.run-status {
+  margin-left: auto;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--primary-soft);
+  color: var(--primary);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.run-status.succeeded { background: var(--success-soft); color: var(--success); }
+.run-status.failed, .run-status.needs_human { background: var(--warning-soft); color: var(--warning); }
+.run-status.cancelled { background: var(--muted-soft); color: var(--muted); }
+
+.pagination {
+  height: 44px;
+  flex: 0 0 auto;
+  padding: 0 10px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.pagination:empty { display: flex; }
+.pagination .page-info { display: inline-block; width: 100px; min-width: 100px; text-align: right; color: var(--text-secondary); font-size: 12px; white-space: nowrap; }
+.pagination .spacer { flex: 1; }
+.pagination .page-btn {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 5px 9px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  min-width: 30px;
+}
+.pagination .page-btn[data-page],
+.pagination .page-btn[aria-hidden="true"] { width: 36px; padding-left: 0; padding-right: 0; }
+.pagination .page-btn:hover:not(:disabled) { background: var(--surface-2); border-color: var(--primary); color: var(--primary); }
+.pagination .page-btn:disabled { opacity: .45; cursor: not-allowed; }
+.pagination .page-btn.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+
+.toolbar {
+  height: 52px;
+  flex: 0 0 auto;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.toolbar .toolbar-label { font-size: 12px; color: var(--text-secondary); font-weight: 600; }
+
+.variant { display: none; }
+.variant.active { display: block; }
+
+.operations-detail { padding: 14px; display: flex; flex-direction: column; gap: 12px; }
+.detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 4px; }
+.detail-head strong { font-size: 15px; }
+.detail-actions { display: flex; gap: 10px; }
+.trace-link { color: var(--primary); font-size: 12px; font-weight: 700; text-decoration: none; }
+.cancel-button { border: 1px solid var(--border); border-radius: 6px; padding: 5px 9px; background: transparent; color: var(--warning); cursor: pointer; font-size: 12px; }
+.run-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
+.run-grid > div { display: grid; gap: 3px; min-width: 0; padding: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); }
+.run-grid span:not(.label) { color: var(--text-secondary); font-size: 11px; overflow-wrap: anywhere; }
+.label { color: var(--text-dim); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
+.terminal { display: flex; gap: 8px; margin-top: 12px; padding: 9px 10px; border-radius: 7px; background: var(--success-soft); color: var(--success); font-size: 12px; }
+.terminal.failed, .terminal.needs_human { background: var(--warning-soft); color: var(--warning); }
+.terminal.cancelled { background: var(--muted-soft); color: var(--muted); }
+.section-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--text-secondary); margin: 16px 0 10px; }
+.steps-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.step-item { border: 1px solid var(--border); border-radius: 8px; padding: 10px; background: var(--surface-2); }
+.step-meta { display: flex; justify-content: space-between; font-size: 11px; color: var(--text-secondary); margin-bottom: 6px; }
+
+@media (max-width: 900px) {
+  .operations-view { grid-template-columns: minmax(0, 1fr); }
+  .legend { grid-template-columns: 1fr; }
+  .header-inner { flex-wrap: wrap; gap: 16px; }
+  .console-nav { order: 3; width: 100%; min-width: 0; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+}
+@media (max-width: 600px) {
+  .header-inner, .runtime-strip-inner, main { padding-left: 12px; padding-right: 12px; }
+  .console-nav .nav-tab { padding: 7px 9px; font-size: 12px; }
+  .run-grid { grid-template-columns: 1fr; }
+  .search-input { min-width: 120px; width: 100%; }
+  .toolbar { height: auto; padding: 8px; gap: 8px; flex-wrap: wrap; }
+  .panel-header { flex-wrap: wrap; }
+  .panel-header-right { margin-left: 0; width: 100%; }
+  .panel-header-right .search-input { flex: 1; }
+}
+</style>
+</head>
+<body>
+<div class="console">
+  <header>
+    <div class="header-inner">
+      <div class="brand"><div class="brand-dot"></div>Rollerskate Console</div>
+      <nav class="console-nav" aria-label="Console views">
+        <span class="nav-tab">Runtime</span>
+        <span class="nav-tab">Events</span>
+        <span class="nav-tab">Agents</span>
+        <span class="nav-tab">Connections</span>
+        <span class="nav-tab">Chats</span>
+        <span class="nav-tab active">Steward</span>
+        <span class="nav-tab">Schedules</span>
+        <span class="nav-tab">Subscriptions</span>
+      </nav>
+    </div>
+    <div class="runtime-strip">
+      <div class="runtime-strip-inner">
+        <span>Runtime <strong>v0.5.2</strong></span>
+        <span>Local loop <span class="status-pill ok">running</span></span>
+        <span>UI <strong>localhost:5173</strong></span>
+        <span>Polling <span class="status-pill ok">core managed</span></span>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <div class="comparison-chrome">
+      <div class="variant-tabs" role="tablist" aria-label="Comparison variants">
+        <button class="variant-tab active" data-variant="A" role="tab" aria-selected="true">Variant A</button>
+        <button class="variant-tab" data-variant="B" role="tab" aria-selected="false">Variant B</button>
+        <button class="variant-tab" data-variant="C" role="tab" aria-selected="false">Variant C</button>
+      </div>
+      <div class="legend">
+        <div><strong>A — Header search / footer pagination</strong> Search lives in the list header; pagination is a fixed-height footer below the rows. Rows stay the same distance from the toolbar, and the footer never collapses.</div>
+        <div><strong>B — Top toolbar</strong> Search and pagination share a single reserved strip above the rows. Controls are reachable without scrolling, but the strip is slightly taller.</div>
+        <div><strong>C — Compact bottom-centered pagination</strong> Search in the header like A, but pagination is centered in the footer with tighter prev/next/next-page controls. Balances scannability with a calmer right edge.</div>
+      </div>
+    </div>
+
+    <div id="variant-A" class="variant active">
+      <div class="operations-view">
+        <aside class="panel operations-list" aria-label="Steward Runs">
+          <div class="panel-header">
+            <span>Steward</span>
+            <span class="count" id="A-count">0 runs</span>
+            <input id="A-search" class="search-input" type="search" placeholder="Search runs…" aria-label="Search runs" />
+          </div>
+          <div class="list-body">
+            <div id="A-rows" class="operation-rows"></div>
+            <div id="A-pagination" class="pagination" aria-label="Pagination"></div>
+          </div>
+        </aside>
+        <section class="panel operations-detail" id="A-detail" aria-label="Run detail">
+          <div class="state">Select a Steward Run.</div>
+        </section>
+      </div>
+    </div>
+
+    <div id="variant-B" class="variant">
+      <div class="operations-view">
+        <aside class="panel operations-list" aria-label="Steward Runs">
+          <div class="panel-header"><span>Steward</span><span class="count" id="B-count">0 runs</span></div>
+          <div class="toolbar">
+            <span class="toolbar-label">Find</span>
+            <input id="B-search" class="search-input" type="search" placeholder="Search runs…" aria-label="Search runs" />
+            <span class="spacer"></span>
+            <div id="B-pagination" class="pagination" aria-label="Pagination"></div>
+          </div>
+          <div id="B-rows" class="operation-rows"></div>
+        </aside>
+        <section class="panel operations-detail" id="B-detail" aria-label="Run detail">
+          <div class="state">Select a Steward Run.</div>
+        </section>
+      </div>
+    </div>
+
+    <div id="variant-C" class="variant">
+      <div class="operations-view">
+        <aside class="panel operations-list" aria-label="Steward Runs">
+          <div class="panel-header">
+            <span>Steward</span>
+            <span class="count" id="C-count">0 runs</span>
+            <input id="C-search" class="search-input" type="search" placeholder="Search runs…" aria-label="Search runs" />
+          </div>
+          <div class="list-body">
+            <div id="C-rows" class="operation-rows"></div>
+            <div id="C-pagination" class="pagination" aria-label="Pagination"></div>
+          </div>
+        </aside>
+        <section class="panel operations-detail" id="C-detail" aria-label="Run detail">
+          <div class="state">Select a Steward Run.</div>
+        </section>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+(function () {
+  const VARIANTS = ["A", "B", "C"];
+  const PAGE_SIZE = 10;
+  const LABELS = [
+    "Review PR", "Deploy staging", "Run integration tests", "Generate release notes",
+    "Audit event log", "Reconcile subscriptions", "Refresh agent roster", "Compact state store",
+    "Validate migrations", "Update capability schema", "Process chat backlog", "Emit monthly report",
+    "Rotate signing keys", "Rebuild projection", "Check loop health", "Retry failed deliveries"
+  ];
+  const STEWARDS = [
+    { handle: "steward", client: "local" },
+    { handle: "codex", client: "codex" },
+    { handle: "claude", client: "claude-code" },
+    { handle: "kimi", client: "kimi-code" },
+    { handle: "pi-deepseek", client: "pi" }
+  ];
+  const STATUSES = ["active", "succeeded", "failed", "needs_human", "cancelled"];
+
+  function makeRuns() {
+    const runs = [];
+    const now = new Date("2026-08-21T04:50:00Z");
+    for (let i = 0; i < 128; i++) {
+      const steward = STEWARDS[i % STEWARDS.length];
+      const status = STATUSES[Math.floor(Math.random() * STATUSES.length)];
+      const ageMinutes = i * 7 + Math.floor(Math.random() * 5);
+      const updated = new Date(now.getTime() - ageMinutes * 60_000);
+      runs.push({
+        runId: "run_" + ("000" + i).slice(-4) + "a022" + i.toString(16).padStart(4, "0") + "deadbeef",
+        mandate: { label: LABELS[i % LABELS.length], kind: i % 3 === 0 ? "objective" : "workflow", workflowRef: i % 3 === 0 ? null : "workflows/" + LABELS[i % LABELS.length].toLowerCase().replace(/\s+/g, "-") },
+        steward,
+        status,
+        updatedAt: updated.toISOString(),
+        orchestrationMode: i % 2 === 0 ? "bounded" : "delegated",
+        participants: 1 + (i % 4),
+        workspace: i % 5 === 0 ? { access: "write", root: "/workspace/demo" } : null,
+        progress: { steps: Math.min(i % 8 + 1, 6), maxSteps: 6, maxDepth: 2 + (i % 3) },
+        exchanges: i % 5,
+        terminalSummary: ["succeeded", "failed", "needs_human", "cancelled"].includes(status)
+          ? "Run " + status.replace("_", " ") + " at " + updated.toISOString().slice(11, 16)
+          : null
+      });
+    }
+    return runs;
+  }
+
+  const runs = makeRuns();
+  let selectedId = runs[0].runId;
+  const state = {
+    A: { q: "", page: 1 },
+    B: { q: "", page: 1 },
+    C: { q: "", page: 1 }
+  };
+
+  function formatDateTime(iso) {
+    const d = new Date(iso);
+    return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  }
+
+  function matches(run, q) {
+    if (!q) return true;
+    const s = q.toLowerCase();
+    return run.mandate.label.toLowerCase().includes(s)
+      || run.runId.toLowerCase().includes(s)
+      || run.steward.handle.toLowerCase().includes(s)
+      || run.status.toLowerCase().includes(s);
+  }
+
+  function filtered(variant) {
+    return runs.filter(r => matches(r, state[variant].q));
+  }
+
+  function paginate(items, page) {
+    const totalPages = Math.ceil(items.length / PAGE_SIZE);
+    const p = totalPages === 0 ? 1 : Math.min(Math.max(1, page), totalPages);
+    return { page: p, totalPages, items: items.slice((p - 1) * PAGE_SIZE, p * PAGE_SIZE) };
+  }
+
+  function statusClass(status) {
+    if (["failed", "needs_human"].includes(status)) return "failed";
+    return status;
+  }
+
+  function detailHTML(run) {
+    const canCancel = ["active", "waiting", "awaiting_orchestrator"].includes(run.status);
+    return `
+      <div class="panel-header"><span>Agent Run</span><span class="run-status ${statusClass(run.status)}">${run.status}</span></div>
+      <div class="panel-body">
+        <div class="detail-head">
+          <div><strong>${run.mandate.label}</strong><div class="dim">${formatDateTime(run.updatedAt)}</div></div>
+          <div class="detail-actions">${canCancel ? '<button class="cancel-button">Cancel</button>' : ""}<a class="trace-link" href="#">Inspect trace</a></div>
+        </div>
+        <div class="run-grid">
+          <div><span class="label">Mandate</span><strong>${run.mandate.workflowRef ?? "inline objective"}</strong><span>${run.mandate.kind}</span></div>
+          <div><span class="label">Steward role</span><strong>@${run.steward.handle}</strong><span>${run.orchestrationMode} · ${run.participants} participant${run.participants === 1 ? "" : "s"}</span></div>
+          <div><span class="label">External workspace</span><strong>${run.workspace ? run.workspace.access : "not granted"}</strong><span class="mono">${run.workspace ? run.workspace.root : "uses Agent default workspace"}</span></div>
+          <div><span class="label">Progress</span><strong>${run.progress.steps}/${run.progress.maxSteps} turns</strong><span>depth ≤ ${run.progress.maxDepth} · ${run.exchanges} Agent exchange${run.exchanges === 1 ? "" : "s"}</span></div>
+        </div>
+        ${run.terminalSummary ? `<div class="terminal ${statusClass(run.status)}"><strong>${run.status}</strong><span>${run.terminalSummary}</span></div>` : ""}
+        <div class="section-title">Steps <span style="margin-left:6px;padding:1px 6px;border-radius:999px;background:var(--surface-2);border:1px solid var(--border);font-size:10px;">${1 + (run.runId.charCodeAt(run.runId.length - 1) % 3)}</span></div>
+        <ol class="steps-list">
+          <li class="step-item"><div class="step-meta"><span class="mono">stp_${run.runId.slice(4, 16)}</span><span>${formatDateTime(run.updatedAt)}</span></div><div><strong>${run.mandate.label}</strong></div></li>
+        </ol>
+      </div>`;
+  }
+
+  function renderPagination(variant, page, totalPages, placement) {
+    const el = document.getElementById(variant + "-pagination");
+    const prevDisabled = page <= 1 || totalPages === 0;
+    const nextDisabled = page >= totalPages || totalPages === 0;
+
+    function pageBtn(label, { page: p, active, disabled, placeholder, dir }) {
+      const classes = ["page-btn"];
+      if (active) classes.push("active");
+      const attrs = [];
+      if (disabled || placeholder) attrs.push("disabled");
+      if (placeholder) attrs.push('aria-hidden="true"');
+      if (p != null && !placeholder) attrs.push(`data-page="${p}"`);
+      if (dir != null) attrs.push(`data-dir="${dir}"`);
+      return `<button type="button" class="${classes.join(" ")}" ${attrs.join(" ")}>${label}</button>`;
+    }
+
+    // Stable skeleton: First | … | PrevPage | Current | NextPage | … | Last
+    const showFirst = totalPages >= 1 && page !== 1;
+    const showLast = totalPages >= 1 && page !== totalPages;
+    const prevPage = page - 1;
+    const nextPage = page + 1;
+    const showPrevPage = prevPage >= 1 && prevPage !== 1;
+    const showNextPage = nextPage <= totalPages && nextPage !== totalPages;
+
+    const numbers = [
+      pageBtn(showFirst ? "1" : "–", { page: showFirst ? 1 : null, active: totalPages > 0 && page === 1, disabled: !showFirst, placeholder: !showFirst }),
+      pageBtn("…", { page: null, active: false, disabled: true, placeholder: true }),
+      pageBtn(showPrevPage ? String(prevPage) : "–", { page: showPrevPage ? prevPage : null, active: false, disabled: !showPrevPage, placeholder: !showPrevPage }),
+      pageBtn(totalPages === 0 ? "–" : String(page), { page: totalPages === 0 ? null : page, active: totalPages > 0, disabled: totalPages === 0, placeholder: totalPages === 0 }),
+      pageBtn(showNextPage ? String(nextPage) : "–", { page: showNextPage ? nextPage : null, active: false, disabled: !showNextPage, placeholder: !showNextPage }),
+      pageBtn("…", { page: null, active: false, disabled: true, placeholder: true }),
+      pageBtn(showLast ? String(totalPages) : "–", { page: showLast ? totalPages : null, active: totalPages > 0 && page === totalPages, disabled: !showLast, placeholder: !showLast })
+    ].join("");
+
+    const pageInfo = `<span class="page-info">${totalPages === 0 ? "0 results" : `Page ${page} of ${totalPages}`}</span>`;
+    const prev = pageBtn("Prev", { page: null, active: false, disabled: prevDisabled, placeholder: false, dir: "prev" });
+    const next = pageBtn("Next", { page: null, active: false, disabled: nextDisabled, placeholder: false, dir: "next" });
+
+    if (placement === "center") {
+      el.innerHTML = `<span class="spacer"></span>${prev}${numbers}${next}<span class="spacer"></span>`;
+    } else if (placement === "right") {
+      el.innerHTML = `${pageInfo}<span class="spacer"></span>${prev}${numbers}${next}`;
+    } else {
+      el.innerHTML = `${prev}${numbers}${next}${pageInfo}<span class="spacer"></span>`;
+    }
+  }
+
+  function renderRows(variant, items) {
+    const el = document.getElementById(variant + "-rows");
+    if (items.length === 0) {
+      el.innerHTML = `<div class="state">No matches.</div>`;
+      return;
+    }
+    el.innerHTML = items.map(run => `
+      <button type="button" class="operation-row ${run.runId === selectedId ? "active" : ""}" data-run="${run.runId}" aria-selected="${run.runId === selectedId}">
+        <span class="row-top"><strong>${run.mandate.label}</strong><span class="run-status ${statusClass(run.status)}">${run.status}</span></span>
+        <span class="mono compact-ref">${run.runId}</span>
+        <span class="row-meta">@${run.steward.handle} · ${formatDateTime(run.updatedAt)}</span>
+      </button>
+    `).join("");
+  }
+
+  function renderVariant(variant) {
+    const f = filtered(variant);
+    const { page, totalPages, items } = paginate(f, state[variant].page);
+    state[variant].page = page;
+    document.getElementById(variant + "-count").textContent = f.length + " run" + (f.length === 1 ? "" : "s");
+    renderRows(variant, items);
+    let placement = "right";
+    if (variant === "B") placement = "inline";
+    if (variant === "C") placement = "center";
+    renderPagination(variant, page, totalPages, placement);
+    document.getElementById(variant + "-detail").innerHTML = detailHTML(runs.find(r => r.runId === selectedId));
+  }
+
+  function renderAll() {
+    VARIANTS.forEach(renderVariant);
+  }
+
+  document.querySelectorAll(".variant-tab").forEach(tab => {
+    tab.addEventListener("click", () => {
+      document.querySelectorAll(".variant-tab").forEach(t => { t.classList.remove("active"); t.setAttribute("aria-selected", "false"); });
+      tab.classList.add("active"); tab.setAttribute("aria-selected", "true");
+      document.querySelectorAll(".variant").forEach(v => v.classList.remove("active"));
+      document.getElementById("variant-" + tab.dataset.variant).classList.add("active");
+    });
+  });
+
+  VARIANTS.forEach(variant => {
+    const search = document.getElementById(variant + "-search");
+    search.addEventListener("input", (e) => {
+      state[variant].q = e.target.value;
+      state[variant].page = 1;
+      renderVariant(variant);
+    });
+    const rows = document.getElementById(variant + "-rows");
+    rows.addEventListener("click", (e) => {
+      const btn = e.target.closest(".operation-row");
+      if (!btn) return;
+      selectedId = btn.dataset.run;
+      renderAll();
+    });
+    const pag = document.getElementById(variant + "-pagination");
+    pag.addEventListener("click", (e) => {
+      const btn = e.target.closest(".page-btn");
+      if (!btn || btn.disabled) return;
+      if (btn.dataset.dir === "prev") state[variant].page--;
+      else if (btn.dataset.dir === "next") state[variant].page++;
+      else state[variant].page = Number(btn.dataset.page);
+      renderVariant(variant);
+    });
+  });
+
+  renderAll();
+})();
+</script>
+</body>
+</html>

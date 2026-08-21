@@ -4,8 +4,14 @@ import test from "node:test";
 import type { RowDataPacket } from "mysql2/promise";
 
 import { connectMysql, connectMysqlPool } from "../src/adapter/persistence/mysql/connection.js";
+import { MysqlConnectorRepository } from
+  "../src/adapter/persistence/mysql/connector-repository.js";
 import { migrateServerDatabase, readMigrations } from "../src/adapter/persistence/mysql/migrations.js";
 import { MysqlRepository } from "../src/adapter/persistence/mysql/repository.js";
+import { MysqlWorkRequestRepository } from
+  "../src/adapter/persistence/mysql/work-request-repository.js";
+import { ConnectorService } from "../src/modules/connector/service.js";
+import { WorkRequestService } from "../src/modules/work-request/service.js";
 import { createVerifier } from "../src/modules/shared/opaque-credential.js";
 import { createTestServices } from "./support/services.js";
 
@@ -17,7 +23,13 @@ test("migration SQL avoids PostgreSQL-only constructs", async () => {
     "0003_agent_enrollment",
     "0004_room_control_plane",
     "0005_first_login_bootstrap",
-    "0006_oidc_device_authorization"
+    "0006_oidc_device_authorization",
+    "0007_profiled_topics",
+    "0008_native_topic_fanout",
+    "0009_owner_scoped_agent_names",
+    "0010_human_topic_publishers",
+    "0011_project_connector_runtime",
+    "0012_agent_work_requests"
   ]);
   const sql = migrations.map((migration) => migration.sql).join("\n");
   for (const unsupported of [
@@ -46,12 +58,26 @@ test("migrations apply idempotently to MySQL 8", {
       "0003_agent_enrollment",
       "0004_room_control_plane",
       "0005_first_login_bootstrap",
-      "0006_oidc_device_authorization"
+      "0006_oidc_device_authorization",
+      "0007_profiled_topics",
+      "0008_native_topic_fanout",
+      "0009_owner_scoped_agent_names",
+      "0010_human_topic_publishers",
+      "0011_project_connector_runtime",
+      "0012_agent_work_requests"
     ]);
     assert.deepEqual(second, []);
 
     const [rows] = await connection.query<RowDataPacket[]>("SHOW TABLES");
-    assert.equal(rows.length, 20);
+    assert.equal(rows.length, 30);
+    const [projectTombstone] = await connection.query<RowDataPacket[]>(
+      "SHOW TABLES LIKE 'project_bindings'"
+    );
+    const [effectTombstone] = await connection.query<RowDataPacket[]>(
+      "SHOW TABLES LIKE 'external_effects'"
+    );
+    assert.equal(projectTombstone.length, 1);
+    assert.equal(effectTombstone.length, 1);
   } finally {
     await connection.end();
   }
@@ -59,6 +85,7 @@ test("migrations apply idempotently to MySQL 8", {
   const pool = connectMysqlPool(databaseUrl);
   try {
     const repository = new MysqlRepository(pool);
+    const connectorRepository = new MysqlConnectorRepository(pool);
     const services = createTestServices(
       repository,
       {
@@ -112,6 +139,77 @@ test("migrations apply idempotently to MySQL 8", {
       )).placement.id,
       created.agent.placement.id
     );
+    const workRequests = new WorkRequestService(
+      new MysqlWorkRequestRepository(pool),
+      repository,
+      undefined,
+      { now: () => new Date("2026-08-13T08:00:00.000Z") }
+    );
+    workRequests.registerRoute(created.agent.id, {
+      schemaVersion: "WorkRequestRouteLease@1",
+      routeId: "mysql-work-route",
+      leaseMilliseconds: 60_000
+    });
+    const mysqlWorkRequest = await workRequests.create(
+      { kind: "human", id: authentication.human.id },
+      {
+        schemaVersion: "AgentWorkRequestCreate@1",
+        requestId: "mysql-work-request",
+        targetAgentId: created.agent.id,
+        objective: "Verify MySQL work request persistence",
+        contextRefs: [],
+        workflowRef: "forum@1",
+        requestedBudget: { maxSteps: 4, maxDepth: 1 },
+        requestedGrantRefs: [],
+        resultRoute: "requester-bounded@1",
+        expiresAt: "2026-08-13T09:00:00.000Z"
+      }
+    );
+    assert.equal(mysqlWorkRequest.request.status, "received");
+    assert.equal((await workRequests.create(
+      { kind: "human", id: authentication.human.id },
+      {
+        schemaVersion: "AgentWorkRequestCreate@1",
+        requestId: "mysql-work-request",
+        targetAgentId: created.agent.id,
+        objective: "Verify MySQL work request persistence",
+        contextRefs: [],
+        workflowRef: "forum@1",
+        requestedBudget: { maxSteps: 4, maxDepth: 1 },
+        requestedGrantRefs: [],
+        resultRoute: "requester-bounded@1",
+        expiresAt: "2026-08-13T09:00:00.000Z"
+      }
+    )).created, false);
+    assert.deepEqual(
+      (await workRequests.routed(created.agent.id, "mysql-work-route"))
+        .map(({ workRequestId }) => workRequestId),
+      [mysqlWorkRequest.request.workRequestId]
+    );
+    const connectors = new ConnectorService(connectorRepository, {
+      now: () => new Date("2026-08-13T08:00:00.000Z")
+    });
+    const integration = await connectors.createIntegrationBinding(authentication, {
+      connectorId: "vikunja",
+      connectorVersion: "1",
+      placement: "runtime",
+      endpointRef: "http://127.0.0.1:3456",
+      profileIds: ["playground@1"],
+      externalScopeRef: "project:7",
+      credentialRef: "credential:vikunja-local"
+    });
+    assert.equal(
+      (await connectors.getIntegrationBinding(authentication, integration.bindingId)).bindingId,
+      integration.bindingId
+    );
+    const suspended = await connectors.updateIntegrationBinding(
+      authentication,
+      integration.bindingId,
+      { expectedRevision: 1, cursor: "mysql-cursor-1", status: "suspended" }
+    );
+    assert.equal(suspended.revision, 2);
+    assert.equal(suspended.cursor, "mysql-cursor-1");
+    assert.equal(suspended.status, "suspended");
     assert.equal(
       (await services.agents.redeemAgentEnrollment(
         authentication,

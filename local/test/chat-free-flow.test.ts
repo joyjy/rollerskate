@@ -5,6 +5,8 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { ChatHandler } from "../src/application/chat/handler.js";
+import { withChatHistoryContinuation } from
+  "../src/application/chat/agent-continuation.js";
 import { addLocalAgent, localRuntimeSnapshot } from "../src/application/agent/control.js";
 import { postLocalChatMessage } from "../src/application/chat/control.js";
 import {
@@ -50,7 +52,7 @@ test("Free Chat runs reply, silence, scoped snooze, deterministic wake, and Sess
               if (input.event.type !== "chat.dispatch") {
                 throw new Error("fixture only accepts chat.dispatch");
               }
-              const source = runtime.event(input.event.sourceMessageEventId);
+              const source = runtime.event(input.event.sourceMessageEventId!);
               if (source?.type !== "chat.message") throw new Error("source missing");
               const aliceFirst = agent.principalId === alice.principalId &&
                 source.body === "Who can inspect the release?";
@@ -63,13 +65,13 @@ test("Free Chat runs reply, silence, scoped snooze, deterministic wake, and Sess
                   body: JSON.stringify(mentioned
                     ? {
                         schema: "ChatMentionDecision@1",
-                        speech: { action: "silent" }
+                        speech: { action: "silent", reason: "Already covered." }
                       }
                     : {
                         schema: "ChatDecision@1",
                         speech: aliceFirst
                           ? { action: "reply", body: "I can inspect it." }
-                          : { action: "silent" },
+                          : { action: "silent", reason: "No useful addition." },
                         presence: agent.principalId === alice.principalId && !afterExpiry
                           ? {
                               scope: "global",
@@ -169,7 +171,7 @@ test("Free Chat runs reply, silence, scoped snooze, deterministic wake, and Sess
     }
   });
 
-test("Chat Agent recalls bounded earlier pages in the same Session without new recall Events",
+test("Chat Agent receives full Topic history in a single prompt",
   async () => {
     const repo = mkdtempSync(join(tmpdir(), "rollerskate-chat-recall-repo-"));
     const runtimeDirectory = mkdtempSync(join(tmpdir(), "rollerskate-chat-recall-runtime-"));
@@ -196,7 +198,7 @@ test("Chat Agent recalls bounded earlier pages in the same Session without new r
         });
         for (const execution of historyExecutions) noAgentChat.handle(execution, at);
 
-        const source = postAt(repo, "@alice recall the oldest context", options, at);
+        postAt(repo, "@alice recall the oldest context", options, at);
         const sourceExecution = runtime.claimDueExecutions(1, at)[0]!;
         new ChatHandler({
           store: runtime,
@@ -204,13 +206,6 @@ test("Chat Agent recalls bounded earlier pages in the same Session without new r
           listAgents: () => [alice]
         }).handle(sourceExecution, at);
         const dispatchExecution = runtime.claimDueExecutions(1, at)[0]!;
-        const initialHistory = boundedChatPromptHistory(chatTimelineFromStore(
-          chat,
-          source.topicId,
-          { beforeEventId: source.eventId, limit: 50 }
-        ));
-        assert.equal(initialHistory.hasEarlier, true);
-        assert.ok(initialHistory.beforeEventId);
 
         const invocations: Array<{
           readonly providerSessionId?: string;
@@ -226,45 +221,37 @@ test("Chat Agent recalls bounded earlier pages in the same Session without new r
                 : { providerSessionId: input.providerSessionId }),
               prompt: input.event.prompt
             });
-            return invocations.length === 1
-              ? {
-                  providerSessionId: "provider-recall",
-                  outcome: {
-                    kind: "message",
-                    body: JSON.stringify({
-                      schema: "ChatHistoryRequest@1",
-                      beforeEventId: initialHistory.beforeEventId,
-                      limit: 50
-                    })
-                  }
-                }
-              : {
-                  providerSessionId: "provider-recall",
-                  outcome: {
-                    kind: "message",
-                    body: JSON.stringify({
-                      schema: "ChatMentionDecision@1",
-                      speech: { action: "reply", body: "I found the older context." }
-                    })
-                  }
-                };
+            return {
+              providerSessionId: "provider-recall",
+              outcome: {
+                kind: "message",
+                body: JSON.stringify({
+                  schema: "ChatMentionDecision@1",
+                  speech: { action: "reply", body: "I found the older context." }
+                })
+              }
+            };
           }
         };
         const eventsBefore = runtime.events().length;
-        const handler = new AgentHandler({
-          store: runtime,
-          adapters: new Map([[alice.principalId, adapter]]),
+        const continuedAdapter = withChatHistoryContinuation(adapter, {
           chatHistory: ({ topicId, beforeEventId, limit }) =>
             boundedChatPromptHistory(chatTimelineFromStore(chat, topicId, {
-              beforeEventId,
+              ...(beforeEventId === undefined ? {} : { beforeEventId }),
               limit
-            }))
+            })),
+          clientHistory: () => {
+            throw new Error("Client history was not requested");
+          }
+        });
+        const handler = new AgentHandler({
+          store: runtime,
+          adapters: new Map([[alice.principalId, continuedAdapter]])
         });
         const reply = await handler.handle(dispatchExecution, at);
 
-        assert.equal(invocations.length, 2);
-        assert.equal(invocations[1]?.providerSessionId, "provider-recall");
-        assert.match(invocations[1]?.prompt ?? "", /historical-0/u);
+        assert.equal(invocations.length, 1);
+        assert.match(invocations[0]?.prompt ?? "", /historical-0/u);
         assert.equal(reply?.type, "chat.message");
         assert.equal(reply?.body, "I found the older context.");
         assert.equal(runtime.events().length, eventsBefore + 1);
@@ -277,6 +264,109 @@ test("Chat Agent recalls bounded earlier pages in the same Session without new r
       rmSync(repo, { recursive: true, force: true });
       rmSync(runtimeDirectory, { recursive: true, force: true });
     }
+  });
+
+test("Chat history continuation fetches earlier pages when the initial page is bounded",
+  async () => {
+    const topicId = "topic-continuation";
+    const firstPageEventId = "evt_first_page_oldest";
+    const olderEventId = "evt_older_context";
+
+    const invocations: string[] = [];
+    const adapter: RuntimeAgentAdapter = {
+      adapterId: "continuation-agent",
+      workspace: join(tmpdir(), "workspace"),
+      async invoke(input) {
+        invocations.push(input.event.prompt);
+        return invocations.length === 1
+          ? {
+              providerSessionId: "provider-continuation",
+              outcome: {
+                kind: "message",
+                body: JSON.stringify({
+                  schema: "ChatHistoryRequest@1",
+                  beforeEventId: firstPageEventId,
+                  limit: 50
+                })
+              }
+            }
+          : {
+              providerSessionId: "provider-continuation",
+              outcome: {
+                kind: "message",
+                body: JSON.stringify({
+                  schema: "ChatMentionDecision@1",
+                  speech: { action: "reply", body: "I found the older context." }
+                })
+              }
+            };
+      }
+    };
+    const continuedAdapter = withChatHistoryContinuation(adapter, {
+      chatHistory: ({ beforeEventId }) => {
+        if (beforeEventId === undefined) {
+          return {
+            topicId,
+            items: [{
+              eventId: "evt_newest",
+              createdAt: "2026-07-25T12:00:00.000Z",
+              sender: { kind: "owner" as const, principalId: "owner", handleSnapshot: "owner" },
+              body: "newest message"
+            }],
+            hasEarlier: true,
+            beforeEventId: firstPageEventId
+          };
+        }
+        if (beforeEventId === firstPageEventId) {
+          return {
+            topicId,
+            items: [{
+              eventId: olderEventId,
+              createdAt: "2026-07-25T11:00:00.000Z",
+              sender: { kind: "owner" as const, principalId: "owner", handleSnapshot: "owner" },
+              body: "older context"
+            }],
+            hasEarlier: false
+          };
+        }
+        throw new Error(`Unexpected history cursor: ${beforeEventId}`);
+      },
+      clientHistory: () => {
+        throw new Error("Client history was not requested");
+      }
+    });
+
+    const reply = await continuedAdapter.invoke({
+      event: {
+        type: "chat.dispatch",
+        eventId: "evt_chat_dispatch_continuation",
+        source: { kind: "handler", externalId: "continuation-test" },
+        destinationIds: [],
+        createdAt: "2026-07-25T12:00:00.000Z",
+        agentId: "continuation-agent",
+        topicId,
+        sourceAttentionEventId: "evt_attention",
+        targetHandleSnapshot: "owner",
+        causality: {
+          rootEventId: "evt_root",
+          parentEventId: "evt_parent",
+          hop: 0
+        },
+        prompt: "continuation test prompt",
+        promptResourceId: chatMentionPromptResourceId
+      } as unknown as import("../src/core/event/model.js").ChatDispatchEvent
+    });
+
+    assert.equal(invocations.length, 2);
+    assert.match(invocations[1] ?? "", /older context/u);
+    assert.equal(reply.outcome.kind, "message");
+    assert.equal(
+      (reply.outcome as { readonly body: string }).body,
+      JSON.stringify({
+        schema: "ChatMentionDecision@1",
+        speech: { action: "reply", body: "I found the older context." }
+      })
+    );
   });
 
 function postAt(

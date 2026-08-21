@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import AddAgentModal from "@/components/AddAgentModal.vue";
 import AgentRoster from "@/components/AgentRoster.vue";
-import type { AgentConsoleItem } from "@/types/local";
+import type { AgentSummary } from "@/types/local";
 
 describe("Agent components", () => {
   it("renders the roster as selected keyboard-operable buttons", async () => {
@@ -30,11 +30,13 @@ describe("Agent components", () => {
     });
     expect(document.activeElement).toBe(wrapper.get("#new-handle").element);
     expect(wrapper.get('[role="dialog"]').attributes("aria-modal")).toBe("true");
+    expect(wrapper.get('option[value="kimi-code"]').text()).toBe("Kimi Code");
+    expect(wrapper.get('option[value="pi"]').text()).toBe("Pi");
     wrapper.unmount();
   });
 });
 
-function fixtureAgent(): AgentConsoleItem {
+function fixtureAgent(): AgentSummary {
   return {
     principalId: "agent-1",
     handle: "reviewer",

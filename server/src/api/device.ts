@@ -1,3 +1,5 @@
+import { randomBytes } from "node:crypto";
+
 import {
   devicePairingCreateRequestSchema,
   devicePairingRedeemRequestSchema
@@ -35,6 +37,12 @@ export async function handleDeviceApi(
   if (request.method === "POST" && url.pathname === "/api/device-pairings") {
     const body = devicePairingCreateRequestSchema.parse(await readJsonBody(request));
     writeJson(response, 201, await dependencies.deviceLogin.begin(body));
+    return true;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/device-pairings/browser") {
+    const body = devicePairingCreateRequestSchema.parse(await readJsonBody(request));
+    writeJson(response, 201, await dependencies.devices.createPairing(body));
     return true;
   }
 
@@ -88,11 +96,14 @@ export async function handleDeviceApi(
     assertSameOrigin(request, dependencies.trust.publicUrl);
     const human = await dependencies.trust.authenticateSession(sessionToken(request));
     await dependencies.devices.approvePairing(browserPairing, human);
+    const scriptNonce = randomBytes(18).toString("base64");
     writeHtml(
       response,
       200,
       "<!doctype html><meta charset=\"utf-8\"><title>Device approved</title>" +
-        "<p>Device approved. Return to the terminal.</p>"
+        "<p>Device approved. You can close this tab.</p>" +
+        `<script nonce="${scriptNonce}">window.close();</script>`,
+      { scriptNonce }
     );
     return true;
   }
@@ -120,12 +131,15 @@ function pairingApprovalPage(input: {
   readonly humanName: string;
   readonly disabled: boolean;
 }): string {
+  const returnTo = `/device/pair/${encodeURIComponent(input.pairingId)}`;
+  const loginUrl = `/auth/login?returnTo=${encodeURIComponent(returnTo)}`;
   return [
     "<!doctype html>",
     "<meta charset=\"utf-8\">",
     "<title>Approve Rollerskate device</title>",
     "<h1>Approve device</h1>",
     `<p>Signed in as ${escapeHtml(input.humanName)}</p>`,
+    `<p><a href="${escapeHtml(loginUrl)}">Sign in again</a></p>`,
     `<p>Device ID: <code>${escapeHtml(input.deviceId)}</code></p>`,
     `<form method=\"post\" action=\"/device/pair/${encodeURIComponent(input.pairingId)}\">`,
     `<button type=\"submit\"${input.disabled ? " disabled" : ""}>Approve</button>`,

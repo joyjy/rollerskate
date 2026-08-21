@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { formatDateTime } from "@/utils/format";
-import type { AgentConsoleItem } from "@/types/local";
+import type { AgentSummary } from "@/types/local";
 
 defineProps<{
-  agents: readonly AgentConsoleItem[];
+  agents: readonly AgentSummary[];
   selectedId: string | null;
 }>();
 
@@ -11,7 +11,7 @@ const emit = defineEmits<{
   select: [id: string];
 }>();
 
-function sessionSummary(agent: AgentConsoleItem): string {
+function sessionSummary(agent: AgentSummary): string {
   if (!agent.currentSession) return "No session yet · 首次调用时创建";
   const session = agent.currentSession;
   return `Generation ${session.generation} · ${session.state} · ${formatDateTime(session.updatedAt)}`;

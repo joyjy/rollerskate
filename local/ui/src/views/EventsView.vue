@@ -2,6 +2,7 @@
 import { computed, ref, watch } from "vue";
 import { useRoute } from "vue-router";
 import {
+  runtimeAuditSchema,
   runtimeAuditsSchema,
   runtimeInfoSchema
 } from "@/api/schema";
@@ -15,7 +16,7 @@ const initialEventId = Array.isArray(route.query.eventId)
   : route.query.eventId;
 
 const eventsQuery = useApi({
-  url: "/api/runtime/events",
+  url: "/api/events",
   schema: runtimeAuditsSchema,
   interval: 3_000
 });
@@ -27,14 +28,27 @@ const runtimeQuery = useApi({
 const audits = computed(() => eventsQuery.data.value ?? []);
 const runtime = runtimeQuery.data;
 const selectedEventId = ref(initialEventId ?? "");
-const apiError = computed(() => eventsQuery.error.value ?? runtimeQuery.error.value);
-const loading = computed(() => eventsQuery.loading.value || runtimeQuery.loading.value);
+const detailPaused = computed(() => selectedEventId.value === "");
+const detailQuery = useApi({
+  url: computed(() => `/api/events/${encodeURIComponent(selectedEventId.value)}`),
+  schema: runtimeAuditSchema,
+  interval: 3_000,
+  paused: detailPaused,
+  immediate: false
+});
+const apiError = computed(() =>
+  eventsQuery.error.value ?? runtimeQuery.error.value ?? detailQuery.error.value);
+const loading = computed(() =>
+  eventsQuery.loading.value || runtimeQuery.loading.value ||
+  (selectedEventId.value !== "" && detailQuery.loading.value));
 
 const runtimePaused = computed(() => runtime.value?.status === "paused");
 const runtimeStale = computed(() => runtime.value?.stale ?? false);
 
-const selected = computed(() => audits.value.find((audit) =>
-  audit.event.eventId === selectedEventId.value));
+const selected = computed(() => {
+  const detail = detailQuery.data.value;
+  return detail?.event.eventId === selectedEventId.value ? detail : undefined;
+});
 
 watch(audits, (next) => {
   if (selectedEventId.value === "" && next.length > 0) {
@@ -42,12 +56,20 @@ watch(audits, (next) => {
   }
 }, { immediate: true });
 
+watch(selectedEventId, (next) => {
+  if (next !== "") void detailQuery.refresh();
+}, { immediate: true });
+
 function selectEvent(id: string) {
   selectedEventId.value = id;
 }
 
 function refresh() {
-  void Promise.all([eventsQuery.refresh(), runtimeQuery.refresh()]);
+  void Promise.all([
+    eventsQuery.refresh(),
+    runtimeQuery.refresh(),
+    ...(selectedEventId.value === "" ? [] : [detailQuery.refresh()])
+  ]);
 }
 </script>
 

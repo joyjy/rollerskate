@@ -2,14 +2,9 @@
 import { computed, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { requestJson } from "@/api/client";
-import {
-  cancelAgentRunReceiptSchema,
-  latestAgentRunViewSchema,
-  runtimeInfoSchema
-} from "@/api/schema";
+import { runtimeInfoSchema } from "@/api/schema";
 import { useApi } from "@/composables/useApi";
 import { useMutation } from "@/composables/useMutation";
-import AgentRunOverview from "@/components/AgentRunOverview.vue";
 import { formatDateTime } from "@/utils/format";
 import type { RuntimeStatus, RuntimeFailure } from "@/types/runtime";
 
@@ -32,17 +27,6 @@ const {
   interval: 5_000,
   paused: mutationPaused
 });
-const {
-  data: latestAgentRun,
-  error: agentRunError,
-  refresh: refreshAgentRun
-} = useApi({
-  url: "/api/runs/latest",
-  schema: latestAgentRunViewSchema,
-  interval: 5_000,
-  paused: mutationPaused
-});
-
 const controlMutation = useMutation({
   async execute(action: "pause" | "resume" | "recover", signal) {
     return requestJson(`/api/runtime/${action}`, runtimeInfoSchema, {
@@ -56,20 +40,6 @@ const controlMutation = useMutation({
 
 const controlling = controlMutation.pending;
 const apiError = computed(() => controlMutation.error.value ?? loadError.value);
-const cancelRunMutation = useMutation({
-  async execute(runId: string, signal) {
-    return requestJson(`/api/runs/${encodeURIComponent(runId)}/cancel`, cancelAgentRunReceiptSchema, {
-      method: "POST",
-      headers: { "X-Rollerskate-Request": "console" },
-      signal
-    });
-  },
-  async refresh() {
-    await Promise.all([refresh(), refreshAgentRun()]);
-  }
-});
-const cancellingRun = cancelRunMutation.pending;
-const cancelRunError = cancelRunMutation.error;
 
 const uptime = computed(() => {
   if (runtime.value?.startedAt === null || runtime.value === null) return "—";
@@ -115,14 +85,6 @@ async function control(action: "pause" | "resume" | "recover") {
   }
 }
 
-async function cancelRun(runId: string) {
-  mutationPaused.value = true;
-  try {
-    await cancelRunMutation.execute(runId);
-  } finally {
-    mutationPaused.value = false;
-  }
-}
 </script>
 
 <template>
@@ -186,22 +148,6 @@ async function cancelRun(runId: string) {
             <div class="metric-label">Total</div>
           </div>
         </div>
-      </div>
-    </section>
-
-    <div v-if="cancelRunError" class="runtime-state error">
-      {{ cancelRunError }}
-    </div>
-    <AgentRunOverview
-      v-if="latestAgentRun"
-      :run="latestAgentRun"
-      :cancelling="cancellingRun"
-      @cancel="cancelRun"
-    />
-    <section v-else class="panel agent-run-empty">
-      <div class="panel-header">Latest Agent Run</div>
-      <div class="panel-body empty-inline">
-        {{ agentRunError ? `Agent Run view unavailable: ${agentRunError}` : "No Agent Run yet" }}
       </div>
     </section>
 

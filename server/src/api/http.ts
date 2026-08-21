@@ -138,11 +138,20 @@ export function writeJson(response: ServerResponse, status: number, body: unknow
   response.end(`${JSON.stringify(body)}\n`);
 }
 
-export function writeHtml(response: ServerResponse, status: number, body: string): void {
+export function writeHtml(
+  response: ServerResponse,
+  status: number,
+  body: string,
+  options: { readonly scriptNonce?: string } = {}
+): void {
+  const scriptPolicy = options.scriptNonce === undefined
+    ? ""
+    : ` script-src 'nonce-${options.scriptNonce}';`;
   response.writeHead(status, {
     "content-type": "text/html; charset=utf-8",
     "cache-control": "no-store",
-    "content-security-policy": "default-src 'none'; form-action 'self'; frame-ancestors 'none'",
+    "content-security-policy":
+      `default-src 'none';${scriptPolicy} form-action 'self'; frame-ancestors 'none'`,
     "x-content-type-options": "nosniff"
   });
   response.end(body);

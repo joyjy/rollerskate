@@ -8,20 +8,37 @@ describe("ChatContextPanel", () => {
   it("separates client identity, topic presence, and suspended lifecycle", async () => {
     const codex = fixtureAgent("agent-codex", "codex", "codex", "active");
     const kimi = fixtureAgent("agent-kimi", "kimi", "kimi-code", "suspended");
+    const futureAgent = fixtureAgent("agent-future", "future", "future-client", "active");
     const wrapper = mount(ChatContextPanel, {
       props: {
-        agents: [kimi, codex],
+        agents: [kimi, futureAgent, codex],
         presenceAgents: [
           {
             principalId: codex.principalId,
             handle: codex.handle,
             status: codex.status,
-            topic: { scope: "topic", mode: "available", wakeKeywords: [] }
+            topic: { scope: "topic", mode: "available", wakeKeywords: [] },
+            clientHistory: {
+              client: "codex",
+              status: "active",
+              updatedAt: "2026-07-31T00:00:00.000Z",
+              coverage: "unavailable"
+            },
+            lastTurn: {
+              state: "silent",
+              at: "2026-07-31T00:00:00.000Z",
+              reason: "The useful point was already covered."
+            }
           },
           {
             principalId: kimi.principalId,
             handle: kimi.handle,
             status: kimi.status
+          },
+          {
+            principalId: futureAgent.principalId,
+            handle: futureAgent.handle,
+            status: futureAgent.status
           }
         ],
         sessions: [],
@@ -33,8 +50,13 @@ describe("ChatContextPanel", () => {
     expect(rows[0]?.text()).toContain("@codex");
     expect(rows[0]?.text()).toContain("Codex");
     expect(rows[0]?.text()).toContain("Listening");
-    expect(rows[1]?.classes()).toContain("suspended");
-    expect(rows[1]?.text()).toContain("Suspended");
+    expect(rows[0]?.text()).toContain("stayed silent");
+    expect(rows[0]?.text()).toContain("already covered");
+    expect(rows[0]?.text()).toContain("Source unavailable");
+    expect(rows[1]?.text()).toContain("@future");
+    expect(rows[1]?.text()).toContain("future-client");
+    expect(rows[2]?.classes()).toContain("suspended");
+    expect(rows[2]?.text()).toContain("Suspended");
 
     await rows[0]!.get("button.presence-control").trigger("click");
     const future = new Date(Date.now() + 60 * 60 * 1_000);

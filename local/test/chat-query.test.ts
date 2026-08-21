@@ -6,7 +6,8 @@ import test from "node:test";
 
 import {
   boundedChatPromptHistory,
-  chatTimelineFromStore
+  chatTimelineFromStore,
+  incrementalChatPromptHistory
 } from "../src/application/chat/query.js";
 import { RuntimeStore } from "../src/core/runtime/store.js";
 import { LocalChatStore } from "../src/infrastructure/sqlite/chat-store.js";
@@ -58,8 +59,8 @@ test("ChatTimeline pages one Topic by the stable createdAt and eventId cursor", 
       /not a message in Topic/u
     );
     assert.throws(
-      () => chat.messagePage("topic-a", { limit: 201 }),
-      /limit must be between 1 and 200/u
+      () => chat.messagePage("topic-a", { limit: 10_001 }),
+      /limit must be between 1 and 10000/u
     );
   } finally {
     chat.close();
@@ -79,6 +80,29 @@ test("bounded Chat prompt history keeps the newest complete message records", ()
   assert.equal(history.hasEarlier, true);
   assert.equal(history.beforeEventId, history.items[0]?.eventId ?? "evt-2");
   assert.ok(history.items.length < 2);
+});
+
+test("incremental Chat prompt history omits messages already held by a resumed Session", () => {
+  const history = incrementalChatPromptHistory({
+    items: [
+      { ...summary("evt-1", "dispatch source"), createdAt: "2026-07-25T11:59:59.000Z" },
+      {
+        ...summary("evt-2", "own reply"),
+        createdAt: "2026-07-25T12:00:01.000Z",
+        sender: { kind: "agent", principalId: "agent-a", handleSnapshot: "alice" }
+      },
+      { ...summary("evt-3", "arrived while running"), createdAt: "2026-07-25T12:00:02.000Z" }
+    ],
+    hasEarlier: true,
+    beforeEventId: "evt-1"
+  }, {
+    sourceMessageEventId: "evt-1",
+    dispatchCreatedAt: "2026-07-25T12:00:00.000Z",
+    agentId: "agent-a"
+  });
+  assert.deepEqual(history.items.map(({ eventId }) => eventId), ["evt-3"]);
+  assert.equal(history.hasEarlier, false);
+  assert.equal(history.beforeEventId, undefined);
 });
 
 function summary(eventId: string, body: string) {

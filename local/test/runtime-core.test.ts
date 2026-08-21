@@ -80,7 +80,7 @@ test("unified core persists an offline Event through result Event and Matrix Del
       async deliver(input) {
         delivered.push(input.delivery.deliveryId);
         assert.equal(input.destination.address.roomId, "!room:example");
-        assert.equal(input.resultEvent.output, "finished");
+        assert.equal(input.resultEvent?.output, "finished");
         return { receipt: "$matrix-result" };
       }
     });
@@ -243,6 +243,151 @@ test("RuntimeCycle isolates one handler exception and continues later Executions
       second.execution.executionId
     ]));
     assert.deepEqual(result.failures.map((failure) => failure.id), [first.execution.executionId]);
+  } finally {
+    store.close();
+  }
+});
+
+test("RuntimeCycle starts a claimed batch concurrently instead of downgrading to serial", {
+  timeout: 3_000
+}, async () => {
+  const store = runtimeStore();
+  try {
+    const first = store.appendEvent({
+      type: "agent.request", source: { kind: "cli" }, agentId: "agent-1", prompt: "first",
+      maxAttempts: 1
+    });
+    const second = store.appendEvent({
+      type: "agent.request", source: { kind: "cli" }, agentId: "agent-2", prompt: "second",
+      maxAttempts: 1
+    });
+    let releaseFirst!: () => void;
+    const firstBlocked = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let secondStarted!: () => void;
+    const observedSecond = new Promise<void>((resolve) => {
+      secondStarted = resolve;
+    });
+    const cycle = new RuntimeCycle({
+      store,
+      handlers: new Map<RuntimeHandlerKind, RuntimeEventHandler>([
+        ["agent", {
+          kind: "agent",
+          async handle(execution) {
+            if (execution.executionId === first.execution.executionId) {
+              await firstBlocked;
+            } else if (execution.executionId === second.execution.executionId) {
+              secondStarted();
+            }
+            store.failExecution(execution.executionId, "terminal", new Date().toISOString(), 1);
+          }
+        }],
+        ["result", new ResultHandler(store)]
+      ]),
+      deliveryHandler: new DeliveryHandler({ store, adapters: new Map() })
+    });
+
+    const running = cycle.run(new Date(Date.now() + 1_000).toISOString());
+    await observedSecond;
+    assert.equal(store.execution(second.execution.executionId)?.status, "failed");
+    releaseFirst();
+    await running;
+  } finally {
+    store.close();
+  }
+});
+
+test("RuntimeCycle poll claims later independent work while an invocation is running", {
+  timeout: 3_000
+}, async () => {
+  const store = runtimeStore();
+  try {
+    const first = store.appendEvent({
+      type: "agent.request", source: { kind: "cli" }, agentId: "agent-1", prompt: "first",
+      maxAttempts: 1
+    });
+    let releaseFirst!: () => void;
+    const firstBlocked = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let firstStarted!: () => void;
+    const observedFirst = new Promise<void>((resolve) => {
+      firstStarted = resolve;
+    });
+    let secondStarted!: () => void;
+    const observedSecond = new Promise<void>((resolve) => {
+      secondStarted = resolve;
+    });
+    const cycle = new RuntimeCycle({
+      store,
+      handlers: new Map<RuntimeHandlerKind, RuntimeEventHandler>([
+        ["agent", {
+          kind: "agent",
+          async handle(execution) {
+            if (execution.executionId === first.execution.executionId) {
+              firstStarted();
+              await firstBlocked;
+            } else {
+              secondStarted();
+            }
+            store.failExecution(execution.executionId, "terminal", new Date().toISOString(), 1);
+          }
+        }],
+        ["result", new ResultHandler(store)]
+      ]),
+      deliveryHandler: new DeliveryHandler({ store, adapters: new Map() })
+    });
+
+    cycle.poll(new Date(Date.now() + 1_000).toISOString());
+    await observedFirst;
+    const second = store.appendEvent({
+      type: "agent.request", source: { kind: "cli" }, agentId: "agent-2", prompt: "second",
+      maxAttempts: 1
+    });
+    cycle.poll(new Date(Date.now() + 2_000).toISOString());
+    await observedSecond;
+
+    assert.equal(store.execution(first.execution.executionId)?.status, "running");
+    assert.equal(store.execution(second.execution.executionId)?.status, "failed");
+    releaseFirst();
+    const settled = await cycle.settle();
+    assert.deepEqual(new Set(settled.executions), new Set([
+      first.execution.executionId,
+      second.execution.executionId
+    ]));
+  } finally {
+    store.close();
+  }
+});
+
+test("AgentHandler serializes concurrent invocations in the same Agent workspace lane", async () => {
+  const store = runtimeStore();
+  try {
+    let active = 0;
+    let maximum = 0;
+    const cycle = runtimeCycle(store, {
+      async invoke() {
+        active += 1;
+        maximum = Math.max(maximum, active);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        active -= 1;
+        return {
+          providerSessionId: `provider-${Date.now()}`,
+          outcome: { kind: "message", body: "done" }
+        };
+      }
+    });
+    store.appendEvent({
+      type: "agent.request", source: { kind: "cli" }, agentId: "agent-1", prompt: "first"
+    });
+    store.appendEvent({
+      type: "agent.request", source: { kind: "cli" }, agentId: "agent-1", prompt: "second"
+    });
+
+    await cycle.run();
+
+    assert.equal(maximum, 1);
   } finally {
     store.close();
   }
@@ -432,6 +577,34 @@ test("runtime recovery never retries an interrupted one-attempt notification", (
     assert.equal(store.reconcileInterrupted(), 1);
     assert.equal(store.delivery(claimed.deliveryId)?.status, "failed");
     assert.deepEqual(store.claimDueDeliveries(), []);
+  } finally {
+    store.close();
+  }
+});
+
+test("runtime recovery terminalizes interrupted Agent invocation as unknown without replay", () => {
+  const store = runtimeStore();
+  try {
+    const request = store.appendEvent({
+      type: "agent.request",
+      source: { kind: "cli", externalId: "interrupted-agent-unknown" },
+      agentId: "agent-1",
+      prompt: "possibly wrote through a provider tool",
+      maxAttempts: 3
+    });
+    const running = store.claimDueExecutions()[0]!;
+    assert.equal(running.attemptCount, 1);
+    assert.equal(running.maxAttempts, 3);
+
+    assert.equal(store.reconcileInterrupted("2026-08-13T04:10:00.000Z"), 1);
+
+    const recovered = store.execution(running.executionId)!;
+    assert.equal(recovered.status, "failed");
+    assert.equal(recovered.lastError, "runtime_interrupted_unknown");
+    const result = store.audit(request.event.eventId)?.resultEvent;
+    assert.equal(result?.outcome, "failed");
+    assert.equal(result?.error, "runtime_interrupted_unknown");
+    assert.deepEqual(store.claimDueExecutions().map(({ handler }) => handler), ["result"]);
   } finally {
     store.close();
   }

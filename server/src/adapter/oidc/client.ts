@@ -36,7 +36,6 @@ export interface OidcClientOptions {
   readonly discoveryUrl?: string;
   readonly clientId: string;
   readonly clientSecret?: string;
-  readonly authorizationRequestMethod?: "get" | "post";
   readonly redirectUri: string;
   readonly fetch?: typeof fetch;
 }
@@ -97,39 +96,9 @@ export class OidcClient implements OidcProvider {
       code_challenge: sha256Base64Url(input.codeVerifier),
       code_challenge_method: "S256"
     });
-    if ((this.#options.authorizationRequestMethod ?? "get") === "get") {
-      const url = new URL(discovery.authorization_endpoint);
-      url.search = parameters.toString();
-      return url.href;
-    }
-    const response = await this.#fetch(discovery.authorization_endpoint, {
-      method: "POST",
-      headers: {
-        "content-type": "application/x-www-form-urlencoded",
-        accept: "application/json",
-        "x-requested-with": "XMLHttpRequest"
-      },
-      body: parameters,
-      redirect: "manual",
-      signal: AbortSignal.timeout(10_000)
-    });
-    if (!response.ok && (response.status < 300 || response.status >= 400)) {
-      throw new Error(`OIDC authorization endpoint returned HTTP ${response.status}`);
-    }
-    const location = response.headers.get("location");
-    if (location === null || location.trim() === "") {
-      throw new Error("OIDC authorization endpoint did not return a location");
-    }
-    const authorization = new URL(location, discovery.authorization_endpoint);
-    const redirect = new URL(this.#options.redirectUri);
-    if (
-      authorization.origin !== redirect.origin ||
-      authorization.pathname !== redirect.pathname
-    ) {
-      authorization.searchParams.set("client_id", this.#options.clientId);
-      authorization.searchParams.set("redirect_uri", this.#options.redirectUri);
-    }
-    return authorization.href;
+    const url = new URL(discovery.authorization_endpoint);
+    url.search = parameters.toString();
+    return url.href;
   }
 
   public async exchangeAuthorizationCode(input: {
@@ -284,6 +253,7 @@ export class OidcClient implements OidcProvider {
     }
     const displayName = firstNonEmptyString(
       payload.name,
+      payload.nickname,
       payload.preferred_username,
       payload.email,
       payload.sub
@@ -294,6 +264,7 @@ export class OidcClient implements OidcProvider {
       displayName,
       metadata: stringClaims(payload, [
         "email",
+        "nickname",
         "preferred_username",
         "tenant",
         "organization"

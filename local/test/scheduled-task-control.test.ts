@@ -16,6 +16,19 @@ import { runtimePaths } from "../src/infrastructure/runtime/config.js";
 import { initializeRuntimeSchema } from "../src/infrastructure/sqlite/schema.js";
 import { runScheduleCommand } from "../src/entrypoints/cli/schedule.js";
 import { ScheduledTaskStore } from "../src/capabilities/scheduled-task/store.js";
+import { CallbackStore } from "../src/infrastructure/callback/store.js";
+
+test("Scheduled Task CLI help exposes the host command callback boundary", () => {
+  let output = "";
+  assert.equal(runScheduleCommand(
+    "/does/not/need/to/exist",
+    ["create", "--help"],
+    { write(text) { output += text; } }
+  ), 0);
+  assert.match(output, /runtime must be "host"/);
+  assert.match(output, /may start transitive child processes/);
+  assert.match(output, /legacy runtime: "node" callbacks remain readable/);
+});
 
 test("Scheduled Task CLI provides a complete durable control and trace surface", () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-schedule-cli-repo-"));
@@ -181,6 +194,148 @@ test("Scheduled Task CLI rejects implicit timezones and unstable run-now request
     );
   } finally {
     rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("Scheduled Task CLI schemaVersion 2 accepts ordered free callbacks", () => {
+  const repo = mkdtempSync(join(tmpdir(), "rollerskate-schedule-v2-repo-"));
+  const runtimeDirectory = mkdtempSync(join(tmpdir(), "rollerskate-schedule-v2-runtime-"));
+  try {
+    const paths = runtimePaths(repo, runtimeDirectory);
+    bootstrapLocalFoundation(paths, "2026-07-28T00:00:00.000Z");
+    const foundation = new LocalFoundationStore(paths.database);
+    foundation.addAgent("alice", "codex", "2026-07-28T00:00:00.000Z");
+    foundation.close();
+    const file = join(repo, "schedule-v2.json");
+    writeFileSync(file, JSON.stringify({
+      schemaVersion: 2,
+      agent: "alice",
+      kind: "once",
+      expression: "2099-07-28T01:00:00.000Z",
+      misfirePolicy: "run_once",
+      overlapPolicy: "queue",
+      misfireGraceMilliseconds: 60_000,
+      session: { policy: "new_each_run" },
+      prompt: "Compatibility metadata",
+      callbacks: [{
+        callbackId: "notify",
+        kind: "destination.deliver",
+        definition: {
+          schemaVersion: "ProactiveCallbackDefinition@1",
+          callbackId: "notify",
+          kind: "destination.deliver",
+          destinationId: "dst_019fa649-637b-7bf2-ad2b-a9b7be044fcd",
+          destinationKind: "macos-notification",
+          address: { channel: "owner" },
+          payload: { title: "Scheduled", body: "Done" }
+        },
+        grant: {
+          schemaVersion: "ProactiveCallbackGrant@1",
+          kind: "destination.deliver",
+          destinationId: "dst_019fa649-637b-7bf2-ad2b-a9b7be044fcd",
+          destinationKind: "macos-notification",
+          address: { channel: "owner" }
+        }
+      }]
+    }));
+    const created = command(repo, runtimeDirectory, ["create", file]) as {
+      revision: { callbacks: Array<{ kind: string }> };
+    };
+    assert.deepEqual(created.revision.callbacks.map(({ kind }) => kind), [
+      "destination.deliver"
+    ]);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(runtimeDirectory, { recursive: true, force: true });
+  }
+});
+
+test("manual unknown resolution atomically resolves Schedule callback children and exposes receipts", () => {
+  const repo = mkdtempSync(join(tmpdir(), "rollerskate-schedule-resolve-repo-"));
+  const runtimeDirectory = mkdtempSync(join(tmpdir(), "rollerskate-schedule-resolve-runtime-"));
+  try {
+    const paths = runtimePaths(repo, runtimeDirectory);
+    bootstrapLocalFoundation(paths, "2026-07-28T00:00:00.000Z");
+    const foundation = new LocalFoundationStore(paths.database);
+    const agent = foundation.addAgent("alice", "codex", "2026-07-28T00:00:00.000Z");
+    const workspace = foundation.foundation()!.workspacePath;
+    foundation.close();
+    const schedules = new ScheduledTaskStore(paths.database);
+    const callbacks = new CallbackStore(paths.database);
+    let runId = "";
+    try {
+      const schedule = schedules.create({
+        ownerPrincipalId: agent.principalId,
+        agentId: agent.principalId,
+        kind: "once",
+        expression: "2099-07-28T01:00:00.000Z",
+        misfirePolicy: "run_once",
+        overlapPolicy: "queue",
+        misfireGraceMilliseconds: 60_000,
+        sessionPolicy: "new_each_run",
+        prompt: "Compatibility metadata",
+        workspace,
+        callbacks: [{
+          callbackId: "notify",
+          kind: "destination.deliver",
+          definition: {
+            schemaVersion: "ProactiveCallbackDefinition@1",
+            callbackId: "notify",
+            kind: "destination.deliver",
+            destinationId: "dst_019fa649-637b-7bf2-ad2b-a9b7be044fcd",
+            destinationKind: "macos-notification",
+            address: { channel: "owner" },
+            payload: { title: "Scheduled", body: "Done" }
+          },
+          grant: {
+            schemaVersion: "ProactiveCallbackGrant@1",
+            kind: "destination.deliver",
+            destinationId: "dst_019fa649-637b-7bf2-ad2b-a9b7be044fcd",
+            destinationKind: "macos-notification",
+            address: { channel: "owner" }
+          }
+        }]
+      }, "2026-07-28T00:00:00.000Z");
+      const run = schedules.insertRun({
+        scheduleId: schedule.definition.scheduleId,
+        occurrenceKey: "manual:resolve",
+        scheduledFor: "2026-07-28T00:00:01.000Z",
+        scheduleRevision: schedule.definition.currentRevision,
+        status: "queued"
+      }).run;
+      runId = run.runId;
+      schedules.admitCallbackRun(runId, "2026-07-28T00:00:01.000Z");
+      callbacks.beginNext({
+        ownerKind: "schedule",
+        ownerId: schedule.definition.scheduleId,
+        triggerOccurrenceKey: runId
+      }, "2026-07-28T00:00:02.000Z");
+      assert.equal(callbacks.reconcileInterrupted("2026-07-28T00:00:03.000Z"), 1);
+      schedules.patchRun(runId, {
+        status: "unknown",
+        decisionReason: "provider-outcome-unknown"
+      }, "2026-07-28T00:00:03.000Z");
+    } finally {
+      callbacks.close();
+      schedules.close();
+    }
+    const resolved = command(repo, runtimeDirectory, ["resolve", runId, "succeeded"]) as {
+      status: string;
+      callbacks: Array<{
+        status: string;
+        phase: string;
+        receipt: { resolution: string; priorStatus: string };
+      }>;
+    };
+    assert.equal(resolved.status, "succeeded");
+    assert.deepEqual(resolved.callbacks.map(({ status, phase }) => ({ status, phase })), [
+      { status: "succeeded", phase: "terminal" }
+    ]);
+    assert.equal(resolved.callbacks[0]!.receipt.resolution, "manual");
+    assert.equal(resolved.callbacks[0]!.receipt.priorStatus, "unknown");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(runtimeDirectory, { recursive: true, force: true });
   }
 });
 

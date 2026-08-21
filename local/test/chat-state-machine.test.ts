@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   parseChatMentionDecision,
   parseChatDecision,
+  parseChatProfileContext,
   type ChatPresence
 } from "../src/core/chat/model.js";
 import {
@@ -38,7 +39,7 @@ test("ChatDecision@1 validates speech and scoped presence", () => {
   assert.throws(
     () => parseChatDecision(JSON.stringify({
       schema: "ChatDecision@1",
-      speech: { action: "silent" },
+      speech: { action: "silent", reason: "Already covered." },
       presence: {
         scope: "global",
         mode: "snoozed",
@@ -61,7 +62,7 @@ test("ChatMentionDecision@1 decides speech without changing presence", () => {
   assert.throws(
     () => parseChatMentionDecision(JSON.stringify({
       schema: "ChatMentionDecision@1",
-      speech: { action: "silent" },
+      speech: { action: "silent", reason: "No useful addition." },
       presence: { scope: "global", mode: "available", wakeKeywords: [] }
     })),
     /must not include presence/
@@ -69,10 +70,46 @@ test("ChatMentionDecision@1 decides speech without changing presence", () => {
   assert.throws(
     () => parseChatMentionDecision(JSON.stringify({
       schema: "ChatDecision@1",
-      speech: { action: "silent" }
+      speech: { action: "silent", reason: "No useful reply." }
     })),
     /must use schema ChatMentionDecision@1/
   );
+});
+
+test("public Chat profile context rejects stale, mismatched and unbounded snapshots", () => {
+  const valid = {
+    schema: "ChatProfileContext@1",
+    visibility: "public",
+    resolvedAt: now,
+    validUntil: later,
+    agent: {
+      agentId: "agent-a",
+      displayName: "Alice",
+      role: "Research Agent",
+      disclosure: "Automated Agent",
+      expressionRules: ["Label inference."],
+      revision: 1
+    },
+    topic: {
+      topicId: "topic-a",
+      purpose: "Research",
+      participationRules: [],
+      expressionRules: ["Stay on topic."],
+      revision: 2
+    },
+    precedence: "topic-rules-further-restrict-agent-rules"
+  };
+  assert.equal(parseChatProfileContext(valid, "agent-a", "topic-a", now).topic.revision, 2);
+  assert.throws(() => parseChatProfileContext(
+    { ...valid, validUntil: "2026-07-25T11:00:00.000Z" },
+    "agent-a", "topic-a", now
+  ), /stale/);
+  assert.throws(() => parseChatProfileContext(valid, "agent-b", "topic-a", now),
+    /identity does not match/);
+  assert.throws(() => parseChatProfileContext({
+    ...valid,
+    agent: { ...valid.agent, expressionRules: Array.from({ length: 33 }, () => "rule") }
+  }, "agent-a", "topic-a", now), /at most 32 rules/);
 });
 
 test("available Agents dispatch while sender, non-target, and suspended Agents skip", () => {
@@ -201,10 +238,10 @@ function message(input: {
     ...(input.targetAgentId === undefined
       ? {}
       : {
-          target: {
+          targets: [{
             principalId: input.targetAgentId,
             handleSnapshot: "bob"
-          }
+          }]
         }),
     causality: { rootEventId: "evt-test", hop: 0 },
     createdAt: now

@@ -56,6 +56,40 @@ export default {
   });
 });
 
+test("poll plugin cannot supply the Runtime-owned terminal identity", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "rollerskate-plugin-terminal-key-"));
+  const plugin = join(directory, "deprecated-terminal-key.mjs");
+  writeFileSync(plugin, `export default {
+    kind: "subscription.probe",
+    id: "deprecated-terminal-key",
+    schemaVersion: 1,
+    plan() { return { kind: "http", url: "https://example.test/status" }; },
+    evaluate() {
+      return {
+        version: "v1",
+        terminalKey: "plugin-owned",
+        facts: {},
+        terminal: "success"
+      };
+    }
+  };`, "utf8");
+  const runner = new PollPluginRunner();
+
+  await assert.rejects(
+    runner.evaluate(plugin, "deprecated-terminal-key", {}, {
+      subscriptionId: "sub-1",
+      attempt: 1,
+      startedAt: "2026-07-22T10:00:00.000Z"
+    }, {
+      kind: "http",
+      status: 200,
+      headers: {},
+      body: "{}"
+    }),
+    /Runtime owns terminal identity/
+  );
+});
+
 test("user plugin must fill the subscription.probe slot and cannot present a Capability", async () => {
   const directory = mkdtempSync(join(tmpdir(), "rollerskate-plugin-kind-"));
   const plugin = join(directory, "capability.ts");
@@ -160,6 +194,7 @@ test("GitLabee reference plugin keeps pipeline planning and status mapping outsi
     stderr: ""
   });
   assert.equal(observation.terminal, "success");
+  assert.equal("terminalKey" in observation, false);
   assert.equal(observation.version, "42:abc123:success:2026-07-22T10:05:00Z");
   assert.deepEqual(observation.facts, {
     pipelineId: 42,
@@ -232,6 +267,7 @@ test("shell command completion plugin observes a fixed workspace receipt without
     completed
   );
   assert.equal(observation.terminal, "success");
+  assert.equal("terminalKey" in observation, false);
   assert.deepEqual(observation.facts, {
     commandId: "acceptance-1",
     state: "completed",

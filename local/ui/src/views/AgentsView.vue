@@ -2,7 +2,7 @@
 import { computed, nextTick, ref } from "vue";
 import { requestJson } from "@/api/client";
 import {
-  agentConsoleItemsSchema,
+  agentSummariesSchema,
   agentMutationResponseSchema,
   localSnapshotSchema
 } from "@/api/schema";
@@ -11,7 +11,7 @@ import { useMutation } from "@/composables/useMutation";
 import AgentRoster from "@/components/AgentRoster.vue";
 import AddAgentModal from "@/components/AddAgentModal.vue";
 import AgentInspector from "@/components/AgentInspector.vue";
-import type { LocalAgentClient } from "@/types/local";
+import type { SupportedLocalAgentClient } from "@/types/local";
 
 const emit = defineEmits<{ (e: "agentAdded"): void }>();
 
@@ -22,7 +22,7 @@ const pendingAction = ref<
 const pollingPaused = computed(() => pendingAction.value !== null);
 const agentsQuery = useApi({
   url: "/api/agents",
-  schema: agentConsoleItemsSchema,
+  schema: agentSummariesSchema,
   interval: 5_000,
   paused: pollingPaused
 });
@@ -57,7 +57,7 @@ const actionError = mutation.error;
 const addDialogOpen = ref(false);
 const addTrigger = ref<HTMLButtonElement | null>(null);
 const newHandle = ref("");
-const newClient = ref<LocalAgentClient>("codex");
+const newClient = ref<SupportedLocalAgentClient>("codex");
 const newLaunchArgs = ref("");
 
 const editing = ref(false);

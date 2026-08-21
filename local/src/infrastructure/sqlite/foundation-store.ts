@@ -3,8 +3,8 @@ import { hostname } from "node:os";
 import type { DatabaseSync } from "node:sqlite";
 
 import { localId } from "../../core/id.js";
-import { openRuntimeDatabase } from "./database.js";
-import { migrateLocalDatabase } from "./local-schema.js";
+import { openInitializedRuntimeDatabase } from "./database.js";
+import { migrateLocalDatabase } from "./schema/index.js";
 import {
   agentExecutionConfig,
   parseAgentExecutionConfig,
@@ -51,14 +51,18 @@ interface AgentRow extends PrincipalRow {
 
 export class LocalFoundationStore {
   readonly #database: DatabaseSync;
+  readonly #ownsDatabase: boolean;
 
-  public constructor(databasePath: string) {
-    this.#database = openRuntimeDatabase(databasePath);
-    this.#migrate();
+  public constructor(database: string | DatabaseSync) {
+    this.#database = typeof database === "string"
+      ? openInitializedRuntimeDatabase(database, migrateLocalDatabase)
+      : database;
+    this.#ownsDatabase = typeof database === "string";
+    if (!this.#ownsDatabase) this.#migrate();
   }
 
   public close(): void {
-    this.#database.close();
+    if (this.#ownsDatabase) this.#database.close();
   }
 
   public bootstrap(paths: RuntimePaths, at = new Date().toISOString()): LocalFoundation {

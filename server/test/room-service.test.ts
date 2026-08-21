@@ -196,7 +196,7 @@ test("Matrix event replay is idempotent even when a transaction id is reused", a
 });
 
 test("bounded snapshot recovery excludes events beyond through and stream has no backlog", async () => {
-  const { rooms, agentRooms, events, matrix, owner, alice } = await fixture();
+  const { rooms, agentRooms, events, owner, alice } = await fixture();
   const room = await rooms.createRoom(owner, { name: "Recovery", visibility: "public" });
   await agentRooms.invite(owner, room.id, alice.agent.id);
   await agentRooms.updateWakeMode(owner, room.id, alice.agent.id, { wakeMode: "proactive" });

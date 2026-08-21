@@ -47,6 +47,7 @@ export interface RuntimePaths {
   readonly config: string;
   readonly secrets: string;
   readonly deviceCredential: string;
+  readonly deviceBinding: string;
   readonly agentConfig: string;
   readonly agentCredentials: string;
   readonly database: string;
@@ -54,8 +55,13 @@ export interface RuntimePaths {
   readonly logs: string;
   readonly daemonLog: string;
   readonly loopState: string;
+  readonly progress: string;
+  readonly runProgressRoot: string;
   readonly loopControl: string;
   readonly matrixPolicy: string;
+  readonly activityAccess: string;
+  readonly clientHistoryAccess: string;
+  readonly topicInbox: string;
 }
 
 export interface SetupInput {
@@ -87,6 +93,7 @@ export function runtimePaths(repoRoot: string, configuredRuntimeDirectory?: stri
     config: join(runtimeDirectory, "config.json"),
     secrets: join(runtimeDirectory, "secrets.json"),
     deviceCredential: join(runtimeDirectory, "device-credential.json"),
+    deviceBinding: join(runtimeDirectory, "device-binding.json"),
     agentConfig: join(runtimeDirectory, "agent-config.json"),
     agentCredentials: join(runtimeDirectory, "agent-credentials"),
     database: join(runtimeDirectory, "runtime.db"),
@@ -94,8 +101,13 @@ export function runtimePaths(repoRoot: string, configuredRuntimeDirectory?: stri
     logs,
     daemonLog: join(logs, "daemon.log"),
     loopState: join(runtimeDirectory, "loop-state.json"),
+    progress: join(runtimeDirectory, "progress.json"),
+    runProgressRoot: join(runtimeDirectory, "runs"),
     loopControl: join(runtimeDirectory, "loop-control.json"),
-    matrixPolicy: join(runtimeDirectory, "matrix-policy.json")
+    matrixPolicy: join(runtimeDirectory, "matrix-policy.json"),
+    activityAccess: join(runtimeDirectory, "activity-access.json"),
+    clientHistoryAccess: join(runtimeDirectory, "client-history-access.json"),
+    topicInbox: join(runtimeDirectory, "topic-inbox.json")
   };
 }
 

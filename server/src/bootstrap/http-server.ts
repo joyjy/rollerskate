@@ -7,6 +7,15 @@ import { handleTrustApi, type TrustApiDependencies } from "../api/trust.js";
 import { handleAgentApi, type AgentApiDependencies } from "../api/agent.js";
 import { handleDeviceApi, type DeviceApiDependencies } from "../api/device.js";
 import { handleRoomApi, type RoomApiDependencies } from "../api/room.js";
+import {
+  handleProfileTopicApi,
+  type ProfileTopicApiDependencies
+} from "../api/profile-topic.js";
+import { handleConnectorApi, type ConnectorApiDependencies } from "../api/connector.js";
+import {
+  handleWorkRequestApi,
+  type WorkRequestApiDependencies
+} from "../api/work-request.js";
 import { ServerError } from "../modules/shared/error.js";
 import { writeJson } from "../api/http.js";
 
@@ -14,7 +23,10 @@ export interface BffDependencies
 extends TrustApiDependencies,
   AgentApiDependencies,
   DeviceApiDependencies,
-  RoomApiDependencies {}
+  RoomApiDependencies,
+  ProfileTopicApiDependencies,
+  ConnectorApiDependencies,
+  WorkRequestApiDependencies {}
 
 export function createBffServer(dependencies?: BffDependencies): Server {
   return createServer((request, response) => {
@@ -48,6 +60,9 @@ async function handleRequest(
     await handleTrustApi(context, dependencies) ||
     await handleDeviceApi(context, dependencies) ||
     await handleAgentApi(context, dependencies) ||
+    await handleProfileTopicApi(context, dependencies) ||
+    await handleConnectorApi(context, dependencies) ||
+    await handleWorkRequestApi(context, dependencies) ||
     await handleRoomApi(context, dependencies)
   ) {
     return;

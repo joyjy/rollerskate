@@ -15,7 +15,7 @@ import {
 } from "../src/infrastructure/sqlite/foundation-store.js";
 import { runtimePaths } from "../src/infrastructure/runtime/config.js";
 import { initializeRuntimeSchema } from "../src/infrastructure/sqlite/schema.js";
-import { runAgentRunCommand } from "../src/entrypoints/cli/run.js";
+import { runStewardCommand } from "../src/entrypoints/cli/run.js";
 
 test("Run CLI starts idempotently, lists, inspects, traces and cancels", () => {
   const fixture = setup();
@@ -116,7 +116,11 @@ test("Run admission allows concurrent reads but only one write per canonical wor
       steward: "steward",
       workflowRef: "review@1",
       inputs: { plan: "plan.md" },
-      workspace: { root: fixture.workspace, access: "write" }
+      workspace: {
+        root: fixture.workspace,
+        access: "write",
+        effect: "must_change"
+      }
     }));
     command(fixture.repo, fixture.runtimeDirectory, [
       "start", read, "--request-id", "read-1"
@@ -135,9 +139,27 @@ test("Run admission allows concurrent reads but only one write per canonical wor
   }
 });
 
+test("Run CLI requires an explicit effect contract for write workspaces", () => {
+  const fixture = setup();
+  try {
+    const config = join(fixture.repo, "missing-effect.json");
+    writeFileSync(config, JSON.stringify({
+      schemaVersion: 1,
+      steward: "steward",
+      objective: "write",
+      workspace: { root: fixture.workspace, access: "write" }
+    }));
+    assert.throws(() => command(fixture.repo, fixture.runtimeDirectory, [
+      "start", config, "--request-id", "missing-effect"
+    ]), /workspace\.effect is required/);
+  } finally {
+    fixture.close();
+  }
+});
+
 test("Run CLI requires an idempotency key before reading input", () => {
   assert.throws(
-    () => runAgentRunCommand(
+    () => runStewardCommand(
       "/missing",
       ["start", "/missing/run.json"],
       { write() {} },
@@ -191,7 +213,7 @@ function command(
   arguments_: readonly string[]
 ): unknown {
   let output = "";
-  assert.equal(runAgentRunCommand(
+  assert.equal(runStewardCommand(
     repo,
     arguments_,
     { write(text) { output += text; } },

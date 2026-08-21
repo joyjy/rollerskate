@@ -1,10 +1,13 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
-import type { LocalAgentClient } from "@/types/local";
+import {
+  supportedLocalAgentClientOptions,
+  type SupportedLocalAgentClient
+} from "@/types/local";
 
 defineProps<{
   handle: string;
-  client: LocalAgentClient;
+  client: SupportedLocalAgentClient;
   launchArgsText: string;
   pending: boolean;
   error: string | null;
@@ -12,7 +15,7 @@ defineProps<{
 
 const emit = defineEmits<{
   "update:handle": [value: string];
-  "update:client": [value: LocalAgentClient];
+  "update:client": [value: SupportedLocalAgentClient];
   "update:launchArgsText": [value: string];
   close: [];
   add: [];
@@ -48,11 +51,13 @@ onMounted(() => handleInput.value?.focus());
             id="new-client"
             :value="client"
             :disabled="pending"
-            @change="emit('update:client', ($event.target as HTMLSelectElement).value as LocalAgentClient)"
+            @change="emit('update:client', ($event.target as HTMLSelectElement).value as SupportedLocalAgentClient)"
           >
-            <option value="codex">Codex</option>
-            <option value="claude-code">Claude Code</option>
-            <option value="kimi-code">Kimi Code</option>
+            <option
+              v-for="option in supportedLocalAgentClientOptions"
+              :key="option.value"
+              :value="option.value"
+            >{{ option.label }}</option>
           </select>
           <div class="preview">决定该 Agent 使用哪个执行 adapter。</div>
         </div>

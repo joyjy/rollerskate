@@ -1,4 +1,7 @@
 import { localId, requireLocalId } from "../../core/id.js";
+import type { ProactiveCallbackDefinition } from "../../modules/callback/proactive-model.js";
+import type { ExternalRefTriggerBinding } from
+  "../../modules/external-resource/trigger-binding.js";
 
 export type ScheduleStatus = "active" | "paused" | "completed" | "cancelled";
 export type ScheduleKind = "once" | "cron";
@@ -41,6 +44,8 @@ export interface ScheduleRevision {
   readonly fixedSessionId?: string;
   readonly prompt: string;
   readonly workspace: string;
+  readonly callbacks: readonly ProactiveCallbackDefinition[];
+  readonly externalRefBinding?: ExternalRefTriggerBinding;
   readonly createdAt: string;
 }
 
@@ -79,6 +84,8 @@ export interface ScheduleRevisionInput {
   readonly fixedSessionId?: string;
   readonly prompt: string;
   readonly workspace: string;
+  readonly callbacks?: readonly ProactiveCallbackDefinition[];
+  readonly externalRefBinding?: ExternalRefTriggerBinding;
 }
 
 export interface CreateScheduleInput extends ScheduleRevisionInput {

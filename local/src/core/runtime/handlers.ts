@@ -10,11 +10,9 @@ import {
 import {
   availableChatDecision,
   chatMentionPromptResourceId,
-  parseChatHistoryRequest,
   parseChatDecision,
   parseChatMentionDecision,
-  silentChatMentionDecision,
-  type ChatPromptHistory
+  silentChatMentionDecision
 } from "../chat/model.js";
 import type {
   RuntimeExecution,
@@ -24,19 +22,18 @@ import type {
   RuntimeSession
 } from "./model.js";
 import { RuntimeStore } from "./store.js";
+import type {
+  AgentAdapterInput,
+  AgentAdapterInvocation,
+  ProviderPolicyObservationSnapshot
+} from "./agent-invocation.js";
+import type { ChatReplyRoute } from "./store/types.js";
 
 export interface RuntimeAgentAdapter {
   readonly adapterId: string;
   readonly workspace: string;
-  invoke(input: {
-    readonly event: AgentInputEvent | ChatDispatchEvent;
-    readonly providerSessionId?: string;
-  }): Promise<{
-    readonly providerSessionId: string;
-    readonly outcome:
-      | { readonly kind: "message"; readonly body: string }
-      | { readonly kind: "silent" };
-  }>;
+  readonly providerPolicy?: ProviderPolicyObservationSnapshot;
+  invoke(input: AgentAdapterInput): Promise<AgentAdapterInvocation>;
 }
 
 export interface RuntimeAgentResultContinuation {
@@ -51,14 +48,15 @@ export interface RuntimeAgentResultContinuation {
 
 export interface RuntimeAgentExecutionGuard {
   readonly moduleId: string;
-  canInvoke(event: import("../event/model.js").AgentRequestEvent): boolean;
+  canInvoke(
+    event: AgentInputEvent | ChatDispatchEvent,
+    at: string
+  ): RuntimeAgentExecutionGuardDecision;
 }
 
-export interface ChatHistoryPageInput {
-  readonly topicId: string;
-  readonly beforeEventId: string;
-  readonly limit: number;
-}
+export type RuntimeAgentExecutionGuardDecision =
+  | { readonly outcome: "allow" }
+  | { readonly outcome: "skip"; readonly reason: string };
 
 export class AgentHandler {
   public readonly kind = "agent" as const;
@@ -68,8 +66,10 @@ export class AgentHandler {
   ) => RuntimeAgentAdapter | undefined;
   readonly #store: RuntimeStore;
   readonly #retryBaseMilliseconds: number;
-  readonly #chatHistory: ((input: ChatHistoryPageInput) => ChatPromptHistory) | undefined;
   readonly #executionGuards: readonly RuntimeAgentExecutionGuard[];
+  readonly #invocationLanes = new Map<string, Promise<void>>();
+  readonly #resolveChatReplyRoute: ((event: ChatDispatchEvent) => ChatReplyRoute | undefined) |
+    undefined;
 
   public constructor(options: {
     readonly store: RuntimeStore;
@@ -78,8 +78,8 @@ export class AgentHandler {
       agentId: string,
       workspace?: string
     ) => RuntimeAgentAdapter | undefined;
-    readonly chatHistory?: (input: ChatHistoryPageInput) => ChatPromptHistory;
     readonly executionGuards?: readonly RuntimeAgentExecutionGuard[];
+    readonly resolveChatReplyRoute?: (event: ChatDispatchEvent) => ChatReplyRoute | undefined;
     readonly retryBaseMilliseconds?: number;
   }) {
     this.#store = options.store;
@@ -91,8 +91,8 @@ export class AgentHandler {
     }
     this.#adapterForAgent = options.adapterForAgent ??
       ((agentId) => options.adapters!.get(agentId));
-    this.#chatHistory = options.chatHistory;
     this.#executionGuards = options.executionGuards ?? [];
+    this.#resolveChatReplyRoute = options.resolveChatReplyRoute;
     this.#retryBaseMilliseconds = options.retryBaseMilliseconds ?? 1_000;
   }
 
@@ -108,12 +108,23 @@ export class AgentHandler {
     if (!isAgentInputEvent(event)) {
       throw new Error(`AgentHandler requires an Agent input Event: ${event.eventId}`);
     }
-    if (event.type === "agent.request" && !this.#canInvoke(event)) {
-      return this.#store.forceTerminalAgentFailure(
+    const invocationAt = at ?? new Date().toISOString();
+    const blocked = this.#blocked(event, invocationAt);
+    if (blocked !== undefined) {
+      const completedAt = invocationAt;
+      if (event.type === "agent.request") {
+        return this.#store.forceTerminalAgentFailure(
+          execution.executionId,
+          blocked,
+          completedAt
+        ).resultEvent;
+      }
+      this.#store.cancelRunningAgentExecution(
         execution.executionId,
-        "agent_run_cancelled",
-        at ?? new Date().toISOString()
-      ).resultEvent;
+        blocked,
+        completedAt
+      );
+      return undefined;
     }
     try {
       const sessionId = event.sessionId ??
@@ -123,7 +134,9 @@ export class AgentHandler {
       const session = sessionId === undefined ? undefined : this.#session(sessionId);
       const controlledWorkspace = event.type === "agent.request"
         ? event.runContext?.workspaceGrant?.root
-        : undefined;
+        : event.type === "subscription.fire"
+          ? event.invocation?.workspaceGrant.root
+          : undefined;
       const adapter = this.#adapterForAgent(
         event.agentId,
         controlledWorkspace ?? session?.workspace
@@ -138,17 +151,15 @@ export class AgentHandler {
           `workspace=${session.workspace === adapter.workspace ? "match" : "mismatch"}`
         );
       }
-      let receipt = await adapter.invoke({
-        event,
-        ...(session === undefined ? {} : { providerSessionId: session.providerSessionId })
-      });
-      if (event.type === "chat.dispatch") {
-        receipt = await this.#continueChatHistory(
-          adapter,
+      const receipt = await this.#invokeInLane(
+        session === undefined
+          ? `agent:${event.agentId}:workspace:${adapter.workspace}`
+          : `session:${session.sessionId}`,
+        () => adapter.invoke({
           event,
-          receipt
-        );
-      }
+          ...(session === undefined ? {} : { providerSessionId: session.providerSessionId })
+        })
+      );
       const completedAt = at ?? new Date().toISOString();
       const chatDecision = event.type === "chat.dispatch"
         ? receipt.outcome.kind === "message"
@@ -159,6 +170,9 @@ export class AgentHandler {
             ? silentChatMentionDecision()
             : availableChatDecision()
         : undefined;
+      const chatReplyRoute = event.type === "chat.dispatch"
+        ? this.#resolveChatReplyRoute?.(event)
+        : undefined;
       return this.#store.completeExecution(execution.executionId, {
         adapterId: adapter.adapterId,
         workspace: adapter.workspace,
@@ -167,13 +181,16 @@ export class AgentHandler {
         ...(event.type !== "chat.dispatch" && receipt.outcome.kind === "message"
           ? { output: receipt.outcome.body }
           : {}),
-        ...(chatDecision === undefined ? {} : { chatDecision })
+        ...(receipt.invocation === undefined ? {} : { invocation: receipt.invocation }),
+        ...(chatDecision === undefined ? {} : { chatDecision }),
+        ...(chatReplyRoute === undefined ? {} : { chatReplyRoute })
       }, completedAt);
     } catch (error) {
-      if (event.type === "agent.request" && !this.#canInvoke(event)) {
+      const retryBlocked = this.#blocked(event, at ?? new Date().toISOString());
+      if (event.type === "agent.request" && retryBlocked !== undefined) {
         return this.#store.forceTerminalAgentFailure(
           execution.executionId,
-          "agent_run_cancelled",
+          retryBlocked,
           at ?? new Date().toISOString()
         ).resultEvent;
       }
@@ -186,8 +203,15 @@ export class AgentHandler {
     }
   }
 
-  #canInvoke(event: import("../event/model.js").AgentRequestEvent): boolean {
-    return this.#executionGuards.every((guard) => guard.canInvoke(event));
+  #blocked(
+    event: AgentInputEvent | ChatDispatchEvent,
+    at: string
+  ): string | undefined {
+    for (const guard of this.#executionGuards) {
+      const decision = guard.canInvoke(event, at);
+      if (decision.outcome === "skip") return decision.reason;
+    }
+    return undefined;
   }
 
   #session(sessionId: string): RuntimeSession {
@@ -196,74 +220,24 @@ export class AgentHandler {
     return session;
   }
 
-  async #continueChatHistory(
-    adapter: RuntimeAgentAdapter,
-    event: ChatDispatchEvent,
-    initialReceipt: Awaited<ReturnType<RuntimeAgentAdapter["invoke"]>>
-  ): Promise<Awaited<ReturnType<RuntimeAgentAdapter["invoke"]>>> {
-    let receipt = initialReceipt;
-    if (receipt.outcome.kind !== "message") return receipt;
-    let request = parseChatHistoryRequest(receipt.outcome.body);
-    if (request === undefined) return receipt;
-    if (this.#chatHistory === undefined) {
-      throw new Error("Chat history recall is not available");
-    }
-
-    const initialHistory = this.#chatHistory({
-      topicId: event.topicId,
-      beforeEventId: event.sourceMessageEventId,
-      limit: 50
+  async #invokeInLane<T>(lane: string, invoke: () => Promise<T>): Promise<T> {
+    const previous = this.#invocationLanes.get(lane) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
     });
-    let expectedCursor = initialHistory.hasEarlier
-      ? initialHistory.beforeEventId
-      : undefined;
-    let recalledMessages = 0;
-    let recalledBytes = 0;
-    let pages = 0;
-    while (request !== undefined) {
-      if (pages >= 3) throw new Error("Chat history recall exceeds three pages");
-      if (expectedCursor === undefined || request.beforeEventId !== expectedCursor) {
-        throw new Error("Chat history recall cursor does not match the previous page");
+    this.#invocationLanes.set(lane, current);
+    await previous;
+    try {
+      return await invoke();
+    } finally {
+      release();
+      if (this.#invocationLanes.get(lane) === current) {
+        this.#invocationLanes.delete(lane);
       }
-      const page = this.#chatHistory({
-        topicId: event.topicId,
-        beforeEventId: request.beforeEventId,
-        limit: request.limit
-      });
-      if (page.items.length === 0) {
-        throw new Error("Chat history recall returned an empty page");
-      }
-      const pageJson = JSON.stringify(page);
-      recalledMessages += page.items.length;
-      recalledBytes += Buffer.byteLength(pageJson, "utf8");
-      if (recalledMessages > 200 || recalledBytes > 65_536) {
-        throw new Error("Chat history recall exceeds the bounded context budget");
-      }
-      if (page.hasEarlier &&
-        (page.beforeEventId === undefined || page.beforeEventId === request.beforeEventId)) {
-        throw new Error("Chat history recall cursor did not advance");
-      }
-      pages += 1;
-      expectedCursor = page.hasEarlier ? page.beforeEventId : undefined;
-      receipt = await adapter.invoke({
-        event: {
-          ...event,
-          prompt: [
-            "The Runtime accepted your ChatHistoryRequest@1.",
-            "Here is the bounded earlier history page:",
-            JSON.stringify(page, null, 2),
-            "Return the original Chat decision schema now. Request another page only when",
-            "`hasEarlier` is true, using exactly this page's `beforeEventId`."
-          ].join("\n")
-        },
-        providerSessionId: receipt.providerSessionId
-      });
-      request = receipt.outcome.kind === "message"
-        ? parseChatHistoryRequest(receipt.outcome.body)
-        : undefined;
     }
-    return receipt;
   }
+
 }
 
 export class ResultHandler {
@@ -326,8 +300,8 @@ export interface RuntimeDestinationAdapter {
   deliver(input: {
     readonly delivery: RuntimeDelivery;
     readonly destination: RuntimeDestination;
-    readonly resultEvent: AgentResultEvent;
-    readonly requestEvent: Event;
+    readonly resultEvent?: AgentResultEvent;
+    readonly requestEvent?: Event;
   }): Promise<{ readonly receipt: string }>;
 }
 
@@ -358,9 +332,23 @@ export class DeliveryHandler {
       if (destination === undefined) {
         throw new Error(`Destination not found: ${delivery.destinationId}`);
       }
-      const resultEvent = this.#store.event(delivery.resultEventId);
+      const adapter = this.#adapters.get(destination.kind);
+      if (adapter === undefined) {
+        throw new Error(`Destination adapter not available: ${destination.kind}`);
+      }
+      if (delivery.origin.kind === "host") {
+        const receipt = await adapter.deliver({ delivery, destination });
+        return this.#store.deliverySucceeded(
+          delivery.deliveryId,
+          receipt.receipt,
+          at ?? new Date().toISOString()
+        );
+      }
+      const resultEvent = delivery.resultEventId === undefined
+        ? undefined
+        : this.#store.event(delivery.resultEventId);
       if (resultEvent === undefined || !isAgentResultEvent(resultEvent)) {
-        throw new Error(`Result Event not found: ${delivery.resultEventId}`);
+        throw new Error(`Result Event not found: ${delivery.resultEventId ?? "missing"}`);
       }
       const parentEventId = resultEvent.causality.parentEventId;
       if (parentEventId === undefined) {
@@ -368,10 +356,6 @@ export class DeliveryHandler {
       }
       const requestEvent = this.#store.event(parentEventId);
       if (requestEvent === undefined) throw new Error(`Request Event not found: ${parentEventId}`);
-      const adapter = this.#adapters.get(destination.kind);
-      if (adapter === undefined) {
-        throw new Error(`Destination adapter not available: ${destination.kind}`);
-      }
       const receipt = await adapter.deliver({ delivery, destination, resultEvent, requestEvent });
       return this.#store.deliverySucceeded(
         delivery.deliveryId,

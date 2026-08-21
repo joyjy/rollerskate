@@ -102,7 +102,12 @@ test("Runtime status and CLI/Console controls share structured availability", ()
     assert.equal(stopped.status, "stopped");
     assert.deepEqual(stopped.controls, { pause: false, resume: false, recover: true });
     assert.equal(controlRuntime(projectRoot, "recover", runtimeDirectory).kind, "recover");
-    assert.equal(store.execution(running.executionId)?.status, "retry_wait");
+    assert.equal(store.execution(running.executionId)?.status, "failed");
+    assert.equal(
+      store.execution(running.executionId)?.lastError,
+      "runtime_interrupted_unknown"
+    );
+    assert.equal(store.audit(queued.event.eventId)?.resultEvent?.outcome, "failed");
     assert.equal(
       runtimeOperationsView(projectRoot, runtimeDirectory, "localhost:4300").controls.recover,
       false

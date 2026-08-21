@@ -20,12 +20,13 @@ import {
   statusAgent
 } from "../src/application/agent/server-control.js";
 import { DeviceCredentialStore } from "../src/infrastructure/files/device-credential-store.js";
+import { LocalFoundationStore } from "../src/infrastructure/sqlite/foundation-store.js";
 
 const SERVER_URL = "http://127.0.0.1:7777";
 const DEVICE_ID = "device-id";
 const DEVICE_CREDENTIAL = "device-credential.device-secret";
 
-test.skip("v0.4 Server Agent binding provisions isolated Agents and recovers them", async () => {
+test("v0.4 Server Agent binding provisions isolated Agents and recovers them", async () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-agents-"));
   const runtime = join(repo, "runtime");
   const workspaceRoot = join(repo, "workspaces");
@@ -149,6 +150,14 @@ test.skip("v0.4 Server Agent binding provisions isolated Agents and recovers the
       "alice",
       { runtimeDirectory: runtime, fetch: fakeFetch }
     )).summary.id, alice.summary.id);
+    const foundation = new LocalFoundationStore(paths.database);
+    try {
+      const localAlice = foundation.agentByHandle("alice");
+      assert.ok(localAlice !== undefined);
+      assert.equal(localAlice.client, "codex");
+    } finally {
+      foundation.close();
+    }
     await assert.rejects(() => createAgent(repo, "bob", {
       runtimeDirectory: runtime,
       fetch: fakeFetch,
@@ -157,6 +166,10 @@ test.skip("v0.4 Server Agent binding provisions isolated Agents and recovers the
 
     const aliceSecret = readFileSync(join(paths.agentCredentials, "alice.json"), "utf8");
     const bobSecret = readFileSync(join(paths.agentCredentials, "bob.json"), "utf8");
+    assert.equal(
+      (JSON.parse(aliceSecret) as { agentId: string }).agentId,
+      alice.summary.id
+    );
     assert.equal(lstatSync(join(paths.agentCredentials, "alice.json")).mode & 0o777, 0o600);
     assert.equal(lstatSync(paths.agentCredentials).mode & 0o777, 0o700);
     assert.doesNotMatch(readFileSync(paths.database).toString("utf8"), /device-secret/);

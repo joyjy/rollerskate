@@ -13,10 +13,9 @@ export interface ServerRuntimeConfig extends ServerConfig {
     readonly discoveryUrl: string;
     readonly clientId: string;
     readonly clientSecret?: string;
-    readonly authorizationRequestMethod: "get" | "post";
     readonly redirectUri: string;
   };
-  readonly matrix: {
+  readonly matrix?: {
     readonly homeserverUrl: string;
     readonly serverName: string;
     readonly asToken: string;
@@ -53,11 +52,7 @@ export function loadServerRuntimeConfig(
     ? issuerFromDiscoveryUrl(discoveryUrl)
     : parseUrl(configuredIssuer, "ROLLERSKATE_OIDC_ISSUER");
   const clientSecret = optionalValue(environment, "ROLLERSKATE_OIDC_CLIENT_SECRET");
-  const homeserverUrl = requireUrl(
-    environment,
-    "ROLLERSKATE_MATRIX_HOMESERVER_URL",
-    environment.ROLLERSKATE_ALLOW_INSECURE_MATRIX_HTTP === "true"
-  );
+  const matrix = optionalMatrixConfig(environment);
   return {
     ...server,
     publicUrl: publicUrl.origin,
@@ -69,15 +64,34 @@ export function loadServerRuntimeConfig(
       ).href,
       clientId: requireValue(environment, "ROLLERSKATE_OIDC_CLIENT_ID"),
       ...(clientSecret === undefined ? {} : { clientSecret }),
-      authorizationRequestMethod: authorizationRequestMethod(environment),
       redirectUri: new URL("/auth/callback", publicUrl).href
     },
-    matrix: {
-      homeserverUrl: homeserverUrl.origin,
-      serverName: requireValue(environment, "ROLLERSKATE_MATRIX_SERVER_NAME"),
-      asToken: requireSecret(environment, "ROLLERSKATE_MATRIX_AS_TOKEN"),
-      hsToken: requireSecret(environment, "ROLLERSKATE_MATRIX_HS_TOKEN")
-    }
+    ...(matrix === undefined ? {} : { matrix })
+  };
+}
+
+function optionalMatrixConfig(
+  environment: NodeJS.ProcessEnv
+): ServerRuntimeConfig["matrix"] {
+  const names = [
+    "ROLLERSKATE_MATRIX_HOMESERVER_URL",
+    "ROLLERSKATE_MATRIX_SERVER_NAME",
+    "ROLLERSKATE_MATRIX_AS_TOKEN",
+    "ROLLERSKATE_MATRIX_AS_TOKEN_FILE",
+    "ROLLERSKATE_MATRIX_HS_TOKEN",
+    "ROLLERSKATE_MATRIX_HS_TOKEN_FILE"
+  ] as const;
+  if (names.every((name) => optionalValue(environment, name) === undefined)) return undefined;
+  const homeserverUrl = requireUrl(
+    environment,
+    "ROLLERSKATE_MATRIX_HOMESERVER_URL",
+    environment.ROLLERSKATE_ALLOW_INSECURE_MATRIX_HTTP === "true"
+  );
+  return {
+    homeserverUrl: homeserverUrl.origin,
+    serverName: requireValue(environment, "ROLLERSKATE_MATRIX_SERVER_NAME"),
+    asToken: requireSecret(environment, "ROLLERSKATE_MATRIX_AS_TOKEN"),
+    hsToken: requireSecret(environment, "ROLLERSKATE_MATRIX_HS_TOKEN")
   };
 }
 
@@ -141,19 +155,4 @@ function issuerFromDiscoveryUrl(discoveryUrl: URL | undefined): URL {
   const issuer = new URL(discoveryUrl);
   issuer.pathname = issuer.pathname.slice(0, -suffix.length);
   return issuer;
-}
-
-function authorizationRequestMethod(
-  environment: NodeJS.ProcessEnv
-): "get" | "post" {
-  const method = optionalValue(
-    environment,
-    "ROLLERSKATE_OIDC_AUTHORIZATION_REQUEST_METHOD"
-  )?.toLowerCase() ?? "get";
-  if (method !== "get" && method !== "post") {
-    throw new Error(
-      "ROLLERSKATE_OIDC_AUTHORIZATION_REQUEST_METHOD must be get or post"
-    );
-  }
-  return method;
 }

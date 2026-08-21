@@ -10,7 +10,7 @@ timestamp: 2026-07-26
 
 ## 30 秒架构
 
-Rollerskate 当前是 Local-first Agent proactive system。每台电脑运行一个 Local Runtime，拥有本机 identity、workspace、Chat、Agent、durable state 和唯一 core loop；首次启动不依赖 Server、OIDC 或 Device enrollment。Server 与 Matrix 的既有代码不接管本机 workspace、权限、执行与停止权；schema v44 已移除旧 Local binding/ingress state，并加入 generic Agent Run 与 Chat message projection，新的 Server Agent authentication、Topic/TransportBinding 与 cursor/session persistence 在 v0.4 重建。
+Rollerskate 是 Local-first Agent proactive system。每台电脑运行一个 Local Runtime，拥有本机 identity、workspace、Chat、Agent、durable state 和唯一 core loop；首次启动不依赖 Server、OIDC 或 Device enrollment。可选 Server control plane 提供 Human/Device/Agent authentication、公开 Agent/Topic/Integration authority、原生 Topic fanout 与在线 Agent work request，但不接管本机 workspace、权限、执行与停止权。schema v63 继续复用唯一 loop；Steward Run 可由 autonomous Agent callback、manual caller decision，或默认 Codex Orchestrator 的 strict decision 推进，autonomous series 还可按 source revision 建 cycle。Schedule/Subscription 可在既有 lifecycle 内固定受 Integration authority 约束的 ExternalRef revision。Work request 只有在目标 Local owner 显式接受后才进入既有 Steward Run，离线或旧 Runtime route 不补推。
 
 ```text
 Owner / Console / fixed ingress
@@ -24,7 +24,7 @@ Optional remote control
   -> Server BFF -> Matrix -> Local Runtime admission
 ```
 
-当前架构记录已实现到 v0.3.11 的公开事实；未实现的私有 roadmap 与 release evidence 不进入分发副本。
+最近完整 release baseline 是 [v0.5.4 verification](../verification/v0.5.4.md)。未发布的 v0.5.3 Project/effect 候选已经降级：Project policy/effect 硬集成退出当前架构，保留 read-only Connector、Integration binding、普通 Vikunja Task writeback 与通用 Steward Orchestrator。其余未实现工作只从 [Active plan](../plan/index.md) 进入。
 
 ## 默认阅读路径
 
@@ -44,13 +44,15 @@ ADR、Source map 和 Event Reference 都是按需材料，不是理解系统的�
 - [State and recovery](./state-and-recovery.md)：SQLite、lease、outbox、Agent invocation、crash 与恢复语义。
 - [Source of truth](./source-of-truth.md)：身份、消息、配置、运行状态、远端 working set 与本地数据的权威归属。
 
-### Capability
+### Capability 与产品 vertical
 
-- [Poll Subscription](./poll-subscription.md)：轮询、受限 probe Plugin slot、durable one-shot fire 与控制面。
+- [Subscription](./poll-subscription.md)：one-shot/Continuous 轮询、受限 probe Plugin、ordered callback 与控制面。
 - [Local Scheduled Task](./scheduled-task.md)：Schedule revision、cron/timezone、misfire/overlap、Session policy 与 unknown recovery。
-- [Local Agent Run And Review Workflow](./local-review.md)：通用 Run、run-scoped Session、单 child callback、external workspace grant 与 versioned `review@1` workflow。
+- Topic scheduled activation：`TopicActivationSchedule` 属于 Topic application vertical，只调度 conversation intent 与 candidate policy，不接受 arbitrary prompt/callback；运行时复用 canonical Chat activation。
+- Interactive Channel：Agent-scoped Local/Server channel allowlist、幂等 send receipt、cursor/follow token 与可选 exact idle `ses_*` callback；不开放 generic channel identity 或远端执行入口。
+- [Local Steward And Review Workflow](./local-review.md)：Steward Run 的 autonomous/manual caller/default Codex Orchestrator、长期 series/revision cycle、cycle-scoped Session、checkpoint/decision、external workspace grant 与 versioned workflow。
 
-只在修改对应 Capability 时读取该专题；它们不是默认架构阅读路径。
+只在修改对应领域时读取这些专题；它们不是默认架构阅读路径。
 
 ### Server 与远端控制面
 
@@ -62,7 +64,7 @@ ADR、Source map 和 Event Reference 都是按需材料，不是理解系统的�
 
 - [Source map](./source-map.md)：workspace、源码 root、ownership、共享 contract、生成关系与验证入口。
 - [Event Reference](./event-reference.md)：Local canonical Event、Runtime object 与 Server/Matrix EventEnvelope。
-- [Database Reference](./db-reference.md)：Event / index / object 建模规范，以及 Local SQLite schema v44 的 15 张物理 table、ownership、authority 与迁移规则。
+- [Database Reference](./db-reference.md)：Event / index / object 建模规范，以及 Local SQLite schema v63 的 28 张物理 table、ownership、authority 与迁移规则。
 
 Source map 只在修改 source root、ownership、共享 contract、生成关系或验证入口时读取；Event Reference 只在查询或修改 Event schema/type 与 Runtime object 时读取；Database Reference 在设计或修改 Local SQLite table、migration、materialized index/projection 或 durable object/state 时读取。
 
@@ -94,5 +96,5 @@ Source map 只在修改 source root、ownership、共享 contract、生成关系
 - 改 durable state、retry、lease、shutdown、recovery 或 Capability 状态机：更新 [State and recovery](./state-and-recovery.md) 与对应 Capability 专题，并保留 crash/restart/duplicate/unknown 证据。
 - 改 Capability/Plugin 信任边界：检查对应 Capability 专题与 [ADR 0005](./adrs/0005-capability-and-plugin-boundary.md)。
 - 改 source root、ownership、共享 contract、生成关系或验证入口：同步 [Source map](./source-map.md)。
-- 新增产品能力只有在实现并验证后才迁入本 bundle；公开架构入口不保存私有 roadmap 或实施过程。
+- 新增产品能力只有在实现并验证后才迁入本 bundle；公开架构入口不保存内部 roadmap 或实施过程。
 - 用户操作和排障步骤属于 [runbook](../runbook/quickstart.md)，实现过程不回填到架构入口。

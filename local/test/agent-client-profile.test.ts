@@ -7,14 +7,17 @@ import {
   runtimeAdapterId
 } from "../src/modules/agent/client-profile.js";
 
-test("Agent client catalog includes native Claude Code and Kimi Code adapters", () => {
+test("Agent client catalog includes native Claude Code, Kimi Code and Pi adapters", () => {
   assert.deepEqual(agentClients, [
     "codex",
     "claude-code",
-    "kimi-code"
+    "kimi-code",
+    "pi"
   ]);
+  assert.equal(runtimeAdapterId("codex"), "codex-runtime-app-server-v1");
   assert.equal(runtimeAdapterId("claude-code"), "claude-code-runtime-json-v1");
-  assert.equal(runtimeAdapterId("kimi-code"), "kimi-code-runtime-jsonl-v1");
+  assert.equal(runtimeAdapterId("kimi-code"), "kimi-code-runtime-acp-v1");
+  assert.equal(runtimeAdapterId("pi"), "pi-runtime-rpc-v1");
 });
 
 test("Agent launch args preserve argv boundaries and reject adapter-owned flags", () => {
@@ -35,7 +38,19 @@ test("Agent launch args preserve argv boundaries and reject adapter-owned flags"
     /controlled by the kimi-code adapter/
   );
   assert.throws(
+    () => agentExecutionConfig("kimi-code", ["--agent", "researcher"]),
+    /controlled by the kimi-code adapter/
+  );
+  assert.throws(
     () => agentExecutionConfig("kimi-code", ["bad\0argument"]),
     /must not contain NUL/
+  );
+  assert.throws(
+    () => agentExecutionConfig("pi", ["--mode", "rpc"]),
+    /controlled by the pi adapter/
+  );
+  assert.throws(
+    () => agentExecutionConfig("pi", ["--api-key", "sk-secret"]),
+    /controlled by the pi adapter/
   );
 });

@@ -30,7 +30,7 @@ const emit = defineEmits<{
       <div class="row-title">{{ sub.title }}</div>
       <div class="row-meta">{{ sub.probe.plugin.id }}</div>
       <div class="row-meta">@{{ sub.owner.handle }} · {{ sub.owner.client }}</div>
-      <div class="row-meta">Provider Session {{ sub.callback.providerSessionId }}</div>
+      <div class="row-meta">{{ sub.callbacks.length }} exact callback(s)</div>
     </button>
   </div>
 </template>

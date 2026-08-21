@@ -1,7 +1,8 @@
 export const agentClients = [
   "codex",
   "claude-code",
-  "kimi-code"
+  "kimi-code",
+  "pi"
 ] as const;
 
 export type AgentClient = (typeof agentClients)[number];
@@ -68,7 +69,31 @@ const reservedOptions: Readonly<Record<AgentClient, ReadonlySet<string>>> = {
     "--yolo",
     "--auto",
     "--plan",
+    "--agent",
+    "--agent-file",
     "--add-dir"
+  ]),
+  "pi": new Set([
+    "-p",
+    "--print",
+    "--mode",
+    "-t",
+    "--tools",
+    "-xt",
+    "--exclude-tools",
+    "-nbt",
+    "--no-builtin-tools",
+    "-nt",
+    "--no-tools",
+    "-r",
+    "--resume",
+    "-c",
+    "--continue",
+    "--session",
+    "--session-id",
+    "--fork",
+    "--no-session",
+    "--api-key"
   ])
 };
 
@@ -80,12 +105,21 @@ export function isAgentClient(value: unknown): value is AgentClient {
 export function runtimeAdapterId(client: AgentClient): string {
   switch (client) {
     case "codex":
-      return "codex-runtime-jsonl-v1";
+      return "codex-runtime-app-server-v1";
     case "claude-code":
       return "claude-code-runtime-json-v1";
     case "kimi-code":
-      return "kimi-code-runtime-jsonl-v1";
+      return "kimi-code-runtime-acp-v1";
+    case "pi":
+      return "pi-runtime-rpc-v1";
   }
+}
+
+export function runtimeAdapterIdMatches(client: AgentClient, adapterId: string): boolean {
+  const expected = runtimeAdapterId(client);
+  return client === "kimi-code"
+    ? new RegExp(`^${expected}:[a-f0-9]{64}$`).test(adapterId)
+    : adapterId === expected;
 }
 
 export function agentExecutionConfig(

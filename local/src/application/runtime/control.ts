@@ -6,11 +6,14 @@ import {
   setupLocalRuntime,
   type SetupInput
 } from "../../infrastructure/runtime/config.js";
-import { PollSubscriptionStore } from "../../capabilities/subscription/store.js";
+import { SubscriptionStore } from "../../capabilities/subscription/store.js";
+import { CallbackStore } from "../../infrastructure/callback/store.js";
 import { ScheduledTaskStore } from "../../capabilities/scheduled-task/store.js";
 import { readLoopStatus, type LoopStatus } from "../../core/loop.js";
 import { RuntimeStore } from "../../core/runtime/store.js";
 import { LoopControlStore } from "../../infrastructure/files/loop-control-store.js";
+import { assertRuntimeSchemaUpgradeAllowed as assertSchemaUpgradeAllowed } from
+  "../../infrastructure/sqlite/schema.js";
 import {
   runtimeOperationsView,
   type RuntimeControlResultView
@@ -31,6 +34,13 @@ export interface RuntimeStatus extends LoopStatus {
 export type { SetupInput };
 
 export type RuntimeControlAction = "pause" | "resume" | "recover";
+
+export function assertRuntimeSchemaUpgradeAllowed(
+  repoRoot: string,
+  runtimeDirectory?: string
+): void {
+  assertSchemaUpgradeAllowed(runtimePaths(repoRoot, runtimeDirectory).database);
+}
 
 export function setupRuntime(
   repoRoot: string,
@@ -70,17 +80,21 @@ export function reconcileRuntime(
   runtimeDirectory?: string
 ): number {
   const paths = runtimePaths(repoRoot, runtimeDirectory);
-  const subscriptions = new PollSubscriptionStore(paths.database);
+  const callbacks = new CallbackStore(paths.database);
+  const subscriptions = new SubscriptionStore(paths.database);
   const schedules = new ScheduledTaskStore(paths.database);
   const runtime = new RuntimeStore(paths.database);
   try {
-    return schedules.reconcileInterrupted() +
+    const recovered = schedules.reconcileInterrupted() +
       runtime.reconcileInterrupted() +
-      subscriptions.reconcileInterrupted();
+      callbacks.reconcileInterrupted();
+    subscriptions.reconcileCallbacks();
+    return recovered;
   } finally {
+    subscriptions.close();
     runtime.close();
     schedules.close();
-    subscriptions.close();
+    callbacks.close();
   }
 }
 

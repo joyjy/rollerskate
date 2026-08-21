@@ -13,7 +13,7 @@ export interface RuntimeWorkloadFacts {
 }
 
 export interface RuntimeFailureFact {
-  readonly kind: "execution" | "delivery" | "schedule" | "subscription" | "review";
+  readonly kind: "execution" | "delivery" | "schedule" | "subscription";
   readonly objectRef: string;
   readonly eventId?: string;
   readonly relatedRef?: string;
@@ -129,7 +129,7 @@ export function readRuntimeFailureFacts(
         LIMIT ?
       `).all(limit) as unknown as Array<{
         delivery_id: string;
-        result_event_id: string;
+        result_event_id: string | null;
         destination_id: string;
         last_error: string;
         updated_at: string;
@@ -137,7 +137,7 @@ export function readRuntimeFailureFacts(
       facts.push(...rows.map((row) => ({
         kind: "delivery" as const,
         objectRef: row.delivery_id,
-        eventId: row.result_event_id,
+        ...(row.result_event_id === null ? {} : { eventId: row.result_event_id }),
         relatedRef: row.destination_id,
         reason: row.last_error,
         occurredAt: row.updated_at
@@ -168,7 +168,7 @@ export function readRuntimeFailureFacts(
     }
     if (hasTable(database, "subscriptions")) {
       const rows = database.prepare(`
-        SELECT subscription_id, fire_event_id, latest_error, updated_at
+        SELECT subscription_id, latest_error, updated_at
         FROM subscriptions
         WHERE latest_error IS NOT NULL
           AND status NOT IN ('cancelled', 'expired')
@@ -176,35 +176,13 @@ export function readRuntimeFailureFacts(
         LIMIT ?
       `).all(limit) as unknown as Array<{
         subscription_id: string;
-        fire_event_id: string | null;
         latest_error: string;
         updated_at: string;
       }>;
       facts.push(...rows.map((row) => ({
         kind: "subscription" as const,
         objectRef: row.subscription_id,
-        ...(row.fire_event_id === null ? {} : { eventId: row.fire_event_id }),
         reason: row.latest_error,
-        occurredAt: row.updated_at
-      })));
-    }
-    if (hasTable(database, "reviews")) {
-      const rows = database.prepare(`
-        SELECT root_event_id, terminal_reason, updated_at
-        FROM reviews
-        WHERE phase = 'terminal' AND terminal_decision = 'blocked'
-        ORDER BY updated_at DESC, root_event_id DESC
-        LIMIT ?
-      `).all(limit) as unknown as Array<{
-        root_event_id: string;
-        terminal_reason: string | null;
-        updated_at: string;
-      }>;
-      facts.push(...rows.map((row) => ({
-        kind: "review" as const,
-        objectRef: row.root_event_id,
-        eventId: row.root_event_id,
-        reason: row.terminal_reason ?? "Review chain is blocked.",
         occurredAt: row.updated_at
       })));
     }

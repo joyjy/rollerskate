@@ -13,10 +13,12 @@ import { runtimePaths } from "../src/infrastructure/runtime/config.js";
 import {
   loginDevice,
   logoutDevice,
+  startBrowserDeviceLogin,
   statusDevice
 } from "../src/application/device/server-control.js";
+import { ConsoleDeviceLogin } from "../src/entrypoints/console/network-api.js";
 
-test.skip("v0.4 Server Device login persists only a private credential", async () => {
+test("v0.4 Server Device login persists only a private credential", async () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-device-"));
   const runtimeDirectory = join(repo, "runtime");
   const serverUrl = "http://127.0.0.1:7777";
@@ -117,7 +119,7 @@ test.skip("v0.4 Server Device login persists only a private credential", async (
   }
 });
 
-test.skip("v0.4 Server Device login reuses the saved server", async () => {
+test("v0.4 Server Device login reuses the saved server", async () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-device-resume-"));
   const runtimeDirectory = join(repo, "runtime");
   const serverUrl = "http://127.0.0.1:7777";
@@ -143,6 +145,132 @@ test.skip("v0.4 Server Device login reuses the saved server", async () => {
     }));
 
     assert.equal(requestedOrigin, serverUrl);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("Console browser login replaces a stale Server binding only after approval", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "rollerskate-device-reconnect-"));
+  const runtimeDirectory = join(repo, "runtime");
+  const oldServerUrl = "http://127.0.0.1:7777";
+  const newServerUrl = "http://127.0.0.1:4100";
+  let deviceId = "";
+  let retryNextBrowserStatus = false;
+  let transientStatusFailures = 0;
+  const approvedFetch = (serverUrl: string, credential: string): typeof fetch =>
+    async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : input.toString());
+      if (url.pathname === "/api/device-pairings" ||
+        url.pathname === "/api/device-pairings/browser") {
+        if (url.pathname.endsWith("/browser")) retryNextBrowserStatus = true;
+        deviceId = (JSON.parse(init?.body?.toString() ?? "{}") as { deviceId: string }).deviceId;
+        return Response.json({
+          pairingId: "pairing-id",
+          deviceId,
+          verificationUri: `${serverUrl}/device/pair/pairing-id`,
+          expiresAt: "2099-01-01T00:00:00.000Z",
+          pollIntervalMilliseconds: 100
+        }, { status: 201 });
+      }
+      if (url.pathname === "/api/device-pairings/pairing-id") {
+        if (retryNextBrowserStatus) {
+          retryNextBrowserStatus = false;
+          transientStatusFailures += 1;
+          throw new TypeError("fetch failed");
+        }
+        return Response.json({
+          pairingId: "pairing-id",
+          deviceId,
+          status: "approved",
+          expiresAt: "2099-01-01T00:00:00.000Z"
+        });
+      }
+      if (url.pathname.endsWith("/redeem")) {
+        return Response.json({
+          credentialId: `${credential}-id`,
+          credential,
+          device: summary(deviceId)
+        });
+      }
+      if (url.pathname === "/api/device") return Response.json(summary(deviceId));
+      return Response.json({ error: "not_found" }, { status: 404 });
+    };
+  try {
+    await loginDevice(repo, { serverUrl: oldServerUrl }, {
+      runtimeDirectory,
+      fetch: approvedFetch(oldServerUrl, "old-credential-secret-value-1234567890"),
+      now: () => new Date("2026-07-27T01:00:00.000Z"),
+      sleep: async () => {}
+    });
+    const reconnect = await startBrowserDeviceLogin(repo, {
+      serverUrl: newServerUrl,
+      replaceExisting: true
+    }, {
+      runtimeDirectory,
+      fetch: approvedFetch(newServerUrl, "new-credential-secret-value-1234567890"),
+      now: () => new Date("2026-07-27T01:05:00.000Z"),
+      sleep: async () => {}
+    });
+    assert.equal(reconnect.verificationUri, `${newServerUrl}/device/pair/pairing-id`);
+    const connected = await reconnect.completion;
+    assert.equal(transientStatusFailures, 1);
+    assert.equal(connected.metadata.serverUrl, newServerUrl);
+    const credentialFile = readFileSync(runtimePaths(repo, runtimeDirectory).deviceCredential, "utf8");
+    assert.match(credentialFile, /new-credential-secret-value-1234567890/);
+    assert.doesNotMatch(credentialFile, /old-credential-secret-value-1234567890/);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("Console browser login admits only one pairing start at a time", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "rollerskate-console-device-login-"));
+  const runtimeDirectory = join(repo, "runtime");
+  const serverUrl = "http://127.0.0.1:4100";
+  let releasePairing!: (response: Response) => void;
+  const pairingResponse = new Promise<Response>((resolvePromise) => {
+    releasePairing = resolvePromise;
+  });
+  let pairingRequests = 0;
+  const deviceLogin = new ConsoleDeviceLogin({
+    repoRoot: repo,
+    runtimeDirectory,
+    port: 0,
+    signal: new AbortController().signal,
+    fetch: async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : input.toString());
+      if (url.pathname === "/api/device-pairings/browser" && init?.method === "POST") {
+        pairingRequests += 1;
+        return pairingResponse;
+      }
+      if (url.pathname === "/api/device-pairings/pairing-id") {
+        return Response.json({
+          pairingId: "pairing-id",
+          deviceId: "device-id",
+          status: "cancelled",
+          expiresAt: "2099-01-01T00:00:00.000Z"
+        });
+      }
+      return Response.json({ error: "not_found" }, { status: 404 });
+    }
+  });
+  try {
+    const first = deviceLogin.start(serverUrl, false);
+    assert.equal(pairingRequests, 1);
+    await assert.rejects(
+      () => deviceLogin.start(serverUrl, false),
+      /already waiting for OIDC approval/
+    );
+    assert.equal(pairingRequests, 1);
+    releasePairing(Response.json({
+      pairingId: "pairing-id",
+      deviceId: "device-id",
+      verificationUri: `${serverUrl}/device/pair/pairing-id`,
+      expiresAt: "2099-01-01T00:00:00.000Z",
+      pollIntervalMilliseconds: 100
+    }, { status: 201 }));
+    assert.equal((await first).status, "pending");
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }

@@ -5,104 +5,115 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
+import {
+  bootstrapLocalFoundation,
+  LocalFoundationStore
+} from "../src/infrastructure/sqlite/foundation-store.js";
+import { runtimePaths } from "../src/infrastructure/runtime/config.js";
 import { initializeRuntimeSchema } from "../src/infrastructure/sqlite/schema.js";
 
-test("schema v44 atomically compacts a v42 database into 15 product tables", () => {
-  const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v44-"));
+const PRODUCT_TABLES = [
+  "agent_run_cycles",
+  "agent_run_decisions",
+  "agent_runs",
+  "agent_sessions",
+  "agents",
+  "channel_follows",
+  "channel_send_receipts",
+  "chat_messages",
+  "chat_presence",
+  "continuous_subscriptions",
+  "deliveries",
+  "events",
+  "executions",
+  "free_chat_mode_receipts",
+  "free_chat_modes",
+  "interactive_channel_bindings",
+  "local_foundation",
+  "notices",
+  "proactive_callback_definitions",
+  "proactive_callback_occurrences",
+  "scheduled_runs",
+  "schedules",
+  "schema_meta",
+  "subscriptions",
+  "topic_activation_schedule_receipts",
+  "topic_activation_schedules",
+  "topic_governance",
+  "topic_governance_control_receipts"
+] as const;
+
+test("schema v63 creates the single post-v0.3.11 schema without legacy Review", () => {
+  const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v50-"));
   const databasePath = join(directory, "runtime.db");
   try {
-    const legacy = new DatabaseSync(databasePath);
-    createV42Fixture(legacy);
-    legacy.close();
-
     const diagnostics = initializeRuntimeSchema(databasePath);
-    const repeated = initializeRuntimeSchema(databasePath);
-    assert.equal(diagnostics.schemaVersion, 44);
-    assert.deepEqual(repeated, diagnostics);
-    assert.deepEqual(diagnostics.tables, [
-      "agent_runs",
-      "agent_sessions",
-      "agents",
-      "chat_messages",
-      "chat_presence",
-      "deliveries",
-      "events",
-      "executions",
-      "local_foundation",
-      "notices",
-      "reviews",
-      "scheduled_runs",
-      "schedules",
-      "schema_meta",
-      "subscriptions"
-    ]);
+    assert.equal(diagnostics.schemaVersion, 63);
+    assert.deepEqual(diagnostics.tables, PRODUCT_TABLES);
 
+    const database = new DatabaseSync(databasePath);
+    try {
+      assert.throws(() => database.prepare(`
+        INSERT INTO events (
+          event_id, type, source_kind, destination_ids_json,
+          destination_snapshots_json, root_event_id, causal_hop, created_at
+        ) VALUES (
+          'evt_019f0000-0000-7000-8000-000000000001', 'review.requested',
+          'cli', '[]', '[]', 'evt_019f0000-0000-7000-8000-000000000001', 0,
+          '2026-07-30T00:00:00.000Z'
+        )
+      `).run(), /CHECK constraint failed/);
+    } finally {
+      database.close();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("schema v63 upgrades a complete v52 database", () => {
+  const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v52-"));
+  const databasePath = join(directory, "runtime.db");
+  try {
+    const foundation = bootstrapLocalFoundation(
+      runtimePaths(directory, directory),
+      "2026-07-31T08:00:00.000Z"
+    );
+    const foundationStore = new LocalFoundationStore(databasePath);
+    const agent = foundationStore.addAgent(
+      "alice",
+      "codex",
+      "2026-07-31T08:00:01.000Z"
+    );
+    foundationStore.close();
+    const database = new DatabaseSync(databasePath);
+    database.prepare(
+      "UPDATE schema_meta SET value = '52' WHERE key = 'schema_version'"
+    ).run();
+    database.close();
+    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 63);
     const migrated = new DatabaseSync(databasePath, { readOnly: true });
     try {
-      const agent = migrated.prepare(`
-        SELECT current_session_id, session_generation
-        FROM agents
-        WHERE principal_id = 'prn_019f0000-0000-7000-8000-000000000002'
-      `).get() as {
-        current_session_id: string;
-        session_generation: number;
+      const row = migrated.prepare(`
+        SELECT participants_json, revision
+        FROM topic_governance
+        WHERE topic_id = ?
+      `).get(foundation.topicId) as {
+        participants_json: string;
+        revision: number;
       };
-      assert.equal(
-        agent.current_session_id,
-        "ses_019f0000-0000-7000-8000-000000000003"
-      );
-      assert.equal(agent.session_generation, 2);
-
-      const event = migrated.prepare(`
-        SELECT destination_snapshots_json
-        FROM events
-        WHERE event_id = 'evt_019f0000-0000-7000-8000-000000000010'
-      `).get() as { destination_snapshots_json: string };
-      assert.deepEqual(JSON.parse(event.destination_snapshots_json), [{
-        destinationId: "dst_019f0000-0000-7000-8000-000000000020",
-        kind: "macos-notification",
-        address: { title: "Preserved destination" },
-        createdAt: "2026-07-25T00:00:00.000Z",
-        updatedAt: "2026-07-25T00:00:00.000Z"
-      }]);
-
-      const receipt = migrated.prepare(`
-        SELECT receipt_json
-        FROM executions
-        WHERE event_id = 'evt_019f0000-0000-7000-8000-000000000010'
-      `).get() as { receipt_json: string };
-      const receiptValue = JSON.parse(receipt.receipt_json) as {
-        schema: string;
-        receipts: Array<{ agentId: string; outcome: string }>;
-      };
-      assert.equal(receiptValue.schema, "ChatAttentionReceiptList@1");
-      assert.deepEqual(
-        receiptValue.receipts.map(({ agentId, outcome }) => ({ agentId, outcome })),
-        [{
-          agentId: "prn_019f0000-0000-7000-8000-000000000002",
-          outcome: "skipped"
-        }]
-      );
-
-      const notice = migrated.prepare(`
-        SELECT title, read_at, acknowledged_at
-        FROM notices
-        WHERE notice_id = 'ntc1_del_019f0000-0000-7000-8000-000000000030'
-      `).get() as {
-        title: string;
-        read_at: string;
-        acknowledged_at: string | null;
-      };
-      assert.equal(notice.title, "Preserved destination");
-      assert.equal(notice.read_at, "2026-07-25T00:03:00.000Z");
-      assert.equal(notice.acknowledged_at, null);
-
-      assert.deepEqual(
-        migrated.prepare("PRAGMA foreign_key_check").all(),
-        []
-      );
-      assert.equal(count(migrated, "chat_messages"), 1);
-      assert.equal(count(migrated, "agent_runs"), 0);
+      assert.equal(row.revision, 1);
+      const participants = JSON.parse(row.participants_json) as [{
+        agentId: string;
+        status: string;
+        joinedAt: string;
+        governanceRevision: number;
+      }];
+      assert.equal(participants[0].agentId, agent.principalId);
+      assert.equal(participants[0].status, "active");
+      assert.match(participants[0].joinedAt, /^20/);
+      assert.equal(participants[0].governanceRevision, 1);
+      assert.equal(count(migrated, "topic_governance_control_receipts"), 1);
     } finally {
       migrated.close();
     }
@@ -111,48 +122,129 @@ test("schema v44 atomically compacts a v42 database into 15 product tables", () 
   }
 });
 
-test("schema v44 preserves already compacted tables still declared as v42", () => {
-  const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v44-hybrid-"));
+test("schema v63 rejects pre-v44 product data without modifying it", () => {
+  const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-pre-v44-"));
   const databasePath = join(directory, "runtime.db");
   try {
-    const legacy = new DatabaseSync(databasePath);
-    createV42Fixture(legacy);
-    legacy.close();
-    initializeRuntimeSchema(databasePath);
+    const database = new DatabaseSync(databasePath);
+    database.exec(`
+      CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      INSERT INTO schema_meta VALUES ('schema_version', '43');
+      CREATE TABLE deliveries (delivery_id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+      INSERT INTO deliveries VALUES ('legacy-delivery', 'preserve-on-rejection');
+    `);
+    database.close();
 
-    const hybrid = new DatabaseSync(databasePath);
-    hybrid.exec(`
-      UPDATE schema_meta SET value = '42' WHERE key = 'schema_version';
-      CREATE TABLE local_principals (
-        principal_id TEXT PRIMARY KEY,
-        kind TEXT NOT NULL,
-        handle TEXT NOT NULL,
-        handle_key TEXT NOT NULL UNIQUE,
+    assert.throws(
+      () => initializeRuntimeSchema(databasePath),
+      /schema 43 cannot migrate directly to 63/
+    );
+    const preserved = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      assert.deepEqual(
+        { ...preserved.prepare("SELECT * FROM deliveries").get() },
+        { delivery_id: "legacy-delivery", payload: "preserve-on-rejection" }
+      );
+    } finally {
+      preserved.close();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("schema v63 drops an entire legacy Review Event chain from v44", () => {
+  const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v44-review-"));
+  const databasePath = join(directory, "runtime.db");
+  try {
+    initializeRuntimeSchema(databasePath);
+    const database = new DatabaseSync(databasePath);
+    database.exec(`
+      PRAGMA foreign_keys = OFF;
+      BEGIN IMMEDIATE;
+      DROP TRIGGER IF EXISTS chat_message_project_event_insert;
+      DROP TRIGGER IF EXISTS chat_message_project_read_progress_attention;
+      DROP TRIGGER IF EXISTS chat_message_project_read_progress_dispatch;
+      DROP VIEW IF EXISTS chat_message_read_progress_v1;
+      ALTER TABLE events RENAME TO events_v50;
+      ALTER TABLE executions RENAME TO executions_v50;
+      CREATE TABLE events (
+        event_id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        source_kind TEXT NOT NULL,
+        source_external_id TEXT,
+        agent_id TEXT,
+        prompt TEXT,
+        outcome TEXT,
+        output TEXT,
+        error TEXT,
+        payload_json TEXT,
+        session_id TEXT,
+        destination_ids_json TEXT NOT NULL,
+        destination_snapshots_json TEXT NOT NULL,
+        root_event_id TEXT NOT NULL,
+        parent_event_id TEXT,
+        causal_hop INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE executions (
+        execution_id TEXT PRIMARY KEY,
+        event_id TEXT NOT NULL UNIQUE,
+        handler TEXT NOT NULL,
         status TEXT NOT NULL,
+        attempt_count INTEGER NOT NULL,
+        max_attempts INTEGER NOT NULL,
+        next_attempt_at TEXT NOT NULL,
+        last_error TEXT,
+        receipt_json TEXT,
         created_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT,
         updated_at TEXT NOT NULL
       );
-      CREATE TABLE local_agent_profiles (
-        principal_id TEXT PRIMARY KEY,
-        agent_client TEXT NOT NULL,
-        execution_config TEXT NOT NULL
+      INSERT INTO events VALUES (
+        'evt_review_root', 'review.requested', 'cli', 'legacy-review',
+        NULL, NULL, NULL, NULL, NULL, '{}', NULL, '[]', '[]',
+        'evt_review_root', NULL, 0, '2026-07-30T00:00:00.000Z'
       );
+      INSERT INTO events VALUES (
+        'evt_review_child', 'agent.request', 'handler', 'legacy-review-child',
+        'prn_review_agent', 'review', NULL, NULL, NULL, '{}', NULL, '[]', '[]',
+        'evt_review_root', 'evt_review_root', 1, '2026-07-30T00:00:01.000Z'
+      );
+      INSERT INTO executions VALUES (
+        'exe_review_root', 'evt_review_root', 'review', 'succeeded', 1, 3,
+        '2026-07-30T00:00:00.000Z', NULL, NULL,
+        '2026-07-30T00:00:00.000Z', '2026-07-30T00:00:00.000Z',
+        '2026-07-30T00:00:01.000Z', '2026-07-30T00:00:01.000Z'
+      );
+      INSERT INTO executions VALUES (
+        'exe_review_child', 'evt_review_child', 'agent', 'succeeded', 1, 3,
+        '2026-07-30T00:00:01.000Z', NULL, NULL,
+        '2026-07-30T00:00:01.000Z', '2026-07-30T00:00:01.000Z',
+        '2026-07-30T00:00:02.000Z', '2026-07-30T00:00:02.000Z'
+      );
+      CREATE TABLE reviews (root_event_id TEXT PRIMARY KEY, phase TEXT NOT NULL);
+      INSERT INTO reviews VALUES ('evt_review_root', 'terminal');
+      DROP TABLE events_v50;
+      DROP TABLE executions_v50;
+      DROP TABLE IF EXISTS subscription_callbacks;
+      DROP TABLE continuous_subscriptions;
+      DROP TABLE proactive_callback_occurrences;
+      DROP TABLE proactive_callback_definitions;
+      UPDATE schema_meta SET value = '44' WHERE key = 'schema_version';
+      COMMIT;
+      PRAGMA foreign_keys = ON;
     `);
-    hybrid.close();
+    database.close();
 
     const diagnostics = initializeRuntimeSchema(databasePath);
-    assert.equal(diagnostics.schemaVersion, 44);
-    assert.equal(diagnostics.tables.length, 15);
-
+    assert.equal(diagnostics.schemaVersion, 63);
     const migrated = new DatabaseSync(databasePath, { readOnly: true });
     try {
-      assert.equal(count(migrated, "local_foundation"), 1);
-      assert.equal(count(migrated, "agents"), 1);
-      assert.equal(count(migrated, "agent_sessions"), 1);
-      assert.equal(count(migrated, "events"), 2);
-      assert.equal(count(migrated, "executions"), 2);
-      assert.equal(count(migrated, "deliveries"), 1);
-      assert.equal(count(migrated, "notices"), 1);
+      assert.equal(count(migrated, "events"), 0);
+      assert.equal(count(migrated, "executions"), 0);
+      assert.ok(!diagnostics.tables.includes("reviews"));
       assert.deepEqual(migrated.prepare("PRAGMA foreign_key_check").all(), []);
     } finally {
       migrated.close();
@@ -162,10 +254,143 @@ test("schema v44 preserves already compacted tables still declared as v42", () =
   }
 });
 
-test("schema v44 fails closed for newer or incomplete declared schemas", () => {
+test("schema v63 upgrades v56 with optional ExternalRef trigger bindings", () => {
+  const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v56-"));
+  const databasePath = join(directory, "runtime.db");
+  try {
+    initializeRuntimeSchema(databasePath);
+    const previous = new DatabaseSync(databasePath);
+    for (const table of ["schedules", "subscriptions", "continuous_subscriptions"]) {
+      previous.exec(`ALTER TABLE ${table} DROP COLUMN external_ref_binding_json`);
+    }
+    previous.prepare(
+      "UPDATE schema_meta SET value = '56' WHERE key = 'schema_version'"
+    ).run();
+    previous.close();
+
+    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 63);
+    const migrated = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      for (const table of ["schedules", "subscriptions", "continuous_subscriptions"]) {
+        const columns = (migrated.prepare(`PRAGMA table_info(${table})`).all() as unknown as
+          Array<{ name: string }>).map(({ name }) => name);
+        assert.ok(columns.includes("external_ref_binding_json"));
+      }
+      assert.deepEqual(migrated.prepare("PRAGMA foreign_key_check").all(), []);
+    } finally {
+      migrated.close();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("schema v63 upgrades v57 without introducing business tables", () => {
+  const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v57-"));
+  const databasePath = join(directory, "runtime.db");
+  try {
+    initializeRuntimeSchema(databasePath);
+    const previous = new DatabaseSync(databasePath);
+    previous.prepare(
+      "UPDATE schema_meta SET value = '57' WHERE key = 'schema_version'"
+    ).run();
+    previous.close();
+
+    const diagnostics = initializeRuntimeSchema(databasePath);
+    assert.equal(diagnostics.schemaVersion, 63);
+    assert.deepEqual(diagnostics.tables, PRODUCT_TABLES);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("schema v63 preserves legacy v58 Candidate tables without extending them", () => {
+  const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v58-"));
+  const databasePath = join(directory, "runtime.db");
+  try {
+    initializeRuntimeSchema(databasePath);
+    const previous = new DatabaseSync(databasePath);
+    previous.exec(`
+      CREATE TABLE release_candidate_runtime (
+        singleton INTEGER PRIMARY KEY,
+        lark_cursor INTEGER NOT NULL,
+        bootstrap_until_cursor INTEGER,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE release_candidates (
+        candidate_id TEXT PRIMARY KEY,
+        marker TEXT NOT NULL
+      );
+      CREATE TABLE release_candidate_messages (
+        message_id TEXT PRIMARY KEY,
+        marker TEXT NOT NULL
+      );
+      INSERT INTO release_candidate_runtime VALUES (
+        1, 164273, 164273, '2026-08-13T00:00:00.000Z'
+      );
+      INSERT INTO release_candidates VALUES ('candidate-legacy', 'preserve');
+      UPDATE schema_meta SET value = '58' WHERE key = 'schema_version';
+    `);
+    previous.close();
+
+    const diagnostics = initializeRuntimeSchema(databasePath);
+    assert.equal(diagnostics.schemaVersion, 63);
+    assert.deepEqual(
+      diagnostics.tables.filter((table) => !table.startsWith("release_candidate")),
+      PRODUCT_TABLES
+    );
+    const preserved = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      assert.equal(count(preserved, "release_candidates"), 1);
+      assert.ok(!diagnostics.tables.includes("release_candidate_effects"));
+    } finally {
+      preserved.close();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("schema v63 tolerates complete legacy Candidate tombstones", () => {
+  const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v60-legacy-candidate-"));
+  const databasePath = join(directory, "runtime.db");
+  try {
+    initializeRuntimeSchema(databasePath);
+    const database = new DatabaseSync(databasePath);
+    database.exec(`
+      CREATE TABLE release_candidate_runtime (
+        singleton INTEGER PRIMARY KEY,
+        lark_cursor INTEGER NOT NULL,
+        bootstrap_until_cursor INTEGER,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE release_candidates (candidate_id TEXT PRIMARY KEY);
+      CREATE TABLE release_candidate_messages (message_id TEXT PRIMARY KEY);
+      CREATE TABLE release_candidate_effects (effect_id TEXT PRIMARY KEY);
+      INSERT INTO release_candidate_runtime VALUES (
+        1, 164273, 164273, '2026-08-13T00:00:00.000Z'
+      );
+      INSERT INTO release_candidates VALUES ('candidate-legacy');
+    `);
+    database.close();
+
+    const diagnostics = initializeRuntimeSchema(databasePath);
+    assert.equal(diagnostics.schemaVersion, 63);
+    const preserved = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      assert.equal(count(preserved, "release_candidates"), 1);
+    } finally {
+      preserved.close();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("schema v63 fails closed for newer and incomplete current schemas", () => {
   for (const [version, expected] of [
-    ["45", /newer than supported 44/],
-    ["44", /schema 44 is incomplete/]
+    ["64", /newer than supported 63/],
+    ["63", /schema 63 is incomplete/]
   ] as const) {
     const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-version-"));
     const databasePath = join(directory, "runtime.db");
@@ -183,443 +408,8 @@ test("schema v44 fails closed for newer or incomplete declared schemas", () => {
   }
 });
 
-test("schema v44 upgrades terminal v43 state and rebuilds Chat projection", () => {
-  const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v44-from-v43-"));
-  const databasePath = join(directory, "runtime.db");
-  try {
-    initializeRuntimeSchema(databasePath);
-    const legacy = new DatabaseSync(databasePath);
-    legacy.exec(`
-      INSERT INTO events (
-        event_id, type, source_kind, source_external_id, agent_id, prompt,
-        outcome, output, error, payload_json, session_id, destination_ids_json,
-        destination_snapshots_json, root_event_id, parent_event_id, causal_hop,
-        created_at
-      ) VALUES (
-        'evt_019f0000-0000-7000-8000-000000000090',
-        'chat.message', 'cli', 'v43-chat', NULL, NULL, NULL, NULL, NULL,
-        '{"topicId":"top_019f0000-0000-7000-8000-000000000091","sender":{"kind":"owner","handleSnapshot":"owner"},"body":"preserve me"}',
-        NULL, '[]', '[]',
-        'evt_019f0000-0000-7000-8000-000000000090', NULL, 0,
-        '2026-07-25T00:00:00.000Z'
-      );
-      DROP TRIGGER IF EXISTS chat_message_project_event_insert;
-      DROP TRIGGER IF EXISTS chat_message_project_attention_update;
-      DROP TRIGGER IF EXISTS chat_message_project_read_progress_attention;
-      DROP TRIGGER IF EXISTS chat_message_project_read_progress_dispatch;
-      DROP VIEW IF EXISTS chat_message_read_progress_v1;
-      DROP TABLE chat_messages;
-      DROP TABLE agent_runs;
-      UPDATE schema_meta SET value = '43' WHERE key = 'schema_version';
-    `);
-    legacy.close();
-
-    const diagnostics = initializeRuntimeSchema(databasePath);
-    assert.equal(diagnostics.schemaVersion, 44);
-    const upgraded = new DatabaseSync(databasePath, { readOnly: true });
-    try {
-      assert.equal(count(upgraded, "chat_messages"), 1);
-      assert.equal(count(upgraded, "agent_runs"), 0);
-      const message = upgraded.prepare(`
-        SELECT body FROM chat_messages
-        WHERE event_id = 'evt_019f0000-0000-7000-8000-000000000090'
-      `).get() as { body: string };
-      assert.equal(message.body, "preserve me");
-    } finally {
-      upgraded.close();
-    }
-  } finally {
-    rmSync(directory, { recursive: true, force: true });
-  }
-});
-
-test("schema v44 fails closed while v43 has an active legacy Review", () => {
-  const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v44-active-review-"));
-  const databasePath = join(directory, "runtime.db");
-  try {
-    initializeRuntimeSchema(databasePath);
-    const legacy = new DatabaseSync(databasePath);
-    legacy.exec(`
-      INSERT INTO events (
-        event_id, type, source_kind, source_external_id, agent_id, prompt,
-        outcome, output, error, payload_json, session_id, destination_ids_json,
-        destination_snapshots_json, root_event_id, parent_event_id, causal_hop,
-        created_at
-      ) VALUES (
-        'evt_019f0000-0000-7000-8000-000000000092',
-        'review.requested', 'cli', 'active-review', NULL, NULL, NULL, NULL, NULL,
-        '{"cycleIndex":0,"subject":{"kind":"acceptance","ref":"/tmp/plan.md","revision":"file1_test"},"artifactRef":"/tmp/plan.md.review.yaml","evidence":[{"kind":"workspace","ref":"/tmp/workspace","revision":"wrk1_test"}],"implementationRevision":"wrk1_test","reviewerAgentId":"reviewer","implementerAgentId":"implementer","reworkLimit":1}',
-        NULL, '[]', '[]',
-        'evt_019f0000-0000-7000-8000-000000000092', NULL, 0,
-        '2026-07-25T00:00:00.000Z'
-      );
-      INSERT INTO executions (
-        execution_id, event_id, handler, status, attempt_count, max_attempts,
-        next_attempt_at, created_at, updated_at
-      ) VALUES (
-        'exe_019f0000-0000-7000-8000-000000000093',
-        'evt_019f0000-0000-7000-8000-000000000092',
-        'review', 'queued', 0, 3,
-        '2026-07-25T00:00:00.000Z',
-        '2026-07-25T00:00:00.000Z',
-        '2026-07-25T00:00:00.000Z'
-      );
-      INSERT INTO reviews (
-        root_event_id, subject_ref, workspace_ref, phase, cycle_index,
-        expected_event_id, active_execution_id, subject_revision,
-        artifact_revision, implementation_revision, rework_count, rework_limit,
-        terminal_decision, terminal_reason, reviewer_session_id,
-        implementer_session_id, transitions_json, updated_at
-      ) VALUES (
-        'evt_019f0000-0000-7000-8000-000000000092',
-        '/tmp/plan.md', '/tmp/workspace', 'reviewing', 0,
-        'evt_019f0000-0000-7000-8000-000000000092',
-        'exe_019f0000-0000-7000-8000-000000000093',
-        'file1_test', NULL, 'wrk1_test', 0, 1,
-        NULL, NULL, NULL, NULL, '[]',
-        '2026-07-25T00:00:00.000Z'
-      );
-      DROP TRIGGER IF EXISTS chat_message_project_event_insert;
-      DROP TRIGGER IF EXISTS chat_message_project_attention_update;
-      DROP TRIGGER IF EXISTS chat_message_project_read_progress_attention;
-      DROP TRIGGER IF EXISTS chat_message_project_read_progress_dispatch;
-      DROP VIEW IF EXISTS chat_message_read_progress_v1;
-      DROP TABLE chat_messages;
-      DROP TABLE agent_runs;
-      UPDATE schema_meta SET value = '43' WHERE key = 'schema_version';
-    `);
-    legacy.close();
-
-    assert.throws(
-      () => initializeRuntimeSchema(databasePath),
-      /1 active legacy Review.*previous Runtime/
-    );
-    const preserved = new DatabaseSync(databasePath, { readOnly: true });
-    try {
-      assert.equal(count(preserved, "reviews"), 1);
-      assert.equal(
-        (preserved.prepare(`
-          SELECT value FROM schema_meta WHERE key = 'schema_version'
-        `).get() as { value: string }).value,
-        "43"
-      );
-    } finally {
-      preserved.close();
-    }
-  } finally {
-    rmSync(directory, { recursive: true, force: true });
-  }
-});
-
 function count(database: DatabaseSync, table: string): number {
-  return Number((database.prepare(
-    `SELECT COUNT(*) AS count FROM "${table}"`
-  ).get() as { count: number | bigint }).count);
-}
-
-function createV42Fixture(database: DatabaseSync): void {
-  database.exec(`
-    PRAGMA foreign_keys = OFF;
-    CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-    INSERT INTO schema_meta VALUES ('schema_version', '42');
-
-    CREATE TABLE sessions (
-      session_id TEXT PRIMARY KEY,
-      agent_id TEXT NOT NULL,
-      adapter_id TEXT NOT NULL,
-      provider_session_id TEXT NOT NULL,
-      workspace TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-    INSERT INTO sessions VALUES (
-      'ses_019f0000-0000-7000-8000-000000000003',
-      'prn_019f0000-0000-7000-8000-000000000002',
-      'codex-runtime-jsonl-v1',
-      'provider-v42',
-      '/tmp/workspace',
-      '2026-07-25T00:00:00.000Z',
-      '2026-07-25T00:01:00.000Z'
-    );
-
-    CREATE TABLE local_principals (
-      principal_id TEXT PRIMARY KEY,
-      kind TEXT NOT NULL,
-      handle TEXT NOT NULL,
-      handle_key TEXT NOT NULL UNIQUE,
-      status TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-    INSERT INTO local_principals VALUES
-      (
-        'prn_019f0000-0000-7000-8000-000000000001',
-        'owner',
-        'owner',
-        'owner',
-        'active',
-        '2026-07-25T00:00:00.000Z',
-        '2026-07-25T00:00:00.000Z'
-      ),
-      (
-        'prn_019f0000-0000-7000-8000-000000000002',
-        'agent',
-        'alice',
-        'alice',
-        'active',
-        '2026-07-25T00:00:00.000Z',
-        '2026-07-25T00:01:00.000Z'
-      );
-    CREATE TABLE local_agent_profiles (
-      principal_id TEXT PRIMARY KEY,
-      agent_client TEXT NOT NULL,
-      execution_config TEXT NOT NULL
-    );
-    INSERT INTO local_agent_profiles VALUES (
-      'prn_019f0000-0000-7000-8000-000000000002',
-      'codex',
-      '{"launchArgs":[]}'
-    );
-    CREATE TABLE local_agent_sessions (
-      principal_id TEXT PRIMARY KEY,
-      current_session_id TEXT,
-      generation INTEGER NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-    INSERT INTO local_agent_sessions VALUES (
-      'prn_019f0000-0000-7000-8000-000000000002',
-      'ses_019f0000-0000-7000-8000-000000000003',
-      2,
-      '2026-07-25T00:01:00.000Z'
-    );
-    CREATE TABLE local_foundation (
-      singleton INTEGER PRIMARY KEY,
-      device_id TEXT NOT NULL,
-      device_name TEXT NOT NULL,
-      workspace_path TEXT NOT NULL,
-      topic_id TEXT NOT NULL,
-      topic_handle TEXT NOT NULL,
-      owner_principal_id TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    );
-    INSERT INTO local_foundation VALUES (
-      1,
-      'dev_019f0000-0000-7000-8000-000000000004',
-      'fixture-device',
-      '/tmp/workspace',
-      'top_019f0000-0000-7000-8000-000000000005',
-      'local',
-      'prn_019f0000-0000-7000-8000-000000000001',
-      '2026-07-25T00:00:00.000Z'
-    );
-
-    CREATE TABLE events (
-      event_id TEXT PRIMARY KEY,
-      type TEXT NOT NULL,
-      source_kind TEXT NOT NULL,
-      source_external_id TEXT,
-      agent_id TEXT,
-      prompt TEXT,
-      outcome TEXT,
-      output TEXT,
-      error TEXT,
-      payload_json TEXT,
-      session_id TEXT,
-      destination_ids_json TEXT NOT NULL,
-      root_event_id TEXT NOT NULL,
-      parent_event_id TEXT,
-      causal_hop INTEGER NOT NULL,
-      created_at TEXT NOT NULL
-    );
-    INSERT INTO events VALUES
-      (
-        'evt_019f0000-0000-7000-8000-000000000010',
-        'chat.message',
-        'cli',
-        NULL,
-        'prn_019f0000-0000-7000-8000-000000000001',
-        NULL,
-        NULL,
-        NULL,
-        NULL,
-        '{"topicId":"top_019f0000-0000-7000-8000-000000000005","sender":{"kind":"owner","principalId":"prn_019f0000-0000-7000-8000-000000000001","handleSnapshot":"owner"},"body":"hello"}',
-        NULL,
-        '["dst_019f0000-0000-7000-8000-000000000020"]',
-        'evt_019f0000-0000-7000-8000-000000000010',
-        NULL,
-        0,
-        '2026-07-25T00:00:00.000Z'
-      ),
-      (
-        'evt_019f0000-0000-7000-8000-000000000011',
-        'agent.result',
-        'handler',
-        'exe_019f0000-0000-7000-8000-000000000012',
-        'prn_019f0000-0000-7000-8000-000000000002',
-        NULL,
-        'succeeded',
-        'done',
-        NULL,
-        NULL,
-        'ses_019f0000-0000-7000-8000-000000000003',
-        '["dst_019f0000-0000-7000-8000-000000000020"]',
-        'evt_019f0000-0000-7000-8000-000000000010',
-        'evt_019f0000-0000-7000-8000-000000000010',
-        1,
-        '2026-07-25T00:01:00.000Z'
-      );
-    CREATE TABLE executions (
-      execution_id TEXT PRIMARY KEY,
-      event_id TEXT NOT NULL UNIQUE,
-      handler TEXT NOT NULL,
-      status TEXT NOT NULL,
-      attempt_count INTEGER NOT NULL,
-      max_attempts INTEGER NOT NULL,
-      next_attempt_at TEXT NOT NULL,
-      last_error TEXT,
-      created_at TEXT NOT NULL,
-      started_at TEXT,
-      completed_at TEXT,
-      updated_at TEXT NOT NULL
-    );
-    INSERT INTO executions VALUES
-      (
-        'exe_019f0000-0000-7000-8000-000000000012',
-        'evt_019f0000-0000-7000-8000-000000000010',
-        'chat',
-        'succeeded',
-        1,
-        3,
-        '2026-07-25T00:00:00.000Z',
-        NULL,
-        '2026-07-25T00:00:00.000Z',
-        '2026-07-25T00:00:00.000Z',
-        '2026-07-25T00:00:01.000Z',
-        '2026-07-25T00:00:01.000Z'
-      ),
-      (
-        'exe_019f0000-0000-7000-8000-000000000013',
-        'evt_019f0000-0000-7000-8000-000000000011',
-        'result',
-        'succeeded',
-        1,
-        3,
-        '2026-07-25T00:01:00.000Z',
-        NULL,
-        '2026-07-25T00:01:00.000Z',
-        '2026-07-25T00:01:00.000Z',
-        '2026-07-25T00:01:01.000Z',
-        '2026-07-25T00:01:01.000Z'
-      );
-
-    CREATE TABLE destinations (
-      destination_id TEXT PRIMARY KEY,
-      kind TEXT NOT NULL,
-      address_json TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-    INSERT INTO destinations VALUES (
-      'dst_019f0000-0000-7000-8000-000000000020',
-      'macos-notification',
-      '{"title":"Preserved destination"}',
-      '2026-07-25T00:00:00.000Z',
-      '2026-07-25T00:00:00.000Z'
-    );
-    CREATE TABLE deliveries (
-      delivery_id TEXT PRIMARY KEY,
-      result_event_id TEXT NOT NULL,
-      destination_id TEXT NOT NULL,
-      status TEXT NOT NULL,
-      attempt_count INTEGER NOT NULL,
-      max_attempts INTEGER NOT NULL,
-      next_attempt_at TEXT NOT NULL,
-      receipt TEXT,
-      last_error TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-    INSERT INTO deliveries VALUES (
-      'del_019f0000-0000-7000-8000-000000000030',
-      'evt_019f0000-0000-7000-8000-000000000011',
-      'dst_019f0000-0000-7000-8000-000000000020',
-      'delivered',
-      1,
-      1,
-      '2026-07-25T00:02:00.000Z',
-      'fixture',
-      NULL,
-      '2026-07-25T00:02:00.000Z',
-      '2026-07-25T00:02:01.000Z'
-    );
-
-    CREATE TABLE chat_attention_receipts (
-      source_message_event_id TEXT NOT NULL,
-      agent_id TEXT NOT NULL,
-      outcome TEXT NOT NULL,
-      reason TEXT NOT NULL,
-      presence_snapshot_json TEXT NOT NULL,
-      dispatch_event_id TEXT,
-      prompt_resource_id TEXT,
-      created_at TEXT NOT NULL,
-      PRIMARY KEY(source_message_event_id, agent_id)
-    );
-    INSERT INTO chat_attention_receipts VALUES (
-      'evt_019f0000-0000-7000-8000-000000000010',
-      'prn_019f0000-0000-7000-8000-000000000002',
-      'skipped',
-      'topic-snoozed',
-      '{"global":{"scope":"global","mode":"available","wakeKeywords":[]},"topic":{"scope":"topic","mode":"snoozed","until":"2026-07-25T01:00:00.000Z","wakeKeywords":[]}}',
-      NULL,
-      NULL,
-      '2026-07-25T00:00:01.000Z'
-    );
-
-    CREATE TABLE notice_index (
-      notice_id TEXT PRIMARY KEY,
-      source_kind TEXT NOT NULL,
-      source_id TEXT NOT NULL,
-      title TEXT NOT NULL,
-      summary TEXT NOT NULL,
-      outcome TEXT NOT NULL,
-      delivery_status TEXT NOT NULL,
-      delivery_error TEXT,
-      event_id TEXT NOT NULL,
-      destination_id TEXT NOT NULL,
-      subscription_id TEXT,
-      occurred_at TEXT NOT NULL,
-      delivered_at TEXT,
-      projection_updated_at TEXT NOT NULL
-    );
-    INSERT INTO notice_index VALUES (
-      'ntc1_del_019f0000-0000-7000-8000-000000000030',
-      'delivery',
-      'del_019f0000-0000-7000-8000-000000000030',
-      'Preserved destination',
-      'done',
-      'succeeded',
-      'delivered',
-      NULL,
-      'evt_019f0000-0000-7000-8000-000000000011',
-      'dst_019f0000-0000-7000-8000-000000000020',
-      NULL,
-      '2026-07-25T00:01:00.000Z',
-      '2026-07-25T00:02:01.000Z',
-      '2026-07-25T00:02:01.000Z'
-    );
-    CREATE TABLE notice_states (
-      notice_id TEXT PRIMARY KEY,
-      read_at TEXT,
-      acknowledged_at TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-    INSERT INTO notice_states VALUES (
-      'ntc1_del_019f0000-0000-7000-8000-000000000030',
-      '2026-07-25T00:03:00.000Z',
-      NULL,
-      '2026-07-25T00:03:00.000Z',
-      '2026-07-25T00:03:00.000Z'
-    );
-  `);
+  return Number((database.prepare(`SELECT COUNT(*) AS count FROM "${table}"`).get() as {
+    count: number | bigint;
+  }).count);
 }

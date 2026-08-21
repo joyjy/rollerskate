@@ -1,94 +1,22 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
-import { LocalFoundationStore } from "../src/infrastructure/sqlite/foundation-store.js";
-import { runtimePaths } from "../src/infrastructure/runtime/config.js";
-import {
-  registerPollSubscription,
-  type RegisterPollSubscriptionInput
-} from "../src/application/subscription/control.js";
-import { RuntimeStore } from "../src/core/runtime/store.js";
+import { listSubscriptionViews } from "../src/application/subscription/control.js";
 import { runSubscriptionCommand } from "../src/entrypoints/cli/subscription.js";
+import { runtimePaths } from "../src/infrastructure/runtime/config.js";
+import { LocalFoundationStore } from "../src/infrastructure/sqlite/foundation-store.js";
 
-test("Subscription admission accepts a provider Session without pre-registration", () => {
-  const repo = mkdtempSync(join(tmpdir(), "rollerskate-subscription-control-repo-"));
-  const runtimeDirectory = mkdtempSync(join(tmpdir(), "rollerskate-subscription-control-runtime-"));
-  try {
-    const paths = runtimePaths(repo, runtimeDirectory);
-    const agents = new LocalFoundationStore(paths.database);
-    const alice = agents.addAgent("alice", "codex");
-    const bob = agents.addAgent("bob", "codex");
-    const suspended = agents.addAgent("paused", "codex");
-    agents.setAgentStatus(suspended.principalId, "suspended");
-    agents.close();
-    mkdirSync(paths.workspace, { recursive: true });
-
-    const aliceSession = seedSession(
-      paths.database,
-      alice.principalId,
-      "codex-runtime-jsonl-v1",
-      paths.workspace
-    );
-    const bobSession = seedSession(
-      paths.database,
-      bob.principalId,
-      "codex-runtime-jsonl-v1",
-      paths.workspace
-    );
-    const plugin = join(runtimeDirectory, "plugin.ts");
-    writeFileSync(plugin, "export default {};\n");
-
-    const registered = registerPollSubscription(
-      repo,
-      input(alice.principalId, aliceSession.providerSessionId, paths.workspace, plugin),
-      runtimeDirectory,
-      "2026-07-24T00:00:00.000Z"
-    );
-    assert.equal(registered.subscription.ownerAgentId, alice.principalId);
-    assert.equal(registered.subscription.callback.providerSessionId, aliceSession.providerSessionId);
-    assert.equal(registered.subscription.callback.localSessionId, aliceSession.sessionId);
-    assert.deepEqual({
-      principalId: registered.owner.principalId,
-      client: registered.owner.client
-    }, {
-      principalId: alice.principalId,
-      client: "codex"
-    });
-
-    assert.throws(
-      () => registerPollSubscription(
-        repo,
-        input(alice.principalId, bobSession.providerSessionId, paths.workspace, plugin),
-        runtimeDirectory
-      ),
-      /already bound to another Agent or workspace/
-    );
-    assert.throws(
-      () => registerPollSubscription(
-        repo,
-        input(suspended.principalId, "not-registered-yet", paths.workspace, plugin),
-        runtimeDirectory
-      ),
-      /Local Agent is not active/
-    );
-
-    const oneShot = registerPollSubscription(
-      repo,
-      input(alice.principalId, "desktop-thread-not-registered", paths.workspace, plugin),
-      runtimeDirectory
-    );
-    assert.equal(oneShot.subscription.callback.providerSessionId, "desktop-thread-not-registered");
-    assert.equal(oneShot.subscription.callback.localSessionId, undefined);
-  } finally {
-    rmSync(repo, { recursive: true, force: true });
-    rmSync(runtimeDirectory, { recursive: true, force: true });
-  }
-});
-
-test("Subscription CLI cleanly accepts providerSessionId and rejects sessionId", () => {
+test("Subscription CLI uses v3 for add, list, inspect and control", () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-subscription-cli-repo-"));
   const runtimeDirectory = mkdtempSync(join(tmpdir(), "rollerskate-subscription-cli-runtime-"));
   try {
@@ -96,79 +24,89 @@ test("Subscription CLI cleanly accepts providerSessionId and rejects sessionId",
     const agents = new LocalFoundationStore(paths.database);
     const owner = agents.addAgent("alice", "codex");
     agents.close();
-    const plugin = join(repo, "plugin.ts");
+    const workspace = realpathSync(repo);
+    const plugin = join(workspace, "plugin.mjs");
     writeFileSync(plugin, "export default {};\n");
-    const valid = join(repo, "subscription.json");
-    writeFileSync(valid, JSON.stringify({
-      schemaVersion: 2,
-      title: "Desktop continuation",
+    const definition = join(workspace, "subscription.json");
+    writeFileSync(definition, JSON.stringify({
+      schemaVersion: 3,
+      revision: "cli-v1",
+      title: "One-shot subscription",
       ownerAgentId: owner.principalId,
       probe: {
         plugin: { path: plugin, id: "fixture", config: {} },
-        policy: {}
+        artifactRevision: "fixture-v1",
+        artifactDigest: `sha256:${createHash("sha256")
+          .update(readFileSync(plugin)).digest("hex")}`,
+        policy: {
+          workspaceRoot: workspace,
+          allowedHttpOrigins: [],
+          allowedExecutables: [],
+          allowedEnvironment: [],
+          timeoutMilliseconds: 1_000,
+          maxOutputBytes: 4_096
+        }
       },
-      callback: {
-        providerSessionId: "desktop-provider-session",
-        prompt: "Report completion."
-      },
+      callbacks: [],
       schedule: {
         intervalMilliseconds: 1_000,
         maxWaitMilliseconds: 60_000,
         maxAttempts: 60
-      }
+      },
+      approvedGrantDigest: createHash("sha256").update("[]").digest("base64url")
     }));
+
     let output = "";
     assert.equal(runSubscriptionCommand(
       repo,
-      ["add", valid],
+      ["add", definition],
       { write(text) { output += text; } },
       runtimeDirectory,
-      repo
+      workspace
     ), 0);
-    const receipt = JSON.parse(output) as {
-      subscription: {
-        callback: {
-          providerSessionId: string;
-          workspace: string;
-          localSessionId?: string;
-        };
-      };
+    const created = JSON.parse(output) as {
+      subscription: { subscriptionId: string; definitionSchema: string };
     };
-    assert.deepEqual(receipt.subscription.callback, {
-      providerSessionId: "desktop-provider-session",
-      adapterId: "codex-runtime-jsonl-v1",
-      workspace: realpathSync(repo),
-      prompt: "Report completion."
-    });
+    assert.equal(created.subscription.definitionSchema, "SubscriptionDefinition@3");
 
-    const legacy = join(repo, "legacy-subscription.json");
-    writeFileSync(legacy, JSON.stringify({
-      schemaVersion: 2,
-      title: "Legacy callback",
-      ownerAgentId: owner.principalId,
-      probe: {
-        plugin: { path: plugin, id: "fixture", config: {} },
-        policy: {}
-      },
-      callback: {
-        sessionId: "ses_legacy",
-        prompt: "Report completion."
-      },
-      schedule: {
-        intervalMilliseconds: 1_000,
-        maxWaitMilliseconds: 60_000,
-        maxAttempts: 60
-      }
-    }));
+    output = "";
+    runSubscriptionCommand(repo, ["list"], { write(text) { output += text; } }, runtimeDirectory);
+    const listed = JSON.parse(output) as Array<{ id: string; kind: string }>;
+    assert.deepEqual(listed.map(({ id, kind }) => ({ id, kind })), [{
+      id: created.subscription.subscriptionId,
+      kind: "free"
+    }]);
+
+    output = "";
+    runSubscriptionCommand(
+      repo,
+      ["inspect", created.subscription.subscriptionId],
+      { write(text) { output += text; } },
+      runtimeDirectory
+    );
+    assert.equal((JSON.parse(output) as { definition: { schema: string } })
+      .definition.schema, "SubscriptionDefinition@3");
+
+    output = "";
+    runSubscriptionCommand(
+      repo,
+      ["pause", created.subscription.subscriptionId],
+      { write(text) { output += text; } },
+      runtimeDirectory
+    );
+    assert.equal((JSON.parse(output) as { status: string }).status, "paused");
+
+    const legacy = join(workspace, "legacy.json");
+    writeFileSync(legacy, JSON.stringify({ schemaVersion: 2 }));
     assert.throws(
       () => runSubscriptionCommand(
         repo,
         ["add", legacy],
         { write() {} },
         runtimeDirectory,
-        repo
+        workspace
       ),
-      /callback has unknown field: sessionId/
+      /schemaVersion must be 3 or ContinuousSubscriptionDefinition@1/
     );
   } finally {
     rmSync(repo, { recursive: true, force: true });
@@ -176,66 +114,107 @@ test("Subscription CLI cleanly accepts providerSessionId and rejects sessionId",
   }
 });
 
-function input(
-  ownerAgentId: string,
-  providerSessionId: string,
-  workspace: string,
-  pluginPath: string
-): RegisterPollSubscriptionInput {
-  return {
-    title: "Fixture pipeline",
-    ownerAgentId,
-    probe: {
-      plugin: {
-        path: pluginPath,
-        id: "fixture",
-        config: {}
-      },
-      policy: {
-        allowedHttpOrigins: [],
-        allowedExecutables: [],
-        allowedEnvironment: [],
-        timeoutMilliseconds: 1_000,
-        maxOutputBytes: 4_096
-      }
-    },
-    callback: { providerSessionId, workspace, prompt: "Report completion." },
-    intervalMilliseconds: 1_000,
-    maxWaitMilliseconds: 60_000,
-    maxAttempts: 60
-  };
-}
+test("Subscription add help exposes the trusted host command boundary", () => {
+  let output = "";
+  assert.equal(runSubscriptionCommand(
+    "/unused",
+    ["add", "--help"],
+    { write: (text) => { output += text; } }
+  ), 0);
+  assert.match(output, /runtime must be "host"/);
+  assert.match(output, /may start transitive child processes/);
+  assert.match(output, /legacy runtime: "node" callbacks remain readable but cannot be added/);
+});
 
-function seedSession(
-  database: string,
-  agentId: string,
-  adapterId: string,
-  workspace: string
-): { readonly sessionId: string; readonly providerSessionId: string } {
-  const runtime = new RuntimeStore(database);
+test("Subscription CLI creates and controls a ContinuousSubscriptionDefinition@1", () => {
+  const repo = mkdtempSync(join(tmpdir(), "rollerskate-continuous-cli-repo-"));
+  const runtimeDirectory = mkdtempSync(join(tmpdir(), "rollerskate-continuous-cli-runtime-"));
   try {
-    runtime.appendEvent({
-      type: "agent.request",
-      source: { kind: "cli" },
-      agentId,
-      prompt: "seed"
+    const paths = runtimePaths(repo, runtimeDirectory);
+    const agents = new LocalFoundationStore(paths.database);
+    const owner = agents.addAgent("continuous", "codex");
+    agents.close();
+    const plugin = join(repo, "continuous-plugin.mjs");
+    writeFileSync(plugin, "export default {};\n");
+    const definition = join(repo, "continuous.json");
+    const workspace = realpathSync(repo);
+    const callbackScript = join(workspace, "refresh.mjs");
+    writeFileSync(callbackScript, "process.stdout.write('refresh');\n");
+    writeFileSync(definition, JSON.stringify({
+      schemaVersion: "ContinuousSubscriptionDefinition@1",
+      revision: 1,
+      title: "Continuous data refresh",
+      ownerAgentId: owner.principalId,
+      probe: {
+        plugin: { path: plugin, id: "continuous-probe", config: {} },
+        policy: {
+          workspaceRoot: workspace,
+          allowedHttpOrigins: [],
+          allowedExecutables: [],
+          allowedEnvironment: [],
+          timeoutMilliseconds: 1_000,
+          maxOutputBytes: 4_096
+        }
+      },
+      callbacks: [{
+        callbackId: "refresh",
+        kind: "command.exec",
+        definition: {
+          schemaVersion: "ProactiveCallbackDefinition@1",
+          callbackId: "refresh",
+          kind: "command.exec",
+          runtime: "host",
+          executable: realpathSync(process.execPath),
+          argv: [callbackScript],
+          cwd: workspace,
+          environment: {},
+          timeoutMilliseconds: 1_000,
+          maxOutputBytes: 4_096
+        },
+        grant: {
+          schemaVersion: "ProactiveCallbackGrant@1",
+          kind: "command.exec",
+          runtime: "host",
+          executable: realpathSync(process.execPath),
+          argv: [callbackScript],
+          cwd: workspace,
+          environment: {},
+          filesystemRoots: [dirname(realpathSync(process.execPath)), workspace],
+          networkAccess: true,
+          timeoutMilliseconds: 1_000,
+          maxOutputBytes: 4_096,
+          secretReferences: []
+        }
+      }],
+      schedule: { intervalMilliseconds: 1_000 }
+    }));
+    let output = "";
+    assert.equal(runSubscriptionCommand(
+      repo,
+      ["add", definition],
+      { write(value) { output += value; } },
+      runtimeDirectory,
+      workspace
+    ), 0);
+    const created = JSON.parse(output) as { kind: string; id: string; status: string };
+    assert.deepEqual({ kind: created.kind, status: created.status }, {
+      kind: "continuous",
+      status: "active"
     });
-    const execution = runtime.claimDueExecutions()[0]!;
-    const providerSessionId = `${agentId}-provider-session`;
-    const result = runtime.completeExecution(execution.executionId, {
-      adapterId,
-      providerSessionId,
-      workspace,
-      output: "seeded"
-    });
-    assert.equal(result?.type, "agent.result");
-    const resultExecution = runtime.claimDueExecutions().find(
-      (candidate) => candidate.handler === "result"
+    assert.equal(
+      listSubscriptionViews(repo, runtimeDirectory).find(({ id }) => id === created.id)?.kind,
+      "continuous"
     );
-    assert.ok(resultExecution);
-    runtime.completeResultExecution(resultExecution.executionId);
-    return { sessionId: result.sessionId!, providerSessionId };
+    output = "";
+    runSubscriptionCommand(
+      repo,
+      ["pause", created.id],
+      { write(value) { output += value; } },
+      runtimeDirectory
+    );
+    assert.equal((JSON.parse(output) as { status: string }).status, "paused");
   } finally {
-    runtime.close();
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(runtimeDirectory, { recursive: true, force: true });
   }
-}
+});

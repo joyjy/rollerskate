@@ -1,37 +1,31 @@
 ---
 type: Runbook
-title: Poll Subscription
-description: 注册 Agent 编写的 TypeScript poll plugin，并在外部 shell command 完成后一次性续接固定 Session。
-tags: [rollerskate, subscription, polling, plugin, continuation]
+title: Subscription
+description: 注册版本化 poll Plugin，在 terminal observation 后执行 ordered exact-grant callbacks。
+tags: [rollerskate, subscription, polling, plugin, callback]
 ---
 
-# Poll Subscription
+# Subscription
 
 [返回 Quickstart](./quickstart.md)
 
 ## 前置条件
 
-- `scripts/rs start` 正在运行，调用方知道当前 provider session ID；Agent 是 Subscription 的准入主体，Codex、Claude Code 或 Kimi Code 会话是固定 callback target，不要求预先制造 Rollerskate `ses_`，也不要求 Room 或 Matrix。
-- Plugin 与版本化 Subscription JSON 位于本机普通文件中。Plugin config 不保存 access token；command probe 复用显式 allowlist 的环境，HTTP probe只引用 allowlist 的环境变量名。
-- `subscription add` 可在 Local Runtime loop 运行时执行；SQLite 负责并发与恢复，不需要重启 Runtime。
+- `scripts/rs start` 正在运行。
+- `ownerAgentId` 对应 active Local Agent。
+- Plugin 与 Subscription JSON 位于本机普通文件中；Plugin config 不保存 token。
+- probe 与 callback 使用绝对路径、canonical origin 和显式 authority。
 
-## Agent 工作流
+目标 shell command 由调用方执行一次并写入 durable receipt。Subscription 只轮询 receipt，不启动、重试或终止目标 command。仓库提供 [shell completion Plugin](../../examples/plugins/shell-command-completion.ts)、[receipt probe](../../examples/probes/read-command-receipt) 和 [command wrapper](../../examples/commands/run-with-receipt)。
 
-目标 shell command 由调用方执行一次，并在结束时写入固定 workspace receipt。Subscription 只轮询这个 receipt；它不启动、重试或终止目标 command。Plugin 只实现两步：`plan` 返回一次只读 command probe；`evaluate` 把 receipt 解析为 JSON facts 和 `continue | success | failure`。Plugin 不写 timer、循环或 Session continuation。
+## 注册 one-shot Subscription
 
-仓库提供 [shell completion Plugin](../../examples/plugins/shell-command-completion.ts)、[receipt probe](../../examples/probes/read-command-receipt) 和 [command wrapper](../../examples/commands/run-with-receipt)。它们是 Agent 可改写的示例，不被 Rollerskate core import；Plugin config 和 callback prompt 直接写入下面的单份 Subscription JSON。
-
-先在目标 workspace 执行一次命令；wrapper 会在 `.rollerskate-command-receipts/<command-id>.json` 以 atomic rename 写入 terminal receipt：
-
-```bash
-<repo>/examples/commands/run-with-receipt acceptance-1 sh -c 'sleep 10; exit 0'
-```
-
-创建 `subscription.json`，把 provider Session、probe definition、prompt 和 schedule 放进同一份版本化输入：
+公开输入只接受 `SubscriptionDefinition@3`：
 
 ```json
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
+  "revision": "acceptance-v1",
   "title": "Acceptance command completed",
   "ownerAgentId": "prn_uuidv7",
   "probe": {
@@ -44,7 +38,10 @@ tags: [rollerskate, subscription, polling, plugin, continuation]
         "cwd": "/absolute/workspace"
       }
     },
+    "artifactRevision": "git:commit-or-content-revision",
+    "artifactDigest": "sha256:<64-lowercase-hex>",
     "policy": {
+      "workspaceRoot": "/absolute/workspace",
       "allowedHttpOrigins": [],
       "allowedExecutables": [
         "/absolute/repo/examples/probes/read-command-receipt"
@@ -54,29 +51,33 @@ tags: [rollerskate, subscription, polling, plugin, continuation]
       "maxOutputBytes": 4096
     }
   },
-  "callback": {
-    "providerSessionId": "019f925c-9759-78b1-816f-781f78062885",
-    "prompt": "Report the command outcome."
-  },
+  "callbacks": [],
   "schedule": {
     "intervalMilliseconds": 1000,
     "maxWaitMilliseconds": 600000,
     "maxAttempts": 600
-  }
+  },
+  "approvedGrantDigest": "T1PNoYwrqgwDVLtfmj7L5e0Sq02OEbqHPC8RFhICuUU"
 }
 ```
 
-然后注册：
+上例没有 callback；terminal observation 自身就是最终产品状态。添加 callback 时，每项必须有系统格式的 `scb_` callback ID、kind、`ProactiveCallbackDefinition@1` definition 和 `ProactiveCallbackGrant@1` exact grant，随后重新计算 `approvedGrantDigest`。支持 `command.exec`、`agent.invoke` 和 `destination.deliver`，最多 16 项并按数组顺序执行。
+
+`command.exec` 的 definition 与 grant 都必须使用 `runtime: "host"`，并精确匹配 executable、argv、cwd、environment、timeout 和 output bound；grant 还声明 filesystem roots、真实的 network authority 与空 secret references。该 executable 是可信 host code，可以调用 Python、GTD CLI 或其他子进程，RS 不沙箱其传递子进程。执行前可用 `scripts/rs subscription add --help` 读取这条 contract；历史 SQLite 中的 `runtime: "node"` 记录只读兼容，不能新增或执行。
+
+`agent.invoke` grant 必须固定 owner Agent、workspace、`workspaceAccess` 与 `networkAccess`；one-shot Subscription adapter 会固定 terminal observation、workspace revision 与 `SubscriptionAgentResult@1` result contract。修改仓库或访问网络必须显式授权。Agent 对 readback 已证明未产生写入的确定性请求错误可以在 grant 内做有限纠正；缺少权限或凭据、target/revision 不明确、写入结果有歧义、需要扩 scope 或纠正已耗尽时，返回 durable `blocked` / `failed`。
+
+Plugin artifact digest 必须匹配 admission 时读取到的文件内容。首次 probe 安排在创建时间加一个完整 interval 之后，不会在注册瞬间执行。
 
 ```bash
 scripts/rs subscription add /absolute/workspace/subscription.json
 ```
 
-`title` 是用户可读的 Subscription 名称，也是 terminal callback 的 macOS 通知标题，必须为 1–120 个字符。`ownerAgentId` 可从 `scripts/rs agent list` 读取。Runtime 先确认该 Agent 为 active，再按 Agent client、当前工作目录和 `callback.providerSessionId` 固定 callback snapshot。若该 provider Session 已登记为本地 `ses_`，它必须属于同一 Agent 与 workspace；未登记时允许注册，并在 terminal fire 的同一事务中 lazy materialize `ses_`。Agent 创建时绑定的 client 决定 callback adapter；Codex Desktop 与 CLI 创建的会话仍由同一个 Codex Agent 和 `codex exec resume` 续接。
+## Continuous Subscription
 
-注册命令返回后，调用 Agent 必须立即结束当前 turn。首次 probe 安排在创建时间加一个完整 `intervalMilliseconds` 之后，不会在注册瞬间执行；这是为了降低 callback 与注册 turn 并发续接同一 provider Session 的概率。真实 smoke 已证明 idle 只避免并发，不保证外部 resume turn 在已打开的 Desktop/CLI 中热刷新。v0.3.2 的稳定契约是 callback 已执行并写入 provider history，再单独发送一次 macOS native notification；通知不等于 live delivery acknowledgement。
+长期观察使用 `schemaVersion: "ContinuousSubscriptionDefinition@1"`。它保留相同 probe 边界，schedule 只包含 `intervalMilliseconds`，callbacks 使用共享 proactive callback definition/grant。
 
-命令输出系统生成的 `sub_` UUIDv7；后续查询和控制使用该 ID。`probe.policy` 是 probe 的能力边界：`read-command-receipt` 是 Subscription 唯一需要执行的 allowlist command，目标 shell command 不应加入 allowlist。Runtime 使用 absolute executable + args、`shell:false` 执行 probe。
+Plugin 每次 observation 必须给出稳定 `occurrenceKey`。新 key materialize callback group；全部 callback terminal 后才 checkpoint。相同 key 不重复执行，crash-unknown occurrence 不自动 replay。
 
 ## 检查与控制
 
@@ -88,16 +89,12 @@ scripts/rs subscription resume sub_uuidv7
 scripts/rs subscription cancel sub_uuidv7
 ```
 
-Local UI 同样读取 durable Subscription，并提供 pause、resume 和 cancel。`unknown` 表示 provider 可能已经执行但 receipt 未确认，Runtime 不会自动重放；当前版本只展示该状态，reconcile 仍需后续显式语义，不允许 UI 猜测成功。
-
-terminal callback 成功或最终失败后，Runtime 都会为该结果建立一个 `macos-notification` Delivery，最多尝试一次。通知失败只会在 Event trace 的 Delivery 中显示为 `failed`，不会反转 callback 的 `agent.result`。通知提示结果已经保存；Desktop 用户重新打开 task，必要时重启 app；CLI 用户在方便时 exit 后运行 `codex resume <providerSessionId>`。
-
-通知标题、目标、投递状态、错误和 callback 结果会投影到 Runtime SQLite 的 Notice Center；可通过 Console 右上角入口，或 `scripts/rs notice list` 与 `scripts/rs notice inspect <notice-id>` 查看并持久化 read/ack，不依赖 macOS 通知中心的临时展示。Delivery receipt 仍以 Runtime Delivery 为事实源，可从 Notice 的 Event/Failure reference 下钻。
+这些命令同时适用于 one-shot 与 Continuous Subscription。Console 展示 terminal/checkpoint observation、callback definition、exact grant、receipt 与 error。不存在 v2 输入、legacy list item 或 parent `fireEventId`。
 
 ## 验收
 
-1. 注册后立即结束当前 Agent turn，在 CLI/UI 中确认 owner Agent、client、状态、attempt budget、deadline、provider Session 与 callback workspace 正确；注册后一个 interval 以内不应开始首次 probe。
-2. 在一次或多次非 terminal probe 后重启 `scripts/rs start`，确认 attempt count 延续而不是归零。
-3. shell command 结束并写入 terminal receipt 后，确认只生成一个 `subscription.fire`，Event payload 保存 terminal observation 的 version、terminal、summary 和 facts，terminal 事务创建或复用本地 `ses_`，原 provider Session 收到预定义 prompt 与 observation，并产生 `agent.result`、ResultHandler Execution 与一个 notification Delivery。
-4. 重启 Runtime 或再次运行 cycle，确认目标 command 没有被重新执行，Agent invocation 与 fire Event 不增加第二次。
-5. 在 Runtime、Event 与 Subscription 三页核对同一 durable facts，并确认 Notification Center 使用 JSON 中的 `title`；区分 provider history 已持久化、通知已送达和客户端是否已刷新。
+1. 注册后确认 definition revision/digest、probe artifact、owner、attempt budget、deadline 与 callback grants 正确。
+2. 一次或多次 non-terminal probe 后重启 Runtime，确认 attempt count 和 next poll 延续。
+3. terminal receipt 出现后，确认 terminal observation 只写入一次，callbacks 按 ordinal 执行并留下 receipt。
+4. 对 `agent.invoke`，确认 callback occurrence 引用唯一 `subscription.fire` Event，Event 使用 callback ID 幂等，并按 exact workspace/network grant 执行。
+5. 模拟 callback 中断，确认 started 与剩余 pending callback 收敛为 `unknown` 且不自动重放。

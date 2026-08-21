@@ -5,16 +5,27 @@ export interface AgentProcessClientConfig {
   readonly adapterId: string;
   readonly executable: string;
   readonly args?: string[] | ((request: unknown) => string[]);
-  readonly environment?: Readonly<Record<string, string>>;
+  readonly environment?: Readonly<Record<string, string>> |
+    ((request: unknown) => Readonly<Record<string, string>>);
   readonly workingDirectory?: string;
   readonly timeoutMilliseconds: number;
+  readonly meaningfulOutputTimeoutMilliseconds?: number;
   readonly maxOutputBytes?: number;
   readonly protocol?: AgentProcessProtocol;
 }
 
 export interface AgentProcessProtocol {
   readonly encodeRequest: (request: unknown) => string;
-  readonly decodeResponse: (output: string) => unknown;
+  readonly decodeResponse?: (output: string, request: unknown) => unknown;
+  readonly createResponseDecoder?: (
+    request: unknown,
+    maxOutputBytes: number
+  ) => AgentProcessResponseDecoder;
+}
+
+export interface AgentProcessResponseDecoder {
+  readonly push: (chunk: Buffer) => boolean;
+  readonly finish: () => unknown;
 }
 
 export interface AgentInvocationReceipt {
@@ -40,9 +51,9 @@ export class AgentProcessClient {
     if (
       !Number.isInteger(config.timeoutMilliseconds) ||
       config.timeoutMilliseconds < 1 ||
-      config.timeoutMilliseconds > 300_000
+      config.timeoutMilliseconds > 900_000
     ) {
-      throw new Error("timeoutMilliseconds must be between 1 and 300000");
+      throw new Error("timeoutMilliseconds must be between 1 and 900000");
     }
     if (
       config.maxOutputBytes !== undefined &&
@@ -51,6 +62,25 @@ export class AgentProcessClient {
         config.maxOutputBytes > 1_048_576)
     ) {
       throw new Error("maxOutputBytes must be between 1 and 1048576");
+    }
+    if (config.protocol !== undefined &&
+      config.protocol.decodeResponse === undefined &&
+      config.protocol.createResponseDecoder === undefined) {
+      throw new Error("agent process protocol requires a response decoder");
+    }
+    if (config.meaningfulOutputTimeoutMilliseconds !== undefined &&
+      (!Number.isInteger(config.meaningfulOutputTimeoutMilliseconds) ||
+        config.meaningfulOutputTimeoutMilliseconds < 1 ||
+        config.meaningfulOutputTimeoutMilliseconds > config.timeoutMilliseconds)) {
+      throw new Error(
+        "meaningfulOutputTimeoutMilliseconds must be between 1 and timeoutMilliseconds"
+      );
+    }
+    if (config.meaningfulOutputTimeoutMilliseconds !== undefined &&
+      config.protocol?.createResponseDecoder === undefined) {
+      throw new Error(
+        "meaningfulOutputTimeoutMilliseconds requires a streaming response decoder"
+      );
     }
     this.#config = config;
   }
@@ -74,6 +104,17 @@ export class AgentProcessClient {
     }
     const startedAt = new Date().toISOString();
     const maxOutputBytes = this.#config.maxOutputBytes ?? 65_536;
+    let responseDecoder: AgentProcessResponseDecoder | undefined;
+    try {
+      responseDecoder = this.#config.protocol?.createResponseDecoder?.(
+        request,
+        maxOutputBytes
+      );
+    } catch (error) {
+      return Promise.reject(new Error(
+        `agent response decoder initialization failed: ${errorMessage(error)}`
+      ));
+    }
     return new Promise((resolve, reject) => {
       const child = spawn(
         this.#config.executable,
@@ -85,13 +126,19 @@ export class AgentProcessClient {
           ...(this.#config.workingDirectory === undefined
             ? {}
             : { cwd: this.#config.workingDirectory }),
-          env: { ...(this.#config.environment ?? {}) },
+          env: {
+            ...(typeof this.#config.environment === "function"
+              ? this.#config.environment(request)
+              : this.#config.environment ?? {})
+          },
           stdio: ["pipe", "pipe", "pipe"]
         }
       );
       const stdout: Buffer[] = [];
+      const stdoutDiagnostics: Buffer[] = [];
       const stderr: Buffer[] = [];
       let stdoutBytes = 0;
+      let stdoutDiagnosticBytes = 0;
       let stderrBytes = 0;
       let settled = false;
 
@@ -101,6 +148,9 @@ export class AgentProcessClient {
         }
         settled = true;
         clearTimeout(timeout);
+        if (meaningfulOutputTimeout !== undefined) {
+          clearTimeout(meaningfulOutputTimeout);
+        }
         if (error !== undefined) {
           reject(error);
           return;
@@ -118,7 +168,36 @@ export class AgentProcessClient {
         finish(new Error(`agent invocation timed out: ${this.#config.adapterId}`));
       }, this.#config.timeoutMilliseconds);
 
+      let meaningfulOutputTimeout: NodeJS.Timeout | undefined;
+      const resetMeaningfulOutputTimeout = () => {
+        const milliseconds = this.#config.meaningfulOutputTimeoutMilliseconds;
+        if (milliseconds === undefined) return;
+        if (meaningfulOutputTimeout !== undefined) clearTimeout(meaningfulOutputTimeout);
+        meaningfulOutputTimeout = setTimeout(() => {
+          child.kill("SIGKILL");
+          finish(new Error(
+            `agent invocation stalled without meaningful output: ${this.#config.adapterId}`
+          ));
+        }, milliseconds);
+      };
+      resetMeaningfulOutputTimeout();
+
       child.stdout.on("data", (chunk: Buffer) => {
+        if (settled) return;
+        if (stdoutDiagnosticBytes < 16_384) {
+          const retained = chunk.subarray(0, 16_384 - stdoutDiagnosticBytes);
+          stdoutDiagnostics.push(Buffer.from(retained));
+          stdoutDiagnosticBytes += retained.length;
+        }
+        if (responseDecoder !== undefined) {
+          try {
+            if (responseDecoder.push(chunk)) resetMeaningfulOutputTimeout();
+          } catch (error) {
+            child.kill("SIGKILL");
+            finish(new Error(`agent response decoding failed: ${errorMessage(error)}`));
+          }
+          return;
+        }
         stdoutBytes += chunk.length;
         if (stdoutBytes > maxOutputBytes) {
           child.kill("SIGKILL");
@@ -128,6 +207,7 @@ export class AgentProcessClient {
         stdout.push(chunk);
       });
       child.stderr.on("data", (chunk: Buffer) => {
+        if (settled) return;
         stderrBytes += chunk.length;
         if (stderrBytes <= 16_384) {
           stderr.push(chunk);
@@ -140,19 +220,33 @@ export class AgentProcessClient {
           return;
         }
         if (code !== 0) {
+          const stderrText = Buffer.concat(stderr).toString("utf8").trim();
+          const stdoutText = Buffer.concat(
+            responseDecoder === undefined ? stdout : stdoutDiagnostics
+          )
+            .subarray(0, 16_384)
+            .toString("utf8")
+            .trim();
+          const detail = [
+            ...(stderrText === "" ? [] : [`stderr: ${stderrText}`]),
+            ...(stdoutText === "" ? [] : [`stdout: ${stdoutText}`])
+          ].join("\n");
           finish(new Error(
             `agent exited with code=${String(code)} signal=${String(signal)}: ` +
-            Buffer.concat(stderr).toString("utf8").trim()
+            (detail === "" ? "no process diagnostics" : detail)
           ));
           return;
         }
         try {
-          const output = Buffer.concat(stdout).toString("utf8");
           finish(
             undefined,
-            this.#config.protocol === undefined
-              ? JSON.parse(output) as unknown
-              : this.#config.protocol.decodeResponse(output)
+            responseDecoder !== undefined
+              ? responseDecoder.finish()
+              : decodeBufferedResponse(
+                  this.#config.protocol,
+                  Buffer.concat(stdout).toString("utf8"),
+                  request
+                )
           );
         } catch (error) {
           finish(new Error(
@@ -166,4 +260,20 @@ export class AgentProcessClient {
       child.stdin.end(requestJson);
     });
   }
+}
+
+function decodeBufferedResponse(
+  protocol: AgentProcessProtocol | undefined,
+  output: string,
+  request: unknown
+): unknown {
+  if (protocol === undefined) return JSON.parse(output) as unknown;
+  if (protocol.decodeResponse === undefined) {
+    throw new Error("agent process protocol has no buffered response decoder");
+  }
+  return protocol.decodeResponse(output, request);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

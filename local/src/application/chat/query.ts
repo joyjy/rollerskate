@@ -1,3 +1,5 @@
+import { join } from "node:path";
+
 import type {
   ChatMessageSummary,
   ChatPromptHistory,
@@ -29,6 +31,19 @@ export interface ChatMessageViewPage {
   readonly items: readonly ChatMessageView[];
   readonly hasEarlier: boolean;
   readonly beforeEventId?: string;
+}
+
+export interface ChatTimelineReader {
+  readonly read: (topicId: string, options?: ChatTimelineOptions) => ChatTimeline;
+  readonly close: () => void;
+}
+
+export function openChatTimelineReader(runtimeDirectory: string): ChatTimelineReader {
+  const store = new LocalChatStore(join(runtimeDirectory, "runtime.db"));
+  return {
+    read: (topicId, options = {}) => chatTimelineFromStore(store, topicId, options),
+    close: () => store.close()
+  };
 }
 
 export function localChatTimeline(
@@ -77,7 +92,7 @@ export function chatMessageViewsFromStore(
 
 export function boundedChatPromptHistory(
   timeline: ChatTimeline,
-  maximumBytes = 32_768
+  maximumBytes = 1_048_576
 ): ChatPromptHistory {
   if (!Number.isInteger(maximumBytes) || maximumBytes < 1) {
     throw new Error("Chat prompt history byte budget must be positive");
@@ -100,6 +115,30 @@ export function boundedChatPromptHistory(
   };
 }
 
+export function incrementalChatPromptHistory(
+  history: ChatPromptHistory,
+  boundary: {
+    readonly sourceMessageEventId?: string;
+    readonly dispatchCreatedAt: string;
+    readonly agentId: string;
+  }
+): ChatPromptHistory {
+  const boundaryTime = Date.parse(boundary.dispatchCreatedAt);
+  if (!Number.isFinite(boundaryTime)) {
+    throw new Error("Chat prompt Session boundary must be an ISO timestamp");
+  }
+  const sourceIndex = boundary.sourceMessageEventId === undefined
+    ? -1
+    : history.items.findIndex(({ eventId }) => eventId === boundary.sourceMessageEventId);
+  const candidates = sourceIndex === -1
+    ? history.items.filter((item) => Date.parse(item.createdAt) > boundaryTime)
+    : history.items.slice(sourceIndex + 1);
+  return {
+    items: candidates.filter((item) => item.sender.principalId !== boundary.agentId),
+    hasEarlier: false
+  };
+}
+
 function mapTimeline(topicId: string, page: ChatMessagePage): ChatTimeline {
   const visibleItems = page.items.filter((item) => item.dispatchCard === undefined);
   return {
@@ -116,6 +155,7 @@ function messageSummary(event: ChatMessageEvent): ChatMessageSummary {
     createdAt: event.createdAt,
     sender: event.sender,
     body: event.body,
-    ...(event.target === undefined ? {} : { target: event.target })
+    ...(event.replyToEventId === undefined ? {} : { replyToEventId: event.replyToEventId }),
+    ...(event.targets === undefined ? {} : { targets: event.targets })
   };
 }

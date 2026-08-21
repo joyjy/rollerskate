@@ -1,4 +1,4 @@
-import type { ChatMessageEvent } from "../event/model.js";
+import type { ChatActivationEvent, ChatMessageEvent } from "../event/model.js";
 import type { ChatPresence } from "./model.js";
 
 export type ChatAttentionReason =
@@ -10,7 +10,32 @@ export type ChatAttentionReason =
   | "not-target"
   | "agent-suspended"
   | "global-snoozed"
-  | "topic-snoozed";
+  | "topic-snoozed"
+  | "activation"
+  | "activation-not-selected"
+  | "activation-expired"
+  | "turn-budget-exhausted";
+
+const chatAttentionReasons: readonly ChatAttentionReason[] = [
+  "available",
+  "direct-mention",
+  "global-wake-keyword",
+  "topic-wake-keyword",
+  "sender",
+  "not-target",
+  "agent-suspended",
+  "global-snoozed",
+  "topic-snoozed",
+  "activation",
+  "activation-not-selected",
+  "activation-expired",
+  "turn-budget-exhausted"
+];
+
+export function isChatAttentionReason(value: unknown): value is ChatAttentionReason {
+  return typeof value === "string" &&
+    chatAttentionReasons.some((reason) => reason === value);
+}
 
 export interface ChatAttentionCandidate {
   readonly agentId: string;
@@ -47,11 +72,11 @@ export function planChatAttention(input: {
     if (candidate.status !== "active") {
       return skipped(candidate, "agent-suspended", snapshot);
     }
-    const targeted = input.message.target?.principalId;
-    if (targeted !== undefined && targeted !== candidate.agentId) {
+    const targeted = new Set(input.message.targets?.map((target) => target.principalId) ?? []);
+    if (targeted.size > 0 && !targeted.has(candidate.agentId)) {
       return skipped(candidate, "not-target", snapshot);
     }
-    const mentioned = targeted === candidate.agentId ||
+    const mentioned = targeted.has(candidate.agentId) ||
       includesMention(input.message.body, candidate.handle);
     if (mentioned) return dispatched(candidate, "direct-mention", snapshot);
 
@@ -68,6 +93,36 @@ export function planChatAttention(input: {
       return skipped(candidate, "topic-snoozed", snapshot);
     }
     return dispatched(candidate, "available", snapshot);
+  });
+}
+
+export function planChatActivation(input: {
+  readonly activation: ChatActivationEvent;
+  readonly candidates: readonly ChatAttentionCandidate[];
+  readonly now?: string;
+}): readonly ChatAttentionPlan[] {
+  const now = Date.parse(iso(input.now ?? new Date().toISOString()));
+  const selected = new Set(input.activation.candidateAgentIds);
+  return input.candidates.map((candidate) => {
+    const global = effectivePresence(candidate.globalPresence, "global", now);
+    const topic = effectivePresence(candidate.topicPresence, "topic", now);
+    const snapshot = { global, topic };
+    if (!selected.has(candidate.agentId)) {
+      return skipped(candidate, "activation-not-selected", snapshot);
+    }
+    if (Date.parse(input.activation.expiresAt) <= now) {
+      return skipped(candidate, "activation-expired", snapshot);
+    }
+    if (candidate.status !== "active") {
+      return skipped(candidate, "agent-suspended", snapshot);
+    }
+    if (global.mode === "snoozed") {
+      return skipped(candidate, "global-snoozed", snapshot);
+    }
+    if (topic.mode === "snoozed") {
+      return skipped(candidate, "topic-snoozed", snapshot);
+    }
+    return dispatched(candidate, "activation", snapshot);
   });
 }
 

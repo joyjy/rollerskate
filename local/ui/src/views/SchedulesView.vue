@@ -11,6 +11,7 @@ import {
 } from "@/api/schema";
 import { useApi } from "@/composables/useApi";
 import { useMutation } from "@/composables/useMutation";
+import AgentInvocationDetail from "@/components/AgentInvocationDetail.vue";
 import { formatDateTime } from "@/utils/format";
 
 const route = useRoute();
@@ -150,6 +151,21 @@ async function resolveRun(run: ScheduledRunViewOutput, outcome: "succeeded" | "f
   if (result !== null) receipt.value = `Run ${run.runId} resolved ${outcome}.`;
   mutationPaused.value = false;
 }
+
+function runConversationStatus(run: ScheduledRunViewOutput): string {
+  return run.audit?.resultEvent?.outcome ?? run.audit?.execution?.status ?? run.status;
+}
+
+function runConversationCompletedAt(run: ScheduledRunViewOutput): string | null {
+  return run.audit?.invocation?.completedAt ??
+    run.audit?.resultEvent?.createdAt ??
+    run.audit?.execution?.completedAt ??
+    run.completedAt;
+}
+
+function runConversationError(run: ScheduledRunViewOutput): string | null {
+  return run.audit?.resultEvent?.error ?? run.audit?.execution?.lastError ?? null;
+}
 </script>
 
 <template>
@@ -254,6 +270,47 @@ async function resolveRun(run: ScheduledRunViewOutput, outcome: "succeeded" | "f
                 <button type="button" class="text-button" :disabled="busy" @click="resolveRun(run, 'succeeded')">Resolve succeeded</button>
                 <button type="button" class="text-button danger" :disabled="busy" @click="resolveRun(run, 'failed')">Resolve failed</button>
               </div>
+              <details v-if="run.callbacks.length > 0" class="diagnostics-disclosure">
+                <summary>Callbacks · {{ run.callbacks.length }}</summary>
+                <div class="callback-list">
+                  <div v-for="callback in run.callbacks" :key="callback.occurrenceId" class="callback-row">
+                    <div class="run-head">
+                      <strong>{{ callback.ordinal + 1 }}. {{ callback.kind }}</strong>
+                      <span class="status-pill" :class="callback.status === 'succeeded' ? 'ok' : callback.status === 'failed' || callback.status === 'unknown' ? 'degraded' : ''">{{ callback.status }}</span>
+                      <span class="dim">{{ callback.phase }}</span>
+                    </div>
+                    <div class="run-refs">
+                      <span class="mono compact-ref">{{ callback.occurrenceId }}</span>
+                      <span v-if="callback.eventId" class="mono compact-ref">{{ callback.eventId }}</span>
+                      <span v-if="callback.deliveryId" class="mono compact-ref">{{ callback.deliveryId }}</span>
+                    </div>
+                    <div v-if="callback.delivery" class="dim">
+                      Delivery {{ callback.delivery.status }} · {{ callback.delivery.attemptCount }}/{{ callback.delivery.maxAttempts }} attempts
+                    </div>
+                    <div v-if="callback.lastError || callback.delivery?.lastError" class="state error">
+                      {{ callback.lastError ?? callback.delivery?.lastError }}
+                    </div>
+                    <pre v-if="callback.receipt !== null" class="mono callback-receipt">{{ JSON.stringify(callback.receipt, null, 2) }}</pre>
+                  </div>
+                </div>
+              </details>
+              <div v-if="run.audit" class="run-conversation">
+                <AgentInvocationDetail
+                  :agent="detail.summary.agent"
+                  :status="runConversationStatus(run)"
+                  :created-at="run.audit.event.createdAt"
+                  :completed-at="runConversationCompletedAt(run)"
+                  :prompt="run.audit.event.prompt ?? detail.revision.prompt"
+                  :effective-prompt="run.audit.invocation?.effectivePrompt"
+                  :raw-output="run.audit.resultEvent?.output"
+                  :error="runConversationError(run)"
+                  :invocation="run.audit.invocation"
+                  :request-event-id="run.audit.event.eventId"
+                  :result-event-id="run.audit.resultEvent?.eventId"
+                  :expanded="run === detail.runs[0]"
+                  expand-raw-output
+                />
+              </div>
             </article>
           </div>
         </section>
@@ -272,6 +329,9 @@ async function resolveRun(run: ScheduledRunViewOutput, outcome: "succeeded" | "f
 .operation-row.active { outline: 2px solid var(--primary-soft); }
 .row-top, .status-line, .run-head, .action-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .row-top { justify-content: space-between; }
+.callback-list { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.callback-row { display: flex; flex-direction: column; gap: 6px; padding: 8px; border: 1px solid var(--border); border-radius: var(--radius); }
+.callback-receipt { margin: 0; max-height: 180px; overflow: auto; white-space: pre-wrap; }
 .row-meta, .detail-label { color: var(--text-secondary); font-size: 12px; }
 .operations-detail { padding: 14px; display: flex; flex-direction: column; gap: 12px; }
 .detail-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
@@ -291,6 +351,7 @@ async function resolveRun(run: ScheduledRunViewOutput, outcome: "succeeded" | "f
 .run-row.unknown, .run-row.failed { border-color: var(--warning); }
 .run-row p { margin: 8px 0; color: var(--text-secondary); }
 .run-refs { display: flex; flex-wrap: wrap; gap: 8px; }
+.run-conversation { margin-top: 10px; }
 .failure-link { color: var(--danger); }
 .control-receipt { border: 1px solid var(--success); background: var(--success-soft); border-radius: var(--radius); padding: 9px 11px; }
 .compact-ref { overflow-wrap: anywhere; }

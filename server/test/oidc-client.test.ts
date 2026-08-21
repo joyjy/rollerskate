@@ -95,10 +95,9 @@ test("OIDC client uses discovery, PKCE and validates a signed ID token", async (
   );
 });
 
-test("OIDC public client supports POST authorization and secretless code exchange", async () => {
+test("OIDC public client uses browser GET authorization and secretless code exchange", async () => {
   const issuer = "https://identity.example.com/api/discov/client-id";
   const discoveryUrl = `${issuer}/.well-known/openid-configuration`;
-  let authorizationBody = "";
   let tokenBody = "";
   let tokenAuthorization: string | null = null;
   const fakeFetch: typeof fetch = async (input, init) => {
@@ -112,13 +111,6 @@ test("OIDC public client supports POST authorization and secretless code exchang
         id_token_signing_alg_values_supported: ["RS256"]
       });
     }
-    if (url === "https://identity.example.com/api/auth") {
-      authorizationBody = init?.body?.toString() ?? "";
-      return new Response(null, {
-        status: 302,
-        headers: { location: "/login?session=example" }
-      });
-    }
     if (url === "https://identity.example.com/api/token") {
       tokenBody = init?.body?.toString() ?? "";
       tokenAuthorization = new Headers(init?.headers).get("authorization");
@@ -130,7 +122,6 @@ test("OIDC public client supports POST authorization and secretless code exchang
     issuer,
     discoveryUrl,
     clientId: "client-id",
-    authorizationRequestMethod: "post",
     redirectUri: "http://localhost:4100/auth/callback",
     fetch: fakeFetch
   });
@@ -140,13 +131,17 @@ test("OIDC public client supports POST authorization and secretless code exchang
     nonce: "nonce",
     codeVerifier: "verifier"
   }));
-  assert.equal(authorization.href.startsWith("https://identity.example.com/login?"), true);
+  assert.equal(authorization.origin, "https://identity.example.com");
+  assert.equal(authorization.pathname, "/api/auth");
+  assert.equal(authorization.searchParams.get("response_type"), "code");
   assert.equal(authorization.searchParams.get("client_id"), "client-id");
   assert.equal(
     authorization.searchParams.get("redirect_uri"),
     "http://localhost:4100/auth/callback"
   );
-  assert.equal(new URLSearchParams(authorizationBody).get("code_challenge_method"), "S256");
+  assert.equal(authorization.searchParams.get("state"), "state");
+  assert.equal(authorization.searchParams.get("nonce"), "nonce");
+  assert.equal(authorization.searchParams.get("code_challenge_method"), "S256");
 
   await assert.rejects(
     () => client.exchangeAuthorizationCode({
@@ -165,7 +160,7 @@ test("OIDC client uses the discovered Device Authorization Grant", async () => {
   const clientId = "rollerskate-device";
   const { privateKey, publicKey } = await generateKeyPair("RS256");
   const jwk = await exportJWK(publicKey);
-  const idToken = await new SignJWT({ name: "Device Human" })
+  const idToken = await new SignJWT({ nickname: "Device Human" })
     .setProtectedHeader({ alg: "RS256", kid: "device-key" })
     .setIssuer(issuer)
     .setAudience(clientId)
@@ -241,7 +236,7 @@ test("OIDC client uses the discovered Device Authorization Grant", async () => {
       issuer,
       subject: "device-subject",
       displayName: "Device Human",
-      metadata: {}
+      metadata: { nickname: "Device Human" }
     }
   });
   for (const body of requestBodies) {

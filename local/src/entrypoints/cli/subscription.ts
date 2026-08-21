@@ -1,17 +1,33 @@
 import { readFileSync, realpathSync } from "node:fs";
 
 import {
-  controlPollSubscription,
-  inspectPollSubscription,
-  listPollSubscriptions,
-  registerPollSubscription,
-  type RegisterPollSubscriptionInput
+  controlSubscriptionView,
+  inspectSubscriptionView,
+  listSubscriptionViews,
+  registerSubscription,
+  type FreeSubscriptionDefinition
 } from "../../application/subscription/control.js";
-import type { PollSubscriptionInspection } from "../../application/subscription/control.js";
+import { parseExternalRefTriggerBinding } from
+  "../../application/external-resource/trigger-binding.js";
+import {
+  registerContinuousSubscription,
+  type ContinuousSubscriptionDefinition
+} from "../../application/subscription/continuous.js";
+import { parseProactiveCallbacks } from "../../application/callback/proactive.js";
+import { HOST_COMMAND_CALLBACK_HELP } from "./shared.js";
 
 interface Output {
   readonly write: (text: string) => void;
 }
+
+const HELP = [
+  "Usage:",
+  "  scripts/rs subscription add <json-file>",
+  "  scripts/rs subscription list",
+  "  scripts/rs subscription inspect|pause|resume|cancel <subscription-id>",
+  "",
+  HOST_COMMAND_CALLBACK_HELP
+].join("\n");
 
 export function runSubscriptionCommand(
   repoRoot: string,
@@ -21,68 +37,51 @@ export function runSubscriptionCommand(
   callbackWorkspace = process.cwd()
 ): number {
   const [command, ...rest] = arguments_;
+  if (command === "--help" || (command === "add" && rest[0] === "--help")) {
+    if (rest.length > (command === "add" ? 1 : 0)) {
+      throw new Error("subscription help accepts no additional arguments");
+    }
+    output.write(`${HELP}\n`);
+    return 0;
+  }
   if (command === "add") {
     const input = parseAdd(rest, callbackWorkspace);
-    output.write(`${JSON.stringify(
-      publicInspection(registerPollSubscription(repoRoot, input, runtimeDirectory)),
-      null,
-      2
-    )}\n`);
+    const inspection = input.schemaVersion === "ContinuousSubscriptionDefinition@1"
+      ? registerContinuousSubscription(repoRoot, input, runtimeDirectory)
+      : registerSubscription(repoRoot, input, runtimeDirectory);
+    output.write(`${JSON.stringify(inspection, null, 2)}\n`);
     return 0;
   }
   if (command === "list") {
     if (rest.length !== 0) throw new Error("subscription list accepts no arguments");
+    output.write(`${JSON.stringify(listSubscriptionViews(repoRoot, runtimeDirectory), null, 2)}\n`);
+    return 0;
+  }
+  if (command === "inspect") {
+    if (rest.length !== 1) throw new Error("subscription inspect requires exactly one id");
     output.write(`${JSON.stringify(
-      listPollSubscriptions(repoRoot, runtimeDirectory).map(publicInspection),
+      inspectSubscriptionView(repoRoot, rest[0]!, runtimeDirectory),
       null,
       2
     )}\n`);
     return 0;
   }
-  if (command === "inspect") {
-    if (rest.length !== 1) throw new Error("subscription inspect requires exactly one id");
-    output.write(`${JSON.stringify(publicInspection(inspectPollSubscription(
-      repoRoot,
-      rest[0]!,
-      runtimeDirectory
-    )), null, 2)}\n`);
-    return 0;
-  }
   if (command === "pause" || command === "resume" || command === "cancel") {
     if (rest.length !== 1) throw new Error(`subscription ${command} requires exactly one id`);
-    output.write(`${JSON.stringify(publicInspection(controlPollSubscription(
-      repoRoot,
-      rest[0]!,
-      command,
-      runtimeDirectory
-    )), null, 2)}\n`);
+    output.write(`${JSON.stringify(
+      controlSubscriptionView(repoRoot, rest[0]!, command, runtimeDirectory),
+      null,
+      2
+    )}\n`);
     return 0;
   }
   throw new Error("subscription requires add, list, inspect, pause, resume or cancel");
 }
 
-function publicInspection(inspection: PollSubscriptionInspection): unknown {
-  const { config: _config, ...plugin } = inspection.subscription.probe.plugin;
-  return {
-    subscription: {
-      ...inspection.subscription,
-      probe: {
-        ...inspection.subscription.probe,
-        plugin
-      }
-    },
-    owner: {
-      agentId: inspection.owner.principalId,
-      handle: inspection.owner.handle,
-      client: inspection.owner.client
-    }
-  };
-}
-
 function parseAdd(
   arguments_: readonly string[],
   callbackWorkspace: string
-): RegisterPollSubscriptionInput {
+): FreeSubscriptionDefinition | ContinuousSubscriptionDefinition {
   if (arguments_.length !== 1) {
     throw new Error("subscription add requires exactly one JSON file");
   }
@@ -94,30 +93,39 @@ function parseAdd(
     throw new Error(`subscription file must be valid JSON: ${message(error)}`);
   }
   const root = record(parsed, "subscription file");
-  exactKeys(root, [
-    "schemaVersion", "title", "ownerAgentId", "probe", "callback", "schedule"
-  ], "subscription file");
-  if (root.schemaVersion !== 2) {
-    throw new Error("subscription file schemaVersion must be 2");
+  if (root.schemaVersion === "ContinuousSubscriptionDefinition@1") {
+    return parseContinuous(root, callbackWorkspace);
   }
+  if (root.schemaVersion !== 3) {
+    throw new Error(
+      "subscription file schemaVersion must be 3 or ContinuousSubscriptionDefinition@1"
+    );
+  }
+  return parseV3(root, callbackWorkspace);
+}
+
+function parseContinuous(
+  root: Readonly<Record<string, unknown>>,
+  defaultWorkspace: string
+): ContinuousSubscriptionDefinition {
+  exactKeys(root, [
+    "schemaVersion", "revision", "title", "ownerAgentId", "probe", "callbacks", "schedule",
+    "externalRefBinding"
+  ], "subscription file");
   const probe = record(root.probe, "probe");
   exactKeys(probe, ["plugin", "policy"], "probe");
   const plugin = record(probe.plugin, "probe.plugin");
   exactKeys(plugin, ["path", "id", "config"], "probe.plugin");
-  const callback = record(root.callback, "callback");
-  exactKeys(callback, ["providerSessionId", "prompt"], "callback");
-  const schedule = record(root.schedule, "schedule");
-  exactKeys(schedule, [
-    "intervalMilliseconds", "maxWaitMilliseconds", "maxAttempts"
-  ], "schedule");
-  const policy = probe.policy === undefined
-    ? {}
-    : record(probe.policy, "probe.policy");
+  const policy = record(probe.policy, "probe.policy");
   exactKeys(policy, [
-    "allowedHttpOrigins", "allowedExecutables", "allowedEnvironment",
-    "timeoutMilliseconds", "maxOutputBytes"
+    "workspaceRoot", "allowedHttpOrigins", "allowedExecutables",
+    "allowedEnvironment", "timeoutMilliseconds", "maxOutputBytes"
   ], "probe.policy");
+  const schedule = record(root.schedule, "schedule");
+  exactKeys(schedule, ["intervalMilliseconds"], "schedule");
   return {
+    schemaVersion: "ContinuousSubscriptionDefinition@1",
+    revision: integer(root.revision, "revision"),
     title: text(root.title, "title"),
     ownerAgentId: text(root.ownerAgentId, "ownerAgentId"),
     probe: {
@@ -127,16 +135,66 @@ function parseAdd(
         config: plugin.config
       },
       policy: {
-        timeoutMilliseconds: optionalInteger(
-          policy.timeoutMilliseconds,
-          "probe.policy.timeoutMilliseconds",
-          30_000
-        ),
-        maxOutputBytes: optionalInteger(
-          policy.maxOutputBytes,
-          "probe.policy.maxOutputBytes",
-          1_048_576
-        ),
+        workspaceRoot: policy.workspaceRoot === undefined
+          ? realpathSync(defaultWorkspace)
+          : text(policy.workspaceRoot, "probe.policy.workspaceRoot"),
+        allowedHttpOrigins: stringArray(policy.allowedHttpOrigins, "allowedHttpOrigins"),
+        allowedExecutables: stringArray(policy.allowedExecutables, "allowedExecutables"),
+        allowedEnvironment: stringArray(policy.allowedEnvironment, "allowedEnvironment"),
+        timeoutMilliseconds: integer(policy.timeoutMilliseconds, "timeoutMilliseconds"),
+        maxOutputBytes: integer(policy.maxOutputBytes, "maxOutputBytes")
+      }
+    },
+    intervalMilliseconds: integer(schedule.intervalMilliseconds, "schedule.intervalMilliseconds"),
+    callbacks: parseProactiveCallbacks(root.callbacks),
+    ...(root.externalRefBinding === undefined
+      ? {}
+      : { externalRefBinding: parseExternalRefTriggerBinding(root.externalRefBinding) })
+  };
+}
+
+function parseV3(
+  root: Readonly<Record<string, unknown>>,
+  defaultWorkspace: string
+): FreeSubscriptionDefinition {
+  exactKeys(root, [
+    "schemaVersion", "revision", "title", "ownerAgentId", "probe", "callbacks",
+    "schedule", "approvedGrantDigest", "externalRefBinding"
+  ], "subscription file");
+  const probe = record(root.probe, "probe");
+  exactKeys(probe, [
+    "plugin", "policy", "artifactRevision", "artifactDigest"
+  ], "probe");
+  const plugin = record(probe.plugin, "probe.plugin");
+  exactKeys(plugin, ["path", "id", "config"], "probe.plugin");
+  const policy = record(probe.policy, "probe.policy");
+  exactKeys(policy, [
+    "workspaceRoot", "allowedHttpOrigins", "allowedExecutables",
+    "allowedEnvironment", "timeoutMilliseconds", "maxOutputBytes"
+  ], "probe.policy");
+  const schedule = record(root.schedule, "schedule");
+  exactKeys(schedule, [
+    "intervalMilliseconds", "maxWaitMilliseconds", "maxAttempts"
+  ], "schedule");
+  const callbacks = parseProactiveCallbacks(root.callbacks);
+  return {
+    schemaVersion: 3,
+    revision: text(root.revision, "revision"),
+    title: text(root.title, "title"),
+    ownerAgentId: text(root.ownerAgentId, "ownerAgentId"),
+    probe: {
+      plugin: {
+        path: text(plugin.path, "probe.plugin.path"),
+        id: text(plugin.id, "probe.plugin.id"),
+        schemaVersion: 1,
+        config: plugin.config
+      },
+      artifactRevision: text(probe.artifactRevision, "probe.artifactRevision"),
+      artifactDigest: text(probe.artifactDigest, "probe.artifactDigest"),
+      policy: {
+        workspaceRoot: policy.workspaceRoot === undefined
+          ? realpathSync(defaultWorkspace)
+          : text(policy.workspaceRoot, "probe.policy.workspaceRoot"),
         allowedHttpOrigins: stringArray(
           policy.allowedHttpOrigins,
           "probe.policy.allowedHttpOrigins"
@@ -148,20 +206,28 @@ function parseAdd(
         allowedEnvironment: stringArray(
           policy.allowedEnvironment,
           "probe.policy.allowedEnvironment"
-        )
+        ),
+        timeoutMilliseconds: integer(
+          policy.timeoutMilliseconds,
+          "probe.policy.timeoutMilliseconds"
+        ),
+        maxOutputBytes: integer(policy.maxOutputBytes, "probe.policy.maxOutputBytes")
       }
     },
-    callback: {
-      providerSessionId: text(
-        callback.providerSessionId,
-        "callback.providerSessionId"
-      ),
-      workspace: callbackWorkspace,
-      prompt: text(callback.prompt, "callback.prompt")
-    },
-    intervalMilliseconds: integer(schedule.intervalMilliseconds, "schedule.intervalMilliseconds"),
-    maxWaitMilliseconds: integer(schedule.maxWaitMilliseconds, "schedule.maxWaitMilliseconds"),
-    maxAttempts: integer(schedule.maxAttempts, "schedule.maxAttempts")
+    callbacks,
+    intervalMilliseconds: integer(
+      schedule.intervalMilliseconds,
+      "schedule.intervalMilliseconds"
+    ),
+    maxWaitMilliseconds: integer(
+      schedule.maxWaitMilliseconds,
+      "schedule.maxWaitMilliseconds"
+    ),
+    maxAttempts: integer(schedule.maxAttempts, "schedule.maxAttempts"),
+    approvedGrantDigest: text(root.approvedGrantDigest, "approvedGrantDigest"),
+    ...(root.externalRefBinding === undefined
+      ? {}
+      : { externalRefBinding: parseExternalRefTriggerBinding(root.externalRefBinding) })
   };
 }
 
@@ -186,14 +252,6 @@ function text(value: unknown, field: string): string {
     throw new Error(`${field} must be a non-empty string`);
   }
   return value;
-}
-
-function optionalInteger(
-  value: unknown,
-  field: string,
-  fallback: number
-): number {
-  return value === undefined ? fallback : integer(value, field);
 }
 
 function integer(value: unknown, field: string): number {

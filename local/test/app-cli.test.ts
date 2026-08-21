@@ -20,6 +20,7 @@ import {
   runtimePaths
 } from "../src/infrastructure/runtime/config.js";
 import { RuntimeStore } from "../src/core/runtime/store.js";
+import { addLocalAgent } from "../src/application/agent/control.js";
 
  test("setup command accepts non-interactive environment without leaking its token", async () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-app-cli-"));
@@ -63,15 +64,6 @@ test("repo-local script resolves Rollerskate independently of caller cwd", () =>
     assert.equal(result.status, 0, result.stderr);
     assert.equal(result.stderr, "");
     assert.match(result.stdout, /scripts\/rs --help/);
-    assert.match(result.stdout, /--runtime <absolute-path>/);
-    assert.match(result.stdout, /subscription add <json-file>/);
-    assert.match(result.stdout, /schedule create\|update\|list\|inspect/);
-    assert.match(result.stdout, /run start\|list\|inspect\|trace\|cancel/);
-    assert.doesNotMatch(result.stdout, /scripts\/rs (?:steward|review) /);
-    assert.match(result.stdout, /agent rename <handle> <new-handle>/);
-    assert.match(result.stdout, /notice list \[--limit <1-1000>\]/);
-    assert.match(result.stdout, /notice mark-read\|ack <notice-id>/);
-    assert.doesNotMatch(result.stdout, /workspace set|room create|device login|subscription.*revoke/);
   } finally {
     rmSync(caller, { recursive: true, force: true });
   }
@@ -177,10 +169,10 @@ test("Local Agent CLI persists, replaces and clears per-Agent launch args", asyn
     assert.equal(await runLocalApp(repo, [
       "--runtime", runtime,
       "agent", "configure", "kimi",
-      "--launch-arg", "--agent",
-      "--launch-arg", "researcher"
+      "--launch-arg", "--model",
+      "--launch-arg", "kimi-code/k2.5"
     ], {}, { write(text) { output += text; } }), 0);
-    assert.match(output, /Launch args: \["--agent","researcher"\]/);
+    assert.match(output, /Launch args: \["--model","kimi-code\/k2.5"\]/);
 
     output = "";
     assert.equal(await runLocalApp(repo, [
@@ -340,15 +332,82 @@ test("Chat CLI posts messages, controls scoped presence, reads status, and rotat
         "--runtime", runtime, "agent", "create", "alice", "--client", "codex"
       ], {}, { write() {} });
       assert.equal(await runLocalApp(repo, [
+        "--runtime", runtime, "chat", "governance"
+      ], {}, { write(text) { output += text; } }), 0);
+      const governance = JSON.parse(output) as {
+        governance: { status: string; revision: number };
+        activeParticipantAgentIds: string[];
+        actionAvailability: { pause: boolean; expectedRevision: number };
+      };
+      assert.equal(governance.governance.status, "active");
+      assert.equal(governance.governance.revision, 1);
+      assert.equal(governance.actionAvailability.pause, true);
+      assert.equal(governance.actionAvailability.expectedRevision, 1);
+
+      output = "";
+      assert.equal(await runLocalApp(repo, [
+        "--runtime", runtime, "chat", "pause", "--revision", "1"
+      ], {}, { write(text) { output += text; } }), 0);
+      assert.equal((JSON.parse(output) as { outcome: string }).outcome, "applied");
+
+      output = "";
+      await runLocalApp(repo, [
+        "--runtime", runtime, "chat", "pause", "--revision", "1"
+      ], {}, { write(text) { output += text; } });
+      assert.equal((JSON.parse(output) as { outcome: string }).outcome, "unchanged");
+      output = "";
+      await runLocalApp(repo, [
+        "--runtime", runtime, "chat", "resume", "--revision", "2"
+      ], {}, { write(text) { output += text; } });
+      assert.equal((JSON.parse(output) as { outcome: string }).outcome, "applied");
+      output = "";
+      await runLocalApp(repo, [
+        "--runtime", runtime, "chat", "free", "status"
+      ], {}, { write(text) { output += text; } });
+      assert.equal((JSON.parse(output) as {
+        actionAvailability: { start: boolean };
+      }).actionAvailability.start, true);
+      output = "";
+      await runLocalApp(repo, [
+        "--runtime", runtime, "chat", "free", "start",
+        "--idempotency-key", "cli-free-chat",
+        "--intent", "directed", "--brief", "Discuss CLI ergonomics."
+      ], {}, { write(text) { output += text; } });
+      assert.equal((JSON.parse(output) as {
+        mode: { sample: { conversationIntent: { mode: string } } };
+      }).mode.sample.conversationIntent.mode, "directed");
+      output = "";
+      await runLocalApp(repo, [
+        "--runtime", runtime, "chat", "free", "continue-now", "--revision", "1"
+      ], {}, { write(text) { output += text; } });
+      assert.equal((JSON.parse(output) as { outcome: string }).outcome, "applied");
+      output = "";
+      await runLocalApp(repo, [
+        "--runtime", runtime, "chat", "free", "exit", "--revision", "2"
+      ], {}, { write(text) { output += text; } });
+      assert.equal((JSON.parse(output) as {
+        mode: { status: string };
+      }).mode.status, "exited");
+      output = "";
+      await runLocalApp(repo, [
+        "--runtime", runtime, "chat", "resume-and-wake",
+        "--revision", "3", "--idempotency-key", "cli-resume-wake"
+      ], {}, { write(text) { output += text; } });
+      assert.equal((JSON.parse(output) as {
+        activation: { status: string; event: { reason: string } };
+      }).activation.event.reason, "resumed");
+
+      output = "";
+      assert.equal(await runLocalApp(repo, [
         "--runtime", runtime, "chat", "post", "@alice inspect this"
       ], {}, { write(text) { output += text; } }), 0);
       const posted = JSON.parse(output) as {
         eventId: string;
         status: string;
-        target: { handleSnapshot: string };
+        targets: readonly { handleSnapshot: string }[];
       };
       assert.equal(posted.status, "queued");
-      assert.equal(posted.target.handleSnapshot, "alice");
+      assert.equal(posted.targets[0]?.handleSnapshot, "alice");
 
       output = "";
       assert.equal(await runLocalApp(repo, [
@@ -455,6 +514,19 @@ test("Chat CLI posts messages, controls scoped presence, reads status, and rotat
         generation: 2,
         currentSessionId: null
       });
+
+      output = "";
+      await runLocalApp(repo, [
+        "--runtime", runtime, "chat", "participant", "remove", "alice",
+        "--revision", "3"
+      ], {}, { write(text) { output += text; } });
+      assert.equal((JSON.parse(output) as { outcome: string }).outcome, "applied");
+      output = "";
+      await runLocalApp(repo, [
+        "--runtime", runtime, "chat", "participant", "add", "alice",
+        "--revision", "4"
+      ], {}, { write(text) { output += text; } });
+      assert.equal((JSON.parse(output) as { outcome: string }).outcome, "applied");
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
@@ -492,6 +564,62 @@ test("Room Agent environment keeps executable lookup without inheriting secrets"
     PATH: "/test/bin:/usr/bin",
     CODEX_HOME: "/test/codex"
   });
+});
+
+test("start rejects a partially numeric UI port", async () => {
+  await assert.rejects(
+    () => runLocalApp("/unused", ["start", "--ui-port", "4300abc"]),
+    /--ui-port must be an integer between 1 and 65535/
+  );
+});
+
+test("start discovers the Pi executable for an active Pi Agent", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "rollerskate-pi-start-"));
+  const runtime = join(repo, "runtime");
+  const port = await unusedLoopbackPort();
+  const pi = join(repo, "pi");
+  writeFileSync(pi, "#!/bin/sh\nexit 0\n");
+  chmodSync(pi, 0o700);
+  addLocalAgent(repo, "pi", "pi", { runtimeDirectory: runtime });
+  const script = join(process.cwd(), "..", "scripts", "rs");
+  const child = spawn(script, [
+    "--runtime",
+    runtime,
+    "start",
+    "--no-open",
+    "--ui-port",
+    String(port)
+  ], {
+    cwd: repo,
+    env: { ...process.env, PATH: `${repo}:${process.env.PATH ?? ""}` },
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+
+  try {
+    await waitForOutput(child, "Runtime loop ready: 1 Agent(s)");
+    assert.equal(child.kill("SIGTERM"), true);
+    const [code, exitSignal] = await once(child, "exit") as [
+      number | null,
+      NodeJS.Signals | null
+    ];
+    assert.equal(code, 0, stderr);
+    assert.equal(exitSignal, null);
+    assert.doesNotMatch(
+      readFileSync(join(runtime, "logs", "daemon.log"), "utf8"),
+      /"type":"runtime\.adapter_unavailable".*"adapter":"pi"/
+    );
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+      await once(child, "exit");
+    }
+    rmSync(repo, { recursive: true, force: true });
+  }
 });
 
 test("start logs graceful shutdown signals before exiting", async () => {

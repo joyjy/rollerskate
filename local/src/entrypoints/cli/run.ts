@@ -1,20 +1,27 @@
 import { readFileSync, realpathSync } from "node:fs";
 
 import {
-  cancelAgentRun,
-  startAgentRun,
-  type StartAgentRunInput
-} from "../../application/agent-run/control.js";
+  cancelStewardRun,
+  closeStewardRunSeries,
+  startStewardRun,
+  submitCallerRunDecision,
+  type StartStewardRunInput
+} from "../../application/steward/control.js";
 import {
-  inspectAgentRunView,
-  listAgentRunViews
-} from "../../application/agent-run/query.js";
+  inspectStewardRunView,
+  listStewardRunViews
+} from "../../application/steward/query.js";
+
+type WorkspaceEffect = Extract<
+  NonNullable<StartStewardRunInput["workspace"]>,
+  { readonly access: "write" }
+>["effect"];
 
 interface Output {
   readonly write: (text: string) => void;
 }
 
-export function runAgentRunCommand(
+export function runStewardCommand(
   repoRoot: string,
   arguments_: readonly string[],
   output: Output,
@@ -25,7 +32,7 @@ export function runAgentRunCommand(
     if (rest.length !== 3 || rest[1] !== "--request-id") {
       throw new Error("run start requires <json-file> --request-id <idempotency-key>");
     }
-    write(output, startAgentRun(
+    write(output, startStewardRun(
       repoRoot,
       {
         ...parseRunFile(rest[0]!),
@@ -39,7 +46,7 @@ export function runAgentRunCommand(
     if (rest.length !== 0 && !(rest.length === 2 && rest[0] === "--limit")) {
       throw new Error("run list accepts [--limit <count>]");
     }
-    write(output, listAgentRunViews(
+    write(output, listStewardRunViews(
       repoRoot,
       runtimeDirectory,
       rest.length === 0 ? 100 : integer(rest[1], "limit", 1, 1_000)
@@ -47,19 +54,46 @@ export function runAgentRunCommand(
     return 0;
   }
   if (command === "inspect" || command === "trace") {
-    requireCount(rest, 1, `run ${command} requires exactly one Agent Run id`);
-    write(output, inspectAgentRunView(repoRoot, rest[0]!, runtimeDirectory));
+    requireCount(rest, 1, `run ${command} requires exactly one Steward Run id`);
+    write(output, inspectStewardRunView(repoRoot, rest[0]!, runtimeDirectory));
     return 0;
   }
   if (command === "cancel") {
-    requireCount(rest, 1, "run cancel requires exactly one Agent Run id");
-    write(output, cancelAgentRun(repoRoot, rest[0]!, runtimeDirectory));
+    requireCount(rest, 1, "run cancel requires exactly one Steward Run id");
+    write(output, cancelStewardRun(repoRoot, rest[0]!, runtimeDirectory));
     return 0;
   }
-  throw new Error("run requires start, list, inspect, trace or cancel");
+  if (command === "close") {
+    requireCount(rest, 1, "run close requires exactly one Steward Run id");
+    write(output, closeStewardRunSeries(
+      repoRoot,
+      rest[0]!,
+      "Source lifecycle closed",
+      runtimeDirectory
+    ));
+    return 0;
+  }
+  if (command === "decide") {
+    if (rest.length !== 4 || rest[2] !== "--request-id") {
+      throw new Error(
+        "run decide requires <run-id> <json-file> --request-id <idempotency-key>"
+      );
+    }
+    write(output, submitCallerRunDecision(
+      repoRoot,
+      rest[0]!,
+      {
+        requestId: text(rest[3], "requestId"),
+        decision: parseJsonFile(rest[1]!, "RunDecision@1")
+      },
+      runtimeDirectory
+    ));
+    return 0;
+  }
+  throw new Error("run requires start, list, inspect, trace, decide, close or cancel");
 }
 
-function parseRunFile(pathInput: string): Omit<StartAgentRunInput, "requestId"> {
+function parseRunFile(pathInput: string): Omit<StartStewardRunInput, "requestId"> {
   const path = realpathSync(pathInput);
   let parsed: unknown;
   try {
@@ -70,6 +104,7 @@ function parseRunFile(pathInput: string): Omit<StartAgentRunInput, "requestId"> 
   const root = record(parsed, "run file");
   exactKeys(root, [
     "schemaVersion",
+    "series",
     "steward",
     "objective",
     "workflowRef",
@@ -77,14 +112,18 @@ function parseRunFile(pathInput: string): Omit<StartAgentRunInput, "requestId"> 
     "workspace",
     "maxSteps",
     "maxDepth",
-    "deadlineAt"
+    "deadlineAt",
+    "taskUrl",
+    "participantAgentIds",
+    "orchestration"
   ]);
   if (root.schemaVersion !== 1) throw new Error("run file schemaVersion must be 1");
   const workspace = root.workspace === undefined
     ? undefined
     : workspaceInput(root.workspace);
   return {
-    steward: text(root.steward, "steward"),
+    ...(root.series === undefined ? {} : { series: seriesInput(root.series) }),
+    ...(root.steward === undefined ? {} : { steward: text(root.steward, "steward") }),
     ...(root.objective === undefined
       ? {}
       : { objective: text(root.objective, "objective") }),
@@ -103,22 +142,102 @@ function parseRunFile(pathInput: string): Omit<StartAgentRunInput, "requestId"> 
       : { maxDepth: integer(root.maxDepth, "maxDepth", 0, 100) }),
     ...(root.deadlineAt === undefined
       ? {}
-      : { deadlineAt: text(root.deadlineAt, "deadlineAt") })
+      : { deadlineAt: text(root.deadlineAt, "deadlineAt") }),
+    ...(root.taskUrl === undefined
+      ? {}
+      : { taskUrl: text(root.taskUrl, "taskUrl") }),
+    ...(root.participantAgentIds === undefined
+      ? {}
+      : { participantAgentIds: stringList(root.participantAgentIds, "participantAgentIds") }),
+    ...(root.orchestration === undefined
+      ? {}
+      : { orchestration: orchestrationInput(root.orchestration) })
   };
+}
+
+function seriesInput(value: unknown): { readonly key: string; readonly sourceRevision: string } {
+  const series = record(value, "series");
+  exactKeys(series, ["key", "sourceRevision"]);
+  return {
+    key: text(series.key, "series.key"),
+    sourceRevision: text(series.sourceRevision, "series.sourceRevision")
+  };
+}
+
+function parseJsonFile(
+  pathInput: string,
+  field: string
+): Readonly<Record<string, unknown>> {
+  const path = realpathSync(pathInput);
+  try {
+    return record(JSON.parse(readFileSync(path, "utf8")) as unknown, field);
+  } catch (error) {
+    throw new Error(`${field} file must be valid JSON: ${message(error)}`);
+  }
+}
+
+function orchestrationInput(
+  value: unknown
+): { readonly mode: "autonomous" | "caller" | "steward" } {
+  const orchestration = record(value, "orchestration");
+  exactKeys(orchestration, ["mode"]);
+  if (orchestration.mode !== "autonomous" && orchestration.mode !== "caller" &&
+    orchestration.mode !== "steward") {
+    throw new Error("orchestration.mode must be autonomous, caller or steward");
+  }
+  return { mode: orchestration.mode };
+}
+
+function stringList(value: unknown, field: string): readonly string[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 64) {
+    throw new Error(`${field} must contain 1-64 strings`);
+  }
+  return value.map((item, index) => text(item, `${field}[${index}]`));
 }
 
 function workspaceInput(value: unknown): {
   readonly root: string;
-  readonly access: "read" | "write";
+  readonly access: "read";
+  readonly networkAccess?: boolean;
+} | {
+  readonly root: string;
+  readonly access: "write";
+  readonly effect: WorkspaceEffect;
+  readonly networkAccess?: boolean;
 } {
   const workspace = record(value, "workspace");
-  exactKeys(workspace, ["root", "access"]);
+  exactKeys(workspace, ["root", "access", "effect", "networkAccess"]);
   if (workspace.access !== "read" && workspace.access !== "write") {
     throw new Error("workspace.access must be read or write");
   }
+  if (workspace.networkAccess !== undefined &&
+    typeof workspace.networkAccess !== "boolean") {
+    throw new Error("workspace.networkAccess must be boolean");
+  }
+  if (workspace.networkAccess === true && workspace.access !== "write") {
+    throw new Error("workspace.networkAccess requires workspace.access=write");
+  }
+  if (workspace.access === "write" && workspace.effect !== "must_change" &&
+    workspace.effect !== "may_remain_unchanged") {
+    throw new Error("workspace.effect is required for write access");
+  }
+  if (workspace.access === "read" && workspace.effect !== undefined) {
+    throw new Error("workspace.effect is valid only with write access");
+  }
+  const root = text(workspace.root, "workspace.root");
+  const networkAccess = workspace.networkAccess as boolean | undefined;
+  if (workspace.access === "read") {
+    return {
+      root,
+      access: "read",
+      ...(networkAccess === undefined ? {} : { networkAccess })
+    };
+  }
   return {
-    root: text(workspace.root, "workspace.root"),
-    access: workspace.access
+    root,
+    access: "write",
+    effect: workspace.effect as WorkspaceEffect,
+    ...(networkAccess === undefined ? {} : { networkAccess })
   };
 }
 

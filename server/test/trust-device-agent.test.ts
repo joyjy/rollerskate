@@ -117,6 +117,22 @@ test("first OIDC login claims admin and pairing resists replay and substitution"
     "pairing_already_redeemed"
   );
 
+  const hostileProof = createVerifier();
+  const hostile = await services.devices.createPairing({
+    deviceId: "device-a",
+    deviceName: "Hostile Replacement",
+    verifierChallenge: hostileProof.challenge
+  });
+  await services.devices.approvePairing(hostile.pairingId, admin.human);
+  await expectServerError(
+    () => services.devices.redeemPairing(
+      hostile.pairingId,
+      "device-a",
+      hostileProof.verifier
+    ),
+    "pairing_device_owner_mismatch"
+  );
+
   const replacementProof = createVerifier();
   const replacement = await services.devices.createPairing({
     deviceId: "device-a",
@@ -124,22 +140,20 @@ test("first OIDC login claims admin and pairing resists replay and substitution"
     verifierChallenge: replacementProof.challenge
   });
   await services.devices.approvePairing(replacement.pairingId, member.human);
-  await expectServerError(
-    () => services.devices.redeemPairing(
-      replacement.pairingId,
-      "device-a",
-      replacementProof.verifier
-    ),
-    "pairing_device_exists"
+  const replacementIssuance = await services.devices.redeemPairing(
+    replacement.pairingId,
+    "device-a",
+    replacementProof.verifier
   );
-
-  const authentication = await services.devices.authenticateDevice(issuance.credential);
-  assert.equal(services.devices.deviceSummary(authentication).name, "Developer Laptop");
-  await services.devices.revokeDevice(authentication);
   await expectServerError(
     () => services.devices.authenticateDevice(issuance.credential),
     "unauthorized"
   );
+  const authentication = await services.devices.authenticateDevice(
+    replacementIssuance.credential
+  );
+  assert.equal(services.devices.deviceSummary(authentication).name, "Replacement Name");
+  await services.devices.revokeDevice(authentication);
 });
 
 test("only one concurrent first OIDC login can claim admin", async () => {
@@ -180,6 +194,85 @@ test("non-admin Humans cannot change admission", async () => {
   await expectServerError(
     () => services.trust.allowSubject(member.human, "another"),
     "forbidden"
+  );
+});
+
+test("Agent names are unique per owner and may repeat across owners", async () => {
+  const { services } = service();
+  const adminAuthorization = await services.trust.beginAuthorization("/");
+  const admin = await services.trust.completeAuthorization(
+    await services.trust.takeAuthorization(adminAuthorization.state),
+    identity("admin")
+  );
+  await services.trust.allowSubject(admin.human, "member");
+  const memberAuthorization = await services.trust.beginAuthorization("/");
+  const member = await services.trust.completeAuthorization(
+    await services.trust.takeAuthorization(memberAuthorization.state),
+    identity("member")
+  );
+
+  async function deviceFor(
+    human: typeof admin.human,
+    deviceId: string
+  ) {
+    const proof = createVerifier();
+    const pairing = await services.devices.createPairing({
+      deviceId,
+      deviceName: "Shared Device Name",
+      verifierChallenge: proof.challenge
+    });
+    await services.devices.approvePairing(pairing.pairingId, human);
+    const issuance = await services.devices.redeemPairing(
+      pairing.pairingId,
+      deviceId,
+      proof.verifier
+    );
+    return services.devices.authenticateDevice(issuance.credential);
+  }
+
+  const [adminDevice, memberDevice] = await Promise.all([
+    deviceFor(admin.human, "admin-device"),
+    deviceFor(member.human, "member-device")
+  ]);
+  const adminProof = createVerifier();
+  const memberProof = createVerifier();
+  const [adminAgent, memberAgent] = await Promise.all([
+    services.agents.createAgent(adminDevice, {
+      name: "codex",
+      verifierChallenge: adminProof.challenge
+    }),
+    services.agents.createAgent(memberDevice, {
+      name: "codex",
+      verifierChallenge: memberProof.challenge
+    })
+  ]);
+
+  assert.notEqual(adminAgent.agent.id, memberAgent.agent.id);
+  assert.equal(adminAgent.agent.owner.id, admin.human.id);
+  assert.equal(memberAgent.agent.owner.id, member.human.id);
+
+  const oldCredential = await services.agents.redeemAgentEnrollment(
+    adminDevice,
+    adminAgent.enrollment.id,
+    adminProof.verifier
+  );
+  const replacementDevice = await deviceFor(admin.human, "admin-replacement-device");
+  const replacementProof = createVerifier();
+  const replacement = await services.agents.createAgent(replacementDevice, {
+    name: "codex",
+    verifierChallenge: replacementProof.challenge
+  });
+  assert.equal(replacement.agent.id, adminAgent.agent.id);
+  assert.equal(replacement.agent.placement.deviceId, "admin-replacement-device");
+  assert.equal(replacement.agent.placement.generation, 2);
+  await services.agents.redeemAgentEnrollment(
+    replacementDevice,
+    replacement.enrollment.id,
+    replacementProof.verifier
+  );
+  await expectServerError(
+    () => services.agents.authenticateAgent(oldCredential.credential),
+    "unauthorized"
   );
 });
 
@@ -277,5 +370,22 @@ test("one Device enrolls isolated Agents with replay-safe credentials", async ()
       bob.agent.id
     )).agent.name,
     "bob"
+  );
+
+  const rotated = await services.agents.rotateCredential(device, alice.agent.id);
+  assert.notEqual(rotated.credentialId, aliceCredential.credentialId);
+  await expectServerError(
+    () => services.agents.authenticateAgent(aliceCredential.credential, alice.agent.id),
+    "unauthorized"
+  );
+  assert.equal(
+    (await services.agents.authenticateAgent(rotated.credential, alice.agent.id)).agent.id,
+    alice.agent.id
+  );
+  const revoked = await services.agents.revokeCredentials(device, alice.agent.id);
+  assert.equal(revoked.revokedCount, 1);
+  await expectServerError(
+    () => services.agents.authenticateAgent(rotated.credential, alice.agent.id),
+    "unauthorized"
   );
 });

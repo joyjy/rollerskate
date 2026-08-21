@@ -12,10 +12,22 @@ timestamp: 2026-07-26
 
 一个设备只运行一个 Local Runtime loop。默认 Runtime home 是 `~/.rollerskate/`；首次启动自动创建 LocalDevice、`<runtime>/workspace`、Owner Principal、唯一 `Local` Chat、承载它的 Local Topic 与 loop state，不依赖 Server 登录。显式 `--runtime <absolute-path>` 用于隔离测试实例；旧 repo-local `.rollerskate/` 不再参与默认发现。
 
+Local Topic 的 `TopicGovernance` 是 application-owned durable current state：status、participant roster、starter/participant-message/scheduled policy、conversation intent default/themes 和 revision 作为一个 aggregate 持久化。首次 materialize 只快照当时 active Local Agents；后续 Agent lifecycle 不改写 roster。每次 mutation 必须以 expected revision CAS，并在同一 transaction 追加 bounded `TopicGovernanceControlReceipt@1`；同状态操作不增加 revision，stale revision 返回 current aggregate 且不写入。Pause/Resume 与 participant Add/Remove 由现有 Chat CLI 和 loopback API 调用同一个 application control；Resume 本身不创建 activation，显式 Resume & wake 复用 Runtime activation idempotency，以 `reason=resumed` 至多创建一个 canonical root。这一状态不替代 Chat Event history，不归 Core 所有，也不改变 Agent lifecycle、Session、history grant、Chat history 或 Server Topic membership。
+
+Free Chat 是同一 Topic application vertical 的 recoverable mode，不建立第二个 loop。唯一 Local Runtime loop 每轮执行一次 `topic.free-chat` phase；mode revision 与 cycle index 决定 delay、参与人数、weighted-fair Agent 顺序和 theme，完整 sample 与 `ConversationIntentSnapshot@1` 在 activation 前持久化。一个 cycle 只建立一个 sequential canonical Chat activation root，同一 root 的 Agent 逐个 continuation 并共享同一 intent；prompt 只接收 intent，不暴露 Event/Execution/Session、timer、sample、source external ID 或 idempotency metadata。restart 从 pending root/activity cursor 恢复，错过的 deadline 最多 admission 当前 cycle，不 backfill；contribution 会重采样，pause、空 roster、exit、连续 silence 和 duration/cycle/turn limits 会用 durable receipt 终止未来 activation。
+
+`TopicActivationSchedule` 仍属于 Topic application vertical，但与允许 arbitrary prompt、callback 和 Session policy 的 Scheduled Task 分开建模。每个 once/cron schedule 固定 timezone、misfire、candidate、intent 和 turn budget；唯一 loop 每轮只运行一次 `topic.schedule` phase，并用 `(scheduleId, occurrenceKey)` receipt 与 canonical activation external identity 收敛为至多一个 scheduled `chat.activation`。Pause/cancel 作为 durable CAS control；resume 会把暂停窗口内已错过的 current occurrence 记为 `paused-window` skip，并直接推进到下一个未来 occurrence，不展开 backlog。运行期 misfire skip、paused Topic、scheduled policy disabled、空 eligible roster或已有 active conversation root 也都只写一个 bounded skip receipt。
+
+Interactive Channel 是 `application/channel` vertical，不是 Core Route 或可安装 integration。唯一 loop 的 `channel.interactive` phase 只负责恢复 pending send、推进 bounded follow 与 admission callback。Binding 精确绑定一个 active Local Agent、channel allowlist、revision、expiry 与可选由该 Agent 拥有的 durable `ses_*`；Local Chat binding/send 还会复核 current Topic participant roster。send 以 `(bindingId, idempotencyKey)` 固定 sender、Channel ref、body、transport transaction、observed cursor 和 follow token。`local-chat` 通过既有 Local Chat admission 写 canonical message；`server-topic` 必须同时满足本地 inbox membership 与该 Agent credential。follow long-poll 每次限制 30 秒、100 个 Event 与 64 KiB delta；Server 没有 thread correlation 时只把 cursor 之后的内容标为“新消息”，不能声称 `first_reply` 或 `terminal`。可选 callback 只在 exact binding/session 仍有效、Agent 仍 active、Session 属于同一 Agent 且当前 idle 时，以稳定 external ID admission 一个 canonical `agent.request`；busy 时 durable pending，不创建任意客户端回调。
+
+联网 Agent work request 复用唯一 loop 的 `agent-work-request` phase，但不成为 Event ingress。每个 Runtime process 为 active paired Agent 注册一个临时 route ID；phase 只续租、读取属于该 exact route 的 bounded request diagnostics、恢复已经 accepted 但未挂 receipt 的 Run，并把本机 terminal Run 的 bounded summary 回写 Server。普通 Chat/Topic/Vikunja 文本不会经过该 application control。Owner 必须用 `work-request accept|reject|await-owner` 显式决定；固定 Local policy revision 1 将 workflow 限于 `review@1|forum@1`、budget 限于 20 steps/4 depth、首版不接受 remote grant。只有 Server 已返回 accepted 后才用 `work-request:<id>` 幂等键创建既有 Steward Run；Run 与 transcript 仍只在 Local SQLite，Server 只持有 Run ID receipt 和 bounded public result。
+
 ```text
 CLI / Agent Run ────┐
 Subscription fire ──┼─> canonical Event + Execution ─> Event.type ─> exactly one Handler
 Scheduled run ──────┤                                      │
+Topic schedule ─────┤                                      │
+Channel callback ───┤                                      │
 Server Event (v0.4) ┘                         agent.result Event
                                                           │
                                                           v
@@ -33,13 +45,15 @@ owner chat.message
 
 ## Canonical Event
 
-`local/src/core/event/model.ts` 是 Event source of truth。所有 Event 都包含全局 `evt_` UUIDv7、固定 `type`、source、可选 Principal/Session/Destination，以及 `rootEventId/parentEventId/hop` 因果关系。`chat.message` 保存 `topicId`、sender、body 与可选 resolved target/handle snapshot；`chat.dispatch` 保存同一 `topicId`、源 message、目标 Principal、稳定 `promptResourceId` 与 rendered Agent prompt。旧 dispatch card payload 保持可读，但不再生成。
+`local/src/core/event/model.ts` 是 Event source of truth。所有 Event 都包含全局 `evt_` UUIDv7、固定 `type`、source、可选 Principal/Session/Destination，以及 `rootEventId/parentEventId/hop` 因果关系。`chat.message` 保存 `topicId`、sender、body、可选 `replyToEventId` 与 resolved `targets[]` Principal/handle snapshot；历史单数 `target` 只在读取时归一化为单元素列表，新 Event 不再写入。每个目标独立形成 `chat.dispatch`，保存同一 `topicId`、源 message、目标 Principal、稳定 `promptResourceId` 与 rendered Agent prompt。旧 dispatch card payload 保持可读，但不再生成。
 
 - CLI、Subscription 与 Scheduled Task 在本地构造 Event 并生成统一 ID。
 - v0.4 Server ingress 必须原样保存 Server 已生成的 Rollerskate Event ID，不能建立第二个语义副本；Matrix 通过 Server TransportBinding 进入，不在当前 Local schema 私建 ingress binding。
 - 用户入口不接受任意 Event envelope；每种 ingress 只接受自己的固定 schema。
 
 `RuntimeStore.appendEvent` 原子保存 Event 与唯一 Execution。旧 `inputs → TriggerRouter → Work[]`、generic emit 和独立 Event store 已移除。
+
+Runtime loop 每次 poll 都先收集已完成 outcome，再在容量内继续 claim 新的 due Execution 与 Delivery；长时间 provider invocation 不会阻止后续独立工作被 claim。AgentHandler 对同一 provider Session 串行化调用；尚无 Session 的调用按 Agent 与 workspace 组成 lane，防止同一会话面并发建链，同时允许不同 Agent 或隔离 workspace 并发。每条 Execution 仍独立完成、重试和隔离异常；Runtime 关闭时会 settle 已经接受的工作，再关闭 stores。
 
 源码中的 core 位于 `local/src/core/`，其中 `core/loop.ts` 拥有唯一长期运行的 loop、cycle 调度、pause/stop 生命周期和顶层异常隔离。`bootstrap/runtime.ts` 只创建固定的 application service、第一方 Capability 与 integration，再交给 core loop 驱动；它不拥有第二个 loop，也不允许 Capability 启动自己的 daemon。完整 ownership 见 [Source map](./source-map.md)。
 
@@ -59,15 +73,19 @@ Runtime application module manifest只贡献稳定的 `moduleId` 和可选 resul
 
 ## Route 与 Handler
 
-Route 只表示需要程序执行的 `Event.type → Handler kind`。`agent.request`、`subscription.fire` 与 `chat.dispatch` 路由到 `AgentHandler`；`agent.result` 路由到 generic `ResultHandler`；`chat.message` 路由到 ChatHandler。legacy `review.requested/review.decision` 只保留历史类型，active Runtime 不注册 ReviewHandler。Agent Run 不增加专用 Event type 或 Handler：Run control 通过带 generic run context 的 `agent.request` 启动，`ResultHandler` 只按 `resultContractId` 路由；注册的 Agent Run continuation 解析 `AgentTurnResult@1`，再根据 host-owned completion callback 原子推进。ChatHandler 在 dispatch 时应用 sender/target/lifecycle 与 Topic/Global presence 状态机，并事务性建立 per-Agent attention receipt、零个或多个 `chat.dispatch`。
+Route 只表示需要程序执行的 `Event.type → Handler kind`。`agent.request`、`subscription.fire` 与 `chat.dispatch` 路由到 `AgentHandler`；`agent.result` 路由到 generic `ResultHandler`；`chat.activation` 与 `chat.message` 路由到 ChatHandler。Agent Run 不增加专用 Event type 或 Handler：Run control 通过带 generic run context 的 `agent.request` 启动，`ResultHandler` 只按 `resultContractId` 路由；autonomous continuation 解析 `AgentTurnResult@1`，Caller continuation 解析 `AgentStepResult@1` 并形成 durable checkpoint，下一步只由 application control 接受严格 `RunDecision@1` 后原子 admission。ChatHandler 在 dispatch 前通过 application-owned Topic governance policy 统一过滤 paused Topic、strategy policy、participant roster 与 Agent lifecycle，再应用 sender/target、Topic/Global presence 和 root conversation budget；governance/participant revision 与 attention presence snapshot 随现有 receipt/Event 持久化。AgentHandler 只消费 transport-neutral execution guard decision；dispatch 在 provider invoke 前按最新 governance/participant revision 与排队后变化的 snooze 复检，拒绝时以 `cancelled` Execution 和 durable skip receipt 终止，不让 Core 导入 TopicGovernance。
 
-`AgentHandler` 调用由 Principal identity 选择的 provider adapter，并由 Execution 持久化有限指数退火重试。传统 Agent input 成功或最终失败仍创建 `agent.result` fallback；Local Chat adapter 返回 `ChatDecision@1`，Runtime 原子保存 Session、Topic/Global presence、decision receipt 与可选 Agent sender `chat.message`，failure 只写 Execution/audit facts。Chat 行为说明只存在于独立 `prompt.chat.free-turn` 资源，build 将资源复制到 `dist/resources`。
+`AgentHandler` 调用由 Principal identity 选择的 provider adapter。generic Agent input 可以使用 Execution 的有限指数退火，Agent Run 与 Subscription callback 则在 admission 时固定 `maxAttempts=1`，避免 provider error、output overflow 或未知 side effect 被 Core 盲目重放。传统 Agent input 成功或最终失败仍创建 `agent.result` fallback；Local Chat adapter 返回 `ChatDecision@1`，Runtime 原子保存 Session、Topic/Global presence、decision receipt 与可选 Agent sender `chat.message`，failure 只写 Execution/audit facts。Chat 的 history request continuation 由 application decorator 在 AgentHandler 外完成；Core 和具体 provider adapter 不枚举 `ClientHistoryRequest@1`。Chat 行为说明只存在于独立 `prompt.chat.free-turn` 资源，build 将资源复制到 `dist/resources`。
 
 Matrix Room 不是本地 Route。当前 outbound adapter 可以投递已经 admission 的 Matrix Destination snapshot；ingress binding、cursor 与 Session persistence 等 v0.4 Server Topic/TransportBinding model 完成后再启用。
 
 ## Capability 与 Plugin
 
-Subscription 与 Scheduled Task 是第一方 bundled Capability：它们随 Rollerskate 源码、migration、测试和发布交付，由项目负责运行稳定性。Capability 可以通过固定 ingress 产生预先注册的 Event，但不能绕过 core 或建立并列 loop。Agent Run 是 application/runtime 协作对象，不是另一个 Capability engine；Steward 是 Run 中承担协调职责的 Agent，Review 是 versioned workflow。Scheduled Task 见 [Local Scheduled Task](./scheduled-task.md)，Agent Run 与 Review 见 [Local Agent Run And Review Workflow](./local-review.md)。
+Subscription 与 Scheduled Task 是第一方 bundled Capability：它们随 Rollerskate 源码、migration、测试和发布交付，由项目负责运行稳定性。Capability 可以通过固定 ingress 产生预先注册的 Event，但不能绕过 core 或建立并列 loop。Topic scheduled activation 与 Interactive Channel 是 application vertical，分别复用 canonical Chat activation/message 和 generic Session/Agent request 原语，不复用 Scheduled Task arbitrary callback contract，也不进入 Core。Steward 是 application/runtime 协作领域，不是另一个 Capability engine；其 durable aggregate 保留 `agent_runs`、`runId` 和 `AgentRunContext@1` 作为持久格式，Review 是 versioned workflow。Scheduled Task 见 [Local Scheduled Task](./scheduled-task.md)，Steward 与 Review 见 [Local Steward And Review Workflow](./local-review.md)。
+
+Runtime 在唯一 loop 的 Agent 执行 phase 之前至多每秒为每个 Steward Run 原子维护固定的 `~/.rollerskate/runs/<runId>/progress.json`，保证已经 admission 的 Run 在可能长时间占用 provider 前先形成可观察文件。每个文件使用 `RunProgressSnapshot@1`，从对应 `agent_runs` authority 重建，包含 Run identity、状态、当前 step / Execution、step budget 与更新时间；不保存 transcript、Agent 原始输出或 terminal summary。启动时最多回填最近 1000 条 Run，后续只扫描最近 100 条 hot Run，并按 Run version / updated time 只投影发生 transition 的文件。`~/.rollerskate/progress.json` 仅使用 `RunProgressIndex@1` 列出最近 Run 的 ID、状态和各自的 progress path，不作为聚合业务进度。内容没有变化时不重写，因此文件 mtime 也可用于观察该 Run 是否发生 transition。进程健康与当前 phase 仍由并列的 `loop-state.json` 表达，消费者不能用 progress 文件替代 liveness，也不能回写这些文件推进业务状态。
+
+Release Candidate 不是 Local application phase。外部业务包可用 Continuous Subscription 观察消息，把 bounded observation 通过通用 `ProactiveCallbackInput@1` stdin 交给 exact-granted command，再用公开 CLI/API 启动普通 Steward Run；Run terminal 的观察、业务账本和回复同样由外部包持有。Local 不解释 MR、AR、Issue、Release Pack 或飞书消息关系。全新数据库不创建 `release_candidate_*` 表；旧 schema 58/59 已有的完整历史表只被兼容性识别并原样保留，不属于当前 schema，也没有 Runtime writer。
 
 用户 Plugin 不是 Capability，也不是 Handler。它只能实现 Capability 预先声明的受限 strategy slot；当前唯一 slot 是 `subscription.probe@1`。Plugin 不能注册 Event type、Route、Handler、loop 或 store，不能直接调用 Agent 或访问 Runtime。完整信任边界见 [ADR 0005](./adrs/0005-capability-and-plugin-boundary.md)。
 
@@ -75,17 +93,19 @@ Subscription 与 Scheduled Task 是第一方 bundled Capability：它们随 Roll
 
 Session 保存本地 Session ID、Agent Principal、adapter、workspace 与 provider session ID。每个 Local Agent 在 `Local` 中有独立 current Session；后续 dispatch 默认续接，New session 只清空该 Agent 的 current pointer 并提高 generation，不删除旧 Session 或 Chat history。
 
-每个 Agent Run 为每个参与 Agent 创建独立 run-scoped Session，并在该 Run 的多轮 callback 中复用。同一 Agent 参与两个 Run 时使用两个 Session；Run Session 不复用 `#local` Chat Session。需要访问源码的 Run 由 Owner 在 admission 时提供 explicit external workspace grant；没有 grant 的 Run 不继承 Chat sandbox 之外的路径权限。
+每个普通 Agent Run 为每个参与 Agent 创建独立 run-scoped Session，并在该 Run 的多轮 callback 中复用；series Run 则按 revision cycle 创建 cycle-scoped Session，同 revision 可续用、新 revision 必须隔离。同一 Agent 参与两个 Run 时使用两个 Session；Run Session 不复用 `#local` Chat Session。需要访问源码的 Run 由 Owner 在 admission 时提供 explicit external workspace grant；没有 grant 的 Run 不继承 Chat sandbox 之外的路径权限。
 
 普通中断恢复把 `running` Execution 与 `delivering` Delivery 放回有限重试状态。ScheduledRun 已经进入 provider invocation 时转为 `unknown` 并停止对应 Execution，等待显式 reconciliation；已经 terminal 的 Agent Execution 不重放 provider 调用。
 
 Agent Run 始终指向唯一 active step/Execution。global recovery 复用既有 Execution；Run CAS 与 deterministic callback key 防止 retry、duplicate result 或 restart 创建第二个 child request。cancel 不强杀已经运行的 provider process，但会取消 queued work，并拒绝后续 retry、delegate 与 callback admission。
 
+Caller-orchestrated Run 固定 admission 时的 active participant roster，`maxDepth=0`，并为每个参与 Agent 复用自己的 `(runId, agentId)` Session。Worker 结果只把 Run 转为 `awaiting_orchestrator`；CLI/Console 从 typed checkpoint 展示等待状态。Local Owner 的 exact current-version decision 可以在同一 Run admission self/agent next step，或终结为 succeeded/failed/needs-human；duplicate request 只重放 receipt，stale、非 roster target 和任何 authority expansion 都拒绝。
+
 ## 审计
 
-SQLite 是本机持久事实源。Events application query 是 CLI `event list/trace`、正式 `/api/events` 与 Console Events 的共同语义出口；旧 `/api/runtime/events` 只保留为现有 consumer 的过渡 alias。Agents 的 list/detail query 同时服务 CLI 与 `/api/agents`，mutation 后重新返回同一个 detail projection。Chats 的 prompt history 继续使用 bounded `ChatTimeline`，Console timeline 改读 `chat_messages` rebuildable projection；Agent Run CLI 与 Runtime Overview 共用 application query，按 `runId/stepId/parentStepId` 组合 Agent request/result/callback timeline 和往返次数。没有 generic Event write API，Event history 不提供修改或删除。
+SQLite 是本机持久事实源。Events application query 是 CLI `event list/trace`、`/api/events` 与 Console Events 的共同语义出口；轮询列表只返回 bounded audit summary，选中的 detail 才按 `rootEventId` 定向读取完整 conversation timeline。Agents 的 list/detail query 同时服务 CLI 与 `/api/agents`，mutation 后重新返回同一个 detail projection。Chats 的 prompt history 继续使用 bounded `ChatTimeline`，Console timeline 改读 `chat_messages` rebuildable projection；当前 conversation 与 participant last turn 使用 Topic/root/Agent 定向查询，不从通用 100/200 条历史窗口猜测。CLI `run` 与 Steward Console 共用 `application/steward/query.ts`，按 `runId/stepId/parentStepId` 组合 Agent request/result/callback timeline 和往返次数。Schedule 与 Subscription 继续从各自 query 读取自己的 Event audit，不经过 Steward query。没有 generic Event write API，Event history 不提供修改或删除。
 
-Loop 输出结构化 JSON log，包括 Subscription、Local Chat、Scheduled Task、Runtime cycle 与 cycle failure。v0.3 先用这些日志做运行审计，不引入 Observer；需要 durable 的产品事实仍必须进入统一数据库。
+Loop 输出结构化 JSON log，包括 Subscription、Local Chat、Topic schedule、Interactive Channel、Scheduled Task、Runtime cycle 与 cycle failure。日志只做运行审计，不引入 Observer；需要 durable 的产品事实仍必须进入统一数据库。
 
 ## Runtime operations projection
 
@@ -95,13 +115,13 @@ Runtime 运维面只投影一个 Local Runtime，不复制 Agents、Events、Cha
 - Loop state file 在 cycle 期间记录当前 phase scope，并在 cycle 完成后记录 start/end/duration；旧 schema v1 文件缺少这些可选字段时仍按 idle 读取。
 - `RuntimeControlAvailability` 统一计算 pause、resume 与 recover；CLI 和 loopback mutation 使用同一个 guard。Recover 只有在进程停止且存在 interrupted Execution、Delivery 或 ScheduledRun 时可用。
 - `RuntimeWorkloadStatus` 只计唯一 Loop 仍负责推进的 Execution、Delivery 和尚未关联 Event/Execution 的 ScheduledRun；terminal history、配置对象、Session、Result 与失败后等待 Owner 的对象不进入 active workload。
-- `RuntimeFailureSummary` 是对 failed Execution/Delivery、unknown ScheduledRun、Subscription error、legacy blocked Review 与无 active Agent readiness 的 bounded application projection，不是新的 durable table。Agent Run terminal/needs-human/cancelled 由 Runtime Overview 和 Run trace 直接解释。detail 仍由 owning domain 或 Event trace 解释。
+- `RuntimeFailureSummary` 是对 failed Execution/Delivery、unknown ScheduledRun、Subscription error 与无 active Agent readiness 的 bounded application projection，不是新的 durable table。Agent Run terminal/needs-human/cancelled 由 Steward Console 和 Run trace 直接解释。detail 仍由 owning domain 或 Event trace 解释。
 
 Runtime operations 的 SQLite 读取位于 `infrastructure/sqlite/runtime-operations-query.ts`；它只查询现有 canonical/durable facts，不新增 schema、业务 identity 或 materialized projection。Console `/api/runtime` 组合 status、controls、workload 与 failures，`/api/failures` 提供同一 Failure list/inspect query。
 
 ## Console engineering boundary
 
-Console 固定包含 Runtime、Events、Agents、Chats 与 Subscriptions 五个直接 URL。`vue-router` 拥有 `/console` 默认选择、direct entry、history 与视图 lifecycle；fresh Runtime 进入 Agents，存在 active Agent 时进入 Chats。
+Console 固定包含 Runtime、Events、Agents、Chats、Steward、Schedules 与 Subscriptions 七个直接 URL。Steward 只索引并展示 Steward Run；Schedules 与 Subscriptions 页面各自负责对象配置、生命周期和自己的 run/fire conversation。三者只复用 `AgentInvocationDetail.vue` 展示 prompt、Agent result、Session、Event 与 invocation diagnostics，不共享 application query 或跨 Capability 索引。Runtime 不复制 Latest Run。`vue-router` 拥有 `/console` 默认选择、direct entry、history 与视图 lifecycle；fresh Runtime 进入 Agents，存在 active Agent 时进入 Chats。
 
 `scripts/rs start` 在唯一 loopback HTTP server 上同时挂载 Console API 与 Vite middleware。`local/ui/src/` 是 Console 产品运行源，Vue、TypeScript 与 CSS 修改通过 HMR 进入已打开页面；`local/ui/dist/` 只用于 build verification，不是默认启动输入。Vite 不接管或热替换 Core Loop、Capability、application 或 SQLite resource lifecycle，非 UI 源码变化仍要求重新编译并重启 Local Runtime。
 
@@ -111,9 +131,15 @@ Console 保持轻量页面组件和既有 CSS primitive，不拥有领域模型�
 
 ## Process boundary
 
-Agent adapter 使用 absolute executable、args array、`shell:false`、显式 cwd/environment、structured stdin/stdout、timeout 与输出上限。每个 Agent 的 `executionConfig.launchArgs` 持久保存独立 argv；application 层限制数量、单项/总字节，并拒绝覆盖 adapter 拥有的协议、Session、workspace 与 permission/sandbox 参数。配置变化进入 adapter cache key，下一次 invocation 自动重建 adapter，不要求重启 Runtime。
+Agent adapter 使用 absolute executable、args array、`shell:false`、显式 cwd/environment、structured stdin/stdout、timeout 与输出上限。每个 Agent 的 `executionConfig.launchArgs` 持久保存独立 argv；application 层限制数量、单项/总字节，并拒绝覆盖 adapter 拥有的协议、Session、workspace 与 permission/sandbox 参数。配置变化进入 adapter cache key，下一次 invocation 自动重建 adapter，不要求重启 Runtime。普通 Steward Run 默认没有网络；只有非委派的 Codex Run（`maxDepth=0`）在 `workspace.access=write` 下显式声明 `workspace.networkAccess=true` 时，网络 authority 才随 workspace grant 固化并传给 Codex adapter。read-only、非 Codex 或可委派 Run 不能申请网络。
 
-Codex、Claude Code 与 Kimi Code 都实现相同 `RuntimeAgentAdapter`，首次执行创建 provider Session，后续通过本地 Session 精确恢复。Codex 使用 JSONL，Claude Code 使用 result JSON，Kimi Code 使用 prompt-mode stream JSONL 与 `session.resume_hint`。Adapter 只声明 structured output、Session resume 与 workspace read/write 等原语能力；它不枚举 Steward/Reviewer/Implementer 或 workflow result schema。Agent Run protocol prompt 要求统一返回 `AgentTurnResult@1`；Core 仍保存不透明 output，由 Agent Run continuation 在 adapter 与 Core 之外校验并推进。
+Codex、Claude Code、Kimi Code 与 Pi 都实现相同 `RuntimeAgentAdapter`，首次执行创建 provider Session，后续通过本地 Session 精确恢复。`integrations/agent/runner/` 以 ACP 的 turn/session 语义定义内部 provider-neutral 协议：request 只有 prompt、Session、workspace access 与可选 model，receipt 统一投影 assistant message、observed tool、usage 与 terminal；`process.ts` 统一拥有无 shell spawn、bounded stderr 与分级停止。ACP、Pi RPC 与 Codex app-server 只在各自 runner 内处理 wire protocol，adapter 只负责 Runtime Event prompt、grant/policy 与结果选择。
+
+Codex 使用 app-server 的 LF-delimited JSON-RPC transport，每次调用严格执行 `initialize`、`initialized`、`thread/start|resume`、`turn/start`，只在 `turn/completed` 后形成 `codex-runtime-app-server-v1` receipt；意外的 server approval request、非 completed turn、超限 protocol record 或 assistant aggregate 都 fail closed。workspace sandbox、`approvalPolicy=never`、network grant、model 与 invocation-scoped MCP server 通过 Thread params/config 传入，不再拼接 `codex exec --json` argv。Claude Code 仍使用 result JSON。Kimi Code 使用 ACP v1：`session/new` 创建 Session，后续以 `session/resume` 精确恢复，`session/prompt` 的 `end_turn` 是 terminal boundary；Chat 合并 assistant message，Run/Subscription 只取末条。adapter 只保留 assistant text 和 bounded tool identity，不保留 `rawInput`、`rawOutput` 等 trace；结果字节上限只约束 assistant text，因此超大 tool trace 不再吞掉短结果。120 秒 meaningful-event watchdog 只由 assistant、thought、tool 或 plan update 续期，总 timeout 独立生效。read grant 在新 Session 选择 `plan` mode，并只批准 read/search/think/fetch tool kind；write grant 选择 `default` mode 并按次批准工具请求；恢复时 access 已由 versioned Session reference 锁定，不重复设置 provider mode。bundled read/write profile 作为 prompt policy 注入，profile 内容、Session reference version 与 policy digest 编入 `kimi-code-runtime-acp-v1` identity；旧格式或 access 不匹配会新建 Session。可选 launch args 只允许 `--model <model>`，由 `session/set_config_option` 应用。macOS 上固定启用 Kimi legacy engine，规避 v2 workspace watcher 在空目录也可能触发的 `EMFILE` 回归；transport 仍是同一 ACP v1。
+
+Pi 使用 RPC mode，以 LF-delimited JSON command/event 交互；adapter 先验证 `get_state` 返回 Runtime 预生成并持久续用的 exact `--session-id`，再发送 `prompt`，只在 `agent_settled` 后形成结果。它不再把整个 provider stdout 当作一次进程结果，也不使用 `--print` 或 `--session`。增量 decoder 丢弃超过单条预算的 RPC record 并继续读取 terminal assistant；发生丢弃时 tool diagnostics 保持未知。`--tools` 白名单映射 read/write grant，Chat history extension 仍由 adapter 装配。这一协议使用 `pi-runtime-rpc-v1` identity。Adapter 只声明 transport、Session resume 与 workspace read/write 等原语能力；它不枚举 Steward/Reviewer/Implementer 或 workflow result schema。Agent Run protocol prompt 按 run context 要求 autonomous `AgentTurnResult@1` 或 caller `AgentStepResult@1`；Core 仍保存不透明 output，由对应 Agent Run continuation 在 adapter 与 Core 之外校验并推进。
+
+Runtime restart 对已 claim 为 `running` 的 Agent invocation 采用 fail-closed unknown，而不是消费剩余 attempt 重放 provider turn：Core 持久化 unknown/no-replay receipt，并生成 canonical failed result。Autonomous Agent Run 将其送入一次 bounded Steward adjudication；Subscription callback 直接失败，不自行重放；其他 owner 按自己的 durable continuation 收口。业务 vertical 不得各自把同一个中断 invocation 重排回队列。
 
 Poll Plugin 只能计划和解析一次受限 probe；真实 HTTP/command 由 Runtime 按 allowlist、workspace、environment、timeout 与 output budget 执行。非 terminal poll 只更新 Subscription 状态和 debug log，只有 terminal `subscription.fire` 才成为 Event。
 

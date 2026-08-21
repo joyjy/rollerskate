@@ -18,8 +18,6 @@ export interface CreateAgentInput {
 }
 
 export type CreateAgentFailure =
-  | "name_taken"
-  | "different_device"
   | "verifier_mismatch"
   | "agent_not_active";
 
@@ -73,6 +71,13 @@ export interface AgentRepository {
     now: string
   ): Promise<AgentAuthenticationRecord | undefined>;
   getAgentAggregateById(agentId: string): Promise<AgentAggregate | undefined>;
+  rotateAgentCredential(
+    agentId: string,
+    placementId: string,
+    credential: AgentCredentialRecord,
+    now: string
+  ): Promise<AgentCredentialRecord | undefined>;
+  revokeAgentCredentials(agentId: string, now: string): Promise<number>;
   getAgentRoomBinding(
     agentId: string,
     roomId: string

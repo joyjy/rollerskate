@@ -6,8 +6,10 @@ import type { DeviceSummary } from "../../protocol.js";
 import { runtimePaths } from "../../infrastructure/runtime/config.js";
 import { initializeRuntimeSchema } from "../../infrastructure/sqlite/schema.js";
 import { DeviceServerClient, DeviceServerError } from "../../integrations/server/device-client.js";
+import { PairingServerClient } from "../../integrations/server/pairing-client.js";
 import { DeviceCredentialStore } from "../../infrastructure/files/device-credential-store.js";
-import { LocalDeviceStore, type LocalDeviceMetadata } from "../../infrastructure/sqlite/device-store.js";
+import { LocalDeviceStore, type LocalDeviceMetadata } from "../../infrastructure/files/device-binding-store.js";
+import { bootstrapLocalFoundation } from "../../infrastructure/sqlite/foundation-store.js";
 
 export interface DeviceOperationDependencies {
   readonly fetch?: typeof fetch;
@@ -19,6 +21,13 @@ export interface DeviceOperationDependencies {
 
 export interface DeviceLoginOptions {
   readonly serverUrl?: string;
+}
+
+export interface DeviceLoginAuthorization {
+  readonly verificationUri: string;
+  readonly userCode?: string;
+  readonly expiresAt: string;
+  readonly completion: Promise<LocalDeviceStatus>;
 }
 
 export interface LocalDeviceStatus {
@@ -44,64 +53,152 @@ export async function loginDevice(
         "device login requires ROLLERSKATE_SERVER_URL or a server saved in this runtime"
       );
     }
-    const serverUrl = normalizeServerUrl(configuredServerUrl);
-    const deviceName = hostname().trim();
-    if (deviceName === "") {
-      throw new Error("device name must be non-empty");
-    }
-    const metadata = resources.store.beginPairing(serverUrl, deviceName);
-    const verifier = randomBytes(32).toString("base64url");
-    const client = new DeviceServerClient({
-      serverUrl,
-      ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch })
-    });
-    const pairing = await client.createPairing({
-      deviceId: metadata.deviceId,
-      deviceName: metadata.deviceName,
-      verifierChallenge: createHash("sha256").update(verifier).digest("base64url")
-    });
+    const login = await beginDeviceLoginWithResources(
+      resources,
+      configuredServerUrl,
+      false,
+      dependencies
+    );
     dependencies.write?.(
-      `Open this URL to approve the device:\n${pairing.verificationUri}\n` +
-      (pairing.userCode === undefined ? "" : `Enter code: ${pairing.userCode}\n`) +
+      `Open this URL to approve the device:\n${login.verificationUri}\n` +
+      (login.userCode === undefined ? "" : `Enter code: ${login.userCode}\n`) +
       "Waiting for approval...\n"
     );
-    const sleep = dependencies.sleep ?? ((milliseconds) =>
-      new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
-    let pollIntervalMilliseconds = pairing.pollIntervalMilliseconds;
-    while (currentTime(dependencies).getTime() < Date.parse(pairing.expiresAt)) {
-      const status = await client.pairingStatus(pairing.pairingId);
-      pollIntervalMilliseconds = status.pollIntervalMilliseconds ?? pollIntervalMilliseconds;
-      if (status.status === "approved") {
-        const issuance = await client.redeemPairing(
-          pairing.pairingId,
-          metadata.deviceId,
-          verifier
-        );
-        resources.credentials.save({
-          serverUrl,
-          deviceId: metadata.deviceId,
-          credentialId: issuance.credentialId,
-          credential: issuance.credential
-        });
-        const timestamp = currentTimestamp(dependencies);
-        return {
-          metadata: resources.store.activate(
-            issuance.credentialId,
-            issuance.device,
-            timestamp
-          ),
-          summary: issuance.device
-        };
-      }
-      if (["expired", "cancelled", "redeemed"].includes(status.status)) {
-        throw new Error(`device pairing ended with status ${status.status}`);
-      }
-      await sleep(pollIntervalMilliseconds);
-    }
-    throw new Error("device pairing expired before approval");
+    return await login.completion;
   } finally {
     resources.store.close();
   }
+}
+
+export async function startBrowserDeviceLogin(
+  repoRoot: string,
+  options: { readonly serverUrl: string; readonly replaceExisting?: boolean },
+  dependencies: DeviceOperationDependencies = {}
+): Promise<DeviceLoginAuthorization> {
+  const resources = openResources(repoRoot, dependencies.runtimeDirectory);
+  try {
+    return await beginDeviceLoginWithResources(
+      resources,
+      options.serverUrl,
+      options.replaceExisting === true,
+      dependencies,
+      true,
+      "authorization_code"
+    );
+  } catch (error) {
+    resources.store.close();
+    throw error;
+  }
+}
+
+async function beginDeviceLoginWithResources(
+  resources: ReturnType<typeof openResources>,
+  configuredServerUrl: string,
+  replaceExisting: boolean,
+  dependencies: DeviceOperationDependencies,
+  closeWhenComplete = false,
+  flow: "device_code" | "authorization_code" = "device_code"
+): Promise<DeviceLoginAuthorization> {
+  const serverUrl = normalizeServerUrl(configuredServerUrl);
+  const deviceName = hostname().trim();
+  if (deviceName === "") throw new Error("device name must be non-empty");
+  const metadata = resources.store.beginPairing(serverUrl, deviceName, { replaceExisting });
+  const verifier = randomBytes(32).toString("base64url");
+  const client = new PairingServerClient({
+    serverUrl,
+    ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch })
+  });
+  const pairingRequest = {
+    deviceId: metadata.deviceId,
+    deviceName: metadata.deviceName,
+    verifierChallenge: createHash("sha256").update(verifier).digest("base64url")
+  };
+  const pairing = await (flow === "authorization_code"
+    ? client.createBrowserPairing(pairingRequest)
+    : client.createPairing(pairingRequest));
+  const completion = completeDeviceLogin(
+    resources,
+    client,
+    pairing,
+    verifier,
+    serverUrl,
+    dependencies
+  ).finally(() => {
+    if (closeWhenComplete) resources.store.close();
+  });
+  return {
+    verificationUri: pairing.verificationUri,
+    ...(pairing.userCode === undefined ? {} : { userCode: pairing.userCode }),
+    expiresAt: pairing.expiresAt,
+    completion
+  };
+}
+
+async function completeDeviceLogin(
+  resources: ReturnType<typeof openResources>,
+  client: PairingServerClient,
+  pairing: Awaited<ReturnType<PairingServerClient["createPairing"]>>,
+  verifier: string,
+  serverUrl: string,
+  dependencies: DeviceOperationDependencies
+): Promise<LocalDeviceStatus> {
+  const sleep = dependencies.sleep ?? ((milliseconds) =>
+    new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
+  let pollIntervalMilliseconds = pairing.pollIntervalMilliseconds;
+  while (currentTime(dependencies).getTime() < Date.parse(pairing.expiresAt)) {
+    let status: Awaited<ReturnType<PairingServerClient["pairingStatus"]>>;
+    try {
+      status = await client.pairingStatus(pairing.pairingId);
+    } catch (error) {
+      if (!isTransientPairingError(error)) throw error;
+      await sleep(pollIntervalMilliseconds);
+      continue;
+    }
+    pollIntervalMilliseconds = status.pollIntervalMilliseconds ?? pollIntervalMilliseconds;
+    if (status.status === "approved") {
+      let issuance: Awaited<ReturnType<PairingServerClient["redeemPairing"]>>;
+      try {
+        issuance = await client.redeemPairing(
+          pairing.pairingId,
+          pairing.deviceId,
+          verifier
+        );
+      } catch (error) {
+        if (!isTransientPairingError(error)) throw error;
+        await sleep(pollIntervalMilliseconds);
+        continue;
+      }
+      resources.credentials.save({
+        serverUrl,
+        deviceId: pairing.deviceId,
+        credentialId: issuance.credentialId,
+        credential: issuance.credential
+      });
+      const timestamp = currentTimestamp(dependencies);
+      return {
+        metadata: resources.store.activate(
+          issuance.credentialId,
+          issuance.device,
+          timestamp,
+          { serverUrl }
+        ),
+        summary: issuance.device
+      };
+    }
+    if (["expired", "cancelled", "redeemed"].includes(status.status)) {
+      throw new Error(`device pairing ended with status ${status.status}`);
+    }
+    await sleep(pollIntervalMilliseconds);
+  }
+  throw new Error("device pairing expired before approval");
+}
+
+function isTransientPairingError(error: unknown): boolean {
+  if (error instanceof DeviceServerError) {
+    return error.status === 408 || error.status === 429 || error.status >= 500;
+  }
+  if (error instanceof TypeError) return true;
+  return error instanceof Error && ["AbortError", "TimeoutError"].includes(error.name);
 }
 
 export async function statusDevice(
@@ -154,8 +251,15 @@ async function verifyCredential(
   if (summary.id !== credential.deviceId) {
     throw new Error("Server returned a different Device identity");
   }
+  const current = store.current();
+  const timestamp = currentTimestamp(dependencies);
   return {
-    metadata: store.verify(summary, currentTimestamp(dependencies)),
+    metadata: current?.status === "active" &&
+      current.credentialId === credential.credentialId
+      ? store.verify(summary, timestamp)
+      : store.activate(credential.credentialId, summary, timestamp, {
+        serverUrl: credential.serverUrl
+      }),
     summary
   };
 }
@@ -179,8 +283,12 @@ function openResources(repoRoot: string, runtimeDirectory?: string): {
   mkdirSync(paths.runtimeDirectory, { recursive: true, mode: 0o700 });
   chmodSync(paths.runtimeDirectory, 0o700);
   initializeRuntimeSchema(paths.database);
+  const foundation = bootstrapLocalFoundation(paths);
   return {
-    store: new LocalDeviceStore(paths.database),
+    store: new LocalDeviceStore(paths.deviceBinding, {
+      deviceId: foundation.deviceId,
+      deviceName: foundation.deviceName
+    }),
     credentials: new DeviceCredentialStore(paths.deviceCredential)
   };
 }

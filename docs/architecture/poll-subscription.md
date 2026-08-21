@@ -1,61 +1,74 @@
 ---
 type: Architecture
-title: Poll Subscription
-description: one-shot Subscription 如何在 terminal 时构造 canonical Event 并恢复固定 Session。
-tags: [rollerskate, subscription, polling, event, session]
-timestamp: 2026-07-23
+title: Subscription
+description: one-shot terminal callback 与 Continuous Subscription delta/checkpoint 的独立生命周期。
+tags: [rollerskate, subscription, polling, callback]
+timestamp: 2026-07-30
 ---
 
-# Poll Subscription
+# Subscription
 
 [返回 architecture index](./index.md)
 
 ## 主路径
 
 ```text
-register title + active owner Agent + provider Session/workspace/prompt snapshot
-  -> persist probe { Plugin/config + policy } + interval/deadline/max attempts
-  -> wait one complete polling interval so the registering turn can exit
+register SubscriptionDefinition@3
+  -> validate active owner, immutable probe artifact, policy and ordered exact-grant callbacks
+  -> persist definition digest + first nextPollAt
   -> claim one due Subscription
   -> Plugin plans one declarative HTTP/command probe
   -> Runtime executes the bounded probe
-  -> Plugin returns terminal or non-terminal decision
-  -> non-terminal: update next poll and debug log only
-  -> terminal: atomically materialize/reuse local Session + create one notification Destination + one subscription.fire Event with observation snapshot + Execution
-  -> AgentHandler resumes the exact Session
-  -> AgentHandler creates one agent.result Event + ResultHandler Execution
-  -> ResultHandler handles the agent.result Event
-  -> one-attempt macOS notification Delivery
+  -> Plugin returns terminal or non-terminal observation
+  -> non-terminal: advance next poll and keep active
+  -> terminal: persist terminal key/observation and open callback phase
+  -> shared ProactiveCallbackRuntime executes callbacks in ordinal order
+     -> command.exec: execute through the host callback kernel
+     -> destination.deliver: admit one host-origin Core Delivery
+     -> agent.invoke: admit one subscription.fire Event using callback identity and exact authority
+  -> reconcile callback receipts into completed/blocked/error/unknown parent state
 ```
 
-## 固定契约
+Continuous Subscription uses a separate parent and checkpoint state machine. A new stable occurrence key materializes a shared proactive callback group; only terminal callback receipts advance its checkpoint.
 
-Subscription 独立保存 required `title` 与 `ownerAgentId`；title 是 Console 名称和 terminal notification 标题，owner Agent 是准入与所有权主体。callback 保存 owner client 决定的 adapter、provider Session ID、注册时 workspace 与 prompt；公开输入不接受含义双义的 `sessionId`，也不要求 provider Session 已存在于本地 `agent_sessions`。若 `(adapterId, providerSessionId)` 已登记，它必须属于同一 owner Agent 与 workspace；否则 Runtime 在 terminal 事务中 lazy materialize `ses_`，随后把该 Session 绑定到唯一 `subscription.fire`。
+## Fixed contract
 
-Codex Desktop 与 CLI 是同一 Codex provider 的会话来源，不是两个 Agent。两者共用 provider thread/rollout，并统一由 `codex exec resume` 续接；origin surface 只属于审计信息，不参与 Agent 身份或 adapter 分裂。
+One-shot registration accepts only `SubscriptionDefinition@3` (`schemaVersion: 3`). The definition fixes:
 
-Subscription 是随 Rollerskate 发布的第一方 Capability；Plugin 只是其中的 `subscription.probe@1` 沙箱 strategy slot。Plugin 只提供 `plan(config, context)` 与 `evaluate(config, result, context)`，不能注册 Capability、Event type、Route、Handler、loop 或 store，不能创建 timer、直接调用 Agent、直接写 Event 或访问 Runtime。
+- required title and active owner Agent;
+- probe Plugin/config, canonical artifact revision/digest and bounded execution policy;
+- interval, deadline and attempt budget;
+- at most 16 ordered callbacks, each with an immutable definition and exact grant;
+- `approvedGrantDigest`, which must match the callback grants.
+- 可选 `ExternalRefTriggerBinding@1`，固定 Project/Integration/ExternalRef revision、profile 与 read schema，但不扩大 probe/callback grant。
 
-Plugin host 在独立受限进程与 VM context 中运行，不允许 runtime import、ambient environment、network、filesystem write 或 process spawn。HTTP/command probe 由 Capability host 按 origin/executable、cwd、environment、timeout 与 output limit 执行。第三方若要完整 Capability，必须修改源码并进入正式发布流程，详见 [ADR 0005](./adrs/0005-capability-and-plugin-boundary.md)。
+The Plugin fills only the `subscription.probe@1` strategy slot. It cannot register a Capability, Event type, Handler, loop or Store, and cannot directly perform ambient network, filesystem writes, process spawn or Agent invocation. The host executes declarative probes under the admitted policy.
 
-Poll status、attempt 与 non-terminal observation 只更新 Subscription 持久状态，并可输出 debug log；它们不是 Event。只有 terminal decision 原子创建一次 `subscription.fire` Event，以 Subscription ID 作为外部幂等键，并把 Plugin 返回的 version、terminal、summary 与 bounded facts 保存为 immutable observation snapshot；同一事务把 `macos-notification` Destination snapshot 固定到 Event。首次 `nextPollAt` 是 `createdAt + intervalMilliseconds`，不是注册时刻；调用 Agent 注册后必须结束当前 turn以避免已知并发，但 active 与 idle smoke 都证明 `codex exec resume` 成功只代表结果进入 provider history，不代表已打开客户端已展示 callback。
+A terminal observation is durable Subscription state, not a parent Event. It includes the Plugin version, terminal outcome, optional summary and bounded facts. The one-shot Runtime owns its stable terminal key; Plugin code cannot supply callback identity. Only an `agent.invoke` callback enters the canonical Event pipeline as `subscription.fire`; its `source.externalId` uses the durable callback occurrence ID, so each trigger occurrence admission is independently idempotent.
 
-外部 shell command 不是 Subscription 的子进程，也不由 poll cycle 启动。调用方只执行一次目标命令，并以 atomic rename 写入固定 workspace completion receipt；Subscription Plugin 只能通过 allowlist command probe 只读该 receipt。缺少 receipt 表示仍在运行，terminal receipt 才能触发 `subscription.fire`，因此 Runtime 重启或重试不会重新执行目标命令。
+One-shot、Continuous Subscription 与 Schedule 使用同一 `ProactiveCallbackDefinition@1` / `ProactiveCallbackGrant@1` contract，只支持 `command.exec | agent.invoke | destination.deliver`。`agent.invoke` 的 exact grant 固定 Agent、workspace、workspace access 与 network access；one-shot adapter 在 Event admission 时补入 terminal observation、workspace revision 和 `SubscriptionAgentResult@1` result contract。Schedule reconciliation 只处理 `schedule` owner，不能先于 Subscription adapter 按 provider 退出码收敛其他 owner；Console 分别投影 invocation status 和结构化 business result，因此 `blocked` / `failed` 不会显示为成功。
 
-## 恢复与隔离
+## Recovery and isolation
 
-Subscription 使用有限 max attempts、deadline 与指数退火。重启后从 durable next poll 继续。取消或过期的 Subscription 不再 fire。
+Polling resumes from durable `nextPollAt`; cancellation, deadline expiry or attempt exhaustion stops further probes. Poll failures only update the Subscription and loop log.
 
-Subscription cycle 的异常只记录为该 cycle failure，不能结束 Local Runtime loop。fire 后的 Agent invocation、`agent.result` Event、ResultHandler Execution 与 Delivery 全部由统一 Runtime core 接管，不存在单独 continuation worker 或 Room continuation handler。`macos-notification` Delivery 的 `maxAttempts` 固定为 1；通知失败只终结该 Delivery，不改变 callback Execution 或 `agent.result`。
+带 ExternalRef binding 的 one-shot/Continuous Subscription 在每次 due probe 前重读 current Integration binding 并做最多 16 KiB 的 exact Connector read。inactive、stale、profile/placement/ownership mismatch 会把 parent 持久标成 `blocked`，不执行 probe、不 materialize callback，也不建立 Run 或外写；transport/read 异常仍走既有 poll failure/retry。相同 terminal/blocked parent 重启后不再次触发。无 binding definition 保持原行为。
 
-## 控制面
+Callbacks run in ordinal order. A normal callback failure is terminal for that callback and does not prevent later callbacks from running. If the process stops after a callback has started but before a durable receipt is known, that callback and the remaining pending callbacks become `unknown` and are not replayed blindly. Agent Event/Execution work already admitted to Core follows Core recovery and is reconciled back into the callback occurrence.
 
-CLI 提供 add/list/inspect/pause/resume/cancel。Loopback Console 展示 Subscription owner、callback 与由它产生的 Event 审计链；Console 不创建 Subscription、不修改 Plugin/config，不提供 Event 写入口。
+Continuous Subscription uses `ContinuousSubscriptionDefinition@1`, stable occurrence keys and shared proactive callback definitions/occurrences. A pending occurrence stops polling until all callbacks are terminal; then the occurrence is checkpointed and polling continues. A repeated occurrence key is a no-op.
+
+`command.exec` receives a bounded `ProactiveCallbackInput@1` JSON document on stdin. For a Continuous Subscription it includes the exact pending `PollObservation`; stdout/stderr remain in the generic callback receipt. Definition and grant require `runtime: "host"` and one exact executable, argv, cwd, environment and resource bound. The executable is trusted code: RS validates the declared entrypoint and bounds, but does not sandbox it or its transitive child processes. Persisted legacy `runtime: "node"` callbacks remain readable for history but cannot be registered or executed. RS does not parse command stdout into a business result and does not interpret the observation payload.
+
+## Control plane
+
+CLI and Console expose the same add/list/inspect/pause/resume/cancel lifecycle. List and inspect return only current one-shot and Continuous views; no v2/legacy shape remains.
+
+Console shows definition/probe identity, terminal observation, callback definitions, exact grants and receipts. For one-shot Agent callbacks it shows Core Runtime invocation status separately from parsed `SubscriptionAgentResult@1` status. Agent callback Event/Execution audit remains owned by Core Runtime and is referenced by the callback occurrence rather than by a parent `fireEventId`.
 
 ## Change guidance
 
-- 新 probe kind 必须定义 side-effect policy、secret、timeout/output 和取消语义。
-- 监控 shell command 时保持“外部执行一次、receipt 原子写、probe 只读”的边界；不要把目标命令藏进 Plugin 或 poll cycle。
-- 新 Plugin slot 必须定义 bounded input/output、host-owned I/O、权限 grant、版本和失败隔离；Plugin 不能扩展 Event core。
-- 不把 poll/observation 状态升级成 Event；持续非 terminal monitoring 留待后续版本重新设计。
-- callback 若需要结果二次加工，必须创建新的 canonical Event。
+- New probe kinds must define side-effect policy, secret handling, time/output bounds and cancellation semantics.
+- External commands are executed once by their owner and publish a durable receipt; the Subscription probe only observes that receipt.
+- New callback kinds must use the shared host callback kernel or Core admission boundary and define exact grants plus crash semantics.
+- Poll attempts and observations remain Capability state; do not turn them into generic Events.

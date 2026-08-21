@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import type {
   RunMandateSnapshot,
   WorkflowRunMandateSnapshot
-} from "../../modules/agent-run/state-machine.js";
+} from "../../modules/steward/state-machine.js";
 
 const MAX_OBJECTIVE = 16_384;
 const MAX_INPUT_BYTES = 32_768;

@@ -19,15 +19,15 @@ import { RuntimeStore } from "../src/core/runtime/store.js";
 import { startRuntime } from "../src/bootstrap/runtime.js";
 import { runLocalApp } from "../src/entrypoints/cli/main.js";
 
-test("due one-shot admits exactly one canonical Event and projects its terminal result", () => {
+test("due one-shot admits exactly one canonical Event and projects its terminal result", async () => {
   const fixture = setup();
   try {
     const schedule = fixture.schedules.create(
       onceInput(fixture.agentId, "2026-07-24T01:00:00.000Z"),
       "2026-07-24T00:00:00.000Z"
     );
-    const first = fixture.scheduler.runCycle("2026-07-24T01:00:00.000Z");
-    const duplicate = fixture.scheduler.runCycle("2026-07-24T01:00:01.000Z");
+    const first = await fixture.scheduler.runCycle("2026-07-24T01:00:00.000Z");
+    const duplicate = await fixture.scheduler.runCycle("2026-07-24T01:00:01.000Z");
     assert.equal(first.admitted.length, 1);
     assert.deepEqual(duplicate.admitted, []);
     assert.equal(fixture.schedules.require(schedule.definition.scheduleId).definition.status, "completed");
@@ -43,7 +43,7 @@ test("due one-shot admits exactly one canonical Event and projects its terminal 
 
     complete(fixture.runtime, run.eventId!, "2026-07-24T01:01:00.000Z");
     assert.deepEqual(
-      fixture.scheduler.runCycle("2026-07-24T01:02:00.000Z").projected,
+      (await fixture.scheduler.runCycle("2026-07-24T01:02:00.000Z")).projected,
       [run.runId]
     );
     const terminal = fixture.schedules.requireRun(run.runId);
@@ -54,7 +54,7 @@ test("due one-shot admits exactly one canonical Event and projects its terminal 
   }
 });
 
-test("sleep recovery coalesces missed cron occurrences without backfill", () => {
+test("sleep recovery coalesces missed cron occurrences without backfill", async () => {
   const fixture = setup();
   try {
     const schedule = fixture.schedules.create(
@@ -64,7 +64,7 @@ test("sleep recovery coalesces missed cron occurrences without backfill", () => 
       }),
       "2026-07-24T00:00:00.000Z"
     );
-    const result = fixture.scheduler.runCycle("2026-07-24T05:30:00.000Z");
+    const result = await fixture.scheduler.runCycle("2026-07-24T05:30:00.000Z");
     assert.equal(result.admitted.length, 1);
     const runs = fixture.schedules.runs(schedule.definition.scheduleId);
     assert.equal(runs.length, 1);
@@ -80,7 +80,7 @@ test("sleep recovery coalesces missed cron occurrences without backfill", () => 
   }
 });
 
-test("misfire skip records one bounded decision", () => {
+test("misfire skip records one bounded decision", async () => {
   const fixture = setup();
   try {
     const schedule = fixture.schedules.create(
@@ -90,7 +90,7 @@ test("misfire skip records one bounded decision", () => {
       }),
       "2026-07-24T00:00:00.000Z"
     );
-    const result = fixture.scheduler.runCycle("2026-07-24T05:30:00.000Z");
+    const result = await fixture.scheduler.runCycle("2026-07-24T05:30:00.000Z");
     assert.equal(result.skipped.length, 1);
     assert.equal(result.admitted.length, 0);
     const run = fixture.schedules.runs(schedule.definition.scheduleId)[0]!;
@@ -104,7 +104,7 @@ test("misfire skip records one bounded decision", () => {
   }
 });
 
-test("overlap queue keeps one pending run and admits it after the active run", () => {
+test("overlap queue keeps one pending run and admits it after the active run", async () => {
   const fixture = setup();
   try {
     const schedule = fixture.schedules.create(
@@ -114,9 +114,9 @@ test("overlap queue keeps one pending run and admits it after the active run", (
       }),
       "2026-07-24T00:00:00.000Z"
     );
-    fixture.scheduler.runCycle("2026-07-24T01:00:00.000Z");
-    fixture.scheduler.runCycle("2026-07-24T03:30:00.000Z");
-    fixture.scheduler.runCycle("2026-07-24T04:30:00.000Z");
+    await fixture.scheduler.runCycle("2026-07-24T01:00:00.000Z");
+    await fixture.scheduler.runCycle("2026-07-24T03:30:00.000Z");
+    await fixture.scheduler.runCycle("2026-07-24T04:30:00.000Z");
     const queued = fixture.schedules.runs(schedule.definition.scheduleId);
     assert.equal(queued.length, 2);
     const active = queued.find((run) => run.eventId !== undefined)!;
@@ -125,7 +125,7 @@ test("overlap queue keeps one pending run and admits it after the active run", (
     assert.equal(pending.coalescedThrough, "2026-07-24T04:00:00.000Z");
 
     complete(fixture.runtime, active.eventId!, "2026-07-24T04:31:00.000Z");
-    const recovered = fixture.scheduler.runCycle("2026-07-24T04:32:00.000Z");
+    const recovered = await fixture.scheduler.runCycle("2026-07-24T04:32:00.000Z");
     assert.deepEqual(recovered.projected, [active.runId]);
     assert.deepEqual(recovered.admitted, [pending.runId]);
     assert.match(fixture.schedules.requireRun(pending.runId).eventId ?? "", /^evt_/);
@@ -134,7 +134,7 @@ test("overlap queue keeps one pending run and admits it after the active run", (
   }
 });
 
-test("overlap skip records one decision without a concurrent invocation", () => {
+test("overlap skip records one decision without a concurrent invocation", async () => {
   const fixture = setup();
   try {
     const schedule = fixture.schedules.create(
@@ -144,8 +144,8 @@ test("overlap skip records one decision without a concurrent invocation", () => 
       }),
       "2026-07-24T00:00:00.000Z"
     );
-    fixture.scheduler.runCycle("2026-07-24T01:00:00.000Z");
-    const second = fixture.scheduler.runCycle("2026-07-24T02:00:00.000Z");
+    await fixture.scheduler.runCycle("2026-07-24T01:00:00.000Z");
+    const second = await fixture.scheduler.runCycle("2026-07-24T02:00:00.000Z");
     assert.equal(second.skipped.length, 1);
     const runs = fixture.schedules.runs(schedule.definition.scheduleId);
     assert.equal(runs.length, 2);
@@ -156,7 +156,7 @@ test("overlap skip records one decision without a concurrent invocation", () => 
   }
 });
 
-test("cancelled pending overlap is skipped before Event admission", () => {
+test("cancelled pending overlap is skipped before Event admission", async () => {
   const fixture = setup();
   try {
     const schedule = fixture.schedules.create(
@@ -166,8 +166,8 @@ test("cancelled pending overlap is skipped before Event admission", () => {
       }),
       "2026-07-24T00:00:00.000Z"
     );
-    fixture.scheduler.runCycle("2026-07-24T01:00:00.000Z");
-    fixture.scheduler.runCycle("2026-07-24T02:00:00.000Z");
+    await fixture.scheduler.runCycle("2026-07-24T01:00:00.000Z");
+    await fixture.scheduler.runCycle("2026-07-24T02:00:00.000Z");
     const before = fixture.schedules.runs(schedule.definition.scheduleId);
     const active = before.find((run) => run.eventId !== undefined)!;
     const pending = before.find((run) => run.eventId === undefined)!;
@@ -178,7 +178,7 @@ test("cancelled pending overlap is skipped before Event admission", () => {
     );
     complete(fixture.runtime, active.eventId!, "2026-07-24T02:02:00.000Z");
 
-    const result = fixture.scheduler.runCycle("2026-07-24T02:03:00.000Z");
+    const result = await fixture.scheduler.runCycle("2026-07-24T02:03:00.000Z");
     assert.ok(result.skipped.includes(pending.runId));
     assert.equal(fixture.schedules.requireRun(pending.runId).status, "skipped");
     assert.equal(
@@ -191,21 +191,21 @@ test("cancelled pending overlap is skipped before Event admission", () => {
   }
 });
 
-test("admission failure is terminal and does not become a misfire retry", () => {
+test("admission failure is terminal and does not become a misfire retry", async () => {
   const fixture = setup(() => "agent-suspended");
   try {
     const schedule = fixture.schedules.create(
       onceInput(fixture.agentId, "2026-07-24T01:00:00.000Z"),
       "2026-07-24T00:00:00.000Z"
     );
-    const result = fixture.scheduler.runCycle("2026-07-24T01:00:00.000Z");
+    const result = await fixture.scheduler.runCycle("2026-07-24T01:00:00.000Z");
     assert.equal(result.failed.length, 1);
     const run = fixture.schedules.runs(schedule.definition.scheduleId)[0]!;
     assert.equal(run.status, "failed");
     assert.equal(run.decisionReason, "admission-failed:agent-suspended");
     assert.equal(run.eventId, undefined);
     assert.deepEqual(
-      fixture.scheduler.runCycle("2026-07-24T02:00:00.000Z").failed,
+      (await fixture.scheduler.runCycle("2026-07-24T02:00:00.000Z")).failed,
       []
     );
   } finally {
@@ -213,14 +213,14 @@ test("admission failure is terminal and does not become a misfire retry", () => 
   }
 });
 
-test("interrupted scheduled provider work becomes unknown instead of replaying", () => {
+test("interrupted scheduled provider work becomes unknown instead of replaying", async () => {
   const fixture = setup();
   try {
     const schedule = fixture.schedules.create(
       onceInput(fixture.agentId, "2026-07-24T01:00:00.000Z"),
       "2026-07-24T00:00:00.000Z"
     );
-    fixture.scheduler.runCycle("2026-07-24T01:00:00.000Z");
+    await fixture.scheduler.runCycle("2026-07-24T01:00:00.000Z");
     const run = fixture.schedules.runs(schedule.definition.scheduleId)[0]!;
     const execution = fixture.runtime.claimDueExecutions(
       1,
@@ -240,7 +240,7 @@ test("interrupted scheduled provider work becomes unknown instead of replaying",
     );
     assert.equal(fixture.runtime.execution(execution.executionId)?.status, "failed");
     assert.deepEqual(
-      fixture.scheduler.runCycle("2026-07-24T01:03:00.000Z").projected,
+      (await fixture.scheduler.runCycle("2026-07-24T01:03:00.000Z")).projected,
       []
     );
   } finally {
@@ -248,7 +248,7 @@ test("interrupted scheduled provider work becomes unknown instead of replaying",
   }
 });
 
-test("crash after Event admission is repaired through the Event source receipt", () => {
+test("crash after Event admission is repaired through the Event source receipt", async () => {
   const fixture = setup();
   try {
     const schedule = fixture.schedules.create(
@@ -281,7 +281,7 @@ test("crash after Event admission is repaired through the Event source receipt",
     );
 
     assert.deepEqual(
-      fixture.scheduler.runCycle("2026-07-24T01:01:00.000Z").admitted,
+      (await fixture.scheduler.runCycle("2026-07-24T01:01:00.000Z")).admitted,
       [run.runId]
     );
     assert.equal(fixture.runtime.events().filter(
@@ -293,7 +293,7 @@ test("crash after Event admission is repaired through the Event source receipt",
   }
 });
 
-test("fixed Session is carried by the admitted Event", () => {
+test("fixed Session is carried by the admitted Event", async () => {
   const fixture = setup();
   try {
     const seed = fixture.runtime.appendEvent({
@@ -311,7 +311,7 @@ test("fixed Session is carried by the admitted Event", () => {
       fixedSessionId: sessionId
     }, "2026-07-24T00:02:00.000Z");
 
-    fixture.scheduler.runCycle("2026-07-24T01:00:00.000Z");
+    await fixture.scheduler.runCycle("2026-07-24T01:00:00.000Z");
     const run = fixture.schedules.runs(schedule.definition.scheduleId)[0]!;
     assert.equal(fixture.runtime.event(run.eventId!)?.sessionId, sessionId);
   } finally {
@@ -319,7 +319,7 @@ test("fixed Session is carried by the admitted Event", () => {
   }
 });
 
-test("two schedules sharing a fixed Session cannot resume it concurrently", () => {
+test("two schedules sharing a fixed Session cannot resume it concurrently", async () => {
   const fixture = setup();
   try {
     const seed = fixture.runtime.appendEvent({
@@ -340,7 +340,7 @@ test("two schedules sharing a fixed Session cannot resume it concurrently", () =
         prompt
       }, "2026-07-24T00:02:00.000Z");
     }
-    const result = fixture.scheduler.runCycle("2026-07-24T01:00:00.000Z");
+    const result = await fixture.scheduler.runCycle("2026-07-24T01:00:00.000Z");
     assert.equal(result.admitted.length, 1);
     assert.equal(result.queued.length, 1);
     assert.equal(fixture.runtime.events().filter(
@@ -352,14 +352,14 @@ test("two schedules sharing a fixed Session cannot resume it concurrently", () =
   }
 });
 
-test("Execution retry stays on the same ScheduledRun and Event", () => {
+test("Execution retry stays on the same ScheduledRun and Event", async () => {
   const fixture = setup();
   try {
     const schedule = fixture.schedules.create(
       onceInput(fixture.agentId, "2026-07-24T01:00:00.000Z"),
       "2026-07-24T00:00:00.000Z"
     );
-    fixture.scheduler.runCycle("2026-07-24T01:00:00.000Z");
+    await fixture.scheduler.runCycle("2026-07-24T01:00:00.000Z");
     const run = fixture.schedules.runs(schedule.definition.scheduleId)[0]!;
     const execution = fixture.runtime.claimDueExecutions(
       1,
@@ -371,7 +371,7 @@ test("Execution retry stays on the same ScheduledRun and Event", () => {
       "2026-07-24T01:01:00.000Z",
       1_000
     );
-    fixture.scheduler.runCycle("2026-07-24T01:01:00.500Z");
+    await fixture.scheduler.runCycle("2026-07-24T01:01:00.500Z");
     assert.equal(fixture.schedules.runs(schedule.definition.scheduleId).length, 1);
     assert.equal(fixture.schedules.requireRun(run.runId).eventId, run.eventId);
     assert.equal(
@@ -390,12 +390,26 @@ test("real foreground loop executes a CLI-created one-shot and traces its Sessio
     addLocalAgent(repo, "alice", "codex", { runtimeDirectory });
     const executable = join(runtimeDirectory, "codex-fixture");
     writeFileSync(executable, `#!${process.execPath}
-process.stdin.resume();
-process.stdin.on("end", () => {
-  process.stdout.write([
-    JSON.stringify({ type: "thread.started", thread_id: "scheduled-provider-session" }),
-    JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "scheduled result" } })
-  ].join("\\n") + "\\n");
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin });
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.id === 0) send({ id: 0, result: {} });
+  if (message.id === 1) send({ id: 1, result: { thread: {
+    id: message.params.threadId || "scheduled-provider-session"
+  } } });
+  if (message.id === 2) {
+    send({ id: 2, result: { turn: { id: "turn-fixture", items: [], status: "inProgress" } } });
+    send({ method: "item/completed", params: {
+      threadId: message.params.threadId, turnId: "turn-fixture", completedAtMs: Date.now(),
+      item: { id: "message-fixture", type: "agentMessage", text: "scheduled result" }
+    } });
+    send({ method: "turn/completed", params: {
+      threadId: message.params.threadId,
+      turn: { id: "turn-fixture", items: [], status: "completed" }
+    } });
+  }
 });
 `);
     chmodSync(executable, 0o700);
@@ -437,8 +451,17 @@ process.stdin.on("end", () => {
           }
           if (admitted && text.includes('"type":"scheduled_task.cycle"') &&
             text.includes('"projected":["run_')) {
-            projected = true;
-            controller.abort();
+            const projection = new ScheduledTaskStore(
+              runtimePaths(repo, runtimeDirectory).database
+            );
+            try {
+              if (projection.runs(scheduleId)[0]?.status === "succeeded") {
+                projected = true;
+                controller.abort();
+              }
+            } finally {
+              projection.close();
+            }
           }
         } }
       }, controller.signal);

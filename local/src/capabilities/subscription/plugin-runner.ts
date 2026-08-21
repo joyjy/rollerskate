@@ -236,6 +236,9 @@ function parseObservation(value: unknown): PollObservation {
       value.terminal !== "failure" && value.terminal !== "cancelled")) {
     throw new Error("Poll plugin returned a malformed observation");
   }
+  if ("terminalKey" in value) {
+    throw new Error("Poll plugin terminalKey is not supported; the Runtime owns terminal identity");
+  }
   return value as unknown as PollObservation;
 }
 

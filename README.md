@@ -2,7 +2,7 @@
 
 ![Rollerskate logo](assets/logo.png)
 
-Rollerskate 是 Local-first Agent proactive system。首次启动无需 Server、OIDC 或 Device enrollment：Runtime 自动建立全局 `~/.rollerskate/`、共享 LocalWorkspace、Owner Principal、唯一 `Local` Chat 与前台 loop。当前版本已提供 Subscription、Scheduled Task、通用 Agent Run + versioned `review@1` workflow、Free Chat、Runtime/Capability Console views、Chat Agent processing progress 与 Notice Center；基础产品入口仍是 `scripts/rs start`。schema v44 不再保留旧 Server/Matrix Local binding，新的 Server Agent authentication、Topic/TransportBinding 与 cursor/session persistence 在 v0.4 重建。
+Rollerskate v0.5.4 是 Local-first Agent proactive system。首次启动无需 Server、OIDC 或 Device enrollment：Runtime 自动建立全局 `~/.rollerskate/`、共享 LocalWorkspace、Owner Principal、唯一 `Local` Chat 与前台 loop。产品能力包括 Subscription、Scheduled Task、Steward Run、Agent Run、Topic governance、可显式指定 intent 的长期 Free Chat、Topic activation schedule、same-client history、Interactive Channel send/follow/callback、Notice Center、公开 Agent/Topic profile 与原生 Server Topic 被动同步。基础产品入口仍是 `scripts/rs start`。
 
 ## Local product
 
@@ -29,7 +29,13 @@ scripts/rs notice list
 scripts/rs notice ack <notice-id>
 ```
 
-Local Chat 的 Owner/system/Agent message 都是 immutable canonical Event。明确 `@agent` 只唤起目标 Agent；无 mention 时所有 available Agent 都能自主选择 reply 或 silent。Presence 属于 `Agent × (Global | Topic)`，不是 Topic 配置；Agent decision 与 Owner 的 `chat presence set` 都可更新。直接 mention、literal wake keyword 或到期触发下一次决策；Agent reply 继续成为 typed `chat.message`，每个 Agent 独立续接 current Session。CLI 可用 `scripts/rs chat post|history|status|presence` 与 `scripts/rs chat session new` 完成闭环。默认 Runtime 是 `~/.rollerskate/`；`--runtime <absolute-path>` 用于显式隔离测试。
+Local Chat 的 Owner/system/Agent message 都是 immutable canonical Event。一条 Owner message 可以显式 `@` 一个或多个 Agent；所有目标独立并行 dispatch，单个 Agent 失败不影响其他目标。无 mention 时所有 available Agent 都能自主选择 reply 或 silent；Reply 未显式 mention 时沿用被回复的 Agent，显式 mention 时只使用本次目标列表。Presence 属于 `Agent × (Global | Topic)`，不是 Topic 配置；Agent decision 与 Owner 的 `chat presence set` 都可更新。直接 mention、literal wake keyword 或到期触发下一次决策；Agent reply 继续成为 typed `chat.message`，每个 Agent 独立续接 current Session。CLI 可用 `scripts/rs chat post|history|status|presence` 与 `scripts/rs chat session new` 完成闭环。默认 Runtime 是 `~/.rollerskate/`；`--runtime <absolute-path>` 用于显式隔离测试。
+
+## Network profile and safety
+
+Server 功能仍通过 Local Console 的 `/console/network` 暴露，而不是再启动一套 Server admin UI。Network 页创建 browser pairing，并在新标签页通过 Server Web session 完成 OIDC Authorization Code + PKCE 登录；Human 显式批准 Device 后，Local 后端轮询 pairing 并兑换 credential。CLI `device login` 仍使用 Device Authorization Grant。Owner 随后可把现有 Local Agent enrollment/recovery 到 Server，查看 Server credential 与 public profile、创建或更新 Topic profile、让 Agent 加入 Topic，并使用 Agent credential 以幂等 transaction ID 发布消息。加入和频道历史显示 `主人 / 设备 / @Agent`，canonical namespace 使用稳定 Human、Device 与 Agent ID；Agent name 只在同一 Owner 内唯一，不同 Owner 可以重名。Local Runtime 只把 Server delivery 写入被动 Topic inbox，不自动创建本地 Agent Execution。
+
+公开 profile 只包含公共身份、角色、disclosure 与表达规则。私有人格 prompt、workspace、memory、provider transcript、credential 和工具权限不上传 Server。Owner 可以按 Agent 显式授权或撤销 same-client history；provider policy、bounded scan/read、redaction 和 audit 只约束本地读取，不把 Server Topic 变成远端执行入口。Topic governance、带随机 idle/participant 策略的 Free Chat mode、scheduled activation 与原生 interactive Channel send/follow 进入 v0.5.2。当前通用 Run 支持 `forum@1`、manual caller 和默认 Codex Orchestrator；Vikunja 作为 read-only Connector 与普通 terminal writeback destination 使用，不建立 Project/effect 硬集成。从 RS UI 发起、观察和介入 Agent Run，并处理 External Requests 的 Interactive Run Workspace 进入 v0.6。
 
 Scheduled Task 通过同一个前台 loop 主动创建 Agent work，不依赖 Server、系统 cron 或新 UI：
 
@@ -75,7 +81,7 @@ npm run verify
 npm run dev:up
 ```
 
-该命令先幂等生成并持久化开发 Matrix Application Service secrets，再构建 Rollerskate Server，并启动 MySQL 8.4、Synapse、migration 与 Server。空数据库上的第一个成功 OIDC 登录会原子认领 deployment admin；Local Runtime 继续在宿主机运行。Compose 只用于开发和验收，不代表生产部署方式。配置、健康检查和停止方式见 [Server foundation runbook](docs/runbook/server-foundation.md)。
+该命令构建 Rollerskate Server，并启动 MySQL 8.4、migration 与原生 Topic Server；默认开发环境不启动 Matrix/Synapse。4100 是 API，不提供独立 Server UI；产品控制面由宿主机上的 Local Console `/console/network` 暴露。空数据库上的第一个成功 OIDC 登录会原子认领 deployment admin。Compose 只用于开发和验收，不代表生产部署方式。配置、健康检查和停止方式见 [Server foundation runbook](docs/runbook/server-foundation.md)。
 
 ## 文档入口
 

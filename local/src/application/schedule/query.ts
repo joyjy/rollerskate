@@ -53,6 +53,8 @@ export interface ScheduleDetailView {
     readonly misfireGraceMilliseconds: number;
     readonly prompt: string;
     readonly workspace: string;
+    readonly externalRefBinding: ScheduleInspection["schedule"]["revision"]["externalRefBinding"] | null;
+    readonly callbacks: ScheduleInspection["schedule"]["revision"]["callbacks"];
     readonly createdAt: string;
   };
   readonly runs: readonly ScheduledRunView[];
@@ -70,6 +72,7 @@ export interface ScheduledRunView {
   readonly executionId: string | null;
   readonly sessionId: string | null;
   readonly decisionReason: string | null;
+  readonly callbacks: readonly ScheduledCallbackView[];
   readonly availableActions: {
     readonly resolveSucceeded: boolean;
     readonly resolveFailed: boolean;
@@ -82,6 +85,28 @@ export interface ScheduledRunView {
   readonly updatedAt: string;
   readonly completedAt: string | null;
   readonly audit: EventTraceView | null;
+}
+
+export interface ScheduledCallbackView {
+  readonly occurrenceId: string;
+  readonly callbackId: string;
+  readonly ordinal: number;
+  readonly kind: "agent.invoke" | "command.exec" | "destination.deliver";
+  readonly status: "pending" | "started" | "succeeded" | "blocked" | "failed" | "unknown";
+  readonly phase: "pending" | "admitted" | "terminal" | "unknown";
+  readonly eventId: string | null;
+  readonly deliveryId: string | null;
+  readonly receipt: unknown | null;
+  readonly lastError: string | null;
+  readonly startedAt: string | null;
+  readonly completedAt: string | null;
+  readonly delivery: {
+    readonly status: "pending" | "delivering" | "retry_wait" | "delivered" | "failed";
+    readonly attemptCount: number;
+    readonly maxAttempts: number;
+    readonly receipt: string | null;
+    readonly lastError: string | null;
+  } | null;
 }
 
 interface AgentReferenceView {
@@ -165,6 +190,8 @@ export function scheduleDetailView(inspection: ScheduleInspection): ScheduleDeta
       misfireGraceMilliseconds: revision.misfireGraceMilliseconds,
       prompt: revision.prompt,
       workspace: revision.workspace,
+      externalRefBinding: revision.externalRefBinding ?? null,
+      callbacks: revision.callbacks,
       createdAt: revision.createdAt
     },
     runs: inspection.runs.map(scheduledRunView)
@@ -189,6 +216,35 @@ export function scheduledRunView(inspection: ScheduledRunInspection): ScheduledR
     executionId: run.executionId ?? null,
     sessionId: run.sessionId ?? null,
     decisionReason: run.decisionReason ?? null,
+    callbacks: inspection.callbacks.map(({ occurrence, delivery }) => ({
+      occurrenceId: occurrence.occurrenceId,
+      callbackId: occurrence.callbackId,
+      ordinal: occurrence.ordinal,
+      kind: occurrence.kind,
+      status: occurrence.status,
+      phase: occurrence.status === "pending"
+        ? "pending"
+        : occurrence.status === "started"
+          ? "admitted"
+          : occurrence.status === "unknown"
+            ? "unknown"
+            : "terminal",
+      eventId: occurrence.eventId ?? null,
+      deliveryId: delivery?.deliveryId ?? callbackDeliveryId(occurrence.receipt) ?? null,
+      receipt: occurrence.receipt ?? null,
+      lastError: occurrence.lastError ?? null,
+      startedAt: occurrence.startedAt ?? null,
+      completedAt: occurrence.completedAt ?? null,
+      delivery: delivery === undefined
+        ? null
+        : {
+            status: delivery.status,
+            attemptCount: delivery.attemptCount,
+            maxAttempts: delivery.maxAttempts,
+            receipt: delivery.receipt ?? null,
+            lastError: delivery.lastError ?? null
+          }
+    })),
     availableActions: {
       resolveSucceeded: resolvable,
       resolveFailed: resolvable
@@ -206,6 +262,12 @@ export function scheduledRunView(inspection: ScheduledRunInspection): ScheduledR
       ? null
       : eventTraceViews([inspection.audit])[0]!
   };
+}
+
+function callbackDeliveryId(receipt: unknown): string | undefined {
+  if (typeof receipt !== "object" || receipt === null || Array.isArray(receipt)) return undefined;
+  const deliveryId = (receipt as Record<string, unknown>).deliveryId;
+  return typeof deliveryId === "string" ? deliveryId : undefined;
 }
 
 function scheduleStatusReason(status: ScheduleStatus): string {

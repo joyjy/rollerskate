@@ -17,10 +17,28 @@ import {
   scheduledRunView,
   traceScheduledRunView
 } from "../../application/schedule/query.js";
+import { parseProactiveCallbacks } from "../../application/callback/proactive.js";
+import { parseExternalRefTriggerBinding } from
+  "../../application/external-resource/trigger-binding.js";
+import { HOST_COMMAND_CALLBACK_HELP } from "./shared.js";
 
 interface Output {
   readonly write: (text: string) => void;
 }
+
+const HELP = [
+  "Usage:",
+  "  scripts/rs schedule create <json-file>",
+  "  scripts/rs schedule update <schedule-id> <json-file>",
+  "  scripts/rs schedule list",
+  "  scripts/rs schedule inspect|pause|resume|cancel <schedule-id>",
+  "  scripts/rs schedule run-now <schedule-id> --request-id <idempotency-key>",
+  "  scripts/rs schedule runs <schedule-id> [--limit <count>]",
+  "  scripts/rs schedule trace <run-id>",
+  "  scripts/rs schedule resolve <run-id> <succeeded|failed>",
+  "",
+  HOST_COMMAND_CALLBACK_HELP
+].join("\n");
 
 export function runScheduleCommand(
   repoRoot: string,
@@ -29,6 +47,16 @@ export function runScheduleCommand(
   runtimeDirectory?: string
 ): number {
   const [command, ...rest] = arguments_;
+  if (
+    command === "--help" ||
+    ((command === "create" || command === "update") && rest[0] === "--help")
+  ) {
+    if (rest.length > (command === "create" || command === "update" ? 1 : 0)) {
+      throw new Error("schedule help accepts no additional arguments");
+    }
+    output.write(`${HELP}\n`);
+    return 0;
+  }
   if (command === "create") {
     requireCount(rest, 1, "schedule create requires exactly one JSON file");
     write(output, scheduleDetailView(createSchedule(
@@ -133,9 +161,19 @@ function parseScheduleFile(
     "misfireGraceMilliseconds",
     "session",
     "prompt",
+    "callbacks",
+    "externalRefBinding",
     ...(update ? ["expectedRevision"] : [])
   ], "schedule file");
-  if (root.schemaVersion !== 1) throw new Error("schedule file schemaVersion must be 1");
+  if (root.schemaVersion !== 1 && root.schemaVersion !== 2) {
+    throw new Error("schedule file schemaVersion must be 1 or 2");
+  }
+  if (root.schemaVersion === 1 && root.callbacks !== undefined) {
+    throw new Error("schedule schemaVersion 1 must not define callbacks");
+  }
+  if (root.schemaVersion === 2 && !Array.isArray(root.callbacks)) {
+    throw new Error("schedule schemaVersion 2 requires callbacks");
+  }
   const kind = oneOf(root.kind, ["once", "cron"] as const, "kind");
   const timezone = optionalText(root.timezone, "timezone");
   if (kind === "cron" && timezone === undefined) {
@@ -179,7 +217,13 @@ function parseScheduleFile(
     ),
     sessionPolicy,
     ...(fixedSessionId === undefined ? {} : { fixedSessionId }),
-    prompt: text(root.prompt, "prompt")
+    prompt: text(root.prompt, "prompt"),
+    ...(root.schemaVersion === 2
+      ? { callbacks: parseProactiveCallbacks(root.callbacks) }
+      : {}),
+    ...(root.externalRefBinding === undefined
+      ? {}
+      : { externalRefBinding: parseExternalRefTriggerBinding(root.externalRefBinding) })
   };
   if (!update) return common;
   return {

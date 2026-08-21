@@ -4,7 +4,6 @@ import type { EventType } from "../event/model.js";
 export const runtimeHandlerKinds = [
   "agent",
   "result",
-  "review",
   "chat"
 ] as const;
 export type RuntimeHandlerKind = (typeof runtimeHandlerKinds)[number];
@@ -18,9 +17,8 @@ const runtimeRoutes: Readonly<Record<EventType, RuntimeRoute>> = {
   "agent.request": { eventType: "agent.request", handler: "agent" },
   "subscription.fire": { eventType: "subscription.fire", handler: "agent" },
   "agent.result": { eventType: "agent.result", handler: "result" },
-  "review.requested": { eventType: "review.requested", handler: "review" },
-  "review.decision": { eventType: "review.decision", handler: "review" },
   "chat.dispatch": { eventType: "chat.dispatch", handler: "agent" },
+  "chat.activation": { eventType: "chat.activation", handler: "chat" },
   "chat.message": { eventType: "chat.message", handler: "chat" }
 };
 
@@ -55,6 +53,7 @@ export interface RuntimeSession {
   readonly sessionId: string;
   readonly agentId: string;
   readonly runId?: string;
+  readonly cycleId?: string;
   readonly adapterId: string;
   readonly providerSessionId: string;
   readonly workspace: string;
@@ -62,10 +61,14 @@ export interface RuntimeSession {
   readonly updatedAt: string;
 }
 
+export type WorkspaceEffect = "must_change" | "may_remain_unchanged";
+
 export interface ExternalWorkspaceGrant {
   readonly schemaVersion: "ExternalWorkspaceGrant@1";
   readonly root: string;
   readonly access: "read" | "write";
+  readonly effect?: WorkspaceEffect;
+  readonly networkAccess?: boolean;
   readonly revision: string;
 }
 
@@ -94,6 +97,7 @@ export interface AgentRunContext {
   readonly schemaVersion: "AgentRunContext@1";
   readonly resultContractId: string;
   readonly runId: string;
+  readonly cycleId?: string;
   readonly stepId: string;
   readonly depth: number;
   readonly parentStepId?: string;
@@ -104,7 +108,7 @@ export interface AgentRunContext {
 
 export interface RuntimeDestination {
   readonly destinationId: string;
-  readonly kind: "matrix" | "macos-notification";
+  readonly kind: "matrix" | "macos-notification" | "server-topic" | "vikunja-task";
   readonly address: Readonly<Record<string, string>>;
   readonly createdAt: string;
   readonly updatedAt: string;
@@ -112,8 +116,13 @@ export interface RuntimeDestination {
 
 export interface RuntimeDelivery {
   readonly deliveryId: string;
-  readonly resultEventId: string;
+  readonly origin: {
+    readonly kind: "event" | "host";
+    readonly id: string;
+  };
+  readonly resultEventId?: string;
   readonly destinationId: string;
+  readonly payload: Readonly<Record<string, unknown>>;
   readonly status: "pending" | "delivering" | "retry_wait" | "delivered" | "failed";
   readonly attemptCount: number;
   readonly maxAttempts: number;

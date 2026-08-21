@@ -5,8 +5,7 @@ export const eventTypes = [
   "agent.request",
   "subscription.fire",
   "agent.result",
-  "review.requested",
-  "review.decision",
+  "chat.activation",
   "chat.message",
   "chat.dispatch"
 ] as const;
@@ -49,39 +48,12 @@ export interface AgentRequestEvent extends EventBase {
   readonly type: "agent.request";
   readonly agentId: string;
   readonly prompt: string;
-  readonly reviewInvocation?: ReviewAgentInvocation;
   readonly runContext?: AgentRunContext;
-}
-
-export interface ReviewReference {
-  readonly kind: "acceptance";
-  readonly ref: string;
-  readonly revision: string;
-}
-
-export interface ReviewEvidenceReference {
-  readonly kind: "workspace";
-  readonly ref: string;
-  readonly revision: string;
-}
-
-export interface ReviewAgentInvocation {
-  readonly schemaVersion: "review-invocation@1";
-  readonly role: "reviewer" | "implementer";
-  readonly rootEventId: string;
-  readonly cycleIndex: number;
-  readonly subject: ReviewReference;
-  readonly artifactRef: string;
-  readonly artifactRevision?: string;
-  readonly evidence: readonly ReviewEvidenceReference[];
-  readonly implementationRevision: string;
-  readonly workspaceAccess: "read" | "write";
-  readonly writableRoot?: string;
-  readonly resultSchema: "ReviewerResult@1" | "ImplementerResult@1";
 }
 
 export interface SubscriptionFireObservation {
   readonly version: string;
+  readonly terminalKey?: string;
   readonly facts: Readonly<Record<string, unknown>>;
   readonly terminal: "success" | "failure" | "cancelled";
   readonly summary?: string;
@@ -92,6 +64,14 @@ export interface SubscriptionFireEvent extends EventBase {
   readonly agentId: string;
   readonly prompt: string;
   readonly observation?: SubscriptionFireObservation;
+  readonly invocation?: SubscriptionAgentInvocation;
+}
+
+export interface SubscriptionAgentInvocation {
+  readonly schemaVersion: "SubscriptionAgentInvocation@1";
+  readonly resultSchema: "SubscriptionAgentResult@1";
+  readonly workspaceGrant: import("../runtime/model.js").ExternalWorkspaceGrant;
+  readonly networkAccess: boolean;
 }
 
 export type AgentInputEvent = AgentRequestEvent | SubscriptionFireEvent;
@@ -104,36 +84,6 @@ export interface AgentResultEvent extends EventBase {
   readonly error?: string;
 }
 
-export interface ReviewRequestedEvent extends EventBase {
-  readonly type: "review.requested";
-  readonly cycleIndex: number;
-  readonly subject: ReviewReference;
-  readonly artifactRef: string;
-  readonly artifactRevision?: string;
-  readonly evidence: readonly ReviewEvidenceReference[];
-  readonly implementationRevision: string;
-  readonly reviewerAgentId: string;
-  readonly implementerAgentId: string;
-  readonly reworkLimit: number;
-}
-
-export interface ReviewDecisionEvent extends EventBase {
-  readonly type: "review.decision";
-  readonly cycleIndex: number;
-  readonly requestedEventId: string;
-  readonly reviewerResultEventId: string;
-  readonly decision: "passed" | "findings" | "blocked";
-  readonly boundedSummary: string;
-  readonly revisionsRead: {
-    readonly subject: string;
-    readonly artifact?: string;
-    readonly evidence: readonly ReviewEvidenceReference[];
-  };
-  readonly artifactRevision: string;
-  readonly openFindingCount: number;
-  readonly blockedReason?: string;
-}
-
 export interface ChatMessageEvent extends EventBase {
   readonly type: "chat.message";
   readonly topicId: string;
@@ -143,10 +93,12 @@ export interface ChatMessageEvent extends EventBase {
     readonly handleSnapshot: string;
   };
   readonly body: string;
-  readonly target?: {
-    readonly principalId: string;
-    readonly handleSnapshot: string;
+  readonly replyToEventId?: string;
+  readonly conversation?: {
+    readonly strategyId: "human-message" | "participant-message";
+    readonly turnBudget: number;
   };
+  readonly targets?: readonly ChatMessageTarget[];
   readonly dispatchCard?: {
     readonly sourceMessageEventId: string;
     readonly candidates: readonly {
@@ -156,31 +108,100 @@ export interface ChatMessageEvent extends EventBase {
   };
 }
 
+export interface ChatMessageTarget {
+  readonly principalId: string;
+  readonly handleSnapshot: string;
+}
+
+export function parseChatMessageTargets(
+  payload: Readonly<Record<string, unknown>>,
+  eventId: string
+): readonly ChatMessageTarget[] | undefined {
+  const current = payload.targets;
+  const legacy = payload.target;
+  if (current !== undefined && legacy !== undefined) {
+    throw new Error(`Chat message has both target and targets: ${eventId}`);
+  }
+  const values = current === undefined
+    ? legacy === undefined ? undefined : [legacy]
+    : current;
+  if (values === undefined) return undefined;
+  if (!Array.isArray(values) || values.length === 0 || values.length > 64 ||
+    values.some((value) => !isRecord(value) ||
+      typeof value.principalId !== "string" || value.principalId.trim() === "" ||
+      typeof value.handleSnapshot !== "string" || value.handleSnapshot.trim() === "")) {
+    throw new Error(`Chat message targets are malformed: ${eventId}`);
+  }
+  const targets = values.map((value) => ({
+    principalId: (value as { principalId: string }).principalId,
+    handleSnapshot: (value as { handleSnapshot: string }).handleSnapshot
+  }));
+  if (new Set(targets.map((target) => target.principalId)).size !== targets.length) {
+    throw new Error(`Chat message targets contain duplicates: ${eventId}`);
+  }
+  return targets;
+}
+
+export type ChatActivationReason =
+  | "topic_opened"
+  | "manual"
+  | "scheduled"
+  | "participant_message"
+  | "resumed";
+
+export type ChatActivationStrategy =
+  | "starter"
+  | "manual"
+  | "scheduled"
+  | "participant-message";
+
+export interface ChatActivationEvent extends EventBase {
+  readonly type: "chat.activation";
+  readonly topicId: string;
+  readonly reason: ChatActivationReason;
+  readonly strategyId: ChatActivationStrategy;
+  readonly strategyRevision: number;
+  readonly contextRevision: number;
+  readonly conversationIntent: import("../chat/model.js").ConversationIntentSnapshot;
+  readonly candidateAgentIds: readonly string[];
+  readonly sequentialDispatch?: boolean;
+  readonly sourceEventId?: string;
+  readonly turnBudget: number;
+  readonly expiresAt: string;
+}
+
 export interface ChatDispatchEvent extends EventBase {
   readonly type: "chat.dispatch";
   readonly agentId: string;
   readonly topicId: string;
-  readonly sourceMessageEventId: string;
+  readonly sourceAttentionEventId: string;
+  /** Present for message-triggered dispatches stored before/after v0.5.1. */
+  readonly sourceMessageEventId?: string;
   readonly targetHandleSnapshot: string;
   readonly promptResourceId: string;
   readonly prompt: string;
+  readonly admissionSnapshot?: {
+    readonly revision: number;
+    readonly participantRevision: number;
+  };
+  readonly profileContext?: import("../chat/model.js").ChatProfileContext;
 }
 
 export type Event =
   | AgentInputEvent
   | AgentResultEvent
-  | ReviewRequestedEvent
-  | ReviewDecisionEvent
+  | ChatActivationEvent
   | ChatMessageEvent
   | ChatDispatchEvent;
 
 export interface CreateEvent {
   readonly eventId?: string;
-  readonly type: "agent.request";
+  readonly type: "agent.request" | "subscription.fire";
   readonly source: EventSource;
   readonly agentId: string;
   readonly prompt: string;
-  readonly reviewInvocation?: ReviewAgentInvocation;
+  readonly observation?: SubscriptionFireObservation;
+  readonly subscriptionInvocation?: SubscriptionAgentInvocation;
   readonly runContext?: AgentRunContext;
   readonly sessionId?: string;
   readonly destinationIds?: readonly string[];
@@ -231,4 +252,8 @@ function prefixedUuidV7(prefix: "evt"): string {
   const hex = bytes.toString("hex");
   return `${prefix}_${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-` +
     `${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

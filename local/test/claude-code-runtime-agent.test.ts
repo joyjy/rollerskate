@@ -26,7 +26,10 @@ process.stdin.on("end", () => {
     subtype: "success",
     is_error: false,
     result: "direct Claude result",
-    session_id: "claude-provider-session"
+    session_id: "claude-provider-session",
+    usage: { input_tokens: 9, output_tokens: 3 },
+    num_turns: 2,
+    total_cost_usd: 0.01
   }));
 });
 `);
@@ -36,8 +39,15 @@ process.stdin.on("end", () => {
     projectRoot: workspace,
     environment: {},
     timeoutMilliseconds: 3_000,
-    launchArgs: ["--model", "claude-sonnet-4-6"]
+    launchArgs: ["--model", "claude-sonnet-4-6"],
+    resolveMcpServers: () => [{
+      name: "rollerskate_chat",
+      command: process.execPath,
+      args: ["chat-history.js"]
+    }]
   });
+  assert.equal(agent.providerPolicy.client, "claude-code");
+  assert.equal(agent.providerPolicy.hook.state, "enforced");
 
   const result = await agent.invoke({
     event: event(),
@@ -50,10 +60,23 @@ process.stdin.on("end", () => {
   };
   assert.deepEqual(request.args.slice(0, 2), ["--model", "claude-sonnet-4-6"]);
   assert.deepEqual(request.args.slice(-2), ["--resume", "claude-existing-session"]);
+  assert.ok(request.args.includes("--strict-mcp-config"));
+  assert.deepEqual(request.args.slice(
+    request.args.indexOf("--allowedTools"),
+    request.args.indexOf("--allowedTools") + 2
+  ), ["--allowedTools", "mcp__rollerskate_chat__read_chat_history"]);
   assert.ok(!request.args.includes("claude"));
   assert.match(request.input, /Prompt:\nrespond directly/);
   assert.equal(result.providerSessionId, "claude-provider-session");
   assert.deepEqual(result.outcome, { kind: "message", body: "direct Claude result" });
+  assert.deepEqual(result.invocation?.tokenUsage, {
+    inputTokens: 9,
+    outputTokens: 3,
+    totalTokens: 12,
+    costUsd: 0.01
+  });
+  assert.equal(result.invocation?.turnCount, 2);
+  assert.equal(result.invocation?.toolUsage, undefined);
 });
 
 function event(): AgentInputEvent {

@@ -16,7 +16,7 @@ const initialSubscriptionId = Array.isArray(route.query.subscriptionId)
 
 const selectedId = ref(initialSubscriptionId ?? "");
 const mutationPaused = ref(false);
-const { data, loading, error: loadError, refresh } = useApi({
+const { data, loading, error: loadError, refresh: refreshSubscriptions } = useApi({
   url: "/api/subscriptions",
   schema: subscriptionsSchema,
   interval: 3_000,
@@ -34,6 +34,10 @@ watch(subscriptions, (next) => {
     selectedId.value = next[0]!.id;
   }
 }, { immediate: true });
+async function refreshAll() {
+  await refreshSubscriptions();
+}
+
 const actionMutation = useMutation({
   async execute(input: {
     id: string;
@@ -49,7 +53,7 @@ const actionMutation = useMutation({
       }
     );
   },
-  refresh
+  refresh: refreshAll
 });
 const error = computed(() => actionMutation.error.value ?? loadError.value);
 

@@ -41,27 +41,6 @@ describe("EventList", () => {
     }).event.eventId).toBe("evt-chat-message");
   });
 
-  it("keeps existing Event inspection compatible with Review handler Events", () => {
-    expect(v.parse(runtimeAuditSchema, {
-      ...audit("evt-review"),
-      event: {
-        ...audit("evt-review").event,
-        type: "review.requested"
-      },
-      execution: {
-        executionId: "exe-review",
-        handler: "review",
-        status: "queued",
-        attemptCount: 0,
-        maxAttempts: 3,
-        firstStartedAt: null,
-        lastAttemptAt: null,
-        completedAt: null,
-        nextAttemptAt: "2026-07-24T00:00:00.000Z",
-        lastError: undefined
-      }
-    }).event.type).toBe("review.requested");
-  });
 });
 
 function audit(eventId: string): RuntimeAuditOutput {

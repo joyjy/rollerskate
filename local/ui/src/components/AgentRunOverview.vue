@@ -2,12 +2,16 @@
 import { computed } from "vue";
 import { RouterLink } from "vue-router";
 
-import type { LatestAgentRunViewOutput } from "@/api/schema";
+import type { AgentRunDetailViewOutput, AgentRunStepOutput } from "@/api/schema";
+import AgentInvocationDetail from "@/components/AgentInvocationDetail.vue";
+import AgentRunOutputs from "@/components/AgentRunOutputs.vue";
 import { formatDateTime } from "@/utils/format";
 
 const props = defineProps<{
-  run: NonNullable<LatestAgentRunViewOutput>;
+  run: AgentRunDetailViewOutput;
   cancelling?: boolean;
+  cycleId?: string;
+  outputId?: string;
 }>();
 
 const emit = defineEmits<{
@@ -16,17 +20,22 @@ const emit = defineEmits<{
 
 const canCancel = computed(() =>
   props.run.summary.status === "active" ||
-  props.run.summary.status === "waiting"
+  props.run.summary.status === "waiting" ||
+  props.run.summary.status === "awaiting_orchestrator"
 );
 const exchangeTotal = computed(() =>
   props.run.exchangeCounts.reduce((total, exchange) => total + exchange.total, 0)
 );
+
+function stepDepthPadding(step: AgentRunStepOutput): string {
+  return `${step.depth * 16}px`;
+}
 </script>
 
 <template>
   <section class="panel agent-run-overview">
     <div class="panel-header">
-      <span>Latest Agent Run</span>
+      <span>Agent Run</span>
       <span class="status" :class="run.summary.status">{{ run.summary.status }}</span>
     </div>
     <div class="panel-body">
@@ -59,7 +68,7 @@ const exchangeTotal = computed(() =>
         <div>
           <span class="label">Steward role</span>
           <strong>@{{ run.summary.steward.handle }}</strong>
-          <span>{{ run.participants.length }} participant{{ run.participants.length === 1 ? "" : "s" }}</span>
+          <span>{{ run.summary.orchestrationMode }} · {{ run.participants.length }} participant{{ run.participants.length === 1 ? "" : "s" }}</span>
         </div>
         <div>
           <span class="label">External workspace</span>
@@ -73,6 +82,12 @@ const exchangeTotal = computed(() =>
         </div>
       </div>
 
+      <div v-if="run.checkpoint" class="checkpoint">
+        <strong>Awaiting Caller decision</strong>
+        <span>{{ run.checkpoint.result.outcome }} · {{ run.checkpoint.result.summary }}</span>
+        <span class="mono">run version {{ run.projection.version }} · {{ run.decisions.length }} accepted decision{{ run.decisions.length === 1 ? "" : "s" }}</span>
+      </div>
+
       <div
         v-if="run.summary.terminalSummary"
         class="terminal"
@@ -80,6 +95,44 @@ const exchangeTotal = computed(() =>
       >
         <strong>{{ run.summary.status }}</strong>
         <span>{{ run.summary.terminalSummary }}</span>
+      </div>
+
+      <AgentRunOutputs
+        :run-id="run.summary.runId"
+        :folders="run.outputFolders"
+        :cycle-id="cycleId"
+        :output-id="outputId"
+      />
+
+      <div class="steps-section">
+        <div class="section-title">
+          Steps
+          <span class="step-count">{{ run.steps.length }}</span>
+        </div>
+        <div v-if="run.steps.length === 0" class="empty-inline">No steps recorded.</div>
+        <ol v-else class="steps-list">
+          <li
+            v-for="step in run.steps"
+            :key="step.stepId"
+            class="step-item"
+            :style="{ paddingLeft: stepDepthPadding(step) }"
+          >
+            <AgentInvocationDetail
+              :agent="step.agent"
+              :status="step.status"
+              :created-at="step.createdAt"
+              :completed-at="step.completedAt"
+              :prompt="step.prompt"
+              :effective-prompt="step.effectivePrompt"
+              :result="step.result"
+              :raw-output="step.rawOutput"
+              :error="step.error"
+              :invocation="step.invocation"
+              :request-event-id="step.requestEventId"
+              :result-event-id="step.resultEventId"
+            />
+          </li>
+        </ol>
       </div>
     </div>
   </section>
@@ -107,6 +160,13 @@ const exchangeTotal = computed(() =>
 .terminal { display: flex; gap: 8px; margin-top: 10px; padding: 9px 10px; border-radius: 7px; background: var(--success-soft); color: var(--success); font-size: 12px; }
 .terminal.failed, .terminal.needs_human { background: var(--warning-soft); color: var(--warning); }
 .terminal.cancelled { background: var(--muted-soft); color: var(--muted); }
+.checkpoint { display: grid; gap: 4px; margin-top: 10px; padding: 10px; border: 1px solid var(--primary); border-radius: 7px; background: var(--primary-soft); color: var(--text); font-size: 12px; }
+.steps-section { margin-top: 16px; }
+.section-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--text-secondary); margin-bottom: 10px; }
+.step-count { margin-left: 6px; padding: 1px 6px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); font-size: 10px; }
+.steps-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.step-item { min-width: 0; }
+.empty-inline { color: var(--text-dim); font-size: 13px; }
 .mono { font-family: var(--mono); }
 @media (max-width: 640px) {
   .run-head { flex-direction: column; }

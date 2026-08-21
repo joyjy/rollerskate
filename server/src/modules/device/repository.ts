@@ -10,7 +10,7 @@ export type PairingRedeemFailure =
   | "not_approved"
   | "expired"
   | "already_redeemed"
-  | "device_exists"
+  | "device_owner_mismatch"
   | "device_mismatch"
   | "verifier_mismatch";
 

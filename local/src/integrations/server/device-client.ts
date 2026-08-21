@@ -5,106 +5,86 @@ import {
   agentRoomBindingListSchema,
   agentRoomBindingSummarySchema,
   agentSummarySchema,
-  deviceCredentialIssuanceSchema,
-  devicePairingCreateResponseSchema,
-  devicePairingStatusSchema,
+  agentPublicProfileSchema,
+  topicJoinReceiptSchema,
   deviceSummarySchema,
   roomListSchema,
   roomMessageSendResponseSchema,
   roomSummarySchema,
+  topicEventPageSchema,
+  topicRuntimeSubscriptionSchema,
+  topicRuntimeViewListSchema,
+  topicSummaryListSchema,
+  topicSummarySchema,
+  integrationBindingSchema,
+  topicEventSchema,
   type AgentCreateRequest,
   type AgentCreateResponse,
   type AgentCredentialIssuance,
   type AgentSummary,
   type AgentRoomBindingSummary,
   type AgentRoomWakeModeUpdate,
-  type DeviceCredentialIssuance,
-  type DevicePairingCreateRequest,
-  type DevicePairingCreateResponse,
-  type DevicePairingStatus,
+  type AgentPublicProfile,
+  type AgentPublicProfileUpdate,
   type DeviceSummary,
   type RoomSummary,
   type RoomVisibility,
-  type RoomMessageSendResponse
+  type RoomMessageSendResponse,
+  type TopicEventPage,
+  type TopicEvent,
+  type TopicEventPublishRequest,
+  type TopicCreateRequest,
+  type TopicJoinReceipt,
+  type TopicProfileUpdate,
+  type TopicRuntimeSubscription,
+  type TopicRuntimeView,
+  type TopicSummary,
+  type IntegrationBinding,
+  type IntegrationBindingCreateRequest,
 } from "../../protocol.js";
+import {
+  DeviceServerError,
+  ServerHttpTransport,
+  throwResponseError,
+  type ServerClientOptions
+} from "./transport.js";
+export { DeviceServerError } from "./transport.js";
 
-const MAX_RESPONSE_BYTES = 1_048_576;
-
-export class DeviceServerError extends Error {
-  public constructor(
-    public readonly status: number,
-    public readonly code: string,
-    message: string
-  ) {
-    super(message);
-    this.name = "DeviceServerError";
-  }
-}
-
-export interface DeviceServerClientOptions {
-  readonly serverUrl: string;
-  readonly credential?: string;
-  readonly fetch?: typeof fetch;
-  readonly timeoutMilliseconds?: number;
+export interface DeviceServerClientOptions extends ServerClientOptions {
+  readonly credential: string;
 }
 
 export class DeviceServerClient {
-  readonly #serverUrl: string;
-  readonly #credential: string | undefined;
-  readonly #fetch: typeof fetch;
-  readonly #timeoutMilliseconds: number;
+  readonly #transport: ServerHttpTransport;
 
   public constructor(options: DeviceServerClientOptions) {
-    const url = new URL(options.serverUrl);
-    if (
-      url.protocol !== "https:" &&
-      !(url.protocol === "http:" && ["127.0.0.1", "localhost"].includes(url.hostname))
-    ) {
-      throw new Error("Rollerskate Server URL must use https except on localhost");
-    }
-    if (url.pathname !== "/" || url.search !== "" || url.hash !== "") {
-      throw new Error("Rollerskate Server URL must be an origin without a path");
-    }
-    this.#serverUrl = url.origin;
-    this.#credential = options.credential;
-    this.#fetch = options.fetch ?? fetch;
-    this.#timeoutMilliseconds = options.timeoutMilliseconds ?? 10_000;
-  }
-
-  public createPairing(
-    request: DevicePairingCreateRequest
-  ): Promise<DevicePairingCreateResponse> {
-    return this.#json("/api/device-pairings", {
-      method: "POST",
-      body: JSON.stringify(request)
-    }, devicePairingCreateResponseSchema.parse);
-  }
-
-  public pairingStatus(pairingId: string): Promise<DevicePairingStatus> {
-    return this.#json(
-      `/api/device-pairings/${encodeURIComponent(pairingId)}`,
-      { method: "GET" },
-      devicePairingStatusSchema.parse
-    );
-  }
-
-  public redeemPairing(
-    pairingId: string,
-    deviceId: string,
-    verifier: string
-  ): Promise<DeviceCredentialIssuance> {
-    return this.#json(`/api/device-pairings/${encodeURIComponent(pairingId)}/redeem`, {
-      method: "POST",
-      body: JSON.stringify({ deviceId, verifier })
-    }, deviceCredentialIssuanceSchema.parse);
+    if (options.credential.trim() === "") throw new Error("Device credential must be non-empty");
+    this.#transport = new ServerHttpTransport(options);
   }
 
   public status(): Promise<DeviceSummary> {
-    return this.#json("/api/device", { method: "GET" }, deviceSummarySchema.parse);
+    return this.#transport.json("/api/device", { method: "GET" }, deviceSummarySchema.parse);
+  }
+
+  public integrationBinding(bindingId: string): Promise<IntegrationBinding> {
+    return this.#transport.json(
+      `/api/integration-bindings/${encodeURIComponent(bindingId)}`,
+      { method: "GET" },
+      integrationBindingSchema.parse
+    );
+  }
+
+  public createIntegrationBinding(
+    request: IntegrationBindingCreateRequest
+  ): Promise<IntegrationBinding> {
+    return this.#transport.json("/api/integration-bindings", {
+      method: "POST",
+      body: JSON.stringify(request)
+    }, integrationBindingSchema.parse);
   }
 
   public async allowSubject(subject: string): Promise<void> {
-    const response = await this.#request("/api/admin/allowlist", {
+    const response = await this.#transport.request("/api/admin/allowlist", {
       method: "POST",
       body: JSON.stringify({ subject })
     });
@@ -112,18 +92,18 @@ export class DeviceServerClient {
   }
 
   public createAgent(request: AgentCreateRequest): Promise<AgentCreateResponse> {
-    return this.#json("/api/agents", {
+    return this.#transport.json("/api/agents", {
       method: "POST",
       body: JSON.stringify(request)
     }, agentCreateResponseSchema.parse);
   }
 
   public listAgents(): Promise<readonly AgentSummary[]> {
-    return this.#json("/api/agents", { method: "GET" }, agentListSchema.parse);
+    return this.#transport.json("/api/agents", { method: "GET" }, agentListSchema.parse);
   }
 
   public agentByName(name: string): Promise<AgentSummary> {
-    return this.#json(
+    return this.#transport.json(
       `/api/agents/by-name/${encodeURIComponent(name)}`,
       { method: "GET" },
       agentSummarySchema.parse
@@ -134,41 +114,120 @@ export class DeviceServerClient {
     enrollmentId: string,
     verifier: string
   ): Promise<AgentCredentialIssuance> {
-    return this.#json(
+    return this.#transport.json(
       `/api/agent-enrollments/${encodeURIComponent(enrollmentId)}/redeem`,
       { method: "POST", body: JSON.stringify({ verifier }) },
       agentCredentialIssuanceSchema.parse
     );
   }
 
-  public agentPrincipal(agentId: string): Promise<AgentSummary> {
-    return this.#json(
-      `/api/agent-principals/${encodeURIComponent(agentId)}`,
+  public runtimeTopics(): Promise<readonly TopicRuntimeView[]> {
+    return this.#transport.json("/api/runtime-topics", { method: "GET" },
+      topicRuntimeViewListSchema.parse);
+  }
+
+  public topic(topicId: string): Promise<TopicSummary> {
+    return this.#transport.json(`/api/topics/${encodeURIComponent(topicId)}`, { method: "GET" },
+      topicSummarySchema.parse);
+  }
+
+  public agentProfile(agentId: string): Promise<AgentPublicProfile> {
+    return this.#transport.json(`/api/agents/${encodeURIComponent(agentId)}/profile`, { method: "GET" },
+      agentPublicProfileSchema.parse);
+  }
+
+  public isMissingAgentProfileError(error: unknown): boolean {
+    return error instanceof DeviceServerError && error.status === 404 &&
+      error.code === "agent_profile_not_found";
+  }
+
+  public updateAgentProfile(
+    agentId: string,
+    update: AgentPublicProfileUpdate
+  ): Promise<AgentPublicProfile> {
+    return this.#transport.json(`/api/agents/${encodeURIComponent(agentId)}/profile`, {
+      method: "PATCH",
+      body: JSON.stringify(update)
+    }, agentPublicProfileSchema.parse);
+  }
+
+  public createTopic(request: TopicCreateRequest): Promise<TopicSummary> {
+    return this.#transport.json("/api/topics", {
+      method: "POST",
+      body: JSON.stringify(request)
+    }, topicSummarySchema.parse);
+  }
+
+  public listTopics(): Promise<readonly TopicSummary[]> {
+    return this.#transport.json("/api/topics", { method: "GET" }, topicSummaryListSchema.parse);
+  }
+
+  public updateTopicProfile(
+    topicId: string,
+    update: TopicProfileUpdate
+  ): Promise<TopicSummary> {
+    return this.#transport.json(`/api/topics/${encodeURIComponent(topicId)}/profile`, {
+      method: "PATCH",
+      body: JSON.stringify(update)
+    }, topicSummarySchema.parse);
+  }
+
+  public joinTopic(topicId: string, agentId: string): Promise<TopicJoinReceipt> {
+    return this.#transport.json(`/api/topics/${encodeURIComponent(topicId)}/memberships`, {
+      method: "POST",
+      body: JSON.stringify({ agentId })
+    }, topicJoinReceiptSchema.parse);
+  }
+
+  public topicEvents(topicId: string, after: number, limit = 100): Promise<TopicEventPage> {
+    const query = new URLSearchParams({ after: String(after), limit: String(limit) });
+    return this.#transport.json(
+      `/api/runtime-topics/${encodeURIComponent(topicId)}/events?${query}`,
       { method: "GET" },
-      agentSummarySchema.parse
+      topicEventPageSchema.parse
     );
   }
 
+  public publishHumanTopic(
+    topicId: string,
+    request: TopicEventPublishRequest
+  ): Promise<TopicEvent> {
+    return this.#transport.json(`/api/topics/${encodeURIComponent(topicId)}/human-events`, {
+      method: "POST",
+      body: JSON.stringify(request)
+    }, topicEventSchema.parse);
+  }
+
+  public acknowledgeTopic(
+    topicId: string,
+    cursor: number
+  ): Promise<TopicRuntimeSubscription> {
+    return this.#transport.json(`/api/runtime-topics/${encodeURIComponent(topicId)}/cursor`, {
+      method: "POST",
+      body: JSON.stringify({ cursor })
+    }, topicRuntimeSubscriptionSchema.parse);
+  }
+
   public createRoom(name: string, visibility: RoomVisibility): Promise<RoomSummary> {
-    return this.#json("/api/rooms", {
+    return this.#transport.json("/api/rooms", {
       method: "POST",
       body: JSON.stringify({ name, visibility })
     }, roomSummarySchema.parse);
   }
 
   public listRooms(): Promise<readonly RoomSummary[]> {
-    return this.#json("/api/rooms", { method: "GET" }, roomListSchema.parse);
+    return this.#transport.json("/api/rooms", { method: "GET" }, roomListSchema.parse);
   }
 
   public joinRoom(roomId: string): Promise<RoomSummary> {
-    return this.#json(`/api/rooms/${encodeURIComponent(roomId)}/join`, {
+    return this.#transport.json(`/api/rooms/${encodeURIComponent(roomId)}/join`, {
       method: "POST",
       body: JSON.stringify({})
     }, roomSummarySchema.parse);
   }
 
   public inviteHuman(roomId: string, humanId: string): Promise<RoomSummary> {
-    return this.#json(`/api/rooms/${encodeURIComponent(roomId)}/members`, {
+    return this.#transport.json(`/api/rooms/${encodeURIComponent(roomId)}/members`, {
       method: "POST",
       body: JSON.stringify({ humanId })
     }, roomSummarySchema.parse);
@@ -179,14 +238,14 @@ export class DeviceServerClient {
     transactionId: string,
     body: string
   ): Promise<RoomMessageSendResponse> {
-    return this.#json(`/api/rooms/${encodeURIComponent(roomId)}/messages`, {
+    return this.#transport.json(`/api/rooms/${encodeURIComponent(roomId)}/messages`, {
       method: "POST",
       body: JSON.stringify({ transactionId, body })
     }, roomMessageSendResponseSchema.parse);
   }
 
   public inviteAgent(roomId: string, agentId: string): Promise<AgentRoomBindingSummary> {
-    return this.#json(`/api/rooms/${encodeURIComponent(roomId)}/agents`, {
+    return this.#transport.json(`/api/rooms/${encodeURIComponent(roomId)}/agents`, {
       method: "POST",
       body: JSON.stringify({ agentId })
     }, agentRoomBindingSummarySchema.parse);
@@ -197,7 +256,7 @@ export class DeviceServerClient {
     agentId: string,
     wakeMode: AgentRoomWakeModeUpdate["wakeMode"]
   ): Promise<AgentRoomBindingSummary> {
-    return this.#json(
+    return this.#transport.json(
       `/api/rooms/${encodeURIComponent(roomId)}/agents/${encodeURIComponent(agentId)}`,
       { method: "PATCH", body: JSON.stringify({ wakeMode }) },
       agentRoomBindingSummarySchema.parse
@@ -205,7 +264,7 @@ export class DeviceServerClient {
   }
 
   public async removeAgent(roomId: string, agentId: string): Promise<void> {
-    const response = await this.#request(
+    const response = await this.#transport.request(
       `/api/rooms/${encodeURIComponent(roomId)}/agents/${encodeURIComponent(agentId)}`,
       { method: "DELETE" }
     );
@@ -213,7 +272,7 @@ export class DeviceServerClient {
   }
 
   public listAgentRoomBindings(agentId: string): Promise<readonly AgentRoomBindingSummary[]> {
-    return this.#json(
+    return this.#transport.json(
       `/api/agent-principals/${encodeURIComponent(agentId)}/rooms`,
       { method: "GET" },
       agentRoomBindingListSchema.parse
@@ -221,74 +280,9 @@ export class DeviceServerClient {
   }
 
   public async revoke(): Promise<void> {
-    const response = await this.#request("/api/device", { method: "DELETE" });
+    const response = await this.#transport.request("/api/device", { method: "DELETE" });
     if (response.status !== 204) {
       await throwResponseError(response);
     }
   }
-
-  async #json<T>(
-    path: string,
-    init: RequestInit,
-    parse: (value: unknown) => T
-  ): Promise<T> {
-    const response = await this.#request(path, init);
-    if (!response.ok) {
-      await throwResponseError(response);
-    }
-    return parse(await readBoundedJson(response));
-  }
-
-  #request(path: string, init: RequestInit): Promise<Response> {
-    const headers = new Headers(init.headers);
-    headers.set("accept", "application/json");
-    if (init.body !== undefined) {
-      headers.set("content-type", "application/json");
-    }
-    if (this.#credential !== undefined) {
-      headers.set("authorization", `Bearer ${this.#credential}`);
-    }
-    return this.#fetch(`${this.#serverUrl}${path}`, {
-      ...init,
-      headers,
-      signal: AbortSignal.timeout(this.#timeoutMilliseconds)
-    });
-  }
-}
-
-async function throwResponseError(response: Response): Promise<never> {
-  let code = `http_${response.status}`;
-  let message = `Rollerskate Server returned HTTP ${response.status}`;
-  try {
-    const body = await readBoundedJson(response);
-    if (isRecord(body) && typeof body.error === "string") {
-      code = body.error;
-    }
-    if (isRecord(body) && typeof body.message === "string") {
-      message = body.message;
-    }
-  } catch {
-    // Preserve the bounded generic error.
-  }
-  throw new DeviceServerError(response.status, code, message);
-}
-
-async function readBoundedJson(response: Response): Promise<unknown> {
-  const length = Number(response.headers.get("content-length") ?? "0");
-  if (length > MAX_RESPONSE_BYTES) {
-    throw new Error("Rollerskate Server response exceeds the 1 MiB limit");
-  }
-  const text = await response.text();
-  if (Buffer.byteLength(text, "utf8") > MAX_RESPONSE_BYTES) {
-    throw new Error("Rollerskate Server response exceeds the 1 MiB limit");
-  }
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    throw new Error("Rollerskate Server response is not valid JSON");
-  }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

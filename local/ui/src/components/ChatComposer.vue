@@ -7,12 +7,16 @@ const props = defineProps<{
   agents: readonly LocalAgent[];
   activeAgents: readonly LocalAgent[];
   pending: string | null;
+  topicHandle?: string;
+  identityLabel?: string;
+  replyTo?: { readonly sender: { readonly handleSnapshot: string }; readonly body: string };
 }>();
 
 const emit = defineEmits<{
   (e: "update:modelValue", value: string): void;
   (e: "send", body: string): void;
   (e: "mention", agent: LocalAgent): void;
+  (e: "cancelReply"): void;
 }>();
 
 const text = ref(props.modelValue);
@@ -29,12 +33,18 @@ function send() {
   const body = text.value.trim();
   if (!body || props.pending !== null) return;
   emit("send", body);
-  text.value = "";
 }
 </script>
 
 <template>
   <div class="composer">
+    <div v-if="replyTo" class="reply-preview">
+      <div>
+        <strong>Replying to {{ replyTo.sender.handleSnapshot }}</strong>
+        <span>{{ replyTo.body }}</span>
+      </div>
+      <button type="button" aria-label="Cancel reply" @click="emit('cancelReply')">×</button>
+    </div>
     <div class="mention-row">
       <span>Quick mention</span>
       <button
@@ -51,13 +61,13 @@ function send() {
     <textarea
       v-model="text"
       rows="3"
-      :placeholder="`Message #local…`"
+      :placeholder="`Message ${topicHandle ?? '#local'}…`"
       :disabled="pending !== null"
       @keydown.meta.enter.prevent="send"
       @keydown.ctrl.enter.prevent="send"
     ></textarea>
     <div class="composer-foot">
-      <span>⌘/Ctrl + Enter to send · messages are immutable</span>
+      <span>{{ identityLabel ? `${identityLabel} · ` : "" }}⌘/Ctrl + Enter · immutable</span>
       <button
         class="primary-button"
         type="button"
@@ -77,6 +87,13 @@ function send() {
   background: var(--surface-2);
   flex-shrink: 0;
 }
+.reply-preview {
+  display: flex; justify-content: space-between; gap: 12px; margin-bottom: 8px;
+  padding: 8px 10px; border-left: 3px solid var(--primary); background: var(--surface);
+}
+.reply-preview div { display: grid; min-width: 0; gap: 2px; }
+.reply-preview span { overflow: hidden; color: var(--text-secondary); text-overflow: ellipsis; white-space: nowrap; }
+.reply-preview button { border: 0; background: transparent; color: var(--text-secondary); cursor: pointer; }
 .mention-row {
   display: flex;
   gap: 7px;

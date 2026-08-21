@@ -33,7 +33,7 @@ scripts/rs start
 
 ## 2. 添加 Local Agent
 
-在 `Agents` 页面填写 1–32 字符的短 handle，例如 `researcher`，选择 Codex、Claude Code 或 Kimi Code client；可选启动参数按“一行一个 argv 参数”填写，然后选择 `Add Agent`。系统生成稳定 Principal ID；handle 只用于展示与 `@mention`。
+在 `Agents` 页面填写 1–32 字符的短 handle，例如 `researcher`，选择 Codex、Claude Code、Kimi Code 或 Pi client；可选启动参数按“一行一个 argv 参数”填写，然后选择 `Add Agent`。系统生成稳定 Principal ID；handle 只用于展示与 `@mention`。
 
 创建首个 active Agent 后 UI 自动进入 `Chats / Local`。Agents 页面还提供启动参数配置、rename、suspend 和 resume，不提供永久删除。
 
@@ -43,6 +43,7 @@ scripts/rs start
 scripts/rs agent create researcher --client codex
 scripts/rs agent create writer --client claude-code --launch-arg --model --launch-arg claude-sonnet-4-6
 scripts/rs agent create explorer --client kimi-code --launch-arg --model --launch-arg kimi-code/kimi-for-coding
+scripts/rs agent create analyst --client pi
 scripts/rs agent configure explorer --launch-arg --model --launch-arg kimi-code/k2.5
 scripts/rs agent list
 scripts/rs agent rename researcher helper
@@ -89,9 +90,9 @@ Rollerskate 不自动迁移或删除旧 runtime。确认不再需要某个旧目
 
 Local Runtime 可以按 one-shot 或 cron 主动创建 Agent work，不需要 Server。创建、更新、misfire/overlap、Session policy 与 unknown recovery 见 [Scheduled Task runbook](./scheduled-tasks.md)；已有 Schedule 可以在 `/console/schedules` 查看和控制。
 
-## 可选：双 Agent acceptance Review
+## 可选：Agent Run 与 acceptance Review
 
-Local Runtime 可以让只读 Reviewer 和 workspace-write Implementer 围绕一个 versioned Plan 完成有限返修和复核，不需要 Server。CLI 配置、MRSF sidecar、trace 与 recovery 见 [Local Review runbook](./reviews.md)；已有 Review 可以在 `/console/reviews` 查看和恢复。
+Local Runtime 可以由一个 Steward 完成 bounded objective，或顺序委派 Agent，并可通过 `review@1` 围绕 versioned Plan 完成有限返修和复核，不需要 Server。CLI admission、trace、cancel 与 recovery 见 [Agent Run runbook](./reviews.md)；全部真实 Run 在 `/console/steward` 查看。
 
 ## 日常启动
 

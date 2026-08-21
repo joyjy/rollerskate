@@ -57,7 +57,7 @@ test("doctor checks local state and exact Matrix identity without exposing the t
     assert.equal(requests, 2);
     assert.equal(result.status, "ready");
     assert.equal(result.projectRoot, setup.config.projectRoot);
-    assert.equal(result.schemaVersion, 44);
+    assert.equal(result.schemaVersion, 63);
     assert.deepEqual(result.matrix, {
       homeserver: "https://matrix.example",
       roomId: "!room:example",
@@ -85,7 +85,7 @@ test("local doctor validates Local-first state without legacy config", async () 
     assert.equal(result.status, "ready");
     assert.equal(result.projectRoot, foundation.workspacePath);
     assert.equal(result.database, paths.database);
-    assert.equal(result.schemaVersion, 44);
+    assert.equal(result.schemaVersion, 63);
     assert.equal(result.matrix, undefined);
     assert.equal(result.codexExecutable, undefined);
   } finally {
@@ -112,7 +112,7 @@ test("agent request admits current Local Agents and rejects a foreign explicit S
     });
     const execution = runtime.claimDueExecutions()[0]!;
     const result = runtime.completeExecution(execution.executionId, {
-      adapterId: "codex-runtime-jsonl-v1",
+      adapterId: "codex-runtime-app-server-v1",
       workspace: repo,
       providerSessionId: "bob-provider-session",
       output: "seeded"

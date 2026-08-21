@@ -7,8 +7,15 @@ process.stdin.on("end", () => {
   const request = JSON.parse(input) as {
     kind?: unknown;
     delay?: unknown;
+    failure?: unknown;
     outputBytes?: unknown;
   };
+  if (request.failure === true) {
+    process.stdout.write("provider detail on stdout");
+    process.stderr.write("wrapper detail on stderr");
+    process.exitCode = 1;
+    return;
+  }
   if (typeof request.delay === "number") {
     setTimeout(
       () => process.stdout.write(JSON.stringify({ delayed: true })),

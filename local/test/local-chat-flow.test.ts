@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import {
@@ -29,10 +30,10 @@ test("Local Chat autonomously dispatches a mention and resumes the per-Agent Ses
     const alice = addLocalAgent(repo, "Alice", "codex", options);
     const explicit = postLocalChatMessage(repo, "please inspect this @alice", options);
     assert.equal(explicit.message.type, "chat.message");
-    assert.deepEqual(explicit.message.target, {
+    assert.deepEqual(explicit.message.targets, [{
       principalId: alice.principalId,
       handleSnapshot: "Alice"
-    });
+    }]);
     assert.equal(explicit.dispatch, undefined);
 
     const invoked: Array<{ providerSessionId?: string; body: string }> = [];
@@ -106,6 +107,15 @@ test("Local Chat autonomously dispatches a mention and resumes the per-Agent Ses
         runtime.chatAttentionReceipts(explicit.message.eventId)[0]?.outcome,
         "dispatched"
       );
+      assert.equal(reply?.replyToEventId, explicit.message.eventId);
+      const ownerReply = postLocalChatMessage(repo, "one follow-up", options, {
+        replyToEventId: reply!.eventId
+      });
+      assert.equal(ownerReply.message.replyToEventId, reply!.eventId);
+      assert.deepEqual(ownerReply.message.targets, [{
+        principalId: alice.principalId,
+        handleSnapshot: "Alice"
+      }]);
     } finally {
       runtime.close();
     }
@@ -117,6 +127,45 @@ test("Local Chat autonomously dispatches a mention and resumes the per-Agent Ses
         event.sourceMessageEventId === explicit.message.eventId
     ));
     assert.equal(localRuntimeSnapshot(repo, options).foundation.topicId, restarted.chat.topicId);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(runtimeDirectory, { recursive: true, force: true });
+  }
+});
+
+test("Local Chat reads legacy target as one canonical target", () => {
+  const repo = mkdtempSync(join(tmpdir(), "rollerskate-chat-legacy-target-repo-"));
+  const runtimeDirectory = mkdtempSync(
+    join(tmpdir(), "rollerskate-chat-legacy-target-runtime-")
+  );
+  const options = { runtimeDirectory };
+  try {
+    const alice = addLocalAgent(repo, "alice", "codex", options);
+    const posted = postLocalChatMessage(repo, "@alice legacy fixture", options).message;
+    const databasePath = join(runtimeDirectory, "runtime.db");
+    const database = new DatabaseSync(databasePath);
+    try {
+      const row = database.prepare("SELECT payload_json FROM events WHERE event_id = ?")
+        .get(posted.eventId) as { payload_json: string };
+      const payload = JSON.parse(row.payload_json) as Record<string, unknown> & {
+        targets?: unknown[];
+      };
+      payload.target = payload.targets?.[0];
+      delete payload.targets;
+      database.prepare("UPDATE events SET payload_json = ? WHERE event_id = ?")
+        .run(JSON.stringify(payload), posted.eventId);
+    } finally {
+      database.close();
+    }
+    const chat = new LocalChatStore(databasePath);
+    try {
+      assert.deepEqual(chat.message(posted.eventId).targets, [{
+        principalId: alice.principalId,
+        handleSnapshot: "alice"
+      }]);
+    } finally {
+      chat.close();
+    }
   } finally {
     rmSync(repo, { recursive: true, force: true });
     rmSync(runtimeDirectory, { recursive: true, force: true });
@@ -385,6 +434,6 @@ function dispatchNextMessage(
 function decision(action: "reply" | "silent", body?: string): string {
   return JSON.stringify({
     schema: "ChatMentionDecision@1",
-    speech: action === "reply" ? { action, body } : { action }
+    speech: action === "reply" ? { action, body } : { action, reason: "No useful reply." }
   });
 }

@@ -18,7 +18,6 @@ export type RuntimeFailureOwner =
   | "chat"
   | "subscription"
   | "schedule"
-  | "review"
   | "notice";
 
 export interface RuntimeFailureSummary {
@@ -118,15 +117,6 @@ function actionFor(
       consoleRoute:
         `/console/schedules?scheduleId=${encodeURIComponent(fact.relatedRef)}`,
       cliHint: `scripts/rs schedule trace ${fact.objectRef}`
-    };
-  }
-  if (owner === "review") {
-    return {
-      kind: "inspect",
-      available: true,
-      consoleRoute:
-        `/console/reviews?reviewId=${encodeURIComponent(fact.objectRef)}`,
-      cliHint: `scripts/rs event trace ${fact.eventId ?? fact.objectRef}`
     };
   }
   if (owner === "notice") {

@@ -11,6 +11,13 @@ import { RoomService } from "../application/room/service.js";
 import { HttpMatrixApplicationServiceGateway } from "../adapter/matrix/application-service.js";
 import { connectMysqlPool } from "../adapter/persistence/mysql/connection.js";
 import { MysqlRepository } from "../adapter/persistence/mysql/repository.js";
+import { MysqlProfileTopicRepository } from "../adapter/persistence/mysql/profile-topic-repository.js";
+import { MysqlConnectorRepository } from "../adapter/persistence/mysql/connector-repository.js";
+import { MysqlWorkRequestRepository } from
+  "../adapter/persistence/mysql/work-request-repository.js";
+import { ProfileTopicService } from "../modules/profile-topic/service.js";
+import { ConnectorService } from "../modules/connector/service.js";
+import { WorkRequestService } from "../modules/work-request/service.js";
 import { OidcClient } from "../adapter/oidc/client.js";
 import { credentialService } from "../adapter/security/credentials.js";
 import { loadServerRuntimeConfig } from "./config.js";
@@ -26,6 +33,9 @@ export async function startServer(): Promise<void> {
     throw error;
   }
   const repository = new MysqlRepository(pool);
+  const profileRepository = new MysqlProfileTopicRepository(pool);
+  const connectorRepository = new MysqlConnectorRepository(pool);
+  const workRequestRepository = new MysqlWorkRequestRepository(pool);
   const trust = new TrustService(repository, {
     issuer: config.oidc.issuer,
     publicUrl: config.publicUrl
@@ -35,22 +45,32 @@ export async function startServer(): Promise<void> {
     credentials: credentialService
   });
   const agents = new AgentService(repository, { credentials: credentialService });
+  const profiles = new ProfileTopicService(profileRepository, repository);
+  const connectors = new ConnectorService(connectorRepository);
+  const workRequests = new WorkRequestService(workRequestRepository, repository);
   const oidc = new OidcClient(config.oidc);
   const deviceLogin = new DeviceLoginService(repository, trust, oidc);
-  const matrix = new HttpMatrixApplicationServiceGateway(config.matrix);
-  const rooms = new RoomService(repository, matrix);
-  const agentRooms = new AgentRoomService(repository, matrix);
+  const matrix = config.matrix === undefined
+    ? undefined
+    : new HttpMatrixApplicationServiceGateway(config.matrix);
+  const rooms = matrix === undefined ? undefined : new RoomService(repository, matrix);
+  const agentRooms = matrix === undefined
+    ? undefined
+    : new AgentRoomService(repository, matrix);
   const events = new EventService(repository, new RoomEventBroker());
   const server = createBffServer({
     trust,
     devices,
     deviceLogin,
     agents,
+    profiles,
+    connectors,
+    workRequests,
     oidc,
-    rooms,
-    agentRooms,
+    ...(rooms === undefined ? {} : { rooms }),
+    ...(agentRooms === undefined ? {} : { agentRooms }),
     events,
-    matrixHsToken: config.matrix.hsToken
+    ...(config.matrix === undefined ? {} : { matrixHsToken: config.matrix.hsToken })
   });
 
   try {

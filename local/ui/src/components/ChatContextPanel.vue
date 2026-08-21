@@ -21,6 +21,7 @@ const emit = defineEmits<{
     agent: LocalAgent,
     presence: { readonly mode: "available" | "snoozed"; readonly until?: string }
   ): void;
+  (e: "setHistoryAccess", agent: LocalAgent, action: "grant" | "revoke"): void;
 }>();
 
 const editingPresenceId = ref<string | null>(null);
@@ -60,6 +61,8 @@ function clientLabel(agent: LocalAgent): string {
     case "codex": return "Codex";
     case "claude-code": return "Claude Code";
     case "kimi-code": return "Kimi";
+    case "pi": return "Pi";
+    default: return agent.client;
   }
 }
 
@@ -90,6 +93,37 @@ function presenceState(agent: LocalAgent): {
     };
   }
   return { label: "Listening", kind: "listening", editable: true };
+}
+
+function lastTurnLabel(agent: LocalAgent): string {
+  const turn = presenceMap.value.get(agent.principalId)?.lastTurn;
+  if (turn === undefined) return "No turn yet";
+  if (turn.state === "thinking") return "Thinking now";
+  if (turn.state === "replied") return "Last turn · contributed";
+  if (turn.state === "silent") {
+    return `Last turn · stayed silent${turn.reason === undefined ? "" : ` · ${turn.reason}`}`;
+  }
+  return "Last turn · execution failed";
+}
+
+function historyDetail(agent: LocalAgent): string {
+  const history = presenceMap.value.get(agent.principalId)?.clientHistory;
+  if (history?.status !== "active") return "Off";
+  const coverage = history.coverage === "available"
+    ? history.truncated
+      ? "Available · bounded result"
+      : "Available"
+    : history.coverage === "unavailable"
+      ? "Source unavailable"
+      : history.coverage === "unsupported"
+        ? "Source unsupported"
+        : history.coverage === "error"
+          ? "Last request failed"
+          : "Allowed · checked on first use";
+  const result = history.lastResultCount === undefined
+    ? ""
+    : ` · ${history.lastResultCount} result${history.lastResultCount === 1 ? "" : "s"}`;
+  return `${clientLabel(agent)} only · ${coverage}${result}`;
 }
 
 function openPresenceEditor(agent: LocalAgent) {
@@ -189,18 +223,47 @@ function toLocalDateTimeInput(value: string): string {
         >Snooze</button>
         <span v-if="editorError" class="editor-error">{{ editorError }}</span>
       </div>
-      <span class="mono session-id">
-        {{ session?.currentSessionId ?? "new on next dispatch" }}
-      </span>
-      <span>Generation {{ session?.generation ?? 1 }}</span>
-      <button
-        class="secondary-button"
-        type="button"
-        :disabled="agent.status !== 'active' || pending !== null"
-        @click="emit('newSession', agent)"
-      >
-        {{ pending === agent.principalId ? "Starting…" : "New session" }}
-      </button>
+      <div class="turn-state">{{ lastTurnLabel(agent) }}</div>
+      <div class="history-row">
+        <span>
+          Client history
+          <small>{{ historyDetail(agent) }}</small>
+        </span>
+        <button
+          type="button"
+          class="secondary-button"
+          :class="{ danger: presenceMap.get(agent.principalId)?.clientHistory?.status === 'active' }"
+          :disabled="agent.status !== 'active' || pending !== null"
+          @click="emit(
+            'setHistoryAccess',
+            agent,
+            presenceMap.get(agent.principalId)?.clientHistory?.status === 'active'
+              ? 'revoke'
+              : 'grant'
+          )"
+        >
+          {{ pending === `history:${agent.principalId}`
+            ? "Saving…"
+            : presenceMap.get(agent.principalId)?.clientHistory?.status === "active"
+              ? "Revoke"
+              : "Allow" }}
+        </button>
+      </div>
+      <details class="session-details">
+        <summary>Session continuity</summary>
+        <div>
+          <span>{{ session?.currentSessionId ? "Existing session" : "New on next turn" }}</span>
+          <span>Generation {{ session?.generation ?? 1 }}</span>
+          <button
+            class="secondary-button"
+            type="button"
+            :disabled="agent.status !== 'active' || pending !== null"
+            @click="emit('newSession', agent)"
+          >
+            {{ pending === agent.principalId ? "Starting…" : "Start fresh" }}
+          </button>
+        </div>
+      </details>
     </article>
   </div>
 </template>
@@ -252,5 +315,25 @@ button.presence-control:hover:not(:disabled) { color: var(--primary); }
   font-size: 11px;
 }
 .editor-error { grid-column: 1 / -1; color: var(--danger); }
-.session-id { font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.turn-state { color: var(--text-dim); font-size: 10px; }
+.history-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 4px;
+  padding-top: 9px;
+  border-top: 1px solid var(--border);
+  color: var(--text);
+}
+.history-row span { display: grid; gap: 2px; }
+.history-row small { color: var(--text-dim); font-size: 10px; }
+.session-details summary { cursor: pointer; color: var(--text-dim); font-size: 11px; }
+.session-details > div {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+  padding-left: 10px;
+  border-left: 2px solid var(--border);
+}
 </style>

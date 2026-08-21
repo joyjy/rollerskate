@@ -7,7 +7,7 @@ COPY package.json package-lock.json ./
 COPY local/package.json ./local/package.json
 COPY packages/protocol/package.json ./packages/protocol/package.json
 COPY server/package.json ./server/package.json
-RUN npm ci \
+RUN npm ci --ignore-scripts \
   && case "$TARGETARCH" in \
     amd64) typescript_arch=x64 ;; \
     arm64) typescript_arch=arm64 ;; \
@@ -17,6 +17,7 @@ RUN npm ci \
 
 COPY packages/protocol ./packages/protocol
 COPY server ./server
+COPY scripts/clean-dist.mjs ./scripts/clean-dist.mjs
 RUN npm run build -w @rollerskate/server \
   && npm prune --omit=dev
 

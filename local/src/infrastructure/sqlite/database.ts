@@ -9,6 +9,20 @@ export function openRuntimeDatabase(databasePath: string): DatabaseSync {
   });
 }
 
+export function openInitializedRuntimeDatabase(
+  databasePath: string,
+  initialize: (database: DatabaseSync) => void
+): DatabaseSync {
+  const database = openRuntimeDatabase(databasePath);
+  try {
+    initialize(database);
+    return database;
+  } catch (error) {
+    database.close();
+    throw error;
+  }
+}
+
 export function openRuntimeDatabaseReadOnly(databasePath: string): DatabaseSync {
   return new DatabaseSync(resolve(databasePath), {
     readOnly: true,

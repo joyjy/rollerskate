@@ -52,6 +52,19 @@ test("Agent process client kills invocations that exceed the output budget", asy
   );
 });
 
+test("Agent process client preserves bounded stdout and stderr diagnostics", async () => {
+  const agent = new AgentProcessClient({
+    adapterId: "fixture-failure-v1",
+    executable: process.execPath,
+    args: [fixture.pathname],
+    timeoutMilliseconds: 1_000
+  });
+  await assert.rejects(
+    agent.invoke({ failure: true }),
+    /stderr: wrapper detail on stderr\nstdout: provider detail on stdout/
+  );
+});
+
 test("Agent process client rejects non-JSON requests before spawning", async () => {
   const agent = new AgentProcessClient({
     adapterId: "fixture-json-v1",
@@ -64,4 +77,13 @@ test("Agent process client rejects non-JSON requests before spawning", async () 
     agent.invoke(circular),
     /agent request is not JSON-serializable/
   );
+});
+
+test("meaningful output timeout requires a streaming response decoder", () => {
+  assert.throws(() => new AgentProcessClient({
+    adapterId: "fixture-invalid-stall-v1",
+    executable: process.execPath,
+    timeoutMilliseconds: 1_000,
+    meaningfulOutputTimeoutMilliseconds: 50
+  }), /requires a streaming response decoder/);
 });

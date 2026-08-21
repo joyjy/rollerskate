@@ -4,7 +4,8 @@ import { DeviceCredentialStore } from "../../infrastructure/files/device-credent
 import {
   LocalDeviceStore,
   type LocalDeviceMetadata
-} from "../../infrastructure/sqlite/device-store.js";
+} from "../../infrastructure/files/device-binding-store.js";
+import { bootstrapLocalFoundation } from "../../infrastructure/sqlite/foundation-store.js";
 
 export interface LocalDeviceInspection {
   readonly hasCredential: boolean;
@@ -17,7 +18,11 @@ export function inspectLocalDevice(
 ): LocalDeviceInspection {
   const paths = runtimePaths(repoRoot, runtimeDirectory);
   initializeRuntimeSchema(paths.database);
-  const store = new LocalDeviceStore(paths.database);
+  const foundation = bootstrapLocalFoundation(paths);
+  const store = new LocalDeviceStore(paths.deviceBinding, {
+    deviceId: foundation.deviceId,
+    deviceName: foundation.deviceName
+  });
   const credentials = new DeviceCredentialStore(paths.deviceCredential);
   try {
     const metadata = store.current();
