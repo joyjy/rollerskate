@@ -93,6 +93,11 @@ export interface AgentStepCompletion {
   readonly observedWorkspaceRevision?: string;
 }
 
+export interface AgentInvocationBudget {
+  readonly schemaVersion: "AgentInvocationBudget@1";
+  readonly totalTimeoutMilliseconds: number;
+}
+
 export interface AgentRunContext {
   readonly schemaVersion: "AgentRunContext@1";
   readonly resultContractId: string;
@@ -101,6 +106,7 @@ export interface AgentRunContext {
   readonly stepId: string;
   readonly depth: number;
   readonly parentStepId?: string;
+  readonly invocationBudget?: AgentInvocationBudget;
   readonly workspaceGrant?: ExternalWorkspaceGrant;
   readonly completionBinding?: AgentCompletionBinding;
   readonly stepCompletion?: AgentStepCompletion;

@@ -1,8 +1,8 @@
 ---
 type: Architecture
 title: Subscription
-description: one-shot terminal callback 与 Continuous Subscription delta/checkpoint 的独立生命周期。
-tags: [rollerskate, subscription, polling, callback]
+description: one-shot terminal 与 Continuous Subscription delta/checkpoint 的 source-owned 生命周期，以及 Run occurrence binding。
+tags: [rollerskate, subscription, polling, run, trigger]
 timestamp: 2026-07-30
 ---
 
@@ -13,40 +13,38 @@ timestamp: 2026-07-30
 ## 主路径
 
 ```text
-register SubscriptionDefinition@3
-  -> validate active owner, immutable probe artifact, policy and ordered exact-grant callbacks
+Steward await_source registers SubscriptionDefinition@4
+  -> validate admitted plugin ref, immutable probe artifact, policy and RunSourceBinding@1
   -> persist definition digest + first nextPollAt
   -> claim one due Subscription
   -> Plugin plans one declarative HTTP/command probe
   -> Runtime executes the bounded probe
   -> Plugin returns terminal or non-terminal observation
   -> non-terminal: advance next poll and keep active
-  -> terminal: persist terminal key/observation and open callback phase
-  -> shared ProactiveCallbackRuntime executes callbacks in ordinal order
-     -> command.exec: execute through the host callback kernel
-     -> destination.deliver: admit one host-origin Core Delivery
-     -> agent.invoke: admit one subscription.fire Event using callback identity and exact authority
-  -> reconcile callback receipts into completed/blocked/error/unknown parent state
+  -> terminal: persist terminal key/observation
+     + atomically activate one bound Run cycle with TriggerOccurrenceEnvelope@1
+  -> duplicate terminal returns the same cycle/admission receipt
+  -> source owner reconciles terminal cycle into completed/error/unknown diagnostics
 ```
 
-Continuous Subscription uses a separate parent and checkpoint state machine. A new stable occurrence key materializes a shared proactive callback group; only terminal callback receipts advance its checkpoint.
+Continuous Subscription uses a separate parent and checkpoint state machine. `ContinuousSubscriptionDefinition@2` turns each new stable occurrence key into one cycle on the same bound Run; only a succeeded cycle advances its checkpoint. V3/V1 callback definitions remain readable and executable only as persisted legacy compatibility during cutover.
 
 ## Fixed contract
 
-One-shot registration accepts only `SubscriptionDefinition@3` (`schemaVersion: 3`). The definition fixes:
+Run-bound one-shot registration uses `SubscriptionDefinition@4`. The definition fixes:
 
-- required title and active owner Agent;
+- required title and exact `RunSourceBinding@1`;
 - probe Plugin/config, canonical artifact revision/digest and bounded execution policy;
 - interval, deadline and attempt budget;
-- at most 16 ordered callbacks, each with an immutable definition and exact grant;
-- `approvedGrantDigest`, which must match the callback grants.
-- 可选 `ExternalRefTriggerBinding@1`，固定 Project/Integration/ExternalRef revision、profile 与 read schema，但不扩大 probe/callback grant。
+- optional `ExternalRefTriggerBinding@1`, which fixes Project/Integration/ExternalRef revision, profile and read schema without expanding Run authority.
 
 The Plugin fills only the `subscription.probe@1` strategy slot. It cannot register a Capability, Event type, Handler, loop or Store, and cannot directly perform ambient network, filesystem writes, process spawn or Agent invocation. The host executes declarative probes under the admitted policy.
 
-A terminal observation is durable Subscription state, not a parent Event. It includes the Plugin version, terminal outcome, optional summary and bounded facts. The one-shot Runtime owns its stable terminal key; Plugin code cannot supply callback identity. Only an `agent.invoke` callback enters the canonical Event pipeline as `subscription.fire`; its `source.externalId` uses the durable callback occurrence ID, so each trigger occurrence admission is independently idempotent.
+Owner-managed `<runtime>/subscription-plugins.json` 是唯一新 plugin registry。`SubscriptionPluginRegistry@1` 把 versioned ref 映射到 canonical project/file artifact、plugin ID、适用 `until | continuous`、probe workspace 与 HTTP/executable allowlist。RunAdmissionCompiler 计算实际 artifact digest，并把所有适用 Owner entry 固定进 Run trigger authority；source registrar 再按 Steward 选择的 exact plugin ref 缩小到该 entry 的 policy。registry 缺失、字段多余、artifact/path 不可证明或 kind 不匹配都在 Event/probe 前 fail closed。
 
-One-shot、Continuous Subscription 与 Schedule 使用同一 `ProactiveCallbackDefinition@1` / `ProactiveCallbackGrant@1` contract，只支持 `command.exec | agent.invoke | destination.deliver`。`agent.invoke` 的 exact grant 固定 Agent、workspace、workspace access 与 network access；one-shot adapter 在 Event admission 时补入 terminal observation、workspace revision 和 `SubscriptionAgentResult@1` result contract。Schedule reconciliation 只处理 `schedule` owner，不能先于 Subscription adapter 按 provider 退出码收敛其他 owner；Console 分别投影 invocation status 和结构化 business result，因此 `blocked` / `failed` 不会显示为成功。
+A terminal observation is durable Subscription state, not a parent Event. It includes the Plugin version, terminal outcome, optional summary and bounded facts. The one-shot Runtime owns its stable terminal key; Plugin code cannot supply cycle or admission identity. The source transaction persists terminal state and activates the bound Run cycle together, so no direct Agent, command, destination or callback Event is created.
+
+`SubscriptionDefinition@3` 与 `ContinuousSubscriptionDefinition@1` 仍保存旧 `ProactiveCallbackDefinition@1` / exact grant，供历史运行、reconcile 与 trace 使用；V4/V2 discriminator 禁止 callbacks，并保存 Run/source/cycle/admission receipt。两条路径不能对同一 definition 双投。
 
 ## Recovery and isolation
 
@@ -54,17 +52,17 @@ Polling resumes from durable `nextPollAt`; cancellation, deadline expiry or atte
 
 带 ExternalRef binding 的 one-shot/Continuous Subscription 在每次 due probe 前重读 current Integration binding 并做最多 16 KiB 的 exact Connector read。inactive、stale、profile/placement/ownership mismatch 会把 parent 持久标成 `blocked`，不执行 probe、不 materialize callback，也不建立 Run 或外写；transport/read 异常仍走既有 poll failure/retry。相同 terminal/blocked parent 重启后不再次触发。无 binding definition 保持原行为。
 
-Callbacks run in ordinal order. A normal callback failure is terminal for that callback and does not prevent later callbacks from running. If the process stops after a callback has started but before a durable receipt is known, that callback and the remaining pending callbacks become `unknown` and are not replayed blindly. Agent Event/Execution work already admitted to Core follows Core recovery and is reconciled back into the callback occurrence.
+Legacy callbacks run in ordinal order. A normal callback failure is terminal for that callback and does not prevent later callbacks from running. If the process stops after a callback has started but before a durable receipt is known, that callback and the remaining pending callbacks become `unknown` and are not replayed blindly. This recovery path never applies to V4/V2 Run-bound definitions.
 
-Continuous Subscription uses `ContinuousSubscriptionDefinition@1`, stable occurrence keys and shared proactive callback definitions/occurrences. A pending occurrence stops polling until all callbacks are terminal; then the occurrence is checkpointed and polling continues. A repeated occurrence key is a no-op.
+Continuous Subscription V2 uses stable occurrence keys and a pending Run cycle receipt. A pending occurrence stops polling until the cycle is terminal; succeeded checkpoints and resumes polling, while failed/needs-human/cancelled/missing-cycle blocks without moving the prior checkpoint. A repeated occurrence key returns the existing pending cycle.
 
 `command.exec` receives a bounded `ProactiveCallbackInput@1` JSON document on stdin. For a Continuous Subscription it includes the exact pending `PollObservation`; stdout/stderr remain in the generic callback receipt. Definition and grant require `runtime: "host"` and one exact executable, argv, cwd, environment and resource bound. The executable is trusted code: RS validates the declared entrypoint and bounds, but does not sandbox it or its transitive child processes. Persisted legacy `runtime: "node"` callbacks remain readable for history but cannot be registered or executed. RS does not parse command stdout into a business result and does not interpret the observation payload.
 
 ## Control plane
 
-CLI and Console expose the same add/list/inspect/pause/resume/cancel lifecycle. List and inspect return only current one-shot and Continuous views; no v2/legacy shape remains.
+CLI and Console expose list/inspect/pause/resume/cancel diagnostics for both definition generations. Legacy definition 可以 pause/cancel，但不能 resume；Console list additionally提供 one-shot/Continuous 的统一服务端分页、搜索和 current/archived visibility；terminal archive/unarchive 不改变 lifecycle、poll checkpoint、cycle 或 legacy callback evidence。Steward `await_source` is the owner of new V4/V2 creation; `subscription add` 固定 fail closed。
 
-Console shows definition/probe identity, terminal observation, callback definitions, exact grants and receipts. For one-shot Agent callbacks it shows Core Runtime invocation status separately from parsed `SubscriptionAgentResult@1` status. Agent callback Event/Execution audit remains owned by Core Runtime and is referenced by the callback occurrence rather than by a parent `fireEventId`.
+Console shows definition/probe identity, terminal or pending observation, linked Run/cycle and admission receipt. V4/V2 primary navigation opens Run Workspace. Persisted callback trace remains visible under `legacy / non-public` diagnostics.
 
 ## Change guidance
 

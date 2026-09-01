@@ -154,7 +154,10 @@ test("failed Delivery Notice and Runtime Failure reference each other", () => {
       failure?.action.consoleRoute,
       `/console/runtime?noticeId=${encodeURIComponent(noticeId)}`
     );
-    assert.equal(failure?.action.cliHint, `scripts/rs notice inspect ${noticeId}`);
+    assert.equal(
+      failure?.action.cliHint,
+      `scripts/rs failure retry failure:delivery:${deliveryId}`
+    );
 
     const center = noticeCenterView(repo, runtimeDirectory);
     assert.equal(center.notices[0]?.noticeId, noticeId);

@@ -3,10 +3,11 @@ import type { ServerResponse } from "node:http";
 import {
   controlSubscriptionView,
   inspectSubscriptionView,
-  listSubscriptionViews
+  pageSubscriptionViews,
+  setSubscriptionArchivedView
 } from "../../application/subscription/control.js";
 import type { ConsoleRequestMarker } from "./http.js";
-import { json } from "./http.js";
+import { json, parseListPageQuery } from "./http.js";
 
 export function serveSubscriptionApi(
   repoRoot: string,
@@ -19,7 +20,11 @@ export function serveSubscriptionApi(
   try {
     const parts = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
     if (parts.length === 2 && method === "GET") {
-      json(response, 200, listSubscriptionViews(repoRoot, runtimeDirectory));
+      json(response, 200, pageSubscriptionViews(
+        repoRoot,
+        parseListPageQuery(url),
+        runtimeDirectory
+      ));
       return;
     }
     const subscriptionId = parts[2];
@@ -47,6 +52,21 @@ export function serveSubscriptionApi(
         runtimeDirectory
       );
       json(response, 200, subscription);
+      return;
+    }
+    if (parts.length === 4 && method === "POST" &&
+      (action === "archive" || action === "unarchive")) {
+      if (requestMarker !== "console") {
+        json(response, 403, { error: "console_request_marker_required" });
+        return;
+      }
+      const subscription = setSubscriptionArchivedView(
+        repoRoot,
+        subscriptionId,
+        action === "archive",
+        runtimeDirectory
+      );
+      json(response, 200, { subscription, status: action });
       return;
     }
     json(response, 405, { error: "method_not_allowed" });

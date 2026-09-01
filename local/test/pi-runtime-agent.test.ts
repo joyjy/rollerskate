@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import type { AgentInputEvent, ChatDispatchEvent } from "../src/core/event/model.js";
+import { AgentInvocationError } from "../src/core/runtime/agent-invocation.js";
 import {
   PI_CHAT_HISTORY_CONTEXT_ENV,
   PiRuntimeAgent
@@ -64,7 +65,83 @@ test("pi keeps JSON events and the bounded history extension in Chat", async () 
   assert.deepEqual(JSON.parse(request.context ?? "null"), context);
 });
 
-function piFixture(): {
+test("pi uses the shared meaningful stall watchdog and sends RPC abort", async () => {
+  const fixture = piFixture({ stall: true });
+  const agent = new PiRuntimeAgent({
+    executable: fixture.executable,
+    projectRoot: fixture.workspace,
+    environment: {},
+    timeoutMilliseconds: 1_000,
+    meaningfulOutputTimeoutMilliseconds: 50
+  });
+
+  await assert.rejects(agent.invoke({ event: runEvent() }), (error: unknown) => {
+    assert.equal(error instanceof AgentInvocationError, true);
+    const failure = (error as AgentInvocationError).failure;
+    assert.equal(failure.reason, "stall");
+    assert.equal(failure.protocolStop, "requested");
+    return true;
+  });
+  assert.equal(invocation(fixture.invocation).commands?.some(
+    (command) => command.type === "abort"
+  ), true);
+});
+
+test("pi progress renews idle only and cannot extend the Run deadline", async () => {
+  const fixture = piFixture({ meaningfulForever: true });
+  const agent = new PiRuntimeAgent({
+    executable: fixture.executable,
+    projectRoot: fixture.workspace,
+    environment: {},
+    timeoutMilliseconds: 1_000,
+    meaningfulOutputTimeoutMilliseconds: 1_000
+  });
+
+  await assert.rejects(
+    agent.invoke({ event: runEvent(650) }),
+    (error: unknown) => {
+      assert.equal(error instanceof AgentInvocationError, true);
+      const failure = (error as AgentInvocationError).failure;
+      assert.equal(failure.reason, "deadline");
+      assert.equal(failure.totalTimeoutMilliseconds, 650);
+      assert.equal(failure.recovery, "explicit_read_only_resume");
+      assert.deepEqual(failure.lastProgress, { kind: "assistant" });
+      assert.equal(JSON.stringify(failure).includes("streamed fixture"), false);
+      return true;
+    }
+  );
+  assert.equal(invocation(fixture.invocation).commands?.some(
+    (command) => command.type === "abort"
+  ), true);
+});
+
+test("pi classifies an early process exit without sending RPC abort", async () => {
+  const fixture = piFixture({ exitBeforeSettlement: true });
+  const agent = new PiRuntimeAgent({
+    executable: fixture.executable,
+    projectRoot: fixture.workspace,
+    environment: {},
+    timeoutMilliseconds: 5_000
+  });
+
+  await assert.rejects(agent.invoke({ event: runEvent() }), (error: unknown) => {
+    assert.equal(error instanceof AgentInvocationError, true);
+    const failure = (error as AgentInvocationError).failure;
+    assert.equal(failure.reason, "protocol_exit");
+    assert.equal(failure.phase, "terminated");
+    assert.equal(failure.protocolStop, "unavailable");
+    return true;
+  });
+  assert.equal(invocation(fixture.invocation).commands?.some(
+    (command) => command.type === "abort"
+  ), false);
+});
+
+function piFixture(options: {
+  readonly stall?: boolean;
+  readonly meaningfulForever?: boolean;
+  readonly exitBeforeSettlement?: boolean;
+} = {}): {
   readonly workspace: string;
   readonly executable: string;
   readonly invocation: string;
@@ -76,10 +153,11 @@ function piFixture(): {
 const fs = require("node:fs");
 const args = process.argv.slice(2);
 const valueAfter = (flag) => args[args.indexOf(flag) + 1];
-fs.writeFileSync(${JSON.stringify(invocation)}, JSON.stringify({
-  args,
-  context: process.env.${PI_CHAT_HISTORY_CONTEXT_ENV}
+const commands = [];
+const save = () => fs.writeFileSync(${JSON.stringify(invocation)}, JSON.stringify({
+  args, commands, context: process.env.${PI_CHAT_HISTORY_CONTEXT_ENV}
 }));
+save();
 let input = "";
 process.stdin.on("data", (chunk) => {
   input += chunk;
@@ -89,6 +167,8 @@ process.stdin.on("data", (chunk) => {
     input = input.slice(index + 1);
     if (line === "") continue;
     const command = JSON.parse(line);
+    commands.push(command);
+    save();
     const sessionId = valueAfter("--session-id");
     if (command.type === "get_state") {
       process.stdout.write(JSON.stringify({
@@ -106,17 +186,18 @@ process.stdin.on("data", (chunk) => {
         command: "prompt",
         success: true
       }) + "\\n");
-      if (args.includes("--emit-large-trace")) process.stdout.write(JSON.stringify({
+      ${options.exitBeforeSettlement === true ? "process.exit(143);" : options.stall === true ? "" : `if (args.includes("--emit-large-trace")) process.stdout.write(JSON.stringify({
         type: "tool_execution_end",
         toolName: "Bash",
         output: "x".repeat(512)
       }) + "\\n");
-      process.stdout.write(JSON.stringify({
+      ${options.meaningfulForever === true ? `setInterval(() => process.stdout.write(JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "streamed fixture" } }) + "\\n"), 5);` : `process.stdout.write(JSON.stringify({
         type: "message_end",
         message: { role: "assistant", content: [{ type: "text", text: "done" }] }
       }) + "\\n");
-      process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
+      process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");`}`}
     }
+    if (command.type === "abort") process.exit(0);
   }
 });
 `);
@@ -124,9 +205,14 @@ process.stdin.on("data", (chunk) => {
   return { workspace, executable, invocation };
 }
 
-function invocation(path: string): { readonly args: string[]; readonly context?: string } {
+function invocation(path: string): {
+  readonly args: string[];
+  readonly commands?: Array<Record<string, unknown>>;
+  readonly context?: string;
+} {
   return JSON.parse(readFileSync(path, "utf8")) as {
     readonly args: string[];
+    readonly commands?: Array<Record<string, unknown>>;
     readonly context?: string;
   };
 }
@@ -136,7 +222,7 @@ function valueAfter(args: readonly string[], flag: string): string | undefined {
   return index < 0 ? undefined : args[index + 1];
 }
 
-function runEvent(): AgentInputEvent {
+function runEvent(totalTimeoutMilliseconds?: number): AgentInputEvent {
   const eventId = "evt_019f92c9-0000-7000-8000-000000000020";
   return {
     eventId,
@@ -146,6 +232,19 @@ function runEvent(): AgentInputEvent {
     destinationIds: [],
     causality: { rootEventId: eventId, hop: 0 },
     prompt: "respond directly",
+    ...(totalTimeoutMilliseconds === undefined ? {} : {
+      runContext: {
+        schemaVersion: "AgentRunContext@1" as const,
+        resultContractId: "agent-turn-result@1",
+        runId: "run_019f92c9-0000-7000-8000-000000000020",
+        stepId: "stp_019f92c9-0000-7000-8000-000000000020",
+        depth: 0,
+        invocationBudget: {
+          schemaVersion: "AgentInvocationBudget@1" as const,
+          totalTimeoutMilliseconds
+        }
+      }
+    }),
     createdAt: "2026-07-25T00:00:00.000Z"
   };
 }

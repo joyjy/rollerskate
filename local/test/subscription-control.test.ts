@@ -1,218 +1,146 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import {
-  mkdtempSync,
-  readFileSync,
-  realpathSync,
-  rmSync,
-  writeFileSync
-} from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import test from "node:test";
 
-import { listSubscriptionViews } from "../src/application/subscription/control.js";
+import { ContinuousSubscriptionStore } from
+  "../src/capabilities/subscription/continuous-store.js";
+import { SubscriptionStore } from "../src/capabilities/subscription/store.js";
+import { localId } from "../src/core/id.js";
 import { runSubscriptionCommand } from "../src/entrypoints/cli/subscription.js";
+import {
+  bootstrapLocalFoundation,
+  LocalFoundationStore
+} from "../src/infrastructure/sqlite/foundation-store.js";
 import { runtimePaths } from "../src/infrastructure/runtime/config.js";
-import { LocalFoundationStore } from "../src/infrastructure/sqlite/foundation-store.js";
 
-test("Subscription CLI uses v3 for add, list, inspect and control", () => {
-  const repo = mkdtempSync(join(tmpdir(), "rollerskate-subscription-cli-repo-"));
-  const runtimeDirectory = mkdtempSync(join(tmpdir(), "rollerskate-subscription-cli-runtime-"));
-  try {
-    const paths = runtimePaths(repo, runtimeDirectory);
-    const agents = new LocalFoundationStore(paths.database);
-    const owner = agents.addAgent("alice", "codex");
-    agents.close();
-    const workspace = realpathSync(repo);
-    const plugin = join(workspace, "plugin.mjs");
-    writeFileSync(plugin, "export default {};\n");
-    const definition = join(workspace, "subscription.json");
-    writeFileSync(definition, JSON.stringify({
-      schemaVersion: 3,
-      revision: "cli-v1",
-      title: "One-shot subscription",
-      ownerAgentId: owner.principalId,
-      probe: {
-        plugin: { path: plugin, id: "fixture", config: {} },
-        artifactRevision: "fixture-v1",
-        artifactDigest: `sha256:${createHash("sha256")
-          .update(readFileSync(plugin)).digest("hex")}`,
-        policy: {
-          workspaceRoot: workspace,
-          allowedHttpOrigins: [],
-          allowedExecutables: [],
-          allowedEnvironment: [],
-          timeoutMilliseconds: 1_000,
-          maxOutputBytes: 4_096
-        }
-      },
-      callbacks: [],
-      schedule: {
-        intervalMilliseconds: 1_000,
-        maxWaitMilliseconds: 60_000,
-        maxAttempts: 60
-      },
-      approvedGrantDigest: createHash("sha256").update("[]").digest("base64url")
-    }));
-
-    let output = "";
-    assert.equal(runSubscriptionCommand(
-      repo,
-      ["add", definition],
-      { write(text) { output += text; } },
-      runtimeDirectory,
-      workspace
-    ), 0);
-    const created = JSON.parse(output) as {
-      subscription: { subscriptionId: string; definitionSchema: string };
-    };
-    assert.equal(created.subscription.definitionSchema, "SubscriptionDefinition@3");
-
-    output = "";
-    runSubscriptionCommand(repo, ["list"], { write(text) { output += text; } }, runtimeDirectory);
-    const listed = JSON.parse(output) as Array<{ id: string; kind: string }>;
-    assert.deepEqual(listed.map(({ id, kind }) => ({ id, kind })), [{
-      id: created.subscription.subscriptionId,
-      kind: "free"
-    }]);
-
-    output = "";
-    runSubscriptionCommand(
-      repo,
-      ["inspect", created.subscription.subscriptionId],
-      { write(text) { output += text; } },
-      runtimeDirectory
-    );
-    assert.equal((JSON.parse(output) as { definition: { schema: string } })
-      .definition.schema, "SubscriptionDefinition@3");
-
-    output = "";
-    runSubscriptionCommand(
-      repo,
-      ["pause", created.subscription.subscriptionId],
-      { write(text) { output += text; } },
-      runtimeDirectory
-    );
-    assert.equal((JSON.parse(output) as { status: string }).status, "paused");
-
-    const legacy = join(workspace, "legacy.json");
-    writeFileSync(legacy, JSON.stringify({ schemaVersion: 2 }));
+test("Subscription CLI closes legacy add before reading input", () => {
+  for (const arguments_ of [
+    ["add", "--help"],
+    ["add", "/missing/subscription.json"]
+  ]) {
     assert.throws(
       () => runSubscriptionCommand(
-        repo,
-        ["add", legacy],
+        "/missing",
+        arguments_,
         { write() {} },
-        runtimeDirectory,
-        workspace
+        "/missing/runtime"
       ),
-      /schemaVersion must be 3 or ContinuousSubscriptionDefinition@1/
+      /legacy_trigger_write_closed.*RunIntent@1/
     );
-  } finally {
-    rmSync(repo, { recursive: true, force: true });
-    rmSync(runtimeDirectory, { recursive: true, force: true });
   }
 });
 
-test("Subscription add help exposes the trusted host command boundary", () => {
-  let output = "";
-  assert.equal(runSubscriptionCommand(
-    "/unused",
-    ["add", "--help"],
-    { write: (text) => { output += text; } }
-  ), 0);
-  assert.match(output, /runtime must be "host"/);
-  assert.match(output, /may start transitive child processes/);
-  assert.match(output, /legacy runtime: "node" callbacks remain readable but cannot be added/);
-});
-
-test("Subscription CLI creates and controls a ContinuousSubscriptionDefinition@1", () => {
-  const repo = mkdtempSync(join(tmpdir(), "rollerskate-continuous-cli-repo-"));
-  const runtimeDirectory = mkdtempSync(join(tmpdir(), "rollerskate-continuous-cli-runtime-"));
+test("legacy one-shot and continuous Subscriptions cannot resume through public control", () => {
+  const repo = mkdtempSync(join(tmpdir(), "rollerskate-subscription-cutover-repo-"));
+  const runtimeDirectory = mkdtempSync(
+    join(tmpdir(), "rollerskate-subscription-cutover-runtime-")
+  );
   try {
     const paths = runtimePaths(repo, runtimeDirectory);
-    const agents = new LocalFoundationStore(paths.database);
-    const owner = agents.addAgent("continuous", "codex");
-    agents.close();
-    const plugin = join(repo, "continuous-plugin.mjs");
-    writeFileSync(plugin, "export default {};\n");
-    const definition = join(repo, "continuous.json");
-    const workspace = realpathSync(repo);
-    const callbackScript = join(workspace, "refresh.mjs");
-    writeFileSync(callbackScript, "process.stdout.write('refresh');\n");
-    writeFileSync(definition, JSON.stringify({
-      schemaVersion: "ContinuousSubscriptionDefinition@1",
-      revision: 1,
-      title: "Continuous data refresh",
+    bootstrapLocalFoundation(paths, "2026-08-26T10:00:00.000Z");
+    const foundation = new LocalFoundationStore(paths.database);
+    const owner = foundation.addAgent("legacy-owner", "codex", "2026-08-26T10:00:00.000Z");
+    foundation.close();
+    const policy = {
+      workspaceRoot: repo,
+      allowedHttpOrigins: [] as string[],
+      allowedExecutables: [] as string[],
+      allowedEnvironment: [] as string[],
+      timeoutMilliseconds: 1_000,
+      maxOutputBytes: 4_096
+    };
+    const oneShotStore = new SubscriptionStore(paths.database);
+    const oneShot = oneShotStore.create({
+      schemaVersion: 3,
+      revision: "legacy-v1",
+      title: "Legacy one-shot",
       ownerAgentId: owner.principalId,
       probe: {
-        plugin: { path: plugin, id: "continuous-probe", config: {} },
-        policy: {
-          workspaceRoot: workspace,
-          allowedHttpOrigins: [],
-          allowedExecutables: [],
-          allowedEnvironment: [],
-          timeoutMilliseconds: 1_000,
-          maxOutputBytes: 4_096
-        }
+        plugin: {
+          path: join(repo, "legacy-plugin.ts"),
+          id: "legacy-poll",
+          schemaVersion: 1,
+          config: {}
+        },
+        artifactRevision: "legacy-v1",
+        artifactDigest: `sha256:${"0".repeat(64)}`,
+        policy
       },
+      intervalMilliseconds: 1_000,
+      maxWaitMilliseconds: 60_000,
+      maxAttempts: 60,
+      callbacks: [],
+      approvedGrantDigest: createHash("sha256").update("[]").digest("base64url")
+    }, "2026-08-26T10:00:00.000Z");
+    oneShotStore.close();
+
+    const continuousStore = new ContinuousSubscriptionStore(paths.database);
+    const callbackId = localId("scb");
+    const continuous = continuousStore.create({
+      schemaVersion: "ContinuousSubscriptionDefinition@1",
+      revision: 1,
+      title: "Legacy continuous",
+      ownerAgentId: owner.principalId,
+      probe: {
+        plugin: { path: join(repo, "legacy-plugin.ts"), id: "legacy-poll", config: {} },
+        policy
+      },
+      intervalMilliseconds: 1_000,
       callbacks: [{
-        callbackId: "refresh",
-        kind: "command.exec",
+        callbackId,
+        kind: "destination.deliver",
         definition: {
           schemaVersion: "ProactiveCallbackDefinition@1",
-          callbackId: "refresh",
-          kind: "command.exec",
-          runtime: "host",
-          executable: realpathSync(process.execPath),
-          argv: [callbackScript],
-          cwd: workspace,
-          environment: {},
-          timeoutMilliseconds: 1_000,
-          maxOutputBytes: 4_096
+          callbackId,
+          kind: "destination.deliver",
+          destinationId: "dst_019fa649-637b-7bf2-ad2b-a9b7be044fcd",
+          destinationKind: "macos-notification",
+          address: { channel: "owner" },
+          payload: { title: "Legacy", body: "readback" }
         },
         grant: {
           schemaVersion: "ProactiveCallbackGrant@1",
-          kind: "command.exec",
-          runtime: "host",
-          executable: realpathSync(process.execPath),
-          argv: [callbackScript],
-          cwd: workspace,
-          environment: {},
-          filesystemRoots: [dirname(realpathSync(process.execPath)), workspace],
-          networkAccess: true,
-          timeoutMilliseconds: 1_000,
-          maxOutputBytes: 4_096,
-          secretReferences: []
+          kind: "destination.deliver",
+          destinationId: "dst_019fa649-637b-7bf2-ad2b-a9b7be044fcd",
+          destinationKind: "macos-notification",
+          address: { channel: "owner" }
         }
-      }],
-      schedule: { intervalMilliseconds: 1_000 }
-    }));
+      }]
+    }, "2026-08-26T10:00:00.000Z");
+    continuousStore.close();
+
+    for (const subscriptionId of [oneShot.subscriptionId, continuous.subscriptionId]) {
+      assert.equal(runSubscriptionCommand(
+        repo,
+        ["pause", subscriptionId],
+        { write() {} },
+        runtimeDirectory
+      ), 0);
+      assert.throws(() => runSubscriptionCommand(
+        repo,
+        ["resume", subscriptionId],
+        { write() {} },
+        runtimeDirectory
+      ), /legacy_trigger_execution_closed/);
+      assert.equal(runSubscriptionCommand(
+        repo,
+        ["cancel", subscriptionId],
+        { write() {} },
+        runtimeDirectory
+      ), 0);
+    }
+
     let output = "";
     assert.equal(runSubscriptionCommand(
       repo,
-      ["add", definition],
-      { write(value) { output += value; } },
-      runtimeDirectory,
-      workspace
-    ), 0);
-    const created = JSON.parse(output) as { kind: string; id: string; status: string };
-    assert.deepEqual({ kind: created.kind, status: created.status }, {
-      kind: "continuous",
-      status: "active"
-    });
-    assert.equal(
-      listSubscriptionViews(repo, runtimeDirectory).find(({ id }) => id === created.id)?.kind,
-      "continuous"
-    );
-    output = "";
-    runSubscriptionCommand(
-      repo,
-      ["pause", created.id],
+      ["list"],
       { write(value) { output += value; } },
       runtimeDirectory
-    );
-    assert.equal((JSON.parse(output) as { status: string }).status, "paused");
+    ), 0);
+    assert.equal((JSON.parse(output) as unknown[]).length, 2);
   } finally {
     rmSync(repo, { recursive: true, force: true });
     rmSync(runtimeDirectory, { recursive: true, force: true });

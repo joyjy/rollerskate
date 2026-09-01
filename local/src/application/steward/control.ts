@@ -1,5 +1,6 @@
 import { realpathSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
 
 import { workspaceRevision } from "../../infrastructure/workspace/revision.js";
 import {
@@ -33,8 +34,13 @@ import {
   parseRunDecision,
   type AgentRunDecisionReceipt,
   type AnyRunDecision,
-  type CallerOrchestratorBinding
+  type CallerOrchestratorBinding,
+  type RunResultDestination
 } from "../../modules/steward/caller-contract.js";
+import type { RunAuthorityEnvelope } from
+  "../../modules/steward/admission-contract.js";
+import { parseStewardOrchestratorBindingV3 } from
+  "../../modules/steward/run-contract-v3.js";
 import {
   callerOrchestratedStepPrompt,
   stewardOrchestratorPrompt,
@@ -58,20 +64,27 @@ export interface StartStewardRunInput {
         readonly root: string;
         readonly access: "read";
         readonly networkAccess?: boolean;
+        readonly expectedRevision?: string;
       }
     | {
         readonly root: string;
         readonly access: "write";
         readonly effect: WorkspaceEffect;
         readonly networkAccess?: boolean;
+        readonly expectedRevision?: string;
       };
   readonly maxSteps?: number;
   readonly maxDepth?: number;
   readonly deadlineAt?: string;
   readonly taskUrl?: string;
+  readonly resultDestination?: RunResultDestination;
   readonly participantAgentIds?: readonly string[];
   readonly orchestration?: {
     readonly mode: "autonomous" | "caller" | "steward";
+    readonly admission?: {
+      readonly digest: string;
+      readonly authority: RunAuthorityEnvelope;
+    };
   };
 }
 
@@ -93,6 +106,11 @@ export interface CloseStewardRunSeriesReceipt {
   readonly status: "closed" | "already_terminal";
 }
 
+export interface SetStewardRunArchivedReceipt {
+  readonly run: AgentRunProjection;
+  readonly status: "archived" | "unarchived" | "unchanged";
+}
+
 export interface SubmitCallerRunDecisionInput {
   readonly requestId: string;
   readonly decision: AnyRunDecision | Readonly<Record<string, unknown>>;
@@ -110,8 +128,29 @@ export function startStewardRun(
   runtimeDirectory?: string,
   at = new Date().toISOString()
 ): StartStewardRunReceipt {
-  const paths = runtimePaths(repoRoot, runtimeDirectory);
-  const foundation = new LocalFoundationStore(paths.database);
+  const database = openRuntimeDatabase(runtimePaths(repoRoot, runtimeDirectory).database);
+  try {
+    return startStewardRunWithDatabase(input, database, true, at);
+  } finally {
+    database.close();
+  }
+}
+
+export function startStewardRunInTransaction(
+  input: StartStewardRunInput,
+  database: DatabaseSync,
+  at = new Date().toISOString()
+): StartStewardRunReceipt {
+  return startStewardRunWithDatabase(input, database, false, at);
+}
+
+function startStewardRunWithDatabase(
+  input: StartStewardRunInput,
+  database: DatabaseSync,
+  ownTransaction: boolean,
+  at: string
+): StartStewardRunReceipt {
+  const foundation = new LocalFoundationStore(database, { migrate: ownTransaction });
   let ownerPrincipalId: string;
   let stewardAgentId: string;
   let stewardClient: string;
@@ -121,8 +160,13 @@ export function startStewardRun(
   let orchestratorBinding: CallerOrchestratorBinding | undefined;
   const requestedMode = input.orchestration?.mode ??
     (input.steward === undefined ? "steward" : "autonomous");
+  if (input.orchestration?.admission !== undefined && requestedMode !== "steward") {
+    throw new Error("Run admission authority is valid only for Steward orchestration");
+  }
   if (input.series !== undefined && requestedMode !== "autonomous") {
-    throw new Error("Run series currently requires autonomous orchestration");
+    throw new Error(
+      "Caller/steward series cycles must be activated through a bound source occurrence"
+    );
   }
   const checkpointDriven = requestedMode !== "autonomous";
   try {
@@ -166,8 +210,12 @@ export function startStewardRun(
     if (requestedMode === "steward" && steward.client !== "codex") {
       throw new Error("Steward orchestration requires an active Codex Agent");
     }
-    if (input.taskUrl !== undefined && requestedMode !== "steward") {
-      throw new Error("taskUrl is supported only by Steward orchestration");
+    if ((input.taskUrl !== undefined || input.resultDestination !== undefined) &&
+      requestedMode !== "steward") {
+      throw new Error("result destination is supported only by Steward orchestration");
+    }
+    if (input.taskUrl !== undefined && input.resultDestination !== undefined) {
+      throw new Error("taskUrl and resultDestination are mutually exclusive");
     }
     orchestratorBinding = requestedMode === "caller"
       ? {
@@ -181,8 +229,8 @@ export function startStewardRun(
           deliveryPolicy: "manual"
         }
       : requestedMode === "steward"
-        ? {
-            schemaVersion: "OrchestratorBinding@2",
+        ? input.orchestration?.admission === undefined ? {
+            schemaVersion: "OrchestratorBinding@2" as const,
             mode: "caller",
             callerRef: {
               kind: "owner",
@@ -194,15 +242,35 @@ export function startStewardRun(
             },
             decisionContractId: "run-decision@2",
             deliveryPolicy: "internal-with-manual-fallback",
-            ...(input.taskUrl === undefined
+            ...(input.taskUrl === undefined && input.resultDestination === undefined
               ? {}
               : {
-                  resultDestination: createVikunjaRunResultDestination(
-                    runtimeId("dst"),
-                    input.taskUrl
-                  )
+                  resultDestination: input.resultDestination ??
+                    createVikunjaRunResultDestination(runtimeId("dst"), input.taskUrl!)
                 })
           }
+        : parseStewardOrchestratorBindingV3({
+            schemaVersion: "OrchestratorBinding@3",
+            mode: "caller",
+            callerRef: {
+              kind: "owner",
+              principalId: ownerPrincipalId
+            },
+            orchestratorRef: {
+              kind: "agent",
+              agentId: stewardAgentId
+            },
+            decisionContractId: "run-decision@3",
+            deliveryPolicy: "internal-with-manual-fallback",
+            admissionDigest: input.orchestration.admission.digest,
+            authority: input.orchestration.admission.authority,
+            ...(input.taskUrl === undefined && input.resultDestination === undefined
+              ? {}
+              : {
+                  resultDestination: input.resultDestination ??
+                    createVikunjaRunResultDestination(runtimeId("dst"), input.taskUrl!)
+                })
+          })
         : undefined;
   } finally {
     foundation.close();
@@ -227,6 +295,17 @@ export function startStewardRun(
       throw new Error("workspace.networkAccess requires maxDepth=0");
     }
   }
+  if (orchestratorBinding?.schemaVersion === "OrchestratorBinding@3") {
+    assertAdmissionAuthority(
+      orchestratorBinding.authority,
+      participantAgentIds!,
+      workspaceGrant,
+      input.maxSteps ?? 20,
+      maxDepth,
+      input.deadlineAt,
+      orchestratorBinding.resultDestination?.destinationId
+    );
+  }
   const timestamp = iso(at);
   if (input.deadlineAt !== undefined &&
     Date.parse(iso(input.deadlineAt)) <= Date.parse(timestamp)) {
@@ -248,6 +327,13 @@ export function startStewardRun(
         maxSteps: input.maxSteps ?? 20,
         completedWorkerSteps: 0,
         participants: participantTargets,
+        contractVersion: orchestratorBinding?.schemaVersion === "OrchestratorBinding@3"
+          ? 3
+          : 2,
+        ...(orchestratorBinding?.schemaVersion !== "OrchestratorBinding@3" ||
+          orchestratorBinding.authority.trigger === undefined
+          ? {}
+          : { triggerKinds: orchestratorBinding.authority.trigger.allowedKinds }),
         ...(workspaceGrant?.effect === undefined
           ? {}
           : { workspaceEffect: workspaceGrant.effect }),
@@ -260,11 +346,10 @@ export function startStewardRun(
           delegateTargets,
           workspaceGrant?.effect
         );
-  const database = openRuntimeDatabase(paths.database);
-  const runtime = new RuntimeStore(database);
-  const runs = new AgentRunStore(database);
+  const runtime = new RuntimeStore(database, { migrate: ownTransaction });
+  const runs = new AgentRunStore(database, { migrate: ownTransaction });
   try {
-    return runtime.withImmediateTransaction(() => {
+    const operation = (): StartStewardRunReceipt => {
       const existingSeries = seriesKey === undefined
         ? undefined
         : runs.projectionBySeriesKey(seriesKey);
@@ -311,7 +396,7 @@ export function startStewardRun(
         runContext: {
           schemaVersion: "AgentRunContext@1",
           resultContractId: requestedMode === "steward"
-            ? "run-decision@2"
+            ? orchestratorBinding!.decisionContractId
             : requestedMode === "caller"
               ? "agent-step-result@1"
               : "agent-turn-result@1",
@@ -319,6 +404,9 @@ export function startStewardRun(
           ...(cycleId === undefined ? {} : { cycleId }),
           stepId: rootStepId,
           depth: 0,
+          ...(mandate.kind !== "workflow" || mandate.invocationBudget === undefined
+            ? {}
+            : { invocationBudget: mandate.invocationBudget }),
           ...(workspaceGrant === undefined ? {} : { workspaceGrant })
         },
         maxAttempts: 1,
@@ -424,11 +512,11 @@ export function startStewardRun(
         rootEventId: admission.event.eventId,
         executionId: admission.execution.executionId
       };
-    });
+    };
+    return ownTransaction ? runtime.withImmediateTransaction(operation) : operation();
   } finally {
     runs.close();
     runtime.close();
-    database.close();
   }
 }
 
@@ -549,6 +637,25 @@ export function closeStewardRunSeries(
   }
 }
 
+export function setStewardRunArchived(
+  repoRoot: string,
+  runId: string,
+  archived: boolean,
+  runtimeDirectory?: string,
+  at = new Date().toISOString()
+): SetStewardRunArchivedReceipt {
+  const runs = new AgentRunStore(runtimePaths(repoRoot, runtimeDirectory).database);
+  try {
+    const result = runs.setArchived(runId, archived, at);
+    return {
+      run: result.run,
+      status: result.changed ? (archived ? "archived" : "unarchived") : "unchanged"
+    };
+  } finally {
+    runs.close();
+  }
+}
+
 function mandateSnapshot(input: StartStewardRunInput): RunMandateSnapshot {
   const hasObjective = input.objective !== undefined;
   const hasWorkflow = input.workflowRef !== undefined;
@@ -569,6 +676,7 @@ function externalWorkspaceGrant(input: {
   readonly access: "read" | "write";
   readonly effect?: WorkspaceEffect;
   readonly networkAccess?: boolean;
+  readonly expectedRevision?: string;
 }): ExternalWorkspaceGrant {
   if (!isAbsolute(input.root)) throw new Error("workspace.root must be absolute");
   const root = realpathSync(input.root);
@@ -583,6 +691,10 @@ function externalWorkspaceGrant(input: {
   if (input.access === "read" && input.effect !== undefined) {
     throw new Error("workspace.effect is valid only with write access");
   }
+  const revision = workspaceRevision(root).revision;
+  if (input.expectedRevision !== undefined && input.expectedRevision !== revision) {
+    throw new Error("workspace revision changed after Run admission preflight");
+  }
   return {
     schemaVersion: "ExternalWorkspaceGrant@1",
     root,
@@ -591,7 +703,7 @@ function externalWorkspaceGrant(input: {
     ...(input.networkAccess === undefined
       ? {}
       : { networkAccess: input.networkAccess }),
-    revision: workspaceRevision(root).revision
+    revision
   };
 }
 
@@ -624,6 +736,33 @@ function admittedParticipantAgentIds(
     if (!activeIds.has(agentId)) throw new Error(`Run participant is not active: ${agentId}`);
   }
   return [...input].sort();
+}
+
+function assertAdmissionAuthority(
+  authority: RunAuthorityEnvelope,
+  participantAgentIds: readonly string[],
+  workspaceGrant: ExternalWorkspaceGrant | undefined,
+  maxSteps: number,
+  maxDepth: number,
+  deadlineAt: string | undefined,
+  destinationId: string | undefined
+): void {
+  const workspace = workspaceGrant === undefined ? undefined : {
+    root: workspaceGrant.root,
+    revision: workspaceGrant.revision,
+    access: workspaceGrant.access,
+    ...(workspaceGrant.effect === undefined ? {} : { effect: workspaceGrant.effect }),
+    networkAccess: workspaceGrant.networkAccess ?? false
+  };
+  const destinationIds = destinationId === undefined ? [] : [destinationId];
+  if (JSON.stringify(authority.participantAgentIds) !==
+      JSON.stringify(participantAgentIds) ||
+    JSON.stringify(authority.workspace) !== JSON.stringify(workspace) ||
+    JSON.stringify(authority.destinationIds) !== JSON.stringify(destinationIds) ||
+    authority.maxSteps !== maxSteps || authority.maxDepth !== maxDepth ||
+    authority.deadlineAt !== (deadlineAt === undefined ? undefined : iso(deadlineAt))) {
+    throw new Error("Steward Run execution fields do not match admitted authority");
+  }
 }
 
 function assertDuplicateAdmission(

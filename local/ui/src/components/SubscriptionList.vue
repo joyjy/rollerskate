@@ -10,6 +10,12 @@ defineProps<{
 const emit = defineEmits<{
   (e: "select", id: string): void;
 }>();
+
+function isRunBound(subscription: Subscription): boolean {
+  return subscription.kind === "free"
+    ? subscription.definition.schema === "SubscriptionDefinition@4"
+    : subscription.definition.schemaVersion === "ContinuousSubscriptionDefinition@2";
+}
 </script>
 
 <template>
@@ -29,18 +35,24 @@ const emit = defineEmits<{
       </div>
       <div class="row-title">{{ sub.title }}</div>
       <div class="row-meta">{{ sub.probe.plugin.id }}</div>
-      <div class="row-meta">@{{ sub.owner.handle }} · {{ sub.owner.client }}</div>
-      <div class="row-meta">{{ sub.callbacks.length }} exact callback(s)</div>
+      <div v-if="sub.owner" class="row-meta">@{{ sub.owner.handle }} · {{ sub.owner.client }}</div>
+      <div v-else class="row-meta">Run-owned trigger source</div>
+      <div class="row-meta">
+        {{ isRunBound(sub) ? "Run binding" : `${sub.callbacks.length} legacy callback(s)` }}
+      </div>
     </button>
   </div>
 </template>
 
 <style scoped>
 .list-body {
+  min-height: 0;
+  flex: 1 1 auto;
   padding: 10px;
   display: flex;
   flex-direction: column;
   gap: 8px;
+  overflow: auto;
 }
 
 .subscription-row {

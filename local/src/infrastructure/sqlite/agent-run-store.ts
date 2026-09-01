@@ -8,6 +8,7 @@ import {
   isTerminal,
   requireAgentRunId,
   requireAgentRunCycleId,
+  type AgentRunInvocationBudget,
   type AgentRunCycleProjection,
   type AgentRunCycleStatus,
   type AgentRunProjection,
@@ -25,6 +26,12 @@ import {
   type AnyRunDecision,
   type CallerOrchestratorBinding
 } from "../../modules/steward/caller-contract.js";
+import {
+  parseRunSourceBinding,
+  parseTriggerOccurrenceEnvelope,
+  type RunSourceBinding,
+  type TriggerOccurrenceEnvelope
+} from "../../modules/steward/source-contract.js";
 
 interface AgentRunRow {
   run_id: string;
@@ -38,6 +45,7 @@ interface AgentRunRow {
   workspace_grant_json: string | null;
   orchestration_mode: "autonomous" | "caller";
   orchestrator_binding_json: string | null;
+  source_binding_json: string | null;
   status: AgentRunStatus;
   active_step_id: string | null;
   active_execution_id: string | null;
@@ -48,6 +56,7 @@ interface AgentRunRow {
   checkpoint_json: string | null;
   terminal_summary: string | null;
   cancelled_at: string | null;
+  archived_at: string | null;
   version: number;
   created_at: string;
   updated_at: string;
@@ -60,6 +69,7 @@ interface AgentRunCycleRow {
   source_revision: string;
   mandate_snapshot_json: string;
   workspace_grant_json: string | null;
+  source_envelope_json: string | null;
   status: AgentRunCycleStatus;
   step_count: number;
   terminal_summary: string | null;
@@ -90,6 +100,7 @@ export interface CreateAgentRunRecord {
   readonly mandate: RunMandateSnapshot;
   readonly workspaceGrant?: ExternalWorkspaceGrant;
   readonly orchestratorBinding?: CallerOrchestratorBinding;
+  readonly sourceBinding?: RunSourceBinding;
   readonly rootStepId: string;
   readonly initialStepCount?: number;
   readonly maxSteps: number;
@@ -113,14 +124,17 @@ export class AgentRunStore {
   readonly #database: DatabaseSync;
   readonly #ownsDatabase: boolean;
 
-  public constructor(database: string | DatabaseSync) {
+  public constructor(
+    database: string | DatabaseSync,
+    options: { readonly migrate?: boolean } = {}
+  ) {
     if (typeof database === "string") {
       this.#database = openInitializedRuntimeDatabase(database, migrateLocalDatabase);
       this.#ownsDatabase = true;
     } else {
       this.#database = database;
       this.#ownsDatabase = false;
-      migrateLocalDatabase(this.#database);
+      if (options.migrate !== false) migrateLocalDatabase(this.#database);
     }
   }
 
@@ -130,6 +144,12 @@ export class AgentRunStore {
 
   public createInTransaction(input: CreateAgentRunRecord): AgentRunProjection {
     requireAgentRunId(input.runId);
+    if (input.sourceBinding !== undefined) {
+      const binding = parseRunSourceBinding(input.sourceBinding);
+      if (binding.runId !== input.runId || binding.seriesKey !== input.seriesKey) {
+        throw new Error("RunSourceBinding does not match the owning Run identity");
+      }
+    }
     const existing = this.projectionByOwnerRequest(input.ownerRequestId);
     if (existing !== undefined) return existing;
     this.#database.prepare(`
@@ -137,10 +157,10 @@ export class AgentRunStore {
         run_id, root_event_id, owner_request_id, owner_principal_id,
         steward_agent_id, series_key, active_cycle_id,
         mandate_snapshot_json, workspace_grant_json,
-        orchestration_mode, orchestrator_binding_json,
+        orchestration_mode, orchestrator_binding_json, source_binding_json,
         status, active_step_id, active_execution_id, step_count,
         max_steps, max_depth, deadline_at, version, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, 1, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, 1, ?, ?)
     `).run(
       input.runId,
       input.rootEventId,
@@ -159,6 +179,9 @@ export class AgentRunStore {
       input.orchestratorBinding === undefined
         ? null
         : boundedJson(input.orchestratorBinding, "orchestratorBinding", 16_384),
+      input.sourceBinding === undefined
+        ? null
+        : boundedJson(input.sourceBinding, "sourceBinding", 16_384),
       text(input.rootStepId, "rootStepId", 256),
       input.rootExecutionId,
       bounded(input.initialStepCount ?? 1, 0, 1_000, "initialStepCount"),
@@ -242,17 +265,26 @@ export class AgentRunStore {
     readonly sourceRevision: string;
     readonly mandate: RunMandateSnapshot;
     readonly workspaceGrant?: ExternalWorkspaceGrant;
+    readonly sourceEnvelope?: TriggerOccurrenceEnvelope;
     readonly initialStepCount: number;
     readonly createdAt: string;
   }): AgentRunCycleProjection {
     const existing = this.cycleByRequest(input.requestId);
     if (existing !== undefined) return existing;
+    if (input.sourceEnvelope !== undefined) {
+      const envelope = parseTriggerOccurrenceEnvelope(input.sourceEnvelope);
+      if (envelope.binding.runId !== input.runId ||
+        envelope.sourceRevision !== input.sourceRevision) {
+        throw new Error("TriggerOccurrenceEnvelope does not match the owning cycle");
+      }
+    }
     this.#database.prepare(`
       INSERT INTO agent_run_cycles (
         cycle_id, run_id, request_id, source_revision,
-        mandate_snapshot_json, workspace_grant_json, status, step_count,
+        mandate_snapshot_json, workspace_grant_json, source_envelope_json,
+        status, step_count,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
     `).run(
       requireAgentRunCycleId(input.cycleId),
       requireAgentRunId(input.runId),
@@ -262,6 +294,9 @@ export class AgentRunStore {
       input.workspaceGrant === undefined
         ? null
         : boundedJson(input.workspaceGrant, "cycleWorkspaceGrant", 16_384),
+      input.sourceEnvelope === undefined
+        ? null
+        : boundedJson(input.sourceEnvelope, "sourceEnvelope", 65_536),
       bounded(input.initialStepCount, 0, 1_000, "initialStepCount"),
       iso(input.createdAt),
       iso(input.createdAt)
@@ -282,13 +317,47 @@ export class AgentRunStore {
     return projection;
   }
 
-  public list(limit = 100): AgentRunProjection[] {
+  public list(
+    limit = 100,
+    archive: "current" | "archived" | "all" = "all"
+  ): AgentRunProjection[] {
+    const archivePredicate = archive === "current"
+      ? "WHERE archived_at IS NULL"
+      : archive === "archived"
+        ? "WHERE archived_at IS NOT NULL"
+        : "";
     return (this.#database.prepare(`
       SELECT * FROM agent_runs
+      ${archivePredicate}
       ORDER BY updated_at DESC, run_id DESC
       LIMIT ?
     `).all(bounded(limit, 1, 1_000, "limit")) as unknown as AgentRunRow[])
       .map(mapProjection);
+  }
+
+  public setArchived(
+    runId: string,
+    archived: boolean,
+    at: string
+  ): { readonly run: AgentRunProjection; readonly changed: boolean } {
+    const current = this.requireProjection(runId);
+    if (!isTerminal(current.status)) {
+      throw new Error(`Only terminal Agent Runs can be archived: ${runId}`);
+    }
+    if (archived === (current.archivedAt !== undefined)) {
+      return { run: current, changed: false };
+    }
+    const archivedAt = archived ? iso(at) : null;
+    const changed = this.#database.prepare(`
+      UPDATE agent_runs
+      SET archived_at = ?
+      WHERE run_id = ?
+        AND ${archived ? "archived_at IS NULL" : "archived_at IS NOT NULL"}
+    `).run(archivedAt, current.runId);
+    if (changed.changes !== 1) {
+      throw new Error(`Agent Run archive update failed: ${runId}`);
+    }
+    return { run: this.requireProjection(runId), changed: true };
   }
 
   public decision(
@@ -433,6 +502,83 @@ export class AgentRunStore {
       input.expectedVersion
     );
     if (changed.changes !== 1) throw new Error(`Agent Run CAS failed: ${input.runId}`);
+    return this.requireProjection(input.runId);
+  }
+
+  public bindSourceInTransaction(input: {
+    readonly runId: string;
+    readonly expectedVersion: number;
+    readonly binding: RunSourceBinding;
+    readonly updatedAt: string;
+  }): AgentRunProjection {
+    const binding = parseRunSourceBinding(input.binding);
+    if (binding.runId !== input.runId) {
+      throw new Error("RunSourceBinding runId does not match the owning Run");
+    }
+    const changed = this.#database.prepare(`
+      UPDATE agent_runs
+      SET series_key = ?, source_binding_json = ?, status = 'awaiting_source',
+        active_cycle_id = NULL, active_step_id = NULL, active_execution_id = NULL,
+        checkpoint_json = NULL, terminal_summary = NULL, cancelled_at = NULL,
+        version = version + 1, updated_at = ?
+      WHERE run_id = ? AND version = ?
+        AND orchestration_mode = 'caller'
+        AND series_key IS NULL AND source_binding_json IS NULL
+        AND active_cycle_id IS NULL
+        AND status IN ('active', 'awaiting_orchestrator')
+    `).run(
+      text(binding.seriesKey, "sourceBinding.seriesKey", 512),
+      boundedJson(binding, "sourceBinding", 16_384),
+      iso(input.updatedAt),
+      requireAgentRunId(input.runId),
+      input.expectedVersion
+    );
+    if (changed.changes !== 1) {
+      throw new Error(`Agent Run source binding CAS failed: ${input.runId}`);
+    }
+    return this.requireProjection(input.runId);
+  }
+
+  public activateSourceCycleInTransaction(input: {
+    readonly runId: string;
+    readonly expectedVersion: number;
+    readonly cycleId: string;
+    readonly mandate: RunMandateSnapshot;
+    readonly workspaceGrant?: ExternalWorkspaceGrant;
+    readonly rootStepId: string;
+    readonly maxSteps: number;
+    readonly maxDepth: number;
+    readonly deadlineAt?: string;
+    readonly updatedAt: string;
+  }): AgentRunProjection {
+    const changed = this.#database.prepare(`
+      UPDATE agent_runs
+      SET active_cycle_id = ?, mandate_snapshot_json = ?, workspace_grant_json = ?,
+        status = 'awaiting_orchestrator', active_step_id = ?, active_execution_id = NULL,
+        step_count = 0, max_steps = ?, max_depth = ?, deadline_at = ?,
+        checkpoint_json = NULL, terminal_summary = NULL, cancelled_at = NULL,
+        version = version + 1, updated_at = ?
+      WHERE run_id = ? AND version = ?
+        AND orchestration_mode = 'caller'
+        AND series_key IS NOT NULL AND source_binding_json IS NOT NULL
+        AND status = 'awaiting_source' AND active_cycle_id IS NULL
+    `).run(
+      requireAgentRunCycleId(input.cycleId),
+      boundedJson(input.mandate, "mandate", 65_536),
+      input.workspaceGrant === undefined
+        ? null
+        : boundedJson(input.workspaceGrant, "workspaceGrant", 16_384),
+      text(input.rootStepId, "rootStepId", 256),
+      bounded(input.maxSteps, 1, 1_000, "maxSteps"),
+      bounded(input.maxDepth, 0, 100, "maxDepth"),
+      input.deadlineAt === undefined ? null : iso(input.deadlineAt),
+      iso(input.updatedAt),
+      requireAgentRunId(input.runId),
+      input.expectedVersion
+    );
+    if (changed.changes !== 1) {
+      throw new Error(`Agent Run source occurrence CAS failed: ${input.runId}`);
+    }
     return this.requireProjection(input.runId);
   }
 
@@ -613,13 +759,17 @@ export class AgentRunStore {
     readonly expectedVersion: number;
     readonly status: "succeeded" | "failed" | "needs_human";
     readonly summary: string;
+    readonly scope?: "cycle" | "run";
     readonly updatedAt: string;
   }): AgentRunProjection {
     const current = this.requireProjection(input.runId);
     if (current.version !== input.expectedVersion) {
       throw new Error(`Agent Run CAS failed: ${input.runId}`);
     }
-    if (current.seriesKey !== undefined && current.activeCycleId !== undefined) {
+    if (input.scope === "cycle" && current.activeCycleId === undefined) {
+      throw new Error(`Agent Run has no active cycle: ${input.runId}`);
+    }
+    if (current.activeCycleId !== undefined) {
       const timestamp = iso(input.updatedAt);
       const completed = this.#database.prepare(`
         UPDATE agent_run_cycles
@@ -638,23 +788,26 @@ export class AgentRunStore {
       if (completed.changes !== 1) {
         throw new Error(`Agent Run cycle completion CAS failed: ${current.activeCycleId}`);
       }
-      const waiting = this.#database.prepare(`
-        UPDATE agent_runs
-        SET status = 'awaiting_source', active_cycle_id = NULL,
-          active_step_id = NULL, active_execution_id = NULL,
-          checkpoint_json = NULL, terminal_summary = NULL,
-          version = version + 1, updated_at = ?
-        WHERE run_id = ? AND version = ?
-          AND status IN ('active', 'waiting', 'awaiting_orchestrator')
-      `).run(timestamp, current.runId, current.version);
-      if (waiting.changes !== 1) {
-        throw new Error(`Agent Run CAS failed: ${input.runId}`);
+      if (input.scope !== "run") {
+        const waiting = this.#database.prepare(`
+          UPDATE agent_runs
+          SET status = 'awaiting_source', active_cycle_id = NULL,
+            active_step_id = NULL, active_execution_id = NULL,
+            checkpoint_json = NULL, terminal_summary = NULL,
+            version = version + 1, updated_at = ?
+          WHERE run_id = ? AND version = ?
+            AND status IN ('active', 'waiting', 'awaiting_orchestrator')
+        `).run(timestamp, current.runId, current.version);
+        if (waiting.changes !== 1) {
+          throw new Error(`Agent Run CAS failed: ${input.runId}`);
+        }
+        return this.requireProjection(input.runId);
       }
-      return this.requireProjection(input.runId);
     }
     const changed = this.#database.prepare(`
       UPDATE agent_runs
-      SET status = ?, active_step_id = NULL, active_execution_id = NULL,
+      SET status = ?, active_cycle_id = NULL,
+        active_step_id = NULL, active_execution_id = NULL,
         checkpoint_json = NULL, terminal_summary = ?,
         version = version + 1, updated_at = ?
       WHERE run_id = ? AND version = ?
@@ -754,9 +907,13 @@ function mapProjection(row: AgentRunRow): AgentRunProjection {
       ? {}
       : {
           orchestratorBinding: parseCallerOrchestratorBinding(
-            normalizeLegacyVikunjaRunResultDestination(row.orchestrator_binding_json)
+            normalizeLegacyVikunjaRunResultDestination(row.orchestrator_binding_json),
+            { allowHistorical: true }
           )
         }),
+    ...(row.source_binding_json === null
+      ? {}
+      : { sourceBinding: parseRunSourceBinding(parseJson(row.source_binding_json, "sourceBinding")) }),
     status: row.status,
     ...(row.active_step_id === null ? {} : { activeStepId: row.active_step_id }),
     ...(row.active_execution_id === null
@@ -773,6 +930,7 @@ function mapProjection(row: AgentRunRow): AgentRunProjection {
       ? {}
       : { terminalSummary: row.terminal_summary }),
     ...(row.cancelled_at === null ? {} : { cancelledAt: row.cancelled_at }),
+    ...(row.archived_at === null ? {} : { archivedAt: row.archived_at }),
     version: row.version,
     createdAt: row.created_at,
     updatedAt: row.updated_at
@@ -789,6 +947,13 @@ function mapCycle(row: AgentRunCycleRow): AgentRunCycleProjection {
     ...(row.workspace_grant_json === null
       ? {}
       : { workspaceGrant: parseWorkspaceGrant(row.workspace_grant_json) }),
+    ...(row.source_envelope_json === null
+      ? {}
+      : {
+          sourceEnvelope: parseTriggerOccurrenceEnvelope(
+            parseJson(row.source_envelope_json, "sourceEnvelope")
+          )
+        }),
     status: row.status,
     stepCount: row.step_count,
     ...(row.terminal_summary === null
@@ -801,8 +966,12 @@ function mapCycle(row: AgentRunCycleRow): AgentRunCycleProjection {
 }
 
 function mapDecision(row: AgentRunDecisionRow): AgentRunDecisionRecord {
-  const decision = parseRunDecision(parseJson(row.decision_json, "decision"));
-  const receipt = parseAgentRunDecisionReceipt(row.receipt_json);
+  const decision = parseRunDecision(parseJson(row.decision_json, "decision"), {
+    allowHistorical: true
+  });
+  const receipt = parseAgentRunDecisionReceipt(row.receipt_json, {
+    allowHistorical: true
+  });
   if (decision.expectedRunVersion !== row.expected_run_version ||
     receipt.runId !== row.run_id || receipt.requestId !== row.request_id ||
     receipt.expectedRunVersion !== row.expected_run_version ||
@@ -862,6 +1031,7 @@ function parseMandate(value: string): RunMandateSnapshot {
     "workflowVersion",
     "inputs",
     "renderedInstruction",
+    ...(parsed.invocationBudget === undefined ? [] : ["invocationBudget"]),
     ...(parsed.participantAgentIds === undefined ? [] : ["participantAgentIds"])
   ], "mandate");
   const inputs = parsed.inputs;
@@ -889,7 +1059,33 @@ function parseMandate(value: string): RunMandateSnapshot {
       "mandate.renderedInstruction",
       65_536
     ),
+    ...invocationBudget(parsed.invocationBudget),
     ...participantAgentIds(parsed.participantAgentIds)
+  };
+}
+
+function invocationBudget(
+  value: unknown
+): { readonly invocationBudget?: AgentRunInvocationBudget } {
+  if (value === undefined) return {};
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Agent Run invocationBudget is malformed");
+  }
+  const parsed = value as Readonly<Record<string, unknown>>;
+  exactKeys(parsed, ["schemaVersion", "totalTimeoutMilliseconds"], "invocationBudget");
+  if (parsed.schemaVersion !== "AgentInvocationBudget@1") {
+    throw new Error("Agent Run invocationBudget schemaVersion is unsupported");
+  }
+  return {
+    invocationBudget: {
+      schemaVersion: "AgentInvocationBudget@1",
+      totalTimeoutMilliseconds: bounded(
+        parsed.totalTimeoutMilliseconds as number,
+        1,
+        900_000,
+        "invocationBudget.totalTimeoutMilliseconds"
+      )
+    }
   };
 }
 

@@ -15,6 +15,7 @@ import {
   requireScheduleId,
   requireScheduleRevision,
   type CreateScheduleInput,
+  type CreateBoundScheduleInput,
   type ScheduledRun,
   type Schedule,
   type ScheduleDefinition,
@@ -30,6 +31,9 @@ import {
   mapDefinition,
   mapRevision,
   normalizeRevision,
+  normalizeBoundRevision,
+  encodeScheduleSourceBinding,
+  scheduleDefinitionSnapshot,
   parseScheduleDefinitionSnapshot,
   targetChanged,
   text,
@@ -56,14 +60,22 @@ export interface ExpectedScheduleOccurrence {
 
 export class ScheduledTaskStore {
   readonly #database: DatabaseSync;
+  readonly #ownsDatabase: boolean;
   readonly #callbacks: CallbackStore;
   readonly #runtime: RuntimeStore;
   readonly #runs: ScheduledRunStore;
 
-  public constructor(databasePath: string) {
-    this.#database = openInitializedRuntimeDatabase(databasePath, migrateLocalDatabase);
-    this.#callbacks = new CallbackStore(this.#database);
-    this.#runtime = new RuntimeStore(this.#database);
+  public constructor(
+    database: string | DatabaseSync,
+    options: { readonly migrate?: boolean } = {}
+  ) {
+    this.#database = typeof database === "string"
+      ? openInitializedRuntimeDatabase(database, migrateLocalDatabase)
+      : database;
+    this.#ownsDatabase = typeof database === "string";
+    const nestedOptions = options.migrate === undefined ? {} : { migrate: options.migrate };
+    this.#callbacks = new CallbackStore(this.#database, nestedOptions);
+    this.#runtime = new RuntimeStore(this.#database, nestedOptions);
     this.#runs = new ScheduledRunStore({
       database: this.#database,
       runtime: this.#runtime,
@@ -123,6 +135,75 @@ export class ScheduledTaskStore {
     return this.require(scheduleId);
   }
 
+  public createBoundInTransaction(
+    input: CreateBoundScheduleInput,
+    createdAt = new Date().toISOString()
+  ): Schedule {
+    requireLocalId(input.ownerPrincipalId, "prn", "ownerPrincipalId");
+    const at = iso(createdAt, "createdAt");
+    const existing = this.boundForRun(input.sourceBinding.runId);
+    if (existing !== undefined) {
+      const expected = normalizeBoundRevision({
+        ...input,
+        scheduleId: existing.definition.scheduleId,
+        sourceBinding: existing.revision.schemaVersion === "ScheduleRevision@2"
+          ? existing.revision.sourceBinding
+          : input.sourceBinding
+      }, existing.revision.createdAt);
+      if (existing.revision.schemaVersion !== "ScheduleRevision@2" ||
+        JSON.stringify(scheduleDefinitionSnapshot(existing.revision)) !==
+          JSON.stringify(scheduleDefinitionSnapshot(expected))) {
+        throw new Error("Agent Run is already bound to another Schedule definition");
+      }
+      return existing;
+    }
+    const revision = normalizeBoundRevision(input, at);
+    const next = initialOccurrence(revision, at);
+    this.#database.prepare(`
+      INSERT INTO schedules (
+        schedule_id, owner_principal_id, status, current_revision,
+        next_run_at, next_occurrence_key, next_occurrence_missing,
+        definition_schema, agent_id, kind, expression, expression_version, timezone,
+        misfire_policy, overlap_policy, misfire_grace_ms, session_policy,
+        fixed_session_id, prompt, workspace, source_binding_json,
+        external_ref_binding_json, revision_created_at, created_at, updated_at
+      ) VALUES (?, ?, 'active', 1, ?, ?, ?, 'ScheduleRevision@2', NULL, ?, ?, ?, ?,
+        ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?)
+    `).run(
+      revision.scheduleId,
+      input.ownerPrincipalId,
+      next?.scheduledFor ?? null,
+      next?.occurrenceKey ?? null,
+      next?.missingLocalTime === true ? 1 : 0,
+      revision.kind,
+      revision.expression,
+      revision.expressionVersion,
+      revision.timezone ?? null,
+      revision.misfirePolicy,
+      revision.overlapPolicy,
+      revision.misfireGraceMilliseconds,
+      encodeScheduleSourceBinding(revision.sourceBinding),
+      encodeExternalRefTriggerBinding(revision.externalRefBinding),
+      revision.createdAt,
+      at,
+      at
+    );
+    return this.require(revision.scheduleId);
+  }
+
+  public boundForRun(runId: string): Schedule | undefined {
+    const row = this.#database.prepare(`
+      SELECT schedule_id
+      FROM schedules
+      WHERE json_extract(source_binding_json, '$.runId') = ?
+    `).get(runId) as { schedule_id: string } | undefined;
+    return row === undefined ? undefined : this.require(row.schedule_id);
+  }
+
+  public withImmediateTransaction<T>(operation: () => T): T {
+    return withImmediateTransaction(this.#database, operation);
+  }
+
   public get(scheduleId: string): Schedule | undefined {
     requireScheduleId(scheduleId);
     const definition = this.#definition(scheduleId);
@@ -152,22 +233,55 @@ export class ScheduledTaskStore {
     });
   }
 
+  public setArchived(
+    scheduleId: string,
+    archived: boolean,
+    at = new Date().toISOString()
+  ): { readonly schedule: Schedule; readonly changed: boolean } {
+    const current = this.require(scheduleId);
+    if (current.definition.status !== "completed" &&
+      current.definition.status !== "cancelled") {
+      throw new Error(`Only terminal Schedules can be archived: ${scheduleId}`);
+    }
+    if (archived === (current.definition.archivedAt !== undefined)) {
+      return { schedule: current, changed: false };
+    }
+    const changed = this.#database.prepare(`
+      UPDATE schedules
+      SET archived_at = ?
+      WHERE schedule_id = ?
+        AND ${archived ? "archived_at IS NULL" : "archived_at IS NOT NULL"}
+    `).run(archived ? iso(at, "at") : null, scheduleId).changes;
+    if (changed !== 1) throw new Error(`Schedule archive update failed: ${scheduleId}`);
+    return { schedule: this.require(scheduleId), changed: true };
+  }
+
   public requireRevision(scheduleId: string, revision: number): ScheduleRevision {
     requireScheduleId(scheduleId);
     requireScheduleRevision(revision);
     const row = this.#database.prepare(`
       SELECT schedule_id, current_revision AS revision, agent_id, kind,
+        definition_schema,
         expression, expression_version, timezone, misfire_policy,
         overlap_policy, misfire_grace_ms, session_policy, fixed_session_id,
-        prompt, workspace, revision_created_at AS created_at
+        prompt, workspace, source_binding_json, revision_created_at AS created_at
         , external_ref_binding_json
       FROM schedules
       WHERE schedule_id = ? AND current_revision = ?
     `).get(scheduleId, revision) as RevisionRow | undefined;
-    if (row !== undefined) return {
-      ...mapRevision(row),
-      callbacks: this.#callbacks.definitions({ kind: "schedule", id: scheduleId, revision })
-    };
+    if (row !== undefined) {
+      const mapped = mapRevision(row);
+      return mapped.schemaVersion === "ScheduleRevision@1"
+        ? {
+            ...mapped,
+            callbacks: this.#callbacks.definitions({
+              kind: "schedule",
+              id: scheduleId,
+              revision
+            })
+          }
+        : mapped;
+    }
     const snapshot = this.#database.prepare(`
       SELECT definition_snapshot_json
       FROM scheduled_runs
@@ -195,6 +309,9 @@ export class ScheduledTaskStore {
     const at = iso(updatedAt, "updatedAt");
     withImmediateTransaction(this.#database, () => {
       const current = this.require(scheduleId);
+      if (current.revision.schemaVersion !== "ScheduleRevision@1") {
+        throw new Error("ScheduleRevision@2 is managed through its bound Steward Run");
+      }
       if (current.definition.status === "completed" ||
         current.definition.status === "cancelled") {
         throw new Error(`Schedule cannot update from ${current.definition.status}: ${scheduleId}`);
@@ -371,6 +488,12 @@ export class ScheduledTaskStore {
     return this.#runs.insertDueRun(input);
   }
 
+  public insertDueRunInTransaction(
+    input: InsertScheduledRunInput
+  ): InsertScheduledRunReceipt {
+    return this.#runs.insertDueRunInTransaction(input);
+  }
+
   public insertRun(input: InsertScheduledRunInput): InsertScheduledRunReceipt {
     return this.#runs.insertRun(input);
   }
@@ -453,6 +576,9 @@ export class ScheduledTaskStore {
     return withImmediateTransaction(this.#database, () => {
       const run = this.#runs.requireRun(runId);
       if (run.status !== "unknown") throw new Error(`Scheduled run is not unknown: ${runId}`);
+      if (run.agentRunId !== undefined) {
+        throw new Error("Run-bound Schedule occurrence must be resolved in the Run Workspace");
+      }
       this.#callbacks.resolveUnknownGroupInTransaction({
         ownerKind: "schedule",
         ownerId: run.scheduleId,
@@ -516,7 +642,7 @@ export class ScheduledTaskStore {
 
   public close(): void {
     this.#callbacks.close();
-    this.#database.close();
+    if (this.#ownsDatabase) this.#database.close();
   }
 
   #definition(scheduleId: string): ScheduleDefinition | undefined {

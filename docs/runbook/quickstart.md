@@ -27,9 +27,9 @@ scripts/rs start
 - `~/.rollerskate/workspace`；
 - Local Owner Principal；
 - 唯一 Local Chat `Local` 及其 Local Topic；
-- SQLite durable state 与前台 loop。
+- SQLite durable state 与后台 Core Loop。
 
-浏览器默认打开 Local Console。没有 active Agent 时首页是 `Agents`；已有 active Agent 时首页是 `Chats / Local`。Console 直接由内置 Vite 从 `local/ui/src/` 提供，Agent 或开发者保存 Vue、TypeScript、CSS 后，已打开页面通过 HMR 更新，不需要重新 build 或重启 Runtime；修改 `local/src/` 等非 UI 源码仍需重启。保持命令运行；使用 `Ctrl-C` 同时停止 loop、API 和 Vite。
+`start` 等待 Runtime 和 Console ready 后返回，daemon 不依赖当前终端。浏览器默认打开 Local Console。没有 active Agent 时首页是 `Agents`；已有 active Agent 时首页是 `Chats / Local`。Console 直接由内置 Vite 从 `local/ui/src/` 提供，Agent 或开发者保存 Vue、TypeScript、CSS 后，已打开页面通过 HMR 更新，不需要重新 build 或重启 Runtime；修改 `local/src/` 等非 UI 源码后运行 `scripts/rs restart`。需要停止服务时运行 `scripts/rs stop`；调试进程生命周期时可显式使用 `scripts/rs start --foreground`，并用 `Ctrl-C` 停止。
 
 ## 2. 添加 Local Agent
 
@@ -59,7 +59,7 @@ scripts/rs agent resume helper
 @helper 检查 workspace 并给出摘要
 ```
 
-消息 admission 会立即把 handle 解析为 generated Principal ID；前台 loop 的 ChatHandler 只唤起该 Agent。Agent 回复直接追加为 immutable `chat.message` 并继续经过同一 ChatHandler。
+消息 admission 会立即把 handle 解析为 generated Principal ID；Core Loop 的 ChatHandler 只唤起该 Agent。Agent 回复直接追加为 immutable `chat.message` 并继续经过同一 ChatHandler。
 
 不写 mention 时，ChatHandler 会让每个 available Agent 自主决定 reply 或 silent。Agent 还能在每轮把 Topic 或 Global presence 设为 `snoozed`；Owner 可用 `scripts/rs chat presence set <handle> --scope <topic|global> --mode <available|snoozed> ...` 覆盖同一条 scoped state。直接 mention、对应 scope 的 literal wake keyword 或到期让它获得一次重新决策机会。
 

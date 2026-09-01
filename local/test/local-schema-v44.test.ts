@@ -29,6 +29,7 @@ const PRODUCT_TABLES = [
   "free_chat_mode_receipts",
   "free_chat_modes",
   "interactive_channel_bindings",
+  "legacy_trigger_migration_receipts",
   "local_foundation",
   "notices",
   "proactive_callback_definitions",
@@ -43,12 +44,12 @@ const PRODUCT_TABLES = [
   "topic_governance_control_receipts"
 ] as const;
 
-test("schema v63 creates the single post-v0.3.11 schema without legacy Review", () => {
+test("schema v69 creates the single post-v0.3.11 schema without legacy Review", () => {
   const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v50-"));
   const databasePath = join(directory, "runtime.db");
   try {
     const diagnostics = initializeRuntimeSchema(databasePath);
-    assert.equal(diagnostics.schemaVersion, 63);
+    assert.equal(diagnostics.schemaVersion, 69);
     assert.deepEqual(diagnostics.tables, PRODUCT_TABLES);
 
     const database = new DatabaseSync(databasePath);
@@ -71,7 +72,7 @@ test("schema v63 creates the single post-v0.3.11 schema without legacy Review", 
   }
 });
 
-test("schema v63 upgrades a complete v52 database", () => {
+test("schema v69 upgrades a complete v52 database", () => {
   const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v52-"));
   const databasePath = join(directory, "runtime.db");
   try {
@@ -91,7 +92,7 @@ test("schema v63 upgrades a complete v52 database", () => {
       "UPDATE schema_meta SET value = '52' WHERE key = 'schema_version'"
     ).run();
     database.close();
-    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 63);
+    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 69);
     const migrated = new DatabaseSync(databasePath, { readOnly: true });
     try {
       const row = migrated.prepare(`
@@ -122,7 +123,7 @@ test("schema v63 upgrades a complete v52 database", () => {
   }
 });
 
-test("schema v63 rejects pre-v44 product data without modifying it", () => {
+test("schema v69 rejects pre-v44 product data without modifying it", () => {
   const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-pre-v44-"));
   const databasePath = join(directory, "runtime.db");
   try {
@@ -137,7 +138,7 @@ test("schema v63 rejects pre-v44 product data without modifying it", () => {
 
     assert.throws(
       () => initializeRuntimeSchema(databasePath),
-      /schema 43 cannot migrate directly to 63/
+      /schema 43 cannot migrate directly to 69/
     );
     const preserved = new DatabaseSync(databasePath, { readOnly: true });
     try {
@@ -153,7 +154,7 @@ test("schema v63 rejects pre-v44 product data without modifying it", () => {
   }
 });
 
-test("schema v63 drops an entire legacy Review Event chain from v44", () => {
+test("schema v69 drops an entire legacy Review Event chain from v44", () => {
   const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v44-review-"));
   const databasePath = join(directory, "runtime.db");
   try {
@@ -239,7 +240,7 @@ test("schema v63 drops an entire legacy Review Event chain from v44", () => {
     database.close();
 
     const diagnostics = initializeRuntimeSchema(databasePath);
-    assert.equal(diagnostics.schemaVersion, 63);
+    assert.equal(diagnostics.schemaVersion, 69);
     const migrated = new DatabaseSync(databasePath, { readOnly: true });
     try {
       assert.equal(count(migrated, "events"), 0);
@@ -254,7 +255,7 @@ test("schema v63 drops an entire legacy Review Event chain from v44", () => {
   }
 });
 
-test("schema v63 upgrades v56 with optional ExternalRef trigger bindings", () => {
+test("schema v69 upgrades v56 with optional ExternalRef trigger bindings", () => {
   const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v56-"));
   const databasePath = join(directory, "runtime.db");
   try {
@@ -268,7 +269,7 @@ test("schema v63 upgrades v56 with optional ExternalRef trigger bindings", () =>
     ).run();
     previous.close();
 
-    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 63);
+    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 69);
     const migrated = new DatabaseSync(databasePath, { readOnly: true });
     try {
       for (const table of ["schedules", "subscriptions", "continuous_subscriptions"]) {
@@ -285,7 +286,7 @@ test("schema v63 upgrades v56 with optional ExternalRef trigger bindings", () =>
   }
 });
 
-test("schema v63 upgrades v57 without introducing business tables", () => {
+test("schema v69 upgrades v57 without introducing business tables", () => {
   const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v57-"));
   const databasePath = join(directory, "runtime.db");
   try {
@@ -297,14 +298,14 @@ test("schema v63 upgrades v57 without introducing business tables", () => {
     previous.close();
 
     const diagnostics = initializeRuntimeSchema(databasePath);
-    assert.equal(diagnostics.schemaVersion, 63);
+    assert.equal(diagnostics.schemaVersion, 69);
     assert.deepEqual(diagnostics.tables, PRODUCT_TABLES);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
 });
 
-test("schema v63 preserves legacy v58 Candidate tables without extending them", () => {
+test("schema v69 preserves legacy v58 Candidate tables without extending them", () => {
   const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v58-"));
   const databasePath = join(directory, "runtime.db");
   try {
@@ -334,7 +335,7 @@ test("schema v63 preserves legacy v58 Candidate tables without extending them", 
     previous.close();
 
     const diagnostics = initializeRuntimeSchema(databasePath);
-    assert.equal(diagnostics.schemaVersion, 63);
+    assert.equal(diagnostics.schemaVersion, 69);
     assert.deepEqual(
       diagnostics.tables.filter((table) => !table.startsWith("release_candidate")),
       PRODUCT_TABLES
@@ -351,7 +352,7 @@ test("schema v63 preserves legacy v58 Candidate tables without extending them", 
   }
 });
 
-test("schema v63 tolerates complete legacy Candidate tombstones", () => {
+test("schema v69 tolerates complete legacy Candidate tombstones", () => {
   const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v60-legacy-candidate-"));
   const databasePath = join(directory, "runtime.db");
   try {
@@ -375,7 +376,7 @@ test("schema v63 tolerates complete legacy Candidate tombstones", () => {
     database.close();
 
     const diagnostics = initializeRuntimeSchema(databasePath);
-    assert.equal(diagnostics.schemaVersion, 63);
+    assert.equal(diagnostics.schemaVersion, 69);
     const preserved = new DatabaseSync(databasePath, { readOnly: true });
     try {
       assert.equal(count(preserved, "release_candidates"), 1);
@@ -387,10 +388,10 @@ test("schema v63 tolerates complete legacy Candidate tombstones", () => {
   }
 });
 
-test("schema v63 fails closed for newer and incomplete current schemas", () => {
+test("schema v69 fails closed for newer and incomplete current schemas", () => {
   for (const [version, expected] of [
-    ["64", /newer than supported 63/],
-    ["63", /schema 63 is incomplete/]
+    ["70", /newer than supported 69/],
+    ["69", /schema 69 is incomplete/]
   ] as const) {
     const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-version-"));
     const databasePath = join(directory, "runtime.db");

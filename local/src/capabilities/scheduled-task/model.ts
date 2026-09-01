@@ -2,6 +2,7 @@ import { localId, requireLocalId } from "../../core/id.js";
 import type { ProactiveCallbackDefinition } from "../../modules/callback/proactive-model.js";
 import type { ExternalRefTriggerBinding } from
   "../../modules/external-resource/trigger-binding.js";
+import type { RunSourceBinding } from "../../modules/steward/source-contract.js";
 
 export type ScheduleStatus = "active" | "paused" | "completed" | "cancelled";
 export type ScheduleKind = "once" | "cron";
@@ -25,14 +26,14 @@ export interface ScheduleDefinition {
   readonly nextRunAt?: string;
   readonly nextOccurrenceKey?: string;
   readonly nextOccurrenceMissing: boolean;
+  readonly archivedAt?: string;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
 
-export interface ScheduleRevision {
+interface ScheduleRevisionBase {
   readonly scheduleId: string;
   readonly revision: number;
-  readonly agentId: string;
   readonly kind: ScheduleKind;
   readonly expression: string;
   readonly expressionVersion: ScheduleExpressionVersion;
@@ -40,21 +41,53 @@ export interface ScheduleRevision {
   readonly misfirePolicy: ScheduleMisfirePolicy;
   readonly overlapPolicy: ScheduleOverlapPolicy;
   readonly misfireGraceMilliseconds: number;
+  readonly externalRefBinding?: ExternalRefTriggerBinding;
+  readonly createdAt: string;
+}
+
+export interface LegacyScheduleRevision extends ScheduleRevisionBase {
+  readonly schemaVersion: "ScheduleRevision@1";
+  readonly sourceBinding?: undefined;
+  readonly agentId: string;
   readonly sessionPolicy: ScheduleSessionPolicy;
   readonly fixedSessionId?: string;
   readonly prompt: string;
   readonly workspace: string;
   readonly callbacks: readonly ProactiveCallbackDefinition[];
-  readonly externalRefBinding?: ExternalRefTriggerBinding;
-  readonly createdAt: string;
 }
+
+export interface BoundScheduleRevision extends ScheduleRevisionBase {
+  readonly schemaVersion: "ScheduleRevision@2";
+  readonly agentId?: undefined;
+  readonly sessionPolicy?: undefined;
+  readonly fixedSessionId?: undefined;
+  readonly prompt?: undefined;
+  readonly workspace?: undefined;
+  readonly callbacks?: undefined;
+  readonly sourceBinding: RunSourceBinding & {
+    readonly source: RunSourceBinding["source"] & { readonly kind: "schedule" };
+  };
+}
+
+export type ScheduleRevision = LegacyScheduleRevision | BoundScheduleRevision;
 
 export interface Schedule {
   readonly definition: ScheduleDefinition;
   readonly revision: ScheduleRevision;
 }
 
-export interface ScheduledRun {
+export interface ScheduleOccurrenceAdmissionReceipt {
+  readonly schemaVersion: "ScheduleOccurrenceAdmissionReceipt@1";
+  readonly scheduleId: string;
+  readonly occurrenceId: string;
+  readonly agentRunId: string;
+  readonly cycleId: string;
+  readonly orchestratorEventId: string;
+  readonly orchestratorExecutionId: string;
+  readonly admittedAt: string;
+}
+
+export interface ScheduleOccurrence {
   readonly runId: string;
   readonly scheduleId: string;
   readonly occurrenceKey: string;
@@ -66,11 +99,17 @@ export interface ScheduledRun {
   readonly eventId?: string;
   readonly executionId?: string;
   readonly sessionId?: string;
+  readonly agentRunId?: string;
+  readonly cycleId?: string;
+  readonly admissionReceipt?: ScheduleOccurrenceAdmissionReceipt;
   readonly decisionReason?: string;
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly completedAt?: string;
 }
+
+/** @deprecated Use ScheduleOccurrence; this alias remains for legacy API compatibility. */
+export type ScheduledRun = ScheduleOccurrence;
 
 export interface ScheduleRevisionInput {
   readonly agentId: string;
@@ -94,6 +133,19 @@ export interface CreateScheduleInput extends ScheduleRevisionInput {
 
 export interface UpdateScheduleInput extends ScheduleRevisionInput {
   readonly expectedRevision: number;
+}
+
+export interface CreateBoundScheduleInput {
+  readonly scheduleId: string;
+  readonly ownerPrincipalId: string;
+  readonly kind: ScheduleKind;
+  readonly expression: string;
+  readonly timezone?: string;
+  readonly misfirePolicy: ScheduleMisfirePolicy;
+  readonly overlapPolicy: ScheduleOverlapPolicy;
+  readonly misfireGraceMilliseconds: number;
+  readonly sourceBinding: BoundScheduleRevision["sourceBinding"];
+  readonly externalRefBinding?: ExternalRefTriggerBinding;
 }
 
 export function newScheduleId(): string {

@@ -9,7 +9,15 @@ import type {
   AgentRunner,
   RunnerEvent,
   RunnerTurnReceipt,
-  RunnerTurnRequest
+  RunnerTurnRequest,
+  RunnerTerminationReason
+} from "./protocol.js";
+import {
+  RunnerInvocationError,
+  RunnerProgressTracker,
+  runnerInvocationFailure,
+  runnerMeaningfulTimeoutMilliseconds,
+  runnerTimeoutMilliseconds
 } from "./protocol.js";
 
 export interface CodexAppServerRunnerOptions {
@@ -18,6 +26,7 @@ export interface CodexAppServerRunnerOptions {
   readonly environment: Readonly<Record<string, string>>;
   readonly workingDirectory: string;
   readonly timeoutMilliseconds: number;
+  readonly meaningfulOutputTimeoutMilliseconds: number;
   readonly maxOutputBytes: number;
   readonly threadParameters: Readonly<Record<string, unknown>>;
 }
@@ -31,6 +40,16 @@ export class CodexAppServerRunner implements AgentRunner {
 
   public invoke(request: RunnerTurnRequest): Promise<RunnerTurnReceipt> {
     const startedAt = new Date().toISOString();
+    const totalTimeoutMilliseconds = runnerTimeoutMilliseconds(
+      request.totalTimeoutMilliseconds ?? this.#options.timeoutMilliseconds,
+      "totalTimeoutMilliseconds"
+    );
+    const meaningfulOutputTimeoutMilliseconds = runnerMeaningfulTimeoutMilliseconds(
+      request.meaningfulOutputTimeoutMilliseconds ??
+        this.#options.meaningfulOutputTimeoutMilliseconds
+    );
+    const progress = new RunnerProgressTracker(startedAt, request.onProgress);
+    progress.phase("starting");
     return new Promise((resolve, reject) => {
       const child = spawnRunnerProcess({
         executable: this.#options.executable,
@@ -45,6 +64,10 @@ export class CodexAppServerRunner implements AgentRunner {
       let assistantBytes = 0;
       let settled = false;
       let threadId: string | undefined;
+      let turnId: string | undefined;
+      let totalTimeout: NodeJS.Timeout | undefined;
+      let meaningfulTimeout: NodeJS.Timeout | undefined;
+      let interruptFlush: Promise<void> | undefined;
 
       const send = (message: Readonly<Record<string, unknown>>) => {
         child.stdin.write(`${JSON.stringify(message)}\n`);
@@ -52,9 +75,17 @@ export class CodexAppServerRunner implements AgentRunner {
       const finish = (error?: Error) => {
         if (settled) return;
         settled = true;
-        clearTimeout(timeout);
+        if (totalTimeout !== undefined) clearTimeout(totalTimeout);
+        if (meaningfulTimeout !== undefined) clearTimeout(meaningfulTimeout);
+        if (error === undefined) progress.phase("terminated");
         void (async () => {
-          await stopRunnerProcess(child, { closeStdin: true });
+          if (interruptFlush !== undefined) {
+            await Promise.race([
+              interruptFlush,
+              new Promise<void>((flush) => setTimeout(flush, 100))
+            ]);
+          }
+          await stopRunnerProcess(child, { closeStdin: true, graceMilliseconds: 5_000 });
           if (error !== undefined) {
             reject(withStderr(error, stderr()));
             return;
@@ -83,15 +114,69 @@ export class CodexAppServerRunner implements AgentRunner {
           });
         })();
       };
+      const terminate = (reason: RunnerTerminationReason, message: string) => {
+        if (settled) return;
+        progress.phase(reason === "protocol_exit" ? "terminated" : "cancelling");
+        const protocolStop = reason === "protocol_exit" || threadId === undefined ||
+          turnId === undefined || child.stdin.destroyed
+          ? "unavailable" as const
+          : "requested" as const;
+        if (protocolStop === "requested") {
+          interruptFlush = new Promise((flushed) => {
+            try {
+              child.stdin.write(`${JSON.stringify({
+                id: 3,
+                method: "turn/interrupt",
+                params: { threadId, turnId }
+              })}\n`, () => flushed());
+            } catch {
+              flushed();
+            }
+          });
+        }
+        finish(runnerInvocationFailure({
+          message,
+          progress,
+          reason,
+          totalTimeoutMilliseconds,
+          meaningfulOutputTimeoutMilliseconds,
+          protocolStop
+        }));
+      };
+      const finishTerminalFailure = (
+        reason: "cancelled" | "protocol_error",
+        message: string,
+        protocolStop: "acknowledged" | "unavailable"
+      ) => {
+        progress.phase("terminated");
+        finish(runnerInvocationFailure({
+          message,
+          progress,
+          reason,
+          totalTimeoutMilliseconds,
+          meaningfulOutputTimeoutMilliseconds,
+          protocolStop
+        }));
+      };
+      const resetMeaningfulTimeout = () => {
+        if (settled) return;
+        if (meaningfulTimeout !== undefined) clearTimeout(meaningfulTimeout);
+        meaningfulTimeout = setTimeout(() => {
+          terminate(
+            "stall",
+            `agent invocation stalled without meaningful output: ${this.#options.adapterId}`
+          );
+        }, meaningfulOutputTimeoutMilliseconds);
+      };
       const addAssistantText = (itemId: string, text: string, replace: boolean) => {
         const previous = replace ? "" : (assistantMessages.get(itemId) ?? "");
         const next = `${previous}${text}`;
         assistantBytes += Buffer.byteLength(next, "utf8") -
           Buffer.byteLength(assistantMessages.get(itemId) ?? "", "utf8");
         if (assistantBytes > this.#options.maxOutputBytes) {
-          finish(new Error(
+          terminate("protocol_error",
             `Codex assistant output exceeds ${this.#options.maxOutputBytes} bytes`
-          ));
+          );
           return;
         }
         assistantMessages.set(itemId, next);
@@ -100,19 +185,25 @@ export class CodexAppServerRunner implements AgentRunner {
       const decoder = new JsonLineResponseDecoder({
         maxLineBytes: this.#options.maxOutputBytes,
         onDiscardedLine: () => {
-          finish(new Error(
+          terminate("protocol_error",
             `Codex app-server record exceeds ${this.#options.maxOutputBytes} bytes`
-          ));
+          );
         },
         onMessage: (value): boolean => {
           if (!isRecord(value)) return false;
           if (value.id !== undefined && typeof value.method === "string") {
-            finish(new Error(`Codex app-server unexpectedly requested ${value.method}`));
+            terminate(
+              "protocol_error",
+              `Codex app-server unexpectedly requested ${value.method}`
+            );
             return true;
           }
           if (value.id === 0) {
             if (value.error !== undefined) {
-              finish(new Error(`Codex initialize failed: ${rpcError(value.error)}`));
+              terminate(
+                "protocol_error",
+                `Codex initialize failed: ${rpcError(value.error)}`
+              );
               return true;
             }
             send({ method: "initialized" });
@@ -128,16 +219,30 @@ export class CodexAppServerRunner implements AgentRunner {
           }
           if (value.id === 1) {
             if (value.error !== undefined) {
-              finish(new Error(`Codex Thread setup failed: ${rpcError(value.error)}`));
+              terminate(
+                "protocol_error",
+                `Codex Thread setup failed: ${rpcError(value.error)}`
+              );
               return true;
             }
             const result = value.result;
             if (!isRecord(result) || !isRecord(result.thread) ||
               typeof result.thread.id !== "string") {
-              finish(new Error("Codex Thread setup response is missing Thread id"));
+              terminate(
+                "protocol_error",
+                "Codex Thread setup response is missing Thread id"
+              );
+              return true;
+            }
+            if (request.sessionId !== undefined && result.thread.id !== request.sessionId) {
+              terminate(
+                "protocol_error",
+                "Codex resumed Thread id does not match the request"
+              );
               return true;
             }
             threadId = result.thread.id;
+            progress.session(threadId);
             send({
               id: 2,
               method: "turn/start",
@@ -146,17 +251,52 @@ export class CodexAppServerRunner implements AgentRunner {
                 input: [{ type: "text", text: request.prompt }]
               }
             });
+            progress.phase("prompting");
             return true;
           }
-          if (value.id === 2 && value.error !== undefined) {
-            finish(new Error(`Codex turn start failed: ${rpcError(value.error)}`));
-            return true;
+          if (value.id === 2) {
+            if (value.error !== undefined) {
+              terminate(
+                "protocol_error",
+                `Codex turn start failed: ${rpcError(value.error)}`
+              );
+              return true;
+            }
+            if (!isRecord(value.result) || !isRecord(value.result.turn) ||
+              typeof value.result.turn.id !== "string") {
+              terminate(
+                "protocol_error",
+                "Codex turn start response is missing Turn id"
+              );
+              return true;
+            }
+            if (turnId !== undefined && value.result.turn.id !== turnId) {
+              terminate("protocol_error", "Codex app-server changed the active Turn id");
+              return true;
+            }
+            turnId = value.result.turn.id;
+          }
+          if (value.method === "turn/started" && isRecord(value.params) &&
+            isRecord(value.params.turn) && typeof value.params.turn.id === "string" &&
+            threadId !== undefined && value.params.threadId === threadId) {
+            if (turnId !== undefined && value.params.turn.id !== turnId) {
+              terminate("protocol_error", "Codex app-server changed the active Turn id");
+              return true;
+            }
+            turnId = value.params.turn.id;
+          }
+          const progressEvent = codexProgress(value, threadId, turnId);
+          if (progressEvent !== undefined) {
+            progress.observe(progressEvent.kind, progressEvent.meaningful);
+            if (progressEvent.meaningful) resetMeaningfulTimeout();
           }
           if (value.method === "item/agentMessage/delta" && isRecord(value.params) &&
+            matchesActiveTurn(value.params, threadId, turnId) &&
             typeof value.params.itemId === "string" && typeof value.params.delta === "string") {
             addAssistantText(value.params.itemId, value.params.delta, false);
           }
           if (value.method === "item/completed" && isRecord(value.params) &&
+            matchesActiveTurn(value.params, threadId, turnId) &&
             isRecord(value.params.item)) {
             const item = value.params.item;
             if (item.type === "agentMessage" && typeof item.id === "string" &&
@@ -173,6 +313,7 @@ export class CodexAppServerRunner implements AgentRunner {
             }
           }
           if (value.method === "thread/tokenUsage/updated" && isRecord(value.params) &&
+            matchesActiveTurn(value.params, threadId, turnId) &&
             isRecord(value.params.tokenUsage) && isRecord(value.params.tokenUsage.last)) {
             const last = value.params.tokenUsage.last;
             usageEvent = {
@@ -186,17 +327,27 @@ export class CodexAppServerRunner implements AgentRunner {
             };
           }
           if (value.method === "turn/completed" && isRecord(value.params) &&
-            isRecord(value.params.turn)) {
-            if (value.params.turn.status !== "completed") {
+            matchesActiveThread(value.params, threadId) && isRecord(value.params.turn) &&
+            (turnId === undefined || value.params.turn.id === turnId)) {
+            const status = value.params.turn.status;
+            if (status === "completed") {
+              finish();
+            } else if (status === "interrupted") {
+              finishTerminalFailure(
+                "cancelled",
+                "Codex turn ended with interrupted",
+                "acknowledged"
+              );
+            } else {
               const detail = isRecord(value.params.turn.error) &&
                 typeof value.params.turn.error.message === "string"
                 ? `: ${value.params.turn.error.message}`
                 : "";
-              finish(new Error(
-                `Codex turn ended with ${String(value.params.turn.status)}${detail}`
-              ));
-            } else {
-              finish();
+              finishTerminalFailure(
+                "protocol_error",
+                `Codex turn ended with ${String(status)}${detail}`,
+                "unavailable"
+              );
             }
           }
           return true;
@@ -204,36 +355,118 @@ export class CodexAppServerRunner implements AgentRunner {
         complete: () => undefined
       });
 
-      const timeout = setTimeout(() => {
-        finish(new Error(`agent invocation timed out: ${this.#options.adapterId}`));
-      }, this.#options.timeoutMilliseconds);
+      resetMeaningfulTimeout();
+      totalTimeout = setTimeout(() => {
+        terminate("deadline", `agent invocation timed out: ${this.#options.adapterId}`);
+      }, totalTimeoutMilliseconds);
       child.stdout.on("data", (chunk: Buffer) => {
         if (settled) return;
         try {
           decoder.push(chunk);
         } catch (error) {
-          finish(new Error(`Codex app-server decoding failed: ${errorMessage(error)}`));
+          terminate(
+            "protocol_error",
+            `Codex app-server decoding failed: ${errorMessage(error)}`
+          );
         }
       });
-      child.once("error", (error) => finish(error));
-      child.stdin.once("error", (error) => finish(error));
+      child.once("error", (error) => terminate("protocol_exit", errorMessage(error)));
+      child.stdin.once("error", (error) => terminate("protocol_exit", errorMessage(error)));
       child.once("close", (code, signal) => {
         if (settled) return;
-        finish(new Error(
+        terminate("protocol_exit",
           `Codex app-server exited before turn completion ` +
           `(code=${String(code)} signal=${String(signal)})`
-        ));
+        );
       });
       send({
         id: 0,
         method: "initialize",
         params: {
-          clientInfo: { name: "rollerskate-local", version: "0.5.4" },
+          clientInfo: { name: "rollerskate-local", version: "0.5.6" },
           capabilities: {}
         }
       });
     });
   }
+}
+
+function codexProgress(
+  value: Readonly<Record<string, unknown>>,
+  threadId: string | undefined,
+  turnId: string | undefined
+): {
+  readonly kind: "assistant" | "thought" | "tool" | "plan" | "protocol";
+  readonly meaningful: boolean;
+} | undefined {
+  if (typeof value.method !== "string" || !isRecord(value.params) ||
+    !matchesActiveThread(value.params, threadId)) return undefined;
+  if (typeof value.params.turnId === "string" && turnId !== undefined &&
+    value.params.turnId !== turnId) return undefined;
+  if ((value.method.startsWith("item/") || value.method.startsWith("hook/") || [
+    "turn/diff/updated",
+    "turn/plan/updated",
+    "thread/tokenUsage/updated"
+  ].includes(value.method)) && !matchesActiveTurn(value.params, threadId, turnId)) {
+    return undefined;
+  }
+  if (value.method === "item/agentMessage/delta") {
+    return { kind: "assistant", meaningful: true };
+  }
+  if ([
+    "item/reasoning/summaryTextDelta",
+    "item/reasoning/summaryPartAdded",
+    "item/reasoning/textDelta"
+  ].includes(value.method)) {
+    return { kind: "thought", meaningful: true };
+  }
+  if (value.method === "item/plan/delta" || value.method === "turn/plan/updated") {
+    return { kind: "plan", meaningful: true };
+  }
+  if ([
+    "hook/started",
+    "hook/completed",
+    "turn/diff/updated",
+    "item/commandExecution/outputDelta",
+    "item/commandExecution/terminalInteraction",
+    "item/fileChange/outputDelta",
+    "item/fileChange/patchUpdated",
+    "item/mcpToolCall/progress"
+  ].includes(value.method)) {
+    return { kind: "tool", meaningful: true };
+  }
+  if ((value.method === "item/started" || value.method === "item/completed") &&
+    isRecord(value.params.item)) {
+    if (value.params.item.type === "agentMessage") {
+      return { kind: "assistant", meaningful: true };
+    }
+    if (value.params.item.type === "reasoning") {
+      return { kind: "thought", meaningful: true };
+    }
+    if (value.params.item.type === "plan") {
+      return { kind: "plan", meaningful: true };
+    }
+    if (isCodexToolItem(value.params.item)) {
+      return { kind: "tool", meaningful: true };
+    }
+  }
+  return { kind: "protocol", meaningful: false };
+}
+
+function matchesActiveThread(
+  params: Readonly<Record<string, unknown>>,
+  threadId: string | undefined
+): boolean {
+  return threadId !== undefined && params.threadId === threadId;
+}
+
+function matchesActiveTurn(
+  params: Readonly<Record<string, unknown>>,
+  threadId: string | undefined,
+  turnId: string | undefined
+): boolean {
+  return matchesActiveThread(params, threadId) && turnId !== undefined &&
+    params.turnId === turnId;
 }
 
 function codexToolName(item: Readonly<Record<string, unknown>>): string {
@@ -242,6 +475,11 @@ function codexToolName(item: Readonly<Record<string, unknown>>): string {
   }
   if (typeof item.name === "string") return item.name;
   return String(item.type);
+}
+
+function isCodexToolItem(item: Readonly<Record<string, unknown>>): boolean {
+  return typeof item.type === "string" &&
+    !["agentMessage", "reasoning", "userMessage", "plan"].includes(item.type);
 }
 
 function numberProperty(value: unknown, key: string): Readonly<Record<string, number>> {
@@ -255,7 +493,10 @@ function rpcError(error: unknown): string {
 }
 
 function withStderr(error: Error, stderr: string): Error {
-  return new Error(`${error.message}${stderr === "" ? "" : `\nstderr: ${stderr}`}`);
+  const message = `${error.message}${stderr === "" ? "" : `\nstderr: ${stderr}`}`;
+  return error instanceof RunnerInvocationError
+    ? new RunnerInvocationError(message, error.trace)
+    : new Error(message);
 }
 
 function errorMessage(error: unknown): string {

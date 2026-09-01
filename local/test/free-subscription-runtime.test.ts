@@ -24,7 +24,6 @@ import { RuntimeStore } from "../src/core/runtime/store.js";
 import { ScheduledTaskStore } from "../src/capabilities/scheduled-task/store.js";
 import { parseSubscriptionAgentResult, subscriptionAgentPrompt } from
   "../src/capabilities/subscription/agent-result.js";
-import { runSubscriptionCommand } from "../src/entrypoints/cli/subscription.js";
 
 test("Subscription Agent prompt grants bounded correction without ambiguous retries", () => {
   const prompt = subscriptionAgentPrompt("Add the reviewer and verify it.");
@@ -51,71 +50,6 @@ test("SubscriptionAgentResult@1 extracts one bounded JSON envelope", () => {
     () => parseSubscriptionAgentResult(`${JSON.stringify(result)}\n${JSON.stringify(result)}`),
     /must be one JSON object/
   );
-});
-
-test("subscription add accepts a strict SubscriptionDefinition@3 file", () => {
-  const repo = mkdtempSync(join(tmpdir(), "rollerskate-free-subscription-cli-repo-"));
-  const runtimeDirectory = mkdtempSync(join(tmpdir(), "rollerskate-free-subscription-cli-runtime-"));
-  try {
-    const paths = runtimePaths(repo, runtimeDirectory);
-    const foundation = new LocalFoundationStore(paths.database);
-    const owner = foundation.addAgent("cli-owner", "codex");
-    foundation.close();
-    const workspace = realpathSync(repo);
-    const pluginPath = join(workspace, "probe.mjs");
-    writeFileSync(pluginPath, `export default {
-      kind: "subscription.probe", id: "cli-probe", schemaVersion: 1,
-      plan() { return { kind: "http", url: "https://probe.example/status" }; },
-      evaluate() { return { version: "v1", facts: {}, terminal: "success" }; }
-    };`);
-    const file = join(workspace, "subscription.json");
-    writeFileSync(file, JSON.stringify({
-      schemaVersion: 3,
-      revision: "cli-v1",
-      title: "CLI free subscription",
-      ownerAgentId: owner.principalId,
-      probe: {
-        plugin: { path: pluginPath, id: "cli-probe", config: {} },
-        artifactRevision: "cli-source-v1",
-        artifactDigest: `sha256:${createHash("sha256").update(readFileSync(pluginPath)).digest("hex")}`,
-        policy: {
-          workspaceRoot: workspace,
-          allowedHttpOrigins: ["https://probe.example"],
-          allowedExecutables: [],
-          allowedEnvironment: [],
-          timeoutMilliseconds: 1_000,
-          maxOutputBytes: 4_096
-        }
-      },
-      callbacks: [],
-      schedule: {
-        intervalMilliseconds: 100,
-        maxWaitMilliseconds: 60_000,
-        maxAttempts: 10
-      },
-      approvedGrantDigest: digest([])
-    }));
-    let output = "";
-    assert.equal(runSubscriptionCommand(
-      repo,
-      ["add", file],
-      { write(text) { output += text; } },
-      runtimeDirectory,
-      workspace
-    ), 0);
-    const receipt = JSON.parse(output) as {
-      subscription: { definitionSchema: string; definitionRevision: string };
-      callbackDefinitions: unknown[];
-      callbacks: unknown[];
-    };
-    assert.equal(receipt.subscription.definitionSchema, "SubscriptionDefinition@3");
-    assert.equal(receipt.subscription.definitionRevision, "cli-v1");
-    assert.deepEqual(receipt.callbackDefinitions, []);
-    assert.deepEqual(receipt.callbacks, []);
-  } finally {
-    rmSync(repo, { recursive: true, force: true });
-    rmSync(runtimeDirectory, { recursive: true, force: true });
-  }
 });
 
 test("SubscriptionDefinition@3 runs shared exact-grant callbacks in order", async () => {

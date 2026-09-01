@@ -160,8 +160,8 @@ test("exact v55 database materializes additive v60 schedule and channel tables",
     `);
     database.close();
     const diagnostics = initializeRuntimeSchema(databasePath);
-    assert.equal(diagnostics.schemaVersion, 63);
-    assert.equal(diagnostics.tables.length, 28);
+    assert.equal(diagnostics.schemaVersion, 69);
+    assert.equal(diagnostics.tables.length, 29);
     for (const table of [
       "topic_activation_schedules", "topic_activation_schedule_receipts",
       "interactive_channel_bindings", "channel_send_receipts", "channel_follows"

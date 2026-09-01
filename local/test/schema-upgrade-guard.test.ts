@@ -28,23 +28,24 @@ test("new CLI cannot upgrade the database while an older Runtime owns the loop",
     setSchemaVersion(databasePath, 59);
     writeFileSync(loopLock, `${process.pid}\n`, { mode: 0o600 });
 
-    for (const command of [
-      ["start", "--no-open", "--ui-port", "4300"],
-      ["run", "list"]
-    ]) {
-      await assert.rejects(
-        () => runLocalApp(repo, ["--runtime", runtime, ...command]),
-        /Cannot upgrade Local database schema 59 to 63 while Runtime pid \d+ is running/
-      );
-      assert.equal(readSchemaVersion(databasePath), 59);
-    }
+    await assert.rejects(
+      () => runLocalApp(repo, [
+        "--runtime", runtime, "start", "--no-open", "--ui-port", "4300"
+      ]),
+      /Cannot upgrade Local database schema 59 to 69 while Runtime pid \d+ is running/
+    );
+    await assert.rejects(
+      () => runLocalApp(repo, ["--runtime", runtime, "run", "list"]),
+      /Cannot upgrade Local database schema 59 to 69 while Runtime pid \d+ is running/
+    );
+    assert.equal(readSchemaVersion(databasePath), 59);
     assert.throws(
       () => runMigration([databasePath]),
-      /Cannot upgrade Local database schema 59 to 63 while Runtime pid \d+ is running/
+      /Cannot upgrade Local database schema 59 to 69 while Runtime pid \d+ is running/
     );
     assert.equal(readSchemaVersion(databasePath), 59);
 
-    setSchemaVersion(databasePath, 63);
+    setSchemaVersion(databasePath, 69);
     let sameVersionOutput = "";
     assert.equal(await runLocalApp(repo, [
       "--runtime", runtime, "run", "list"
@@ -53,12 +54,18 @@ test("new CLI cannot upgrade the database while an older Runtime owns the loop",
 
     setSchemaVersion(databasePath, 59);
     rmSync(loopLock);
+    await assert.rejects(
+      () => runLocalApp(repo, ["--runtime", runtime, "run", "list"]),
+      /read-only queries do not migrate schema.*scripts\/rs start/
+    );
+    assert.equal(readSchemaVersion(databasePath), 59);
+    runMigration([databasePath]);
     let output = "";
     assert.equal(await runLocalApp(repo, [
       "--runtime", runtime, "run", "list"
     ], {}, { write(text) { output += text; } }), 0);
     assert.deepEqual(JSON.parse(output), []);
-    assert.equal(readSchemaVersion(databasePath), 63);
+    assert.equal(readSchemaVersion(databasePath), 69);
   } finally {
     rmSync(repo, { recursive: true, force: true });
     rmSync(runtime, { recursive: true, force: true });

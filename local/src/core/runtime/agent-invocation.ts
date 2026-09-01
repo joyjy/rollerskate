@@ -33,9 +33,56 @@ export interface AgentAdapterInvocation {
   readonly invocation?: AgentInvocationDiagnostics;
 }
 
+interface AgentInvocationProgressBase {
+  readonly adapterId: string;
+  readonly workspace: string;
+  readonly workspaceAccess: "read" | "write";
+  readonly providerSessionId?: string;
+  readonly startedAt: string;
+  readonly observedAt: string;
+  readonly lastMeaningfulAt: string;
+  readonly phase:
+    | "starting"
+    | "session_ready"
+    | "prompting"
+    | "streaming"
+    | "cancelling"
+    | "terminated";
+  readonly updateCount: number;
+  readonly meaningfulUpdateCount: number;
+  readonly lastProgress?: {
+    readonly kind: "session" | "assistant" | "thought" | "tool" | "plan" | "protocol";
+  };
+}
+
+export interface AgentInvocationProgress extends AgentInvocationProgressBase {
+  readonly schemaVersion: "AgentInvocationProgress@1";
+}
+
+export interface AgentInvocationFailure extends AgentInvocationProgressBase {
+  readonly schemaVersion: "AgentInvocationFailure@1";
+  readonly failedAt: string;
+  readonly reason: "stall" | "deadline" | "protocol_exit" | "cancelled" | "protocol_error";
+  readonly totalTimeoutMilliseconds: number;
+  readonly meaningfulOutputTimeoutMilliseconds: number;
+  readonly protocolStop: "requested" | "acknowledged" | "unavailable";
+  readonly recovery: "explicit_read_only_resume" | "unknown_outcome_no_replay" | "none";
+}
+
+export class AgentInvocationError extends Error {
+  public readonly failure: AgentInvocationFailure;
+
+  public constructor(message: string, failure: AgentInvocationFailure) {
+    super(message);
+    this.name = "AgentInvocationError";
+    this.failure = failure;
+  }
+}
+
 export interface AgentAdapterInput {
   readonly event: AgentInputEvent | ChatDispatchEvent;
   readonly providerSessionId?: string;
+  readonly reportProgress?: (progress: AgentInvocationProgress) => void;
 }
 
 export interface ProviderPolicyObservationSnapshot {

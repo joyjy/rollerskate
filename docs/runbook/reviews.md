@@ -8,7 +8,7 @@ timestamp: 2026-07-26
 
 # Local Steward And Review Workflow Runbook
 
-Steward 不依赖 Server 或 Matrix。默认 start 使用 active、client 为 `codex`、handle 为 `codex` 的 Local Agent 作为 Orchestrator；也可显式选择 autonomous 或 manual caller。Steward 不是 Agent 类型。Runtime 为每个参与 Agent 建立 Run 专属 Session。autonomous mode 由 Agent delegate/callback 推进；manual caller 由 Worker checkpoint 和 Owner decision 推进；default steward 先由 Codex `RunDecision@2` 拆分并选择首个 Worker，之后按 Worker checkpoint 继续编排，失败时可人工接管。CLI 使用简短的 `run` 子命令，持久对象使用 `agent_runs` 与 `agent_run_decisions`，都属于 Steward application domain。
+Steward 不依赖 Server 或 Matrix。公共 start 只接受 `RunIntent@1`，由 Owner 持有的 deterministic compiler 通过 canonical spec registry 选择 active、client/handle 均为 `codex` 的 Local Agent 作为 Orchestrator，解析 participant/workspace/destination reference，并固定 `RunAuthorityEnvelope@1`。Steward 不是 Agent 类型。Runtime 为每个参与 Agent 建立 Run 专属 Session；旧 autonomous/manual raw input 只保留为内部 legacy seam。default steward 固定 `OrchestratorBinding@3`，先由 Codex `RunDecision@3` 拆分并选择首个 Worker，之后按 Worker checkpoint 继续编排或绑定已准入 source，失败时可人工接管。CLI 使用简短的 `run` 子命令，持久对象使用 `agent_runs` 与 `agent_run_decisions`，都属于 Steward application domain。
 
 ## 1. 准备 Agent
 
@@ -22,81 +22,57 @@ Agent Run 不固定 Reviewer/Implementer 名单，也不限制某种 client 只�
 
 ## 2. 创建 Run 文件
 
-内联 objective：
+只读 objective：
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": "RunIntent@1",
+  "requestId": "review-acceptance-1",
   "objective": "检查当前实现是否满足计划，并给出可验证结论。",
-  "workspace": {
-    "root": "/absolute/path/to/git-worktree",
-    "access": "read"
-  },
-  "maxSteps": 12,
-  "maxDepth": 0,
-  "deadlineAt": "2030-07-26T18:00:00+08:00"
+  "acceptance": ["给出 exact implementation 和 test evidence"],
+  "contextRefs": ["release:acceptance"],
+  "workspaceRef": "file:///absolute/path/to/git-worktree",
+  "desiredEffect": "read",
+  "requestedParticipantRefs": ["agent:reviewer"],
+  "terminalEvidence": ["review artifact"]
 }
 ```
 
-使用 `review@1`：
+需要修改 workspace：
 
 ```json
 {
-  "schemaVersion": 1,
-  "workflowRef": "review@1",
-  "inputs": {
-    "plan": "/absolute/path/to/plan.md",
-    "acceptance": "验证实现、测试和边界"
-  },
-  "workspace": {
-    "root": "/absolute/path/to/git-worktree",
-    "access": "write",
-    "effect": "may_remain_unchanged"
-  }
+  "schemaVersion": "RunIntent@1",
+  "requestId": "fix-acceptance-1",
+  "objective": "修复验收缺口并验证。",
+  "acceptance": ["缺口关闭且验证通过"],
+  "contextRefs": ["release:acceptance"],
+  "workspaceRef": "file:///absolute/path/to/git-worktree",
+  "desiredEffect": "change",
+  "terminalEvidence": ["changed workspace revision", "test receipt"]
 }
 ```
 
-默认 Codex Orchestrator + Vikunja Task writeback：
-
-```json
-{
-  "schemaVersion": 1,
-  "objective": "分步检查实现、修复问题并复查验收。",
-  "orchestration": {
-    "mode": "steward"
-  },
-  "participantAgentIds": ["<codex-agent-id>", "<reviewer-agent-id>", "<implementer-agent-id>"],
-  "taskUrl": "http://127.0.0.1:3456/tasks/42",
-  "workspace": {
-    "root": "/absolute/path/to/git-worktree",
-    "access": "write",
-    "effect": "must_change"
-  },
-  "maxSteps": 6
-}
-```
-
-若要保留旧 autonomous 行为，必须显式提供 `steward` handle，或设置 `orchestration.mode = "autonomous"`。若要 manual Owner decision，设置 `orchestration.mode = "caller"`；manual mode 不接受 `taskUrl`。
-
-`objective` 与 `workflowRef` 必须二选一；`inputs` 只与 workflow 一起使用。`workspace` 可省略；提供时 root 必须是绝对、真实、Git-backed directory。`access: "write"` 必须同时声明 `effect: "must_change" | "may_remain_unchanged"`：前者只有在 Runtime 独立观察到 workspace revision 改变后才接受 `succeeded`，后者允许无修改完成。Runtime 在 admission 固定 canonical root、access、effect 与 Git revision，Agent output 不能扩大权限。相同 root 可以并发多个 read Run，但同时最多一个 non-terminal write Run。
+`workspaceRef` 接受 `project:self`、`local:workspace` 或显式本机 `file://` Git workspace。`desiredEffect: read` 编译为只读 grant，`change` 编译为 `write + must_change`；省略 workspace 时 effect 只能省略或为 `none`。participant 使用 `agent:<handle>` / `principal:<id>`，result destination 使用已登记的 `destination:<dst-id>`。compiler 固定 canonical root、revision、roster、network off 和 budget；无法解析或合同冲突时 fail closed。
 
 ## 3. 启动与推进
 
 ```bash
-scripts/rs run start /absolute/path/to/run.json --request-id acceptance-1
+scripts/rs run preflight /absolute/path/to/run-intent.json
+scripts/rs run start /absolute/path/to/run-intent.json
 scripts/rs start --no-open
 ```
 
-`request-id` 是本地幂等键；相同键重复 start 返回原 Run。autonomous mode 的每个 turn 必须返回一个 `AgentTurnResult@1`：
+`preflight` 不创建 Event/Execution/Run；start 使用 intent 内的 `requestId` 作为本地幂等键，相同 request 返回原 Run。内部 legacy autonomous mode 的每个 turn 必须返回一个 `AgentTurnResult@1`：
 
 - `complete`：以 `succeeded | failed | needs_human` 完成当前 step；
 - `delegate`：指定一个 child Agent，并给出 bounded objective 或 workflow invocation。
 
 Agent 不填写 callback target。Runtime 从 caller 的 Run Session 固定 callback binding；child provider retry 不 callback，child terminal 后只恢复一次 caller。A → B → C 会形成 durable async call stack，B 的完成先回 B 的 caller，再由 B 决定如何回 A。
 
-default steward 的第一个 Agent invocation 就是固定 Codex Orchestrator：它在 `stepCount = 0` 时读取 objective、remaining budget 和 participant roster，建立最多 32 个结构化 task 的 `OrchestratorState@1`，并用 strict `RunDecision@2` 选择首个 Worker。之后 checkpoint-driven Worker 必须返回 `AgentStepResult@1`；结果不会直接完成整个 Run，而是形成 `AgentRunCheckpoint@1`，状态进入 `awaiting_orchestrator`，同一 Codex Session 再读取 checkpoint 与历史状态做下一次 decision。
+default steward 的第一个 Agent invocation 就是固定 Codex Orchestrator：它在 `stepCount = 0` 时读取 objective、remaining budget、participant roster 和 admitted authority，建立最多 32 个结构化 task 的 `OrchestratorState@1`，并用 strict `RunDecision@3` 选择首个 Worker。之后 checkpoint-driven Worker 必须返回 `AgentStepResult@1`；结果不会直接完成整个 Run，而是形成 `AgentRunCheckpoint@1`，状态进入 `awaiting_orchestrator`，同一 Codex Session 再读取 checkpoint 与历史状态做下一次 decision。
 
-如果 Orchestrator 输出 malformed/stale/越权 decision，Runtime 保留 current decision source：后续轮次保留 Worker checkpoint，首轮则保留 `stepCount = 0` 的初始 source。此时先用 `inspect` 读取 current state 和 Run version，再提交 manual `RunDecision@1`：
+如果 Orchestrator 输出 malformed/stale/越权 decision，或返回未在 registry/authority 中登记的 source template，Runtime 保留 current decision source：后续轮次保留 Worker checkpoint，首轮则保留 `stepCount = 0` 的初始 source。此时先用 `inspect` 读取 current state 和 Run version，再提交 manual `RunDecision@1`：
 
 ```json
 {
@@ -120,7 +96,7 @@ scripts/rs run inspect <run-id>
 scripts/rs run decide <run-id> /absolute/path/to/decision.json --request-id review-next-1
 ```
 
-`expectedRunVersion` 必须使用 inspect 返回的当前值。action 还可以是 `finish` 或 `needs_human`；`next_step` 只能选择 `self` 或 admission 时固定且当前仍 active 的 exact Agent。manual decision 不能伪造 `RunDecision@2` 的 Orchestrator task state。
+`expectedRunVersion` 必须使用 inspect 返回的当前值。action 还可以是 `finish` 或 `needs_human`；`next_step` 只能选择 `self` 或 admission 时固定且当前仍 active 的 exact Agent。manual decision 不能伪造 `RunDecision@3` 的 Orchestrator task state，也不能提交 `await_source`。
 
 ## 4. 查询、决定与取消
 

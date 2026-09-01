@@ -6,9 +6,12 @@ import { requestJson } from "@/api/client";
 import {
   agentRunDetailViewSchema,
   agentRunSummariesSchema,
-  cancelAgentRunReceiptSchema
+  cancelAgentRunReceiptSchema,
+  setAgentRunArchivedReceiptSchema
 } from "@/api/schema";
 import AgentRunOverview from "@/components/AgentRunOverview.vue";
+import ListControls from "@/components/ListControls.vue";
+import PaginationControls from "@/components/PaginationControls.vue";
 import { useApi } from "@/composables/useApi";
 import { useMutation } from "@/composables/useMutation";
 import { formatDateTime } from "@/utils/format";
@@ -23,12 +26,22 @@ const routeCycleId = computed(() => queryText(route.query.cycleId));
 const routeOutputId = computed(() => queryText(route.query.outputId));
 const selectedId = ref(routeRunId.value);
 const mutationPaused = ref(false);
+const archivedView = ref(false);
 const searchQuery = ref("");
 const currentPage = ref(1);
-const PAGE_SIZE = 10;
+const PAGE_SIZE = 20;
 
+const runsUrl = computed(() => {
+  const parameters = new URLSearchParams({
+    page: String(currentPage.value),
+    pageSize: String(PAGE_SIZE),
+    archive: archivedView.value ? "archived" : "current"
+  });
+  if (searchQuery.value.trim() !== "") parameters.set("q", searchQuery.value.trim());
+  return `/api/runs?${parameters}`;
+});
 const runsQuery = useApi({
-  url: "/api/runs",
+  url: runsUrl,
   schema: agentRunSummariesSchema,
   interval: 5_000,
   paused: mutationPaused
@@ -44,42 +57,17 @@ const detailQuery = useApi({
 });
 
 const runs = computed(() => {
-  const list = runsQuery.data.value ?? [];
-  return [...list].sort((left, right) =>
-    right.updatedAt.localeCompare(left.updatedAt));
+  return runsQuery.data.value?.items ?? [];
 });
-const filteredRuns = computed(() => {
-  const query = searchQuery.value.trim().toLowerCase();
-  if (query === "") return runs.value;
-  return runs.value.filter((run) => [
-    run.mandate.label,
-    run.runId,
-    run.steward.handle,
-    run.status
-  ].some((value) => value.toLowerCase().includes(query)));
-});
+const total = computed(() => runsQuery.data.value?.total ?? 0);
 const pageCount = computed(() =>
-  Math.max(1, Math.ceil(filteredRuns.value.length / PAGE_SIZE)));
-const visibleRuns = computed(() => {
-  const start = (currentPage.value - 1) * PAGE_SIZE;
-  return filteredRuns.value.slice(start, start + PAGE_SIZE);
-});
-const pageSlots = computed<Array<number | null>>(() => {
-  const total = pageCount.value;
-  if (filteredRuns.value.length === 0) return [null, null, null];
-  if (total <= 3) {
-    return [...Array.from({ length: total }, (_, index) => index + 1),
-      ...Array.from({ length: 3 - total }, () => null)];
-  }
-  if (currentPage.value <= 2) return [1, 2, total];
-  if (currentPage.value >= total - 1) return [1, total - 1, total];
-  return [1, currentPage.value, total];
-});
+  Math.max(1, Math.ceil(total.value / PAGE_SIZE)));
 const detail = detailQuery.data;
 const loading = computed(() =>
   runsQuery.loading.value ||
   (selectedId.value !== "" && detailQuery.loading.value));
 const error = computed(() =>
+  archiveMutation.error.value ??
   cancelMutation.error.value ??
   detailQuery.error.value ??
   runsQuery.error.value);
@@ -90,19 +78,7 @@ watch(runs, (next) => {
   }
 }, { immediate: true });
 
-watch([runs, routeRunId], ([nextRuns, nextRunId]) => {
-  if (nextRunId === "" || searchQuery.value.trim() !== "") return;
-  const selectedIndex = nextRuns.findIndex((run) => run.runId === nextRunId);
-  if (selectedIndex >= 0) {
-    currentPage.value = Math.floor(selectedIndex / PAGE_SIZE) + 1;
-  }
-}, { immediate: true });
-
-watch(searchQuery, () => {
-  currentPage.value = 1;
-});
-
-watch([() => filteredRuns.value.length, pageCount], () => {
+watch(pageCount, () => {
   currentPage.value = Math.min(currentPage.value, pageCount.value);
 });
 
@@ -111,7 +87,12 @@ watch(routeRunId, (next) => {
 });
 
 watch(selectedId, (next) => {
-  if (next === "") return;
+  if (next === "") {
+    if (routeRunId.value !== "") {
+      void router.replace({ name: "steward" });
+    }
+    return;
+  }
   detailQuery.data.value = null;
   void router.replace({
     name: "steward",
@@ -143,6 +124,24 @@ const cancelMutation = useMutation({
   }
 });
 
+const archiveMutation = useMutation({
+  async execute(
+    input: { readonly runId: string; readonly archived: boolean },
+    signal: AbortSignal
+  ) {
+    const action = input.archived ? "archive" : "unarchive";
+    return requestJson(
+      `/api/runs/${encodeURIComponent(input.runId)}/${action}`,
+      setAgentRunArchivedReceiptSchema,
+      {
+        method: "POST",
+        headers: { "X-Rollerskate-Request": "console" },
+        signal
+      }
+    );
+  }
+});
+
 async function cancelRun(runId: string) {
   mutationPaused.value = true;
   try {
@@ -151,6 +150,41 @@ async function cancelRun(runId: string) {
     mutationPaused.value = false;
   }
 }
+
+async function archiveRun(runId: string, archived: boolean) {
+  mutationPaused.value = true;
+  try {
+    const result = await archiveMutation.execute({ runId, archived });
+    if (result === null) return;
+    detailQuery.data.value = null;
+    selectedId.value = "";
+    await runsQuery.refresh();
+    if (runs.value.length === 0 && currentPage.value > 1) {
+      currentPage.value -= 1;
+      await runsQuery.refresh();
+    }
+    selectedId.value = runs.value[0]?.runId ?? "";
+  } finally {
+    mutationPaused.value = false;
+  }
+}
+
+watch([searchQuery, archivedView], async () => {
+  currentPage.value = 1;
+  runsQuery.data.value = null;
+  detailQuery.data.value = null;
+  selectedId.value = "";
+  await runsQuery.refresh();
+  selectedId.value = runs.value[0]?.runId ?? "";
+});
+
+watch(currentPage, async () => {
+  await runsQuery.refresh();
+  if (!runs.value.some((run) => run.runId === selectedId.value)) {
+    detailQuery.data.value = null;
+    selectedId.value = runs.value[0]?.runId ?? "";
+  }
+});
 
 function queryText(value: unknown): string {
   if (Array.isArray(value)) return String(value[0] ?? "");
@@ -165,30 +199,27 @@ function goToPage(page: number) {
 <template>
   <div class="operations-view">
     <aside class="panel operations-list" aria-label="Steward Runs">
-      <div class="panel-header list-header">
-        <span>Steward</span>
-        <span class="dim">{{ filteredRuns.length }} Runs</span>
-        <input
-          v-model="searchQuery"
-          class="search-input"
-          type="search"
-          aria-label="Search Steward Runs"
-          placeholder="Search runs…"
-        />
-      </div>
+      <ListControls
+        title="Steward"
+        :total="total"
+        :search="searchQuery"
+        :archived="archivedView"
+        :busy="archiveMutation.pending.value"
+        @update:search="searchQuery = $event"
+        @toggle-archive="archivedView = !archivedView"
+      />
       <div v-if="runsQuery.loading.value && runs.length === 0" class="state">
         Loading Steward Runs…
       </div>
-      <div v-else-if="runs.length === 0" class="state list-state">
-        No Steward Run has been created.
-      </div>
       <div v-else class="list-body">
-        <div class="operation-rows">
-          <div v-if="filteredRuns.length === 0" class="state no-matches">
-            No matches.
-          </div>
+        <div v-if="runs.length === 0" class="state list-state">
+          {{ archivedView
+            ? "No archived Steward Runs."
+            : "No Steward Run has been created." }}
+        </div>
+        <div v-else class="operation-rows">
         <button
-          v-for="run in visibleRuns"
+          v-for="run in runs"
           :key="run.runId"
           type="button"
           class="operation-row"
@@ -204,40 +235,17 @@ function goToPage(page: number) {
           <span class="row-meta">
             @{{ run.steward.handle }} · {{ formatDateTime(run.updatedAt) }}
           </span>
+          <span v-if="run.source" class="row-meta">
+            {{ run.source.kind }} · {{ run.source.id }}
+          </span>
         </button>
         </div>
-        <nav class="pagination" aria-label="Steward Runs pagination">
-          <span class="pagination-info">
-            {{ filteredRuns.length === 0 ? "0 results" : `Page ${currentPage}/${pageCount}` }}
-          </span>
-          <span class="pagination-spacer" />
-          <button
-            type="button"
-            class="page-button direction-button"
-            :disabled="currentPage === 1 || filteredRuns.length === 0"
-            aria-label="Previous page"
-            @click="goToPage(currentPage - 1)"
-          >Prev</button>
-          <template v-for="(page, index) in pageSlots" :key="`${index}-${page ?? 'empty'}`">
-            <button
-              v-if="page !== null"
-              type="button"
-              class="page-button page-number"
-              :class="{ active: page === currentPage }"
-              :aria-current="page === currentPage ? 'page' : undefined"
-              :aria-label="`Page ${page}`"
-              @click="goToPage(page)"
-            >{{ page }}</button>
-            <span v-else class="page-placeholder" aria-hidden="true" />
-          </template>
-          <button
-            type="button"
-            class="page-button direction-button"
-            :disabled="currentPage === pageCount || filteredRuns.length === 0"
-            aria-label="Next page"
-            @click="goToPage(currentPage + 1)"
-          >Next</button>
-        </nav>
+        <PaginationControls
+          :page="currentPage"
+          :page-size="PAGE_SIZE"
+          :total="total"
+          @page="goToPage"
+        />
       </div>
     </aside>
 
@@ -251,7 +259,9 @@ function goToPage(page: number) {
           :cycle-id="routeCycleId"
           :output-id="routeOutputId"
           :cancelling="cancelMutation.pending.value"
+          :archiving="archiveMutation.pending.value"
           @cancel="cancelRun"
+          @archive="archiveRun"
         />
       </template>
       <div v-else class="state">Select a Steward Run.</div>
@@ -260,18 +270,9 @@ function goToPage(page: number) {
 </template>
 
 <style scoped>
-.operations-view { display: grid; grid-template-columns: minmax(260px, 0.8fr) minmax(0, 2fr); gap: 12px; min-width: 0; height: 952px; min-height: 600px; }
-.operations-list, .operations-detail { min-width: 0; display: flex; flex-direction: column; }
-.operations-list { height: 100%; }
-.list-header { display: flex; align-items: center; gap: 8px; min-height: 61px; }
-.list-header .dim { white-space: nowrap; }
-.search-input { min-width: 0; width: 100%; margin-left: auto; padding: 7px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: inherit; font: inherit; text-transform: none; letter-spacing: normal; }
-.search-input:focus { outline: 2px solid var(--primary-soft); border-color: var(--primary); }
 .list-body { min-height: 0; flex: 1 1 0; display: flex; flex-direction: column; }
-.list-state { flex: 1 1 0; }
-.operation-rows { min-height: 0; flex: 1 1 0; display: grid; grid-template-rows: repeat(10, minmax(0, 1fr)); gap: 6px; padding: 8px; overflow: auto; }
-.no-matches { grid-row: 1 / -1; align-self: center; justify-self: center; }
-.operation-row { min-height: 0; display: flex; flex-direction: column; gap: 5px; width: 100%; padding: 10px; overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); color: inherit; text-align: left; cursor: pointer; }
+.operation-rows { min-height: 0; flex: 1 1 auto; display: flex; flex-direction: column; gap: 6px; padding: 8px; overflow: auto; }
+.operation-row { min-height: 68px; flex: 0 0 auto; display: flex; flex-direction: column; gap: 5px; width: 100%; padding: 10px; overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); color: inherit; text-align: left; cursor: pointer; }
 .operation-row:hover, .operation-row.active { border-color: var(--primary); }
 .operation-row.active { outline: 2px solid var(--primary-soft); }
 .row-top { min-width: 0; display: flex; align-items: center; gap: 8px; }
@@ -282,22 +283,4 @@ function goToPage(page: number) {
 .run-status.succeeded { background: var(--success-soft); color: var(--success); }
 .run-status.failed, .run-status.needs_human { background: var(--warning-soft); color: var(--warning); }
 .run-status.cancelled { background: var(--muted-soft); color: var(--muted); }
-.pagination { flex: 0 0 44px; min-width: 0; display: flex; align-items: center; gap: 4px; padding: 0 8px; border-top: 1px solid var(--border); background: var(--surface); }
-.pagination-info { flex: 0 0 58px; overflow: hidden; color: var(--text-secondary); font-size: 11px; white-space: nowrap; }
-.pagination-spacer { flex: 1 1 auto; min-width: 0; }
-.page-button { flex: 0 0 auto; height: 28px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: inherit; cursor: pointer; font-size: 11px; font-weight: 600; }
-.direction-button { width: 40px; padding: 0; }
-.page-number, .page-placeholder { width: 28px; }
-.page-placeholder { flex: 0 0 28px; height: 28px; }
-.page-button:hover:not(:disabled), .page-button.active { border-color: var(--primary); color: var(--primary); }
-.page-button.active { background: var(--primary); color: white; }
-.page-button:disabled { cursor: not-allowed; opacity: .45; }
-.operations-detail { padding: 14px; display: flex; flex-direction: column; gap: 12px; }
-@media (max-width: 900px) {
-  .operations-view { grid-template-columns: minmax(0, 1fr); height: auto; }
-  .operations-list { height: 952px; }
-}
-@media (max-width: 420px) {
-  .pagination-info { display: none; }
-}
 </style>

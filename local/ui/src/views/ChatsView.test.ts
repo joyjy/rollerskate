@@ -1,5 +1,5 @@
 import { flushPromises, mount } from "@vue/test-utils";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { requestJson } from "@/api/client";
 import ChatsView from "@/views/ChatsView.vue";
@@ -10,6 +10,8 @@ vi.mock("@/api/client", () => ({
 }));
 
 const mockedRequestJson = vi.mocked(requestJson);
+
+afterEach(() => vi.useRealTimers());
 
 describe("ChatsView", () => {
   beforeEach(() => {
@@ -61,6 +63,48 @@ describe("ChatsView", () => {
     expect(wrapper.text()).toContain("No Agents have joined this Topic.");
     expect(wrapper.find("textarea").exists()).toBe(true);
     expect(wrapper.text()).toContain("You speak as Human; only Agents join the Topic.");
+    wrapper.unmount();
+  });
+
+  it("keeps Chat history visible while a failed presence query retries", async () => {
+    vi.useFakeTimers();
+    let presenceRequests = 0;
+    let rejectRetry!: (reason: unknown) => void;
+    const retry = new Promise<never>((_resolve, reject) => {
+      rejectRetry = reject;
+    });
+    mockedRequestJson.mockImplementation(async (path) => {
+      const control = controlResponse(path, []);
+      if (control !== undefined) return control;
+      if (path === "/api/chat/presence") {
+        presenceRequests += 1;
+        if (presenceRequests === 1) throw new Error("Presence unavailable");
+        return retry;
+      }
+      if (path === "/api/network/topics") return [];
+      if (path === "/api/network") return networkView(false, false);
+      return {
+        chat: { topicId: "local_1", handle: "local" },
+        agents: [],
+        events: [],
+        messages: { topicId: "local_1", items: [], hasEarlier: false },
+        sessions: [],
+        conversation: conversation()
+      };
+    });
+    const wrapper = mount(ChatsView);
+    await flushPromises();
+
+    expect(wrapper.find(".chats-layout").exists()).toBe(true);
+    expect(wrapper.text()).toContain("Presence unavailable");
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(presenceRequests).toBe(2);
+    expect(wrapper.find(".chats-layout").exists()).toBe(true);
+    expect(wrapper.text()).not.toContain("Loading immutable Chat history");
+
+    rejectRetry(new Error("Presence still unavailable"));
+    await flushPromises();
     wrapper.unmount();
   });
 

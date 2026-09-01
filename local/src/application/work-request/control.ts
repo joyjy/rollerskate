@@ -8,11 +8,13 @@ import { runtimePaths } from "../../infrastructure/runtime/config.js";
 import { LocalFoundationStore } from
   "../../infrastructure/sqlite/foundation-store.js";
 import { AgentServerClient } from "../../integrations/server/agent-client.js";
-import { startStewardRun, type StartStewardRunReceipt } from "../steward/control.js";
+import type { StartStewardRunReceipt } from "../steward/control.js";
+import { startStewardRunFromOwnerIntent } from "../steward/intent-control.js";
 
 const POLICY_REVISION = 1;
 const MAX_STEPS = 20;
-const MAX_DEPTH = 4;
+const MAX_DEPTH = 0;
+const ADMITTED_WORKFLOWS = new Set(["review@1", "forum@1"]);
 
 export type WorkRequestOwnerDecision = "awaiting-owner" | "accepted" | "rejected";
 
@@ -93,26 +95,37 @@ export async function attachAcceptedWorkRequest(
   const workflowRef = admission.admittedWorkflowRef;
   const budget = admission.admittedBudget;
   const startedAt = (dependencies.now ?? (() => new Date()))().toISOString();
-  const run = startStewardRun(repoRoot, {
+  const run = startStewardRunFromOwnerIntent(repoRoot, {
+    schemaVersion: "RunIntent@1",
     requestId: `work-request:${request.workRequestId}`,
-    steward: target.handle,
-    workflowRef,
-    inputs: {
-      objective: request.objective,
-      workRequestAdmission: {
-        schemaVersion: "AgentWorkRequestAdmission@1",
-        workRequestId: request.workRequestId,
-        requesterRef: request.requesterRef,
-        targetServerAgentId: target.serverAgentId,
-        contextRefs: request.contextRefs,
-        resultRoute: request.resultRoute,
-        decisionReceipt: admission
+    objective: request.objective,
+    acceptance: ["Complete the Owner-admitted external work request"],
+    contextRefs: [
+      `work-request:${request.workRequestId}`,
+      `workflow:${workflowRef}`,
+      ...request.contextRefs
+    ],
+    requestedParticipantRefs: [`principal:${target.localAgentId}`],
+    terminalEvidence: ["Submit the exact terminal Run receipt to the work request"]
+  }, {
+    mandate: {
+      kind: "workflow",
+      workflowRef,
+      inputs: {
+        objective: request.objective,
+        workRequestAdmission: {
+          schemaVersion: "AgentWorkRequestAdmission@1",
+          workRequestId: request.workRequestId,
+          requesterRef: request.requesterRef,
+          targetServerAgentId: target.serverAgentId,
+          contextRefs: request.contextRefs,
+          resultRoute: request.resultRoute,
+          decisionReceipt: admission
+        }
       }
     },
     maxSteps: budget.maxSteps,
-    maxDepth: budget.maxDepth,
-    ...(request.deadlineAt === undefined ? {} : { deadlineAt: request.deadlineAt }),
-    participantAgentIds: [target.localAgentId]
+    ...(request.deadlineAt === undefined ? {} : { deadlineAt: request.deadlineAt })
   }, dependencies.runtimeDirectory, startedAt);
   const attached = await target.client.attachWorkRequestRun(request.workRequestId, {
     schemaVersion: "AgentWorkRequestRunAttach@1",
@@ -184,12 +197,16 @@ function decisionReceipt(
     };
   }
   const requested = request.requestedBudget;
+  const workflowRef = request.workflowRef ?? "forum@1";
+  if (!ADMITTED_WORKFLOWS.has(workflowRef)) {
+    throw new Error(`Work request workflow is not admitted by Owner policy: ${workflowRef}`);
+  }
   return {
     schemaVersion: "AgentWorkRequestDecisionReceipt@1",
     decision,
     policyRevision: POLICY_REVISION,
     statusReason: "owner-explicit-acceptance",
-    admittedWorkflowRef: request.workflowRef ?? "forum@1",
+    admittedWorkflowRef: workflowRef,
     admittedBudget: {
       maxSteps: Math.min(requested?.maxSteps ?? MAX_STEPS, MAX_STEPS),
       maxDepth: Math.min(requested?.maxDepth ?? MAX_DEPTH, MAX_DEPTH)

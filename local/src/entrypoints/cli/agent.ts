@@ -1,7 +1,4 @@
-import {
-  configureAgents,
-  enqueueAgentRequest
-} from "../../application/agent/server-control.js";
+import { configureAgents } from "../../application/agent/server-control.js";
 import {
   addLocalAgent,
   configureLocalAgent,
@@ -125,21 +122,12 @@ export async function runAgentCommand(
     return 0;
   }
   if (command === "request") {
-    const request = parseAgentRequest(rest);
-    const receipt = enqueueAgentRequest(repoRoot, request.name, request.prompt, {
-      ...options,
-      ...(request.sessionId === undefined ? {} : { sessionId: request.sessionId })
-    });
-    output.write(`${JSON.stringify({
-      eventId: receipt.event.eventId,
-      executionId: receipt.execution.executionId,
-      status: receipt.execution.status,
-      ...(receipt.event.sessionId === undefined ? {} : { sessionId: receipt.event.sessionId })
-    })}\n`);
-    return 0;
+    throw new Error(
+      "direct_agent_work_closed: start RunIntent@1 and select the Agent by stable participant ref"
+    );
   }
   throw new Error(
-    "agent requires create, configure, list, status, rename, suspend, resume, request or profile"
+    "agent requires create, configure, list, status, rename, suspend, resume or profile"
   );
 }
 
@@ -223,35 +211,4 @@ function parseAgentConfigure(arguments_: readonly string[]): {
     launchArgs.push(value);
   }
   return { handle, launchArgs };
-}
-
-function parseAgentRequest(arguments_: readonly string[]): {
-  readonly name: string;
-  readonly prompt: string;
-  readonly sessionId?: string;
-} {
-  const name = arguments_[0];
-  if (name === undefined || name.trim() === "") {
-    throw new Error("agent request requires an Agent name");
-  }
-  let sessionId: string | undefined;
-  const promptParts: string[] = [];
-  for (let offset = 1; offset < arguments_.length; offset += 1) {
-    const value = arguments_[offset]!;
-    if (value === "--session") {
-      const candidate = arguments_[offset + 1];
-      if (candidate === undefined || candidate.trim() === "") {
-        throw new Error("--session requires a local Session ID");
-      }
-      sessionId = candidate;
-      offset += 1;
-    } else if (value.startsWith("--")) {
-      throw new Error(`unexpected agent request option: ${value}`);
-    } else {
-      promptParts.push(value);
-    }
-  }
-  const prompt = promptParts.join(" ").trim();
-  if (prompt === "") throw new Error("agent request requires a non-empty prompt");
-  return { name, prompt, ...(sessionId === undefined ? {} : { sessionId }) };
 }

@@ -34,6 +34,7 @@ describe("AgentRunOverview", () => {
             progress: { steps: 3, maxSteps: 8, maxDepth: 3 },
             status: "waiting",
             terminalSummary: null,
+            archivedAt: null,
             updatedAt: "2026-07-25T00:00:00.000Z"
           },
           projection: {
@@ -104,6 +105,39 @@ describe("AgentRunOverview", () => {
     expect(items[1]!.attributes("style")).toContain("padding-left: 16px");
   });
 
+  it("renders a persisted orchestrator decision step", async () => {
+    const router = createConsoleRouter(createMemoryHistory());
+    await router.push("/console/steward");
+    const decisionStep = step({
+      stepId: "stp_orchestrator",
+      depth: 0,
+      result: {
+        schemaVersion: "RunDecision@3",
+        expectedRunVersion: 3,
+        rationale: "the admitted work is complete",
+        checkedAcceptance: ["artifact exists"],
+        state: {
+          schemaVersion: "OrchestratorState@1",
+          goal: "complete the run",
+          tasks: [],
+          acceptedEvidence: ["file:///workspace/result.txt"],
+          unresolvedQuestions: []
+        },
+        action: "finish",
+        finish: { scope: "run", outcome: "succeeded", summary: "done" }
+      }
+    });
+    const wrapper = mount(AgentRunOverview, {
+      global: { plugins: [router] },
+      props: { run: baseRun({ steps: [decisionStep] }) }
+    });
+
+    expect(wrapper.text()).toContain("RunDecision@3");
+    expect(wrapper.text()).toContain("orchestrator · finish");
+    expect(wrapper.text()).toContain("done");
+    expect(wrapper.text()).toContain("1 evidence");
+  });
+
   it("shows empty state when no steps are present", async () => {
     const router = createConsoleRouter(createMemoryHistory());
     await router.push("/console/steward");
@@ -155,6 +189,43 @@ describe("AgentRunOverview", () => {
     expect(wrapper.text()).toContain("Awaiting Caller decision");
     expect(wrapper.text()).toContain("succeeded · audit complete");
   });
+
+  it("shows the exact trigger occurrence, cycle and diagnostics deep link", async () => {
+    const router = createConsoleRouter(createMemoryHistory());
+    await router.push("/console/steward");
+    const wrapper = mount(AgentRunOverview, {
+      global: { plugins: [router] },
+      props: {
+        run: {
+          ...baseRun(),
+          triggerSource: {
+            kind: "continuous_subscription",
+            id: "sub_bound",
+            definitionRevision: "ContinuousSubscriptionDefinition@2:1",
+            status: "blocked",
+            diagnosticsRoute: "/console/subscriptions?subscriptionId=sub_bound",
+            nextActionAt: null,
+            pendingOccurrenceKey: "delta-2",
+            checkpointOccurrenceKey: "delta-1",
+            reconcileStatus: "run-cycle-failed",
+            latestError: "run-cycle-failed",
+            lastOccurrence: {
+              occurrenceKey: "delta-2",
+              cycleId: "cyc_2",
+              status: "failed",
+              observedAt: "2026-08-26T09:02:00.000Z"
+            }
+          }
+        }
+      }
+    });
+
+    expect(wrapper.text()).toContain("continuous_subscription · blocked");
+    expect(wrapper.text()).toContain("delta-2 · cyc_2 · failed");
+    expect(wrapper.text()).toContain("delta-1");
+    expect(wrapper.get(".source-card .trace-link").attributes("href"))
+      .toContain("/console/subscriptions?subscriptionId=sub_bound");
+  });
 });
 
 function baseRun(overrides: { steps?: AgentRunStepOutput[] } = {}): AgentRunDetailViewOutput {
@@ -178,6 +249,7 @@ function baseRun(overrides: { steps?: AgentRunStepOutput[] } = {}): AgentRunDeta
       progress: { steps: 3, maxSteps: 8, maxDepth: 3 },
       status: "waiting",
       terminalSummary: null,
+      archivedAt: null,
       updatedAt: "2026-07-25T00:00:00.000Z"
     },
     projection: {

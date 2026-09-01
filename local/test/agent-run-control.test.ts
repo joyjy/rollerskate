@@ -6,6 +6,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 
@@ -22,25 +23,25 @@ test("Run CLI starts idempotently, lists, inspects, traces and cancels", () => {
   try {
     const config = join(fixture.repo, "run.json");
     writeFileSync(config, JSON.stringify({
-      schemaVersion: 1,
-      steward: "steward",
+      schemaVersion: "RunIntent@1",
+      requestId: "run-cli-1",
       objective: "Review the current implementation.",
-      workspace: {
-        root: fixture.workspace,
-        access: "read"
-      },
-      maxSteps: 8,
-      maxDepth: 3
+      acceptance: ["Report exact evidence"],
+      contextRefs: [],
+      workspaceRef: pathToFileURL(fixture.workspace).href,
+      desiredEffect: "read",
+      requestedParticipantRefs: ["agent:child"],
+      terminalEvidence: ["review receipt"]
     }));
     const created = command(fixture.repo, fixture.runtimeDirectory, [
-      "start", config, "--request-id", "run-cli-1"
+      "start", config
     ]) as {
       status: string;
       run: { runId: string; status: string };
       rootEventId: string;
     };
     const duplicate = command(fixture.repo, fixture.runtimeDirectory, [
-      "start", config, "--request-id", "run-cli-1"
+      "start", config
     ]) as {
       status: string;
       run: { runId: string };
@@ -68,13 +69,13 @@ test("Run CLI starts idempotently, lists, inspects, traces and cancels", () => {
     assert.equal(listed.length, 1);
     assert.equal(inspected.summary.runId, created.run.runId);
     assert.equal(inspected.timeline.length, 1);
-    assert.match(
-      inspected.timeline[0]?.event.prompt ?? "",
-      new RegExp(fixture.childAgentId)
-    );
-    assert.match(inspected.timeline[0]?.event.prompt ?? "", /"handle": "child"/);
+    assert.match(inspected.timeline[0]?.event.prompt ?? "", /participants=2/);
+    assert.doesNotMatch(inspected.timeline[0]?.event.prompt ?? "", /workspace.*root/i);
     assert.deepEqual(inspected.exchanges, []);
     assert.equal(traced.summary.runId, created.run.runId);
+    assert.throws(() => command(fixture.repo, fixture.runtimeDirectory, [
+      "archive", created.run.runId
+    ]), /Only terminal Agent Runs can be archived/);
 
     const cancelled = command(fixture.repo, fixture.runtimeDirectory, [
       "cancel", created.run.runId
@@ -95,6 +96,22 @@ test("Run CLI starts idempotently, lists, inspects, traces and cancels", () => {
     assert.equal((command(fixture.repo, fixture.runtimeDirectory, [
       "cancel", created.run.runId
     ]) as { status: string }).status, "already_terminal");
+
+    const archived = command(fixture.repo, fixture.runtimeDirectory, [
+      "archive", created.run.runId
+    ]) as { status: string; run: { archivedAt?: string } };
+    assert.equal(archived.status, "archived");
+    assert.equal(typeof archived.run.archivedAt, "string");
+    assert.deepEqual(command(fixture.repo, fixture.runtimeDirectory, ["list"]), []);
+    assert.equal((command(fixture.repo, fixture.runtimeDirectory, [
+      "list", "--archived"
+    ]) as Array<{ runId: string }>)[0]?.runId, created.run.runId);
+    assert.equal((command(fixture.repo, fixture.runtimeDirectory, [
+      "unarchive", created.run.runId
+    ]) as { status: string }).status, "unarchived");
+    assert.equal((command(fixture.repo, fixture.runtimeDirectory, [
+      "list"
+    ]) as Array<{ runId: string }>)[0]?.runId, created.run.runId);
   } finally {
     fixture.close();
   }
@@ -106,66 +123,92 @@ test("Run admission allows concurrent reads but only one write per canonical wor
     const read = join(fixture.repo, "read.json");
     const write = join(fixture.repo, "write.json");
     writeFileSync(read, JSON.stringify({
-      schemaVersion: 1,
-      steward: "steward",
+      schemaVersion: "RunIntent@1",
+      requestId: "read-1",
       objective: "read",
-      workspace: { root: fixture.workspace, access: "read" }
+      acceptance: ["read complete"],
+      contextRefs: [],
+      workspaceRef: pathToFileURL(fixture.workspace).href,
+      desiredEffect: "read",
+      terminalEvidence: ["read receipt"]
     }));
     writeFileSync(write, JSON.stringify({
-      schemaVersion: 1,
-      steward: "steward",
-      workflowRef: "review@1",
-      inputs: { plan: "plan.md" },
-      workspace: {
-        root: fixture.workspace,
-        access: "write",
-        effect: "must_change"
-      }
+      schemaVersion: "RunIntent@1",
+      requestId: "write-1",
+      objective: "write",
+      acceptance: ["workspace changed"],
+      contextRefs: [],
+      workspaceRef: pathToFileURL(fixture.workspace).href,
+      desiredEffect: "change",
+      terminalEvidence: ["changed revision"]
     }));
     command(fixture.repo, fixture.runtimeDirectory, [
-      "start", read, "--request-id", "read-1"
+      "start", read
+    ]);
+    writeFileSync(read, JSON.stringify({
+      schemaVersion: "RunIntent@1",
+      requestId: "read-2",
+      objective: "read",
+      acceptance: ["read complete"],
+      contextRefs: [],
+      workspaceRef: pathToFileURL(fixture.workspace).href,
+      desiredEffect: "read",
+      terminalEvidence: ["read receipt"]
+    }));
+    command(fixture.repo, fixture.runtimeDirectory, [
+      "start", read
     ]);
     command(fixture.repo, fixture.runtimeDirectory, [
-      "start", read, "--request-id", "read-2"
+      "start", write
     ]);
-    command(fixture.repo, fixture.runtimeDirectory, [
-      "start", write, "--request-id", "write-1"
-    ]);
+    writeFileSync(write, JSON.stringify({
+      schemaVersion: "RunIntent@1",
+      requestId: "write-2",
+      objective: "write",
+      acceptance: ["workspace changed"],
+      contextRefs: [],
+      workspaceRef: pathToFileURL(fixture.workspace).href,
+      desiredEffect: "change",
+      terminalEvidence: ["changed revision"]
+    }));
     assert.throws(() => command(fixture.repo, fixture.runtimeDirectory, [
-      "start", write, "--request-id", "write-2"
+      "start", write
     ]), /UNIQUE constraint failed/);
   } finally {
     fixture.close();
   }
 });
 
-test("Run CLI requires an explicit effect contract for write workspaces", () => {
+test("Run CLI rejects the legacy raw workspace grant contract", () => {
   const fixture = setup();
   try {
     const config = join(fixture.repo, "missing-effect.json");
     writeFileSync(config, JSON.stringify({
-      schemaVersion: 1,
-      steward: "steward",
+      schemaVersion: "RunIntent@1",
+      requestId: "legacy-grant",
       objective: "write",
+      acceptance: ["changed"],
+      contextRefs: [],
+      terminalEvidence: ["revision"],
       workspace: { root: fixture.workspace, access: "write" }
     }));
     assert.throws(() => command(fixture.repo, fixture.runtimeDirectory, [
-      "start", config, "--request-id", "missing-effect"
-    ]), /workspace\.effect is required/);
+      "start", config
+    ]), /unknown field: workspace/);
   } finally {
     fixture.close();
   }
 });
 
-test("Run CLI requires an idempotency key before reading input", () => {
+test("Run CLI requires exactly one RunIntent file before reading input", () => {
   assert.throws(
     () => runStewardCommand(
       "/missing",
-      ["start", "/missing/run.json"],
+      ["start"],
       { write() {} },
       "/missing/runtime"
     ),
-    /--request-id/
+    /requires one RunIntent@1 JSON file/
   );
 });
 
@@ -173,7 +216,6 @@ function setup(): {
   readonly repo: string;
   readonly runtimeDirectory: string;
   readonly workspace: string;
-  readonly childAgentId: string;
   readonly close: () => void;
 } {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-run-cli-repo-"));
@@ -188,8 +230,8 @@ function setup(): {
   git(paths.workspace, ["add", "plan.md"]);
   git(paths.workspace, ["commit", "-m", "initial"]);
   const foundation = new LocalFoundationStore(paths.database);
-  foundation.addAgent("steward", "codex", "2026-07-26T00:00:00.000Z");
-  const child = foundation.addAgent(
+  foundation.addAgent("codex", "codex", "2026-07-26T00:00:00.000Z");
+  foundation.addAgent(
     "child",
     "kimi-code",
     "2026-07-26T00:00:00.000Z"
@@ -199,7 +241,6 @@ function setup(): {
     repo,
     runtimeDirectory,
     workspace: paths.workspace,
-    childAgentId: child.principalId,
     close() {
       rmSync(repo, { recursive: true, force: true });
       rmSync(runtimeDirectory, { recursive: true, force: true });

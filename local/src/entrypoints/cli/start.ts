@@ -1,9 +1,11 @@
 import { mkdirSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { finished } from "node:stream/promises";
+import { setTimeout as delay } from "node:timers/promises";
 
 import {
-  runtimeLogPaths
+  runtimeLogPaths,
+  runtimeProcessStatus
 } from "../../application/runtime/control.js";
 import { createRuntimeLogStream } from "../../bootstrap/logging.js";
 import { startRuntime } from "../../bootstrap/runtime.js";
@@ -14,7 +16,11 @@ import { findExecutable, parseBoundedInteger } from "./shared.js";
 export interface StartOptions {
   readonly noOpen: boolean;
   readonly uiPort: number;
+  readonly foreground: boolean;
 }
+
+const DAEMON_READY_TIMEOUT_MILLISECONDS = 10_000;
+const DAEMON_POLL_MILLISECONDS = 50;
 
 const GRACEFUL_SHUTDOWN_SIGNALS = [
   "SIGINT",
@@ -111,6 +117,11 @@ export async function runStartForeground(
     }, controller.signal);
     sink.write(`Rollerskate stopped after ${result.cycles} Runtime cycle(s).\n`);
     return 0;
+  } catch (error) {
+    sink.write(
+      `Rollerskate failed: ${error instanceof Error ? error.message : String(error)}\n`
+    );
+    return 1;
   } finally {
     removeSignalHandlers();
     try {
@@ -121,6 +132,130 @@ export async function runStartForeground(
       await closeLog();
     }
   }
+}
+
+export async function runStartDaemon(
+  repoRoot: string,
+  runtimeDirectory: string | undefined,
+  environment: NodeJS.ProcessEnv,
+  output: AppOutput,
+  startOptions: StartOptions,
+  launcher: string | undefined
+): Promise<number> {
+  const paths = runtimeLogPaths(repoRoot, runtimeDirectory);
+  const existing = runtimeProcessStatus(repoRoot, runtimeDirectory);
+  if (existing.running) {
+    output.write([
+      `Rollerskate is already running with pid ${existing.state!.pid}.`,
+      `Log: ${paths.daemonLog}`
+    ].join("\n") + "\n");
+    return 0;
+  }
+
+  if (launcher === undefined || launcher.trim() === "") {
+    throw new Error("cannot resolve the Rollerskate CLI launcher");
+  }
+  mkdirSync(paths.logs, { recursive: true, mode: 0o700 });
+  const child = spawn(process.execPath, [
+    launcher,
+    ...(runtimeDirectory === undefined ? [] : ["--runtime", runtimeDirectory]),
+    "start",
+    "--foreground",
+    ...(startOptions.noOpen ? ["--no-open"] : []),
+    "--ui-port",
+    String(startOptions.uiPort)
+  ], {
+    cwd: repoRoot,
+    detached: true,
+    env: environment,
+    stdio: "ignore",
+    windowsHide: true
+  });
+  if (child.pid === undefined) {
+    throw new Error("failed to spawn the Rollerskate daemon");
+  }
+  const childPid = child.pid;
+  let childExited = false;
+  let childError: Error | undefined;
+  child.once("exit", () => {
+    childExited = true;
+  });
+  child.once("error", (error) => {
+    childError = error;
+  });
+  child.unref();
+
+  const deadline = Date.now() + DAEMON_READY_TIMEOUT_MILLISECONDS;
+  while (Date.now() < deadline) {
+    const status = runtimeProcessStatus(repoRoot, runtimeDirectory);
+    if (status.running) {
+      const pid = status.state!.pid;
+      output.write(pid === childPid
+        ? [
+          "Rollerskate started in the background.",
+          `PID: ${pid}`,
+          `UI: http://localhost:${startOptions.uiPort}/console/`,
+          `Log: ${paths.daemonLog}`
+        ].join("\n") + "\n"
+        : [
+          `Rollerskate is already running with pid ${pid}.`,
+          `Log: ${paths.daemonLog}`
+        ].join("\n") + "\n");
+      return 0;
+    }
+    if (childError !== undefined) {
+      throw new Error(`failed to spawn the Rollerskate daemon: ${childError.message}`);
+    }
+    if (childExited) {
+      throw new Error(
+        `Rollerskate daemon exited before readiness; inspect ${paths.daemonLog}`
+      );
+    }
+    await delay(DAEMON_POLL_MILLISECONDS);
+  }
+
+  try {
+    process.kill(childPid, "SIGTERM");
+  } catch {
+    // The child may have exited between the final readiness check and cleanup.
+  }
+  throw new Error(
+    `Rollerskate daemon did not become ready within ${DAEMON_READY_TIMEOUT_MILLISECONDS}ms; ` +
+    `inspect ${paths.daemonLog}`
+  );
+}
+
+export async function stopRuntimeDaemon(
+  repoRoot: string,
+  runtimeDirectory: string | undefined,
+  output: AppOutput
+): Promise<number> {
+  const status = runtimeProcessStatus(repoRoot, runtimeDirectory);
+  if (!status.running) {
+    output.write("Rollerskate is already stopped.\n");
+    return 0;
+  }
+  const pid = status.state!.pid;
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error &&
+      error.code === "ESRCH") {
+      output.write("Rollerskate is already stopped.\n");
+      return 0;
+    }
+    throw error;
+  }
+
+  const deadline = Date.now() + DAEMON_READY_TIMEOUT_MILLISECONDS;
+  while (Date.now() < deadline) {
+    if (!runtimeProcessStatus(repoRoot, runtimeDirectory).running) {
+      output.write(`Rollerskate stopped (pid ${pid}).\n`);
+      return 0;
+    }
+    await delay(DAEMON_POLL_MILLISECONDS);
+  }
+  throw new Error(`Rollerskate pid ${pid} did not stop within 10000ms`);
 }
 
 export function roomAgentEnvironment(
@@ -140,11 +275,15 @@ export function roomAgentEnvironment(
 export function parseStartOptions(argv: readonly string[]): StartOptions {
   let noOpen = false;
   let uiPort = 4300;
+  let foreground = false;
   let offset = 0;
   while (offset < argv.length) {
     const arg = argv[offset];
     if (arg === "--no-open") {
       noOpen = true;
+      offset += 1;
+    } else if (arg === "--foreground") {
+      foreground = true;
       offset += 1;
     } else if (arg === "--ui-port") {
       const value = argv[offset + 1];
@@ -157,7 +296,7 @@ export function parseStartOptions(argv: readonly string[]): StartOptions {
       throw new Error(`unexpected argument: ${arg}`);
     }
   }
-  return { noOpen, uiPort };
+  return { noOpen, uiPort, foreground };
 }
 
 function openBrowser(url: string, output: AppOutput): void {

@@ -75,6 +75,54 @@ const proactiveCallbackOccurrenceSchema = v.looseObject({
   lastError: v.optional(v.string())
 });
 
+const archiveActionsSchema = v.object({
+  archive: v.boolean(),
+  unarchive: v.boolean()
+});
+
+const subscriptionAdmissionReceiptSchema = v.object({
+  schemaVersion: v.literal("SubscriptionOccurrenceAdmissionReceipt@1"),
+  subscriptionId: v.string(),
+  occurrenceKey: v.string(),
+  agentRunId: v.string(),
+  cycleId: v.string(),
+  orchestratorEventId: v.string(),
+  orchestratorExecutionId: v.string(),
+  admittedAt: v.string()
+});
+
+const legacyFreeDefinitionSchema = v.object({
+  schema: v.literal("SubscriptionDefinition@3"),
+  revision: v.string(),
+  digest: v.string(),
+  callbackPhaseStatus: v.union([
+    v.literal("pending"), v.literal("running"), v.literal("completed"),
+    v.literal("completed_with_errors"), v.literal("completed_with_unknown"),
+    v.literal("blocked")
+  ]),
+  artifactRevision: v.string(),
+  artifactDigest: v.string(),
+  externalRefBinding: v.optional(v.nullable(v.unknown())),
+  callbacks: v.array(proactiveCallbackDefinitionSchema),
+  sourceBinding: v.optional(v.nullable(v.unknown()))
+});
+
+const boundFreeDefinitionSchema = v.object({
+  schema: v.literal("SubscriptionDefinition@4"),
+  revision: v.string(),
+  digest: v.string(),
+  callbackPhaseStatus: v.union([
+    v.literal("pending"), v.literal("running"), v.literal("completed"),
+    v.literal("completed_with_errors"), v.literal("completed_with_unknown"),
+    v.literal("blocked")
+  ]),
+  artifactRevision: v.string(),
+  artifactDigest: v.string(),
+  externalRefBinding: v.optional(v.nullable(v.unknown())),
+  callbacks: v.array(proactiveCallbackDefinitionSchema),
+  sourceBinding: v.unknown()
+});
+
 const freeSubscriptionSchema = v.object({
   kind: v.literal("free"),
   id: v.string(),
@@ -83,28 +131,20 @@ const freeSubscriptionSchema = v.object({
     v.literal("active"), v.literal("paused"), v.literal("completed"),
     v.literal("blocked"), v.literal("cancelled"), v.literal("expired")
   ]),
-  owner: subscriptionOwnerSchema,
-  definition: v.object({
-    schema: v.literal("SubscriptionDefinition@3"),
-    revision: v.string(),
-    digest: v.string(),
-    callbackPhaseStatus: v.union([
-      v.literal("pending"), v.literal("running"), v.literal("completed"),
-      v.literal("completed_with_errors"), v.literal("completed_with_unknown"),
-      v.literal("blocked")
-    ]),
-    artifactRevision: v.string(),
-    artifactDigest: v.string(),
-    externalRefBinding: v.optional(v.nullable(v.unknown())),
-    callbacks: v.array(proactiveCallbackDefinitionSchema)
-  }),
+  owner: v.nullable(subscriptionOwnerSchema),
+  definition: v.union([legacyFreeDefinitionSchema, boundFreeDefinitionSchema]),
   callbacks: v.array(proactiveCallbackOccurrenceSchema),
   probe: subscriptionProbeSchema,
   schedule: subscriptionScheduleSchema,
   createdAt: v.string(),
   updatedAt: v.string(),
   latestError: nullableString,
-  terminalObservation: v.unknown()
+  terminalObservation: v.unknown(),
+  agentRunId: v.optional(nullableString),
+  cycleId: v.optional(nullableString),
+  admissionReceipt: v.optional(v.nullable(subscriptionAdmissionReceiptSchema)),
+  archivedAt: nullableString,
+  availableActions: archiveActionsSchema
 });
 
 const continuousSubscriptionSchema = v.object({
@@ -114,8 +154,18 @@ const continuousSubscriptionSchema = v.object({
   status: v.union([
     v.literal("active"), v.literal("paused"), v.literal("blocked"), v.literal("cancelled")
   ]),
-  owner: subscriptionOwnerSchema,
-  definition: v.unknown(),
+  owner: v.nullable(subscriptionOwnerSchema),
+  definition: v.union([
+    v.looseObject({
+      schemaVersion: v.literal("ContinuousSubscriptionDefinition@1"),
+      revision: v.number()
+    }),
+    v.looseObject({
+      schemaVersion: v.literal("ContinuousSubscriptionDefinition@2"),
+      revision: v.number(),
+      sourceBinding: v.unknown()
+    })
+  ]),
   callbacks: v.array(proactiveCallbackOccurrenceSchema),
   callbackOccurrenceKey: nullableString,
   callbackSummary: v.object({
@@ -132,7 +182,12 @@ const continuousSubscriptionSchema = v.object({
   checkpointObservation: v.unknown(),
   pendingOccurrenceKey: nullableString,
   pendingObservation: v.unknown(),
+  agentRunId: v.optional(nullableString),
+  pendingCycleId: v.optional(nullableString),
+  pendingAdmissionReceipt: v.optional(v.nullable(subscriptionAdmissionReceiptSchema)),
   latestError: nullableString,
+  archivedAt: nullableString,
+  availableActions: archiveActionsSchema,
   createdAt: v.string(),
   updatedAt: v.string()
 });
@@ -142,6 +197,16 @@ export const subscriptionSchema = v.union([
   freeSubscriptionSchema
 ]);
 
-export const subscriptionsSchema = v.array(subscriptionSchema);
+export const subscriptionsSchema = v.object({
+  items: v.array(subscriptionSchema),
+  total: v.number(),
+  page: v.number(),
+  pageSize: v.number()
+});
+
+export const subscriptionArchiveResponseSchema = v.object({
+  subscription: subscriptionSchema,
+  status: v.union([v.literal("archive"), v.literal("unarchive")])
+});
 
 export type SubscriptionOutput = v.InferOutput<typeof subscriptionSchema>;

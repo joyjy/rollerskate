@@ -1,3 +1,15 @@
+import {
+  parseRunSourceBinding,
+  type RunSourceBinding
+} from "./source-contract.js";
+import {
+  parseStewardOrchestratorBindingV3,
+  parseStewardRunDecisionV3,
+  type StewardOrchestratorBindingV3,
+  type StewardRunDecisionV3
+} from "./run-contract-v3.js";
+import { assertSpecCompatibility, resolveSpecToken } from "../spec/registry.js";
+
 const MAX_SUMMARY = 4_096;
 const MAX_TEXT = 16_384;
 const MAX_LIST = 100;
@@ -41,7 +53,8 @@ export interface StewardOrchestratorBinding {
 
 export type CallerOrchestratorBinding =
   | ManualCallerOrchestratorBinding
-  | StewardOrchestratorBinding;
+  | StewardOrchestratorBinding
+  | StewardOrchestratorBindingV3;
 
 export interface AgentStepResult {
   readonly schemaVersion: "AgentStepResult@1";
@@ -158,10 +171,9 @@ export type StewardRunDecision =
   | StewardFinishRunDecision
   | StewardNeedsHumanRunDecision;
 
-export type AnyRunDecision = RunDecision | StewardRunDecision;
+export type AnyRunDecision = RunDecision | StewardRunDecision | StewardRunDecisionV3;
 
-export interface AgentRunDecisionReceipt {
-  readonly schemaVersion: "AgentRunDecisionReceipt@1";
+interface AgentRunDecisionReceiptBase {
   readonly runId: string;
   readonly requestId: string;
   readonly expectedRunVersion: number;
@@ -176,8 +188,35 @@ export interface AgentRunDecisionReceipt {
   readonly acceptedAt: string;
 }
 
+export interface AgentRunDecisionReceiptV1 extends AgentRunDecisionReceiptBase {
+  readonly schemaVersion: "AgentRunDecisionReceipt@1";
+  readonly action: Exclude<AnyRunDecision["action"], "await_source">;
+}
+
+export interface AgentRunDecisionReceiptV2 extends AgentRunDecisionReceiptBase {
+  readonly schemaVersion: "AgentRunDecisionReceipt@2";
+  readonly resultingRunStatus:
+    | "active"
+    | "awaiting_source"
+    | "succeeded"
+    | "failed"
+    | "needs_human";
+  readonly finishScope?: "cycle" | "run";
+  readonly sourceBinding?: RunSourceBinding;
+  readonly cycleId?: string;
+}
+
+export type AgentRunDecisionReceipt =
+  | AgentRunDecisionReceiptV1
+  | AgentRunDecisionReceiptV2;
+
 export function parseAgentStepResult(input: string): AgentStepResult {
   const parsed = jsonRecord(input, "AgentStepResult@1 output");
+  assertSpecCompatibility(
+    "spec:rollerskate/agent-step-result@1",
+    parsed.schemaVersion,
+    { kind: "result-contract" }
+  );
   exactKeys(parsed, [
     "schemaVersion", "outcome", "summary", "artifactRefs",
     "acceptanceEvidence", "unresolvedQuestions", "observedWorkspaceRevision"
@@ -214,9 +253,19 @@ export function parseAgentStepResult(input: string): AgentStepResult {
   };
 }
 
-export function parseRunDecision(input: unknown): AnyRunDecision {
+export function parseRunDecision(
+  input: unknown,
+  options: { readonly allowHistorical?: boolean } = {}
+): AnyRunDecision {
   const parsed = record(input, "RunDecision");
-  if (parsed.schemaVersion === "RunDecision@2") {
+  const registered = resolveSpecToken(parsed.schemaVersion, {
+    kind: "result-contract",
+    ...(options.allowHistorical === true ? { allowHistorical: true } : {})
+  });
+  if (registered.ref === "spec:rollerskate/run-decision@3") {
+    return parseStewardRunDecisionV3(parsed);
+  }
+  if (registered.ref === "spec:rollerskate/run-decision@2") {
     return parseStewardRunDecision(parsed);
   }
   return parseManualRunDecision(parsed);
@@ -345,10 +394,18 @@ function parseStewardRunDecision(
 }
 
 export function parseCallerOrchestratorBinding(
-  input: string
+  input: string,
+  options: { readonly allowHistorical?: boolean } = {}
 ): CallerOrchestratorBinding {
   const parsed = jsonRecord(input, "OrchestratorBinding");
-  if (parsed.schemaVersion === "OrchestratorBinding@2") {
+  const registered = resolveSpecToken(parsed.schemaVersion, {
+    kind: "contract",
+    ...(options.allowHistorical === true ? { allowHistorical: true } : {})
+  });
+  if (registered.ref === "spec:rollerskate/orchestrator-binding@3") {
+    return parseStewardOrchestratorBindingV3(parsed);
+  }
+  if (registered.ref === "spec:rollerskate/orchestrator-binding@2") {
     return parseStewardOrchestratorBinding(parsed);
   }
   exactKeys(parsed, [
@@ -411,21 +468,28 @@ function parseStewardOrchestratorBinding(
 
 export function isStewardOrchestrated(
   binding: CallerOrchestratorBinding | undefined
-): binding is StewardOrchestratorBinding {
-  return binding?.schemaVersion === "OrchestratorBinding@2";
+): binding is StewardOrchestratorBinding | StewardOrchestratorBindingV3 {
+  return binding?.schemaVersion === "OrchestratorBinding@2" ||
+    binding?.schemaVersion === "OrchestratorBinding@3";
 }
 
 export function latestOrchestratorState(
   decisions: readonly { readonly decision: AnyRunDecision }[]
 ): OrchestratorState | undefined {
   for (const record of decisions) {
-    if (record.decision.schemaVersion === "RunDecision@2") return record.decision.state;
+    if (record.decision.schemaVersion === "RunDecision@2" ||
+      record.decision.schemaVersion === "RunDecision@3") return record.decision.state;
   }
   return undefined;
 }
 
 export function parseAgentRunCheckpoint(input: string): AgentRunCheckpoint {
   const parsed = jsonRecord(input, "AgentRunCheckpoint@1");
+  assertSpecCompatibility(
+    "spec:rollerskate/agent-run-checkpoint@1",
+    parsed.schemaVersion,
+    { kind: "contract" }
+  );
   exactKeys(parsed, [
     "schemaVersion", "stepId", "agentId", "requestEventId", "resultEventId",
     "executionId", "result", "observedWorkspaceRevision", "recordedAt"
@@ -455,34 +519,119 @@ export function parseAgentRunCheckpoint(input: string): AgentRunCheckpoint {
 }
 
 export function parseAgentRunDecisionReceipt(
-  input: string
+  input: string,
+  options: { readonly allowHistorical?: boolean } = {}
 ): AgentRunDecisionReceipt {
-  const parsed = jsonRecord(input, "AgentRunDecisionReceipt@1");
-  exactKeys(parsed, [
+  const parsed = jsonRecord(input, "AgentRunDecisionReceipt");
+  const registered = resolveSpecToken(parsed.schemaVersion, {
+    kind: "contract",
+    ...(options.allowHistorical === true ? { allowHistorical: true } : {})
+  });
+  const commonKeys = [
     "schemaVersion", "runId", "requestId", "expectedRunVersion",
     "resultingRunVersion", "sourceStepId", "action", "targetAgentId",
     "nextStepId", "nextEventId", "nextExecutionId", "terminalStatus", "acceptedAt"
-  ], "AgentRunDecisionReceipt@1", [
+  ] as const;
+  const optional = [
     "targetAgentId", "nextStepId", "nextEventId", "nextExecutionId", "terminalStatus"
-  ]);
+  ] as const;
+  if (registered.ref === "spec:rollerskate/agent-run-decision-receipt@2") {
+    exactKeys(parsed, [
+      ...commonKeys, "resultingRunStatus", "finishScope", "sourceBinding", "cycleId"
+    ], "AgentRunDecisionReceipt@2", [
+      ...optional, "finishScope", "sourceBinding", "cycleId"
+    ]);
+    if (parsed.action !== "next_step" && parsed.action !== "await_source" &&
+      parsed.action !== "finish" && parsed.action !== "needs_human") {
+      throw new Error("AgentRunDecisionReceipt@2 action is unsupported");
+    }
+    const resultingRunStatus = parsed.resultingRunStatus;
+    if (resultingRunStatus !== "active" && resultingRunStatus !== "awaiting_source" &&
+      resultingRunStatus !== "succeeded" && resultingRunStatus !== "failed" &&
+      resultingRunStatus !== "needs_human") {
+      throw new Error("AgentRunDecisionReceipt@2 resultingRunStatus is unsupported");
+    }
+    if (parsed.finishScope !== undefined && parsed.finishScope !== "cycle" &&
+      parsed.finishScope !== "run") {
+      throw new Error("AgentRunDecisionReceipt@2 finishScope is unsupported");
+    }
+    if (parsed.action === "await_source" && parsed.sourceBinding === undefined) {
+      throw new Error("AgentRunDecisionReceipt@2 await_source requires sourceBinding");
+    }
+    if (parsed.action === "finish" && parsed.finishScope === undefined) {
+      throw new Error("AgentRunDecisionReceipt@2 finish requires finishScope");
+    }
+    const hasNextStep = parsed.targetAgentId !== undefined &&
+      parsed.nextStepId !== undefined && parsed.nextEventId !== undefined &&
+      parsed.nextExecutionId !== undefined;
+    const hasAnyNextStep = parsed.targetAgentId !== undefined ||
+      parsed.nextStepId !== undefined || parsed.nextEventId !== undefined ||
+      parsed.nextExecutionId !== undefined;
+    if (parsed.action === "next_step" &&
+      (!hasNextStep || resultingRunStatus !== "active" ||
+        parsed.terminalStatus !== undefined || parsed.finishScope !== undefined ||
+        parsed.sourceBinding !== undefined || parsed.cycleId !== undefined)) {
+      throw new Error("AgentRunDecisionReceipt@2 next_step shape is inconsistent");
+    }
+    if (parsed.action === "await_source" &&
+      (resultingRunStatus !== "awaiting_source" || hasAnyNextStep ||
+        parsed.terminalStatus !== undefined || parsed.finishScope !== undefined ||
+        parsed.cycleId !== undefined)) {
+      throw new Error("AgentRunDecisionReceipt@2 await_source shape is inconsistent");
+    }
+    if (parsed.action === "finish" &&
+      (hasAnyNextStep || parsed.sourceBinding !== undefined ||
+        (parsed.terminalStatus !== "succeeded" && parsed.terminalStatus !== "failed") ||
+        (parsed.finishScope === "cycle" &&
+          (resultingRunStatus !== "awaiting_source" || parsed.cycleId === undefined)) ||
+        (parsed.finishScope === "run" && resultingRunStatus !== parsed.terminalStatus))) {
+      throw new Error("AgentRunDecisionReceipt@2 finish shape is inconsistent");
+    }
+    if (parsed.action === "needs_human" &&
+      (hasAnyNextStep || parsed.sourceBinding !== undefined ||
+        parsed.finishScope !== undefined || parsed.cycleId !== undefined ||
+        parsed.terminalStatus !== "needs_human" || resultingRunStatus !== "needs_human")) {
+      throw new Error("AgentRunDecisionReceipt@2 needs_human shape is inconsistent");
+    }
+    return {
+      schemaVersion: "AgentRunDecisionReceipt@2",
+      ...decisionReceiptCommon(parsed),
+      action: parsed.action,
+      resultingRunStatus,
+      ...(parsed.finishScope === undefined ? {} : { finishScope: parsed.finishScope }),
+      ...(parsed.sourceBinding === undefined
+        ? {}
+        : { sourceBinding: parseRunSourceBinding(parsed.sourceBinding) }),
+      ...optionalText(parsed, "cycleId")
+    };
+  }
+  exactKeys(parsed, commonKeys, "AgentRunDecisionReceipt@1", optional);
   if (parsed.schemaVersion !== "AgentRunDecisionReceipt@1" ||
     (parsed.action !== "next_step" && parsed.action !== "finish" &&
       parsed.action !== "needs_human")) {
     throw new Error("AgentRunDecisionReceipt@1 is unsupported");
   }
+  return {
+    schemaVersion: "AgentRunDecisionReceipt@1",
+    ...decisionReceiptCommon(parsed),
+    action: parsed.action
+  };
+}
+
+function decisionReceiptCommon(
+  parsed: Readonly<Record<string, unknown>>
+): Omit<AgentRunDecisionReceiptBase, "action"> {
   const terminalStatus = parsed.terminalStatus;
   if (terminalStatus !== undefined && terminalStatus !== "succeeded" &&
     terminalStatus !== "failed" && terminalStatus !== "needs_human") {
-    throw new Error("AgentRunDecisionReceipt@1 terminalStatus is unsupported");
+    throw new Error("AgentRunDecisionReceipt terminalStatus is unsupported");
   }
   return {
-    schemaVersion: "AgentRunDecisionReceipt@1",
     runId: text(parsed.runId, "receipt.runId", 256),
     requestId: text(parsed.requestId, "receipt.requestId", 256),
     expectedRunVersion: integer(parsed.expectedRunVersion, "expectedRunVersion", 1, Number.MAX_SAFE_INTEGER),
     resultingRunVersion: integer(parsed.resultingRunVersion, "resultingRunVersion", 2, Number.MAX_SAFE_INTEGER),
     sourceStepId: text(parsed.sourceStepId, "receipt.sourceStepId", 256),
-    action: parsed.action,
     ...optionalText(parsed, "targetAgentId"),
     ...optionalText(parsed, "nextStepId"),
     ...optionalText(parsed, "nextEventId"),

@@ -19,6 +19,7 @@ export interface LoopState {
   readonly startedAt: string;
   readonly updatedAt: string;
   readonly runtimeDirectory: string;
+  readonly runtimeRevision?: string;
   readonly agentNames: readonly string[];
   readonly routeIds: readonly string[];
   readonly cycles: number;
@@ -46,6 +47,7 @@ export interface LoopPhase {
 export interface LoopOptions {
   readonly statePath: string;
   readonly runtimeDirectory: string;
+  readonly runtimeRevision: string;
   readonly agentNames: readonly string[];
   readonly routeIds: readonly string[];
   readonly phases: readonly LoopPhase[];
@@ -191,6 +193,7 @@ function state(
     startedAt,
     updatedAt: new Date().toISOString(),
     runtimeDirectory: options.runtimeDirectory,
+    runtimeRevision: options.runtimeRevision,
     agentNames: options.agentNames,
     routeIds: options.routeIds,
     cycles,

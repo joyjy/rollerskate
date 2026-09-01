@@ -414,7 +414,7 @@ test("activation admission rolls back when the mode receipt transition cannot co
   }
 });
 
-test("Free Chat Exit is CAS-safe and schema v63 upgrades a v54 database", () => {
+test("Free Chat Exit is CAS-safe and schema v69 upgrades a v54 database", () => {
   const fixture = runtimeFixture("exit-migration");
   try {
     addLocalAgent(fixture.repo, "alice", "codex", fixture.options);
@@ -459,8 +459,8 @@ test("Free Chat Exit is CAS-safe and schema v63 upgrades a v54 database", () => 
     `);
     database.close();
     const diagnostics = initializeRuntimeSchema(databasePath);
-    assert.equal(diagnostics.schemaVersion, 63);
-    assert.equal(diagnostics.tables.length, 28);
+    assert.equal(diagnostics.schemaVersion, 69);
+    assert.equal(diagnostics.tables.length, 29);
   } finally {
     fixture.close();
   }

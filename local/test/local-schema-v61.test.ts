@@ -8,7 +8,7 @@ import test from "node:test";
 import { RuntimeStore } from "../src/core/runtime/store.js";
 import { initializeRuntimeSchema } from "../src/infrastructure/sqlite/schema.js";
 
-test("schema v63 preserves existing Deliveries while admitting Vikunja task destinations", () => {
+test("schema v69 preserves existing Deliveries while admitting Vikunja task destinations", () => {
   const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v61-delivery-"));
   const databasePath = join(directory, "runtime.db");
   try {
@@ -25,7 +25,7 @@ test("schema v63 preserves existing Deliveries while admitting Vikunja task dest
     store.close();
 
     downgradeDeliveriesToV61(databasePath);
-    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 63);
+    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 69);
 
     const restored = new RuntimeStore(databasePath);
     try {

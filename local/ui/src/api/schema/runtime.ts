@@ -16,6 +16,11 @@ export const runtimeInfoSchema = v.object({
   pid: v.nullable(v.number()),
   startedAt: v.nullable(v.string()),
   schemaVersion: v.nullable(v.number()),
+  runtimeRevision: v.object({
+    expected: v.string(),
+    running: v.nullable(v.string()),
+    matchesExpected: v.boolean()
+  }),
   consoleAddress: v.string(),
   lastRefreshedAt: v.string(),
   stale: v.boolean(),

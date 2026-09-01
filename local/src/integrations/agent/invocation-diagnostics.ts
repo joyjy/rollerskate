@@ -1,9 +1,15 @@
 import type {
+  AgentInvocationFailure,
+  AgentInvocationProgress,
   AgentInvocationDiagnostics,
   AgentTokenUsage,
   AgentToolUsage
 } from "../../core/runtime/agent-invocation.js";
 import type { AgentInputEvent, ChatDispatchEvent } from "../../core/event/model.js";
+import type {
+  RunnerFailureTrace,
+  RunnerProgress
+} from "./runner/protocol.js";
 import { runtimeAgentEventPrompt } from "./event-prompt.js";
 
 interface InvocationTimingReceipt {
@@ -76,6 +82,82 @@ export function finiteNonNegative(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value >= 0
     ? value
     : undefined;
+}
+
+export function invocationTimeoutMilliseconds(
+  event: AgentInputEvent | ChatDispatchEvent,
+  fallback: number
+): number {
+  const configured = event.type === "agent.request"
+    ? event.runContext?.invocationBudget?.totalTimeoutMilliseconds
+    : undefined;
+  return boundedTimeout(configured ?? fallback);
+}
+
+export function agentInvocationProgress(input: {
+  readonly adapterId: string;
+  readonly workspace: string;
+  readonly workspaceAccess: "read" | "write";
+  readonly progress: RunnerProgress;
+  readonly providerSessionId?: string;
+}): AgentInvocationProgress {
+  return {
+    schemaVersion: "AgentInvocationProgress@1",
+    adapterId: input.adapterId,
+    workspace: input.workspace,
+    workspaceAccess: input.workspaceAccess,
+    ...(input.providerSessionId === undefined
+      ? {}
+      : { providerSessionId: input.providerSessionId }),
+    startedAt: input.progress.startedAt,
+    observedAt: input.progress.observedAt,
+    lastMeaningfulAt: input.progress.lastMeaningfulAt,
+    phase: input.progress.phase,
+    updateCount: input.progress.updateCount,
+    meaningfulUpdateCount: input.progress.meaningfulUpdateCount,
+    ...(input.progress.lastProgress === undefined
+      ? {}
+      : { lastProgress: input.progress.lastProgress })
+  };
+}
+
+export function agentInvocationFailure(input: {
+  readonly adapterId: string;
+  readonly workspace: string;
+  readonly workspaceAccess: "read" | "write";
+  readonly trace: RunnerFailureTrace;
+  readonly providerSessionId?: string;
+}): AgentInvocationFailure {
+  const progress = agentInvocationProgress({
+    adapterId: input.adapterId,
+    workspace: input.workspace,
+    workspaceAccess: input.workspaceAccess,
+    progress: input.trace,
+    ...(input.providerSessionId === undefined
+      ? {}
+      : { providerSessionId: input.providerSessionId })
+  });
+  return {
+    ...progress,
+    schemaVersion: "AgentInvocationFailure@1",
+    failedAt: input.trace.failedAt,
+    reason: input.trace.reason,
+    totalTimeoutMilliseconds: input.trace.totalTimeoutMilliseconds,
+    meaningfulOutputTimeoutMilliseconds: input.trace.meaningfulOutputTimeoutMilliseconds,
+    protocolStop: input.trace.protocolStop,
+    recovery: input.workspaceAccess === "write"
+      ? "unknown_outcome_no_replay"
+      : input.trace.sessionId === undefined
+        ? "none"
+        : "explicit_read_only_resume"
+  };
+}
+
+function boundedTimeout(value: number): number {
+  if (!Number.isInteger(value) || value < 1 || value > 900_000) {
+    throw new Error("totalTimeoutMilliseconds must be an integer between 1 and 900000");
+  }
+  return value;
 }
 
 function bounded(value: string, maximum: number): string {

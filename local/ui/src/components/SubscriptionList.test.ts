@@ -60,6 +60,8 @@ function fixtureSubscription(): Subscription {
     createdAt: "2026-07-24T00:00:00.000Z",
     updatedAt: "2026-07-24T00:00:00.000Z",
     latestError: null,
-    terminalObservation: null
+    terminalObservation: null,
+    archivedAt: null,
+    availableActions: { archive: false, unarchive: false }
   };
 }

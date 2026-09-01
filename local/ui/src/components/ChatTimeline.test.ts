@@ -45,12 +45,15 @@ describe("ChatTimeline", () => {
         },
         messages: [original, reply],
         activeAgents: [],
-        allowReply: true
+        allowReply: true,
+        allowWorkHandoff: true
       }
     });
 
     await wrapper.findAll("button.reply-action")[0]!.trigger("click");
     expect(wrapper.emitted("reply")?.[0]?.[0]).toEqual(original);
+    await wrapper.get("button.handoff-action").trigger("click");
+    expect(wrapper.emitted("handoff")?.[0]?.[0]).toEqual(reply);
     expect(wrapper.get("button.reply-reference").text()).toContain("alice");
     expect(wrapper.get("button.reply-reference").text()).toContain("The referenced claim.");
     expect(wrapper.text()).toContain("to @alice, @bob");

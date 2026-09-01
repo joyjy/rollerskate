@@ -17,7 +17,7 @@ timestamp: 2026-07-26
 Rollerskate 中有三个不同层次的 event：
 
 - **Local canonical Event**：保存在本机 SQLite `events` 表，拥有 `evt_` UUIDv7、因果关系与不可变 payload；Events UI 和 `scripts/rs trace` 查看这一层。
-- **Runtime log event**：前台 loop 输出的结构化 JSON 运行记录；Runtime UI 属于这一层，不参与 canonical Event route。
+- **Runtime log event**：Core Loop 输出的结构化 JSON 运行记录；Runtime UI 属于这一层，不参与 canonical Event route。
 - **Server/Matrix EventEnvelope**：Server 保存的远端 Room transport envelope；当前主要承载 Matrix `m.room.message`，不等同于 Local canonical Event。
 
 Runtime 与 Events 因此保持独立的 UI 导航入口。
@@ -37,7 +37,7 @@ Event type、Runtime work object、Capability object 与产品 read model 不属
 | `RuntimeDelivery` | Runtime work index | `deliveries` 表中的 mutable lifecycle和 immutable Destination snapshot | `core/runtime` | `agent.result` 按 Event snapshot 建立 Delivery；Loop 驱动投递与重试 |
 | `RuntimeRoute`、Handler | 静态规则与行为组件 | 源码固定，不是业务数据 | `core/runtime`、application/Capability handler | 把 Event type 映射到唯一 Handler |
 | Loop、Cycle | Runtime orchestrator | 只有进程生命周期状态 | `core/loop` | 驱动 Execution、Delivery 与第一方 Capability，不是 Event 或 index object |
-| Subscription、Schedule、ScheduledRun | Capability domain/work object | 各 Capability 的 durable mutable state | `capabilities/*` | 可产生或消费固定 Event，但不加入全局 Event type 列表 |
+| Subscription、Schedule、ScheduleOccurrence | Capability domain/work object | 各 Capability 的 durable mutable state | `capabilities/*` | V1 可产生固定 Event；V2 只激活 bound Steward Run cycle；均不加入全局 Event type 列表 |
 | StewardRun | application/runtime coordination object | `agent_runs` 的 durable lifecycle/current checkpoint、`agent_run_decisions` 的 immutable decision audit；transcript 留在 Event/Execution | `application/steward` | 以 generic `agent.request/result` 接收 Agent 结果，再由 autonomous callback 或 caller `RunDecision@1` 推进；不增加 Steward 专用 Event type |
 | ChatPresence、attention receipt、decision receipt | Chat policy/index object | Presence 在 `chat_presence`；两个 receipt 使用对应 `executions.receipt_json` 的 versioned schema | `core/chat`、`core/runtime` | 由 `chat.message`/`chat.dispatch` 处理更新，不是 Chat Event |
 | ChatMessage projection、read progress | Application projection | `chat_messages` 可从 Event、attention receipt 与 dispatch Execution 完整重建 | `application/chat`、`infrastructure/sqlite/chat-store` | 不拥有 message content 或用户 read cursor；只解释 Agent processing progress |
@@ -74,7 +74,7 @@ Notice 不是 Event type。`application/notice` 通过 `notices` 读取由 `agen
 
 - `cli`：CLI 或 Local UI/application admission。
 - `subscription`：Subscription `agent.invoke` callback admission。
-- `schedule`：ScheduledRun admission；`externalId` 固定为 `scheduled-run:<runId>`，用于修复 Event 已建立但 run 尚未链接的 crash window。
+- `schedule`：只用于 legacy V1 ScheduleOccurrence admission；`externalId` 固定为 `scheduled-run:<runId>`，用于修复 Event 已建立但 occurrence 尚未链接的 crash window。V2 不创建 `source.kind=schedule` 的 Agent Event，而是用 `TriggerOccurrenceEnvelope@1` 激活 bound Run cycle；orchestrator Event 仍属于 Run handler source。
 - `matrix`：Matrix Room projection。
 - `server`：预留给 Server Event ingress。
 - `handler`：Runtime Handler 或 Local Chat system 产生的后继 Event。
@@ -83,12 +83,12 @@ Notice 不是 Event type。`application/notice` 通过 `notices` 读取由 `agen
 
 ## `agent.request`
 
-向一个 Agent 发起一次请求。普通 CLI/Schedule/Subscription request 可以独立存在；Agent Run step 复用同一 Event type。
+向一个 Agent 发起一次内部执行请求。公共 work admission 不直接创建该 Event；Steward Run step、Chat dispatch continuation 与 persisted legacy reconciliation 在各自 Owner policy 下复用同一 Event type。
 
 - 特有字段：`agentId`、`prompt`，可选 `sessionId` 与 host-owned `runContext`。
 - `AgentRunContext@1` 只包含通用协调信息：`runId`、`stepId`、可选 `parentStepId`、按 orchestration mode 选择的 result contract、effective workspace grant snapshot，以及 autonomous mode 可选的 immutable completion callback binding。它不包含 workflow、Reviewer/Implementer、Caller decision 或其他领域字段。
 - callback request 还携带 bounded `AgentStepCompletion@1`，记录 child request/result/Execution、terminal outcome、summary、artifact references 与 observed workspace revision；它恢复 admission 时固定的 caller Session。
-- 当前生产者：`scripts/rs agent request`、Local Scheduled Task。旧 Matrix ingress binding 已随 schema v43 cutover 移除；v0.4 transport ingress 通过 Server-assigned canonical Event 进入。
+- 当前生产者：Steward Run control、Chat/Interactive Channel application 与 persisted legacy callback reconciliation。公共 `agent request` 已关闭；ScheduleRevision@2 与 Subscription V4/V2 只激活 Run cycle，不直接创建自己的 Agent request。
 - Route：`AgentHandler`。
 - 成功结果：创建子 `agent.result`，包含不透明 output 和 Session；存在 result contract 时由注册 continuation 后续校验。
 - 最终失败：创建失败的子 `agent.result`。
@@ -266,13 +266,13 @@ Server `EventEnvelope.type` 当前没有封闭的 Rollerskate 产品类型注册
 - `subscription.probe`：用户 Plugin strategy slot kind。
 - `reply`、`silent`、`request_history`、`compact`：Agent/Room action contract。
 - `thread/start|resume`、`turn/start`、`item/completed`、`turn/completed`：Codex app-server runner 读写的外部 LF-delimited JSON-RPC message；只投影为内部 runner receipt，不进入 Core Event schema。
-- Execution、Session、Destination snapshot、Delivery、Subscription、Schedule、ScheduledRun、AgentRun、ChatMessage projection、workflow/artifact 与 Agent lifecycle status：独立 durable object/state，不是 Event type。
+- Execution、Session、Destination snapshot、Delivery、Subscription、Schedule、ScheduleOccurrence、AgentRun、ChatMessage projection、workflow/artifact 与 Agent lifecycle status：独立 durable object/state，不是 Event type。
 
 ## 查看与变更
 
 - Events UI：查看六种 Local canonical Event 及其 Execution、Result、Session、Delivery 和因果关系。
 - Runtime UI：查看 loop health、workload 与 isolation；structured log 当前输出到 loop stdout，不代替 Event history。
 - Chats UI：只显示 `chat.message`；`chat.dispatch` 留在 Event trace，并以 Owner message 上的 Agent processing progress ring 表达 read/reading/unread/failed。
-- CLI：`scripts/rs trace <event-id>` 查看一个 canonical Event 的审计链；`scripts/rs schedule trace <run-id>` 从 ScheduledRun 查看同一 audit；`scripts/rs run trace <run-id>` 查看完整 Agent request/result/callback chain。完整命令见 [CLI Command Reference](../runbook/cli-reference.md)。
+- CLI：`scripts/rs trace <event-id>` 查看一个 canonical Event 的审计链；`scripts/rs schedule trace <occurrence-id>` 从 ScheduleOccurrence 查看 V1 Event audit 或 V2 Run/cycle receipt；`scripts/rs run trace <run-id>` 查看完整 Agent request/result/callback chain。完整命令见 [CLI Command Reference](../runbook/cli-reference.md)。
 
 新增 canonical Event type 时，必须同时修改 Event model、SQLite constraint、唯一 Route、Handler/typed outcome、UI type、测试与本文。新增 Runtime log event 不得混入 canonical Event type registry。

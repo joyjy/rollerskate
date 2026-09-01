@@ -32,6 +32,12 @@ test("loopback UI API reads durable Subscriptions and applies explicit control a
       ),
       "2026-07-22T10:00:00.000Z"
     ).subscriptionId;
+    for (let index = 0; index < 19; index += 1) {
+      store.create(
+        freeSubscription(directory, ownerAgentId, localId("scb")),
+        `2026-07-22T09:00:${String(index).padStart(2, "0")}.000Z`
+      );
+    }
     const callbackId = localId("scb");
     freeCallbackId = callbackId;
     freeSubscriptionId = store.create(
@@ -85,7 +91,7 @@ test("loopback UI API reads durable Subscriptions and applies explicit control a
       failures: Array<{ owner: string }>;
     };
     assert.equal(runtimeView.status, "stopped");
-    assert.equal(runtimeView.version, "0.5.4");
+    assert.equal(runtimeView.version, "0.5.6");
     assert.deepEqual(runtimeView.controls, { pause: false, resume: false, recover: false });
     assert.ok(runtimeView.workload.ready >= 0);
     assert.ok(runtimeView.failures.every((failure) => failure.owner !== "runtime"));
@@ -153,7 +159,7 @@ test("loopback UI API reads durable Subscriptions and applies explicit control a
 
     const list = await fetch(`${origin}/api/subscriptions`);
     assert.equal(list.status, 200);
-    const items = await list.json() as Array<{
+    const page = await list.json() as { total: number; items: Array<{
       kind?: string;
       id: string;
       title: string;
@@ -162,7 +168,10 @@ test("loopback UI API reads durable Subscriptions and applies explicit control a
       probe: { plugin: { id: string } };
       definition?: { schema: string; revision: string; callbackPhaseStatus: string };
       callbacks?: Array<{ status: string; grant: unknown; receipt?: unknown }>;
-    }>;
+    }> };
+    const items = page.items;
+    assert.equal(page.total, 21);
+    assert.equal(items.length, 20);
     const active = items.find((item) => item.id === subscriptionId);
     assert.equal(active?.kind, "free");
     assert.equal(active?.status, "active");
@@ -176,6 +185,12 @@ test("loopback UI API reads durable Subscriptions and applies explicit control a
     assert.equal(freeCallback?.status, "succeeded");
     assert.deepEqual(freeCallback?.grant, callbackGrant(freeCallbackId));
     assert.deepEqual(freeCallback?.receipt, { channel: "native", delivered: true });
+    const pageTwo = await (await fetch(
+      `${origin}/api/subscriptions?page=2&pageSize=20`
+    )).json() as { total: number; page: number; items: unknown[] };
+    assert.equal(pageTwo.total, 21);
+    assert.equal(pageTwo.page, 2);
+    assert.equal(pageTwo.items.length, 1);
     const rejected = await fetch(
       `${origin}/api/subscriptions/${subscriptionId}/pause`,
       { method: "POST" }
@@ -187,6 +202,22 @@ test("loopback UI API reads durable Subscriptions and applies explicit control a
     });
     assert.equal(paused.status, 200);
     assert.equal((await paused.json() as { status: string }).status, "paused");
+
+    const rejectedArchive = await fetch(
+      `${origin}/api/subscriptions/${freeSubscriptionId}/archive`,
+      { method: "POST" }
+    );
+    assert.equal(rejectedArchive.status, 403);
+    const archived = await fetch(
+      `${origin}/api/subscriptions/${freeSubscriptionId}/archive`,
+      { method: "POST", headers: { "X-Rollerskate-Request": "console" } }
+    );
+    assert.equal(archived.status, 200);
+    const archivedPage = await (await fetch(
+      `${origin}/api/subscriptions?archive=archived&q=free%20fixture`
+    )).json() as { total: number; items: Array<{ id: string }> };
+    assert.equal(archivedPage.total, 1);
+    assert.equal(archivedPage.items[0]?.id, freeSubscriptionId);
     const removedRevoke = await fetch(
       `${origin}/api/subscriptions/${subscriptionId}/revoke`,
       {

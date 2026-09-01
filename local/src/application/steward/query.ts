@@ -1,4 +1,5 @@
 import type { AgentRequestEvent } from "../../core/event/model.js";
+import type { DatabaseSync } from "node:sqlite";
 import { RuntimeStore, type RuntimeAudit } from "../../core/runtime/store.js";
 import { runtimePaths } from "../../infrastructure/runtime/config.js";
 import { AgentRunStore } from "../../infrastructure/sqlite/agent-run-store.js";
@@ -22,7 +23,11 @@ import {
 import {
   parseAgentTurnAdjudication
 } from "../../modules/steward/result-adjudication.js";
-import type { AgentInvocationDiagnostics } from "../../core/runtime/agent-invocation.js";
+import type {
+  AgentInvocationDiagnostics,
+  AgentInvocationFailure,
+  AgentInvocationProgress
+} from "../../core/runtime/agent-invocation.js";
 import type { WorkspaceEffect } from "../../core/runtime/model.js";
 import type { LocalAgent } from "../../modules/foundation/model.js";
 import {
@@ -30,6 +35,17 @@ import {
   type WorkspaceRevision
 } from "../../infrastructure/workspace/revision.js";
 import { eventTraceViews, type EventTraceView } from "../event/query.js";
+import {
+  literalLikePattern,
+  normalizeListPageInput,
+  type ListPage,
+  type ListPageInput
+} from "../list-page.js";
+import { openRuntimeDatabaseReadOnly } from "../../infrastructure/sqlite/database.js";
+import { assertCurrentLocalSchema } from
+  "../../infrastructure/sqlite/schema/index.js";
+import { inspectScheduleViewForRunSource } from "../schedule/query.js";
+import { inspectSubscriptionViewForRunSource } from "../subscription/query.js";
 
 export interface StewardRunSummaryView {
   readonly runId: string;
@@ -39,6 +55,11 @@ export interface StewardRunSummaryView {
   readonly series: {
     readonly key: string;
     readonly activeCycleId: string | null;
+  } | null;
+  readonly source: {
+    readonly kind: "schedule" | "subscription" | "continuous_subscription";
+    readonly id: string;
+    readonly definitionRevision: string;
   } | null;
   readonly mandate: {
     readonly kind: AgentRunProjection["mandate"]["kind"];
@@ -59,6 +80,7 @@ export interface StewardRunSummaryView {
     readonly maxDepth: number;
   };
   readonly terminalSummary: string | null;
+  readonly archivedAt: string | null;
   readonly updatedAt: string;
 }
 
@@ -83,6 +105,7 @@ export interface StewardRunDetailView {
   readonly summary: StewardRunSummaryView;
   readonly projection: AgentRunProjection;
   readonly cycles: readonly AgentRunCycleProjection[];
+  readonly triggerSource: TriggerSourceView | null;
   readonly checkpoint: AgentRunCheckpoint | null;
   readonly decisions: readonly AgentRunDecisionReceipt[];
   readonly orchestrationHistory: readonly {
@@ -98,6 +121,25 @@ export interface StewardRunDetailView {
   readonly timeline: readonly EventTraceView[];
   readonly currentWorkspaceRevision: WorkspaceRevision | null;
   readonly workspaceRevisionError: string | null;
+}
+
+export interface TriggerSourceView {
+  readonly kind: "schedule" | "subscription" | "continuous_subscription";
+  readonly id: string;
+  readonly definitionRevision: string;
+  readonly status: string;
+  readonly diagnosticsRoute: string;
+  readonly nextActionAt: string | null;
+  readonly pendingOccurrenceKey: string | null;
+  readonly checkpointOccurrenceKey: string | null;
+  readonly reconcileStatus: string;
+  readonly latestError: string | null;
+  readonly lastOccurrence: {
+    readonly occurrenceKey: string;
+    readonly cycleId: string | null;
+    readonly status: string;
+    readonly observedAt: string;
+  } | null;
 }
 
 export interface StewardOutputFolderView {
@@ -131,6 +173,8 @@ export interface StewardRunStepView {
   readonly rawOutput: string | null;
   readonly error: string | null;
   readonly invocation: AgentInvocationDiagnostics | null;
+  readonly invocationProgress: AgentInvocationProgress | null;
+  readonly invocationFailure: AgentInvocationFailure | null;
   readonly observedWorkspaceRevision: string | null;
   readonly createdAt: string;
   readonly completedAt: string | null;
@@ -146,11 +190,71 @@ interface AgentReferenceView {
 export function listStewardRunViews(
   repoRoot: string,
   runtimeDirectory?: string,
-  limit = 100
+  limit = 100,
+  archive: "current" | "archived" | "all" = "current"
 ): readonly StewardRunSummaryView[] {
   return withStores(repoRoot, runtimeDirectory, (stores) =>
-    stores.runs.list(limit).map((run) => summary(run, stores.foundation))
+    stores.runs.list(limit, archive).map((run) => summary(run, stores.foundation))
   );
+}
+
+export function pageStewardRunViews(
+  repoRoot: string,
+  input: ListPageInput = {},
+  runtimeDirectory?: string
+): ListPage<StewardRunSummaryView> {
+  const query = normalizeListPageInput(input);
+  const database = openRuntimeDatabaseReadOnly(runtimePaths(repoRoot, runtimeDirectory).database);
+  const where = `
+    ($archive = 'all'
+      OR ($archive = 'current' AND run.archived_at IS NULL)
+      OR ($archive = 'archived' AND run.archived_at IS NOT NULL))
+    AND ($search = ''
+      OR run.run_id LIKE $pattern ESCAPE '\\'
+      OR run.status LIKE $pattern ESCAPE '\\'
+      OR steward.handle LIKE $pattern ESCAPE '\\'
+      OR COALESCE(json_extract(run.mandate_snapshot_json, '$.objective'), '')
+        LIKE $pattern ESCAPE '\\'
+      OR COALESCE(json_extract(run.mandate_snapshot_json, '$.workflowRef'), '')
+        LIKE $pattern ESCAPE '\\')
+  `;
+  const filterParameters = {
+    archive: query.archive,
+    search: query.search,
+    pattern: literalLikePattern(query.search)
+  };
+  try {
+    assertCurrentLocalSchema(database);
+    database.exec("BEGIN");
+    const total = Number((database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM agent_runs AS run
+      JOIN agents AS steward ON steward.principal_id = run.steward_agent_id
+      WHERE ${where}
+    `).get(filterParameters) as { count: number }).count);
+    const ids = database.prepare(`
+      SELECT run.run_id
+      FROM agent_runs AS run
+      JOIN agents AS steward ON steward.principal_id = run.steward_agent_id
+      WHERE ${where}
+      ORDER BY run.updated_at DESC, run.run_id DESC
+      LIMIT $pageSize OFFSET $offset
+    `).all({
+      ...filterParameters,
+      pageSize: query.pageSize,
+      offset: query.offset
+    }) as unknown as Array<{ run_id: string }>;
+    database.exec("COMMIT");
+    const items = withStores(repoRoot, runtimeDirectory, (stores) =>
+      ids.map(({ run_id }) => summary(stores.runs.requireProjection(run_id), stores.foundation))
+    );
+    return { items, total, page: query.page, pageSize: query.pageSize };
+  } catch (error) {
+    if (database.isTransaction) database.exec("ROLLBACK");
+    throw error;
+  } finally {
+    database.close();
+  }
 }
 
 export function latestStewardRunView(
@@ -158,7 +262,7 @@ export function latestStewardRunView(
   runtimeDirectory?: string
 ): StewardRunDetailView | null {
   const latest = withStores(repoRoot, runtimeDirectory, (stores) =>
-    stores.runs.list(1)[0]
+    stores.runs.list(1, "current")[0]
   );
   return latest === undefined
     ? null
@@ -205,6 +309,7 @@ export function inspectStewardRunView(
       summary: summary(run, stores.foundation),
       projection: run,
       cycles,
+      triggerSource: triggerSourceView(run, cycles, stores),
       checkpoint: run.checkpoint ?? null,
       decisions: stores.runs.decisions(run.runId).map((record) => record.receipt),
       orchestrationHistory: stores.runs.decisions(run.runId),
@@ -284,11 +389,13 @@ function primaryOutput(result: StewardRunStepView["result"]): string | null {
   if (result?.schemaVersion === "AgentTurnResult@1" && result.action === "complete") {
     return result.summary;
   }
-  if ((result?.schemaVersion === "RunDecision@1" || result?.schemaVersion === "RunDecision@2") &&
+  if ((result?.schemaVersion === "RunDecision@1" || result?.schemaVersion === "RunDecision@2" ||
+    result?.schemaVersion === "RunDecision@3") &&
     result.action === "finish") {
     return result.finish.summary;
   }
-  if ((result?.schemaVersion === "RunDecision@1" || result?.schemaVersion === "RunDecision@2") &&
+  if ((result?.schemaVersion === "RunDecision@1" || result?.schemaVersion === "RunDecision@2" ||
+    result?.schemaVersion === "RunDecision@3") &&
     result.action === "needs_human") {
     return result.rationale;
   }
@@ -320,6 +427,8 @@ function stepView(
     rawOutput: output ?? null,
     error: audit.resultEvent?.error ?? audit.execution?.lastError ?? null,
     invocation: audit.invocation ?? null,
+    invocationProgress: audit.invocationProgress ?? null,
+    invocationFailure: audit.invocationFailure ?? null,
     observedWorkspaceRevision: resultObservedWorkspaceRevision(audit, runtime),
     createdAt: request.createdAt,
     completedAt: audit.invocation?.completedAt ?? audit.resultEvent?.createdAt ?? null
@@ -351,8 +460,11 @@ function parseStepOutput(
   if (request.runContext?.resultContractId === "agent-step-result@1") {
     return parseAgentStepResult(output);
   }
-  if (request.runContext?.resultContractId === "run-decision@2") {
-    return parseRunDecision(JSON.parse(output) as unknown);
+  if (request.runContext?.resultContractId === "run-decision@2" ||
+    request.runContext?.resultContractId === "run-decision@3") {
+    return parseRunDecision(JSON.parse(output) as unknown, {
+      allowHistorical: request.runContext.resultContractId === "run-decision@2"
+    });
   }
   if (request.runContext?.resultContractId === "agent-turn-adjudication@1") {
     const adjudication = parseAgentTurnAdjudication(output);
@@ -363,6 +475,7 @@ function parseStepOutput(
 }
 
 interface Stores {
+  readonly database: DatabaseSync;
   readonly runs: AgentRunStore;
   readonly runtime: RuntimeStore;
   readonly foundation: LocalFoundationStore;
@@ -374,15 +487,21 @@ function withStores<T>(
   callback: (stores: Stores) => T
 ): T {
   const databasePath = runtimePaths(repoRoot, runtimeDirectory).database;
-  const runs = new AgentRunStore(databasePath);
-  const runtime = new RuntimeStore(databasePath);
-  const foundation = new LocalFoundationStore(databasePath);
+  const database = openRuntimeDatabaseReadOnly(databasePath);
   try {
-    return callback({ runs, runtime, foundation });
+    assertCurrentLocalSchema(database);
+    const runs = new AgentRunStore(database, { migrate: false });
+    const runtime = new RuntimeStore(database, { migrate: false });
+    const foundation = new LocalFoundationStore(database, { migrate: false });
+    try {
+      return callback({ database, runs, runtime, foundation });
+    } finally {
+      foundation.close();
+      runtime.close();
+      runs.close();
+    }
   } finally {
-    foundation.close();
-    runtime.close();
-    runs.close();
+    database.close();
   }
 }
 
@@ -398,6 +517,13 @@ function summary(
     series: run.seriesKey === undefined
       ? null
       : { key: run.seriesKey, activeCycleId: run.activeCycleId ?? null },
+    source: run.sourceBinding === undefined
+      ? null
+      : {
+          kind: run.sourceBinding.source.kind,
+          id: run.sourceBinding.source.id,
+          definitionRevision: run.sourceBinding.source.definitionRevision
+        },
     mandate: {
       kind: run.mandate.kind,
       label: run.mandate.kind === "workflow"
@@ -427,7 +553,118 @@ function summary(
       maxDepth: run.maxDepth
     },
     terminalSummary: run.terminalSummary ?? null,
+    archivedAt: run.archivedAt ?? null,
     updatedAt: run.updatedAt
+  };
+}
+
+function triggerSourceView(
+  run: AgentRunProjection,
+  cycles: readonly AgentRunCycleProjection[],
+  stores: Stores
+): TriggerSourceView | null {
+  const binding = run.sourceBinding;
+  if (binding === undefined) return null;
+  const source = binding.source;
+  if (source.kind === "schedule") {
+    const schedule = inspectScheduleViewForRunSource(stores.database, source.id);
+    const occurrence = schedule.occurrence;
+    const cycle = occurrence === null || occurrence.cycleId === null
+      ? undefined
+      : cycles.find(({ cycleId }) => cycleId === occurrence.cycleId);
+    return {
+      kind: source.kind,
+      id: source.id,
+      definitionRevision: source.definitionRevision,
+      status: schedule.status,
+      diagnosticsRoute: `/console/schedules?scheduleId=${encodeURIComponent(source.id)}`,
+      nextActionAt: schedule.nextRunAt,
+      pendingOccurrenceKey: occurrence !== null &&
+        (occurrence.status === "queued" || occurrence.status === "running")
+        ? occurrence.occurrenceKey
+        : null,
+      checkpointOccurrenceKey: occurrence?.status === "succeeded"
+        ? occurrence.occurrenceKey
+        : null,
+      reconcileStatus: cycle?.status ?? occurrence?.status ?? "awaiting_occurrence",
+      latestError: occurrence?.failureRef ?? null,
+      lastOccurrence: occurrence === null
+        ? null
+        : {
+            occurrenceKey: occurrence.occurrenceKey,
+            cycleId: occurrence.cycleId,
+            status: cycle?.status ?? occurrence.status,
+            observedAt: occurrence.updatedAt
+          }
+    };
+  }
+  const subscription = inspectSubscriptionViewForRunSource(stores.database, source.id);
+  if (subscription.kind === "free") {
+    const admission = subscription.admissionReceipt ?? null;
+    const cycle = subscription.cycleId === null
+      ? undefined
+      : cycles.find(({ cycleId }) => cycleId === subscription.cycleId);
+    return {
+      kind: source.kind,
+      id: source.id,
+      definitionRevision: source.definitionRevision,
+      status: subscription.status,
+      diagnosticsRoute: `/console/subscriptions?subscriptionId=${encodeURIComponent(source.id)}`,
+      nextActionAt: subscription.nextPollAt,
+      pendingOccurrenceKey: admission !== null &&
+        subscription.callbackPhaseStatus === "running"
+        ? admission.occurrenceKey
+        : null,
+      checkpointOccurrenceKey: admission !== null &&
+        subscription.callbackPhaseStatus === "completed"
+        ? admission.occurrenceKey
+        : null,
+      reconcileStatus: subscription.callbackPhaseStatus,
+      latestError: subscription.latestError ?? null,
+      lastOccurrence: admission === null
+        ? null
+        : {
+            occurrenceKey: admission.occurrenceKey,
+            cycleId: subscription.cycleId,
+            status: cycle?.status ?? subscription.callbackPhaseStatus,
+            observedAt: admission.admittedAt
+          }
+    };
+  }
+  const pendingAdmission = subscription.pendingAdmissionReceipt ?? null;
+  const cycle = subscription.pendingCycleId === null
+    ? undefined
+      : cycles.find(({ cycleId }) => cycleId === subscription.pendingCycleId);
+  return {
+    kind: source.kind,
+    id: source.id,
+    definitionRevision: source.definitionRevision,
+    status: subscription.status,
+    diagnosticsRoute: `/console/subscriptions?subscriptionId=${encodeURIComponent(source.id)}`,
+    nextActionAt: subscription.nextPollAt,
+    pendingOccurrenceKey: subscription.pendingOccurrenceKey,
+    checkpointOccurrenceKey: subscription.checkpointOccurrenceKey,
+    reconcileStatus: subscription.latestError !== null
+      ? `blocked:${subscription.latestError}`
+      : cycle?.status ?? (subscription.pendingOccurrenceKey === null
+          ? "awaiting_delta"
+          : "pending_cycle"),
+    latestError: subscription.latestError,
+    lastOccurrence: pendingAdmission !== null
+      ? {
+          occurrenceKey: pendingAdmission.occurrenceKey,
+          cycleId: subscription.pendingCycleId,
+          status: cycle?.status ?? "pending_cycle",
+          observedAt: pendingAdmission.admittedAt
+        }
+      : subscription.checkpointOccurrenceKey === null
+        ? null
+        : {
+            occurrenceKey: subscription.checkpointOccurrenceKey,
+            cycleId: null,
+            status: "checkpointed",
+            observedAt: subscription.updatedAt
+          }
   };
 }
 

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { RouterLink } from "vue-router";
 import { formatDateTime } from "@/utils/format";
 import type { Subscription, SubscriptionVisualStatus } from "@/types/subscription";
 import StatusBadge from "./StatusBadge.vue";
@@ -56,26 +57,45 @@ function agentResultBadge(callback: {
         <dt>Probe artifact</dt><dd class="mono">{{ subscription.definition.artifactRevision }} · {{ subscription.definition.artifactDigest }}</dd>
         <dt>Callback phase</dt><dd><StatusBadge :status="callbackBadge(subscription.definition.callbackPhaseStatus)" /></dd>
       </dl>
-      <div class="section-title registration-title">Registered callback grants</div>
-      <div v-if="subscription.definition.callbacks.length === 0" class="fire-card">No callbacks. Terminal observation is the final product state.</div>
-      <article v-for="callback in subscription.definition.callbacks" :key="callback.callbackId" class="callback-card">
-        <header><strong>{{ callback.kind }}</strong></header>
-        <div class="callback-columns"><div><span>Definition</span><pre>{{ JSON.stringify(callback.definition, null, 2) }}</pre></div><div><span>Exact grant</span><pre>{{ JSON.stringify(callback.grant, null, 2) }}</pre></div></div>
-      </article>
-      <div v-if="subscription.callbacks.length > 0" class="section-title registration-title">Terminal callback occurrences</div>
-      <article v-for="callback in subscription.callbacks" :key="callback.callbackId" class="callback-card">
-        <header>
-          <strong>#{{ callback.ordinal + 1 }} {{ callback.kind }}</strong>
-          <div v-if="callback.kind === 'agent.invoke'" class="callback-status">
-            <span>Invocation {{ callback.invocationStatus ?? "unknown" }}</span><StatusBadge :status="invocationBadge(callback)" />
-            <span>Result {{ callback.agentResult?.status ?? "unknown" }}</span><StatusBadge :status="agentResultBadge(callback)" />
-          </div>
-          <StatusBadge v-else :status="callbackBadge(callback.status)" />
-        </header>
-        <div v-if="callback.receipt !== undefined"><span class="note">Receipt</span><pre>{{ JSON.stringify(callback.receipt, null, 2) }}</pre></div>
-        <div v-if="callback.agentResult && callback.agentResult.status !== 'succeeded'" class="error-card">{{ callback.agentResult.summary }}</div>
-        <div v-if="callback.lastError" class="error-card">{{ callback.lastError }}</div>
-      </article>
+      <template v-if="subscription.definition.schema === 'SubscriptionDefinition@4'">
+        <div class="section-title registration-title">Run trigger binding</div>
+        <div class="fire-card">The Subscription owns observation lifecycle only. Its terminal occurrence activates a Run cycle.</div>
+        <pre>{{ JSON.stringify(subscription.definition.sourceBinding, null, 2) }}</pre>
+        <dl class="kv">
+          <dt>Run</dt>
+          <dd>
+            <RouterLink
+              v-if="subscription.agentRunId"
+              :to="{ name: 'steward', query: { runId: subscription.agentRunId, ...(subscription.cycleId ? { cycleId: subscription.cycleId } : {}) } }"
+            >{{ subscription.agentRunId }}<template v-if="subscription.cycleId"> / {{ subscription.cycleId }}</template> → Run Workspace</RouterLink>
+            <span v-else>Awaiting terminal occurrence</span>
+          </dd>
+          <dt>Admission receipt</dt><dd>{{ subscription.admissionReceipt ? "durable" : "pending" }}</dd>
+        </dl>
+        <pre v-if="subscription.admissionReceipt">{{ JSON.stringify(subscription.admissionReceipt, null, 2) }}</pre>
+      </template>
+      <template v-else>
+        <div class="section-title registration-title">Legacy callback grants · non-public</div>
+        <div v-if="subscription.definition.callbacks.length === 0" class="fire-card">No callbacks. Terminal observation is the final product state.</div>
+        <article v-for="callback in subscription.definition.callbacks" :key="callback.callbackId" class="callback-card">
+          <header><strong>{{ callback.kind }}</strong></header>
+          <div class="callback-columns"><div><span>Definition</span><pre>{{ JSON.stringify(callback.definition, null, 2) }}</pre></div><div><span>Exact grant</span><pre>{{ JSON.stringify(callback.grant, null, 2) }}</pre></div></div>
+        </article>
+        <div v-if="subscription.callbacks.length > 0" class="section-title registration-title">Legacy callback occurrences</div>
+        <article v-for="callback in subscription.callbacks" :key="callback.callbackId" class="callback-card">
+          <header>
+            <strong>#{{ callback.ordinal + 1 }} {{ callback.kind }}</strong>
+            <div v-if="callback.kind === 'agent.invoke'" class="callback-status">
+              <span>Invocation {{ callback.invocationStatus ?? "unknown" }}</span><StatusBadge :status="invocationBadge(callback)" />
+              <span>Result {{ callback.agentResult?.status ?? "unknown" }}</span><StatusBadge :status="agentResultBadge(callback)" />
+            </div>
+            <StatusBadge v-else :status="callbackBadge(callback.status)" />
+          </header>
+          <div v-if="callback.receipt !== undefined"><span class="note">Receipt</span><pre>{{ JSON.stringify(callback.receipt, null, 2) }}</pre></div>
+          <div v-if="callback.agentResult && callback.agentResult.status !== 'succeeded'" class="error-card">{{ callback.agentResult.summary }}</div>
+          <div v-if="callback.lastError" class="error-card">{{ callback.lastError }}</div>
+        </article>
+      </template>
       <div v-if="subscription.terminalObservation !== null" class="registration-title"><div class="section-title">Terminal observation</div><pre>{{ JSON.stringify(subscription.terminalObservation, null, 2) }}</pre></div>
     </template>
 
@@ -89,6 +109,23 @@ function agentResultBadge(callback: {
         <dt>Visible callback occurrence</dt><dd class="mono">{{ subscription.callbackOccurrenceKey ?? "none" }}</dd>
         <dt>Callback state</dt><dd>{{ subscription.callbackSummary.terminal }}/{{ subscription.callbackSummary.total }} terminal · {{ subscription.callbackSummary.started }} started · {{ subscription.callbackSummary.unknown }} unknown</dd>
       </dl>
+      <template v-if="subscription.definition.schemaVersion === 'ContinuousSubscriptionDefinition@2'">
+        <div class="section-title registration-title">Run trigger binding</div>
+        <pre>{{ JSON.stringify(subscription.definition.sourceBinding, null, 2) }}</pre>
+        <dl class="kv">
+          <dt>Run</dt>
+          <dd>
+            <RouterLink
+              v-if="subscription.agentRunId"
+              :to="{ name: 'steward', query: { runId: subscription.agentRunId, ...(subscription.pendingCycleId ? { cycleId: subscription.pendingCycleId } : {}) } }"
+            >{{ subscription.agentRunId }}<template v-if="subscription.pendingCycleId"> / {{ subscription.pendingCycleId }}</template> → Run Workspace</RouterLink>
+            <span v-else>Awaiting first delta</span>
+          </dd>
+          <dt>Pending admission</dt><dd>{{ subscription.pendingAdmissionReceipt ? "durable" : "none" }}</dd>
+        </dl>
+        <pre v-if="subscription.pendingAdmissionReceipt">{{ JSON.stringify(subscription.pendingAdmissionReceipt, null, 2) }}</pre>
+      </template>
+      <div v-else class="fire-card registration-title">Legacy callbacks · non-public</div>
       <div v-if="subscription.latestError" class="error-card">{{ subscription.latestError }}</div>
       <article v-for="callback in subscription.callbacks" :key="callback.callbackId" class="callback-card">
         <header><strong>#{{ callback.ordinal + 1 }} {{ callback.kind }}</strong><StatusBadge :status="callbackBadge(callback.status)" /></header>

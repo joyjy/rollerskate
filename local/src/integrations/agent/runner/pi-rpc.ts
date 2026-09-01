@@ -10,7 +10,15 @@ import type {
   RunnerEvent,
   RunnerTurnReceipt,
   RunnerTurnRequest,
+  RunnerTerminationReason,
   RunnerUsage
+} from "./protocol.js";
+import {
+  RunnerInvocationError,
+  RunnerProgressTracker,
+  runnerInvocationFailure,
+  runnerMeaningfulTimeoutMilliseconds,
+  runnerTimeoutMilliseconds
 } from "./protocol.js";
 
 export interface PiRpcRunnerOptions {
@@ -20,6 +28,7 @@ export interface PiRpcRunnerOptions {
   readonly environment: Readonly<Record<string, string>>;
   readonly workingDirectory: string;
   readonly timeoutMilliseconds: number;
+  readonly meaningfulOutputTimeoutMilliseconds: number;
   readonly maxOutputBytes: number;
 }
 
@@ -35,6 +44,16 @@ export class PiRpcRunner implements AgentRunner {
       return Promise.reject(new Error("pi RPC requires a Session id"));
     }
     const startedAt = new Date().toISOString();
+    const totalTimeoutMilliseconds = runnerTimeoutMilliseconds(
+      request.totalTimeoutMilliseconds ?? this.#options.timeoutMilliseconds,
+      "totalTimeoutMilliseconds"
+    );
+    const meaningfulOutputTimeoutMilliseconds = runnerMeaningfulTimeoutMilliseconds(
+      request.meaningfulOutputTimeoutMilliseconds ??
+        this.#options.meaningfulOutputTimeoutMilliseconds
+    );
+    const progress = new RunnerProgressTracker(startedAt, request.onProgress);
+    progress.session(request.sessionId);
     return new Promise((resolve, reject) => {
       const child = spawnRunnerProcess({
         executable: this.#options.executable,
@@ -50,14 +69,28 @@ export class PiRpcRunner implements AgentRunner {
       let assistantBytes = 0;
       let assistantMessageSeen = false;
       let toolEventsComplete = true;
+      let totalTimeout: NodeJS.Timeout | undefined;
+      let meaningfulTimeout: NodeJS.Timeout | undefined;
+
+      const resetMeaningfulTimeout = () => {
+        if (meaningfulTimeout !== undefined) clearTimeout(meaningfulTimeout);
+        meaningfulTimeout = setTimeout(() => {
+          terminate(
+            "stall",
+            `agent invocation stalled without meaningful output: ${this.#options.adapterId}`
+          );
+        }, meaningfulOutputTimeoutMilliseconds);
+      };
 
       const finish = (error?: Error) => {
         if (settled) return;
         settled = true;
-        clearTimeout(timeout);
+        if (totalTimeout !== undefined) clearTimeout(totalTimeout);
+        if (meaningfulTimeout !== undefined) clearTimeout(meaningfulTimeout);
+        if (error === undefined) progress.phase("terminated");
         void (async () => {
           if (error !== undefined) {
-            await stopRunnerProcess(child);
+            await stopRunnerProcess(child, { closeStdin: true, graceMilliseconds: 5_000 });
             reject(withStderr(error, stderr()));
             return;
           }
@@ -84,6 +117,25 @@ export class PiRpcRunner implements AgentRunner {
         })();
       };
 
+      const terminate = (reason: RunnerTerminationReason, message: string) => {
+        if (settled) return;
+        progress.phase(reason === "protocol_exit" ? "terminated" : "cancelling");
+        const protocolStop = reason === "protocol_exit" || child.stdin.destroyed
+          ? "unavailable" as const
+          : "requested" as const;
+        if (protocolStop === "requested") {
+          child.stdin.write(`${JSON.stringify({ id: "abort", type: "abort" })}\n`);
+        }
+        finish(runnerInvocationFailure({
+          message,
+          progress,
+          reason,
+          totalTimeoutMilliseconds,
+          meaningfulOutputTimeoutMilliseconds,
+          protocolStop
+        }));
+      };
+
       const decoder = new JsonLineResponseDecoder({
         maxLineBytes: this.#options.maxOutputBytes,
         onDiscardedLine: () => {
@@ -91,9 +143,14 @@ export class PiRpcRunner implements AgentRunner {
         },
         onMessage: (value): boolean => {
           if (!isRecord(value)) return false;
+          const progressEvent = piProgress(value);
+          if (progressEvent !== undefined) {
+            progress.observe(progressEvent.kind, progressEvent.meaningful);
+            if (progressEvent.meaningful) resetMeaningfulTimeout();
+          }
           if (value.type === "response" && value.command === "get_state") {
             if (value.success !== true) {
-              finish(new Error(`pi RPC get_state failed: ${responseError(value)}`));
+              terminate("protocol_error", `pi RPC get_state failed: ${responseError(value)}`);
               return true;
             }
             if (isRecord(value.data) && typeof value.data.sessionId === "string") {
@@ -102,7 +159,7 @@ export class PiRpcRunner implements AgentRunner {
           }
           if (value.type === "response" && value.command === "prompt") {
             if (value.success !== true) {
-              finish(new Error(`pi RPC prompt failed: ${responseError(value)}`));
+              terminate("protocol_error", `pi RPC prompt failed: ${responseError(value)}`);
               return true;
             }
             promptAccepted = true;
@@ -113,9 +170,9 @@ export class PiRpcRunner implements AgentRunner {
               assistantMessageSeen = true;
               assistantBytes += Buffer.byteLength(event.message.text, "utf8");
               if (assistantBytes > this.#options.maxOutputBytes) {
-                finish(new Error(
+                terminate("protocol_error",
                   `pi Runtime assistant output exceeds ${this.#options.maxOutputBytes} bytes`
-                ));
+                );
                 return true;
               }
             }
@@ -127,28 +184,37 @@ export class PiRpcRunner implements AgentRunner {
         complete: () => undefined
       });
 
-      const timeout = setTimeout(() => {
-        finish(new Error(`agent invocation timed out: ${this.#options.adapterId}`));
-      }, this.#options.timeoutMilliseconds);
+      meaningfulTimeout = setTimeout(() => {
+        terminate(
+          "stall",
+          `agent invocation stalled without meaningful output: ${this.#options.adapterId}`
+        );
+      }, meaningfulOutputTimeoutMilliseconds);
+      totalTimeout = setTimeout(() => {
+        terminate("deadline", `agent invocation timed out: ${this.#options.adapterId}`);
+      }, totalTimeoutMilliseconds);
 
       child.stdout.on("data", (chunk: Buffer) => {
         if (settled) return;
         try {
           decoder.push(chunk);
         } catch (error) {
-          finish(new Error(`pi RPC response decoding failed: ${errorMessage(error)}`));
+          terminate(
+            "protocol_error",
+            `pi RPC response decoding failed: ${errorMessage(error)}`
+          );
         }
       });
-      child.once("error", (error) => finish(error));
-      child.stdin.once("error", (error) => finish(error));
+      child.once("error", (error) => terminate("protocol_exit", errorMessage(error)));
+      child.stdin.once("error", (error) => terminate("protocol_exit", errorMessage(error)));
       child.once("close", (code, signal) => {
         if (settled) return;
         const detail = stderr();
-        finish(new Error(
+        terminate("protocol_exit",
           `pi RPC process exited before agent settlement ` +
           `(code=${String(code)} signal=${String(signal)}): ` +
           (detail === "" ? "no process diagnostics" : detail)
-        ));
+        );
       });
       child.stdin.write(`${JSON.stringify({ id: "state", type: "get_state" })}\n`);
       child.stdin.write(`${JSON.stringify({
@@ -156,8 +222,30 @@ export class PiRpcRunner implements AgentRunner {
         type: "prompt",
         message: request.prompt
       })}\n`);
+      progress.phase("prompting");
     });
   }
+}
+
+function piProgress(value: Readonly<Record<string, unknown>>): {
+  readonly kind: "assistant" | "thought" | "tool" | "protocol";
+  readonly meaningful: boolean;
+} | undefined {
+  if (value.type === "message_update" || value.type === "message_end") {
+    const update = isRecord(value.assistantMessageEvent)
+      ? value.assistantMessageEvent.type
+      : undefined;
+    return {
+      kind: update === "thinking_delta" ? "thought" : "assistant",
+      meaningful: true
+    };
+  }
+  if (value.type === "tool_execution_start" || value.type === "tool_execution_update" ||
+    value.type === "tool_execution_end") {
+    return { kind: "tool", meaningful: true };
+  }
+  if (typeof value.type === "string") return { kind: "protocol", meaningful: false };
+  return undefined;
 }
 
 function piRunnerEvents(
@@ -225,7 +313,10 @@ function responseError(response: Readonly<Record<string, unknown>>): string {
 }
 
 function withStderr(error: Error, stderr: string): Error {
-  return new Error(`${error.message}${stderr === "" ? "" : `\nstderr: ${stderr}`}`);
+  const message = `${error.message}${stderr === "" ? "" : `\nstderr: ${stderr}`}`;
+  return error instanceof RunnerInvocationError
+    ? new RunnerInvocationError(message, error.trace)
+    : new Error(message);
 }
 
 function errorMessage(error: unknown): string {

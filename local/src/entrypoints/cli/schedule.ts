@@ -1,26 +1,16 @@
-import { readFileSync, realpathSync } from "node:fs";
-
 import {
   controlSchedule,
-  createSchedule,
   resolveUnknownScheduledRun,
   runScheduleNow,
-  updateSchedule,
-  type ScheduleControlInput,
-  type UpdateScheduleControlInput
 } from "../../application/schedule/control.js";
 import {
   inspectScheduleView,
-  listScheduledRunViews,
+  listScheduleOccurrenceViews,
   listScheduleViews,
   scheduleDetailView,
-  scheduledRunView,
-  traceScheduledRunView
+  scheduleOccurrenceView,
+  traceScheduleOccurrenceView
 } from "../../application/schedule/query.js";
-import { parseProactiveCallbacks } from "../../application/callback/proactive.js";
-import { parseExternalRefTriggerBinding } from
-  "../../application/external-resource/trigger-binding.js";
-import { HOST_COMMAND_CALLBACK_HELP } from "./shared.js";
 
 interface Output {
   readonly write: (text: string) => void;
@@ -28,16 +18,13 @@ interface Output {
 
 const HELP = [
   "Usage:",
-  "  scripts/rs schedule create <json-file>",
-  "  scripts/rs schedule update <schedule-id> <json-file>",
   "  scripts/rs schedule list",
   "  scripts/rs schedule inspect|pause|resume|cancel <schedule-id>",
   "  scripts/rs schedule run-now <schedule-id> --request-id <idempotency-key>",
-  "  scripts/rs schedule runs <schedule-id> [--limit <count>]",
+  "  scripts/rs schedule occurrences <schedule-id> [--limit <count>]",
+  "  scripts/rs schedule runs <schedule-id> [--limit <count>] (legacy alias)",
   "  scripts/rs schedule trace <run-id>",
-  "  scripts/rs schedule resolve <run-id> <succeeded|failed>",
-  "",
-  HOST_COMMAND_CALLBACK_HELP
+  "  scripts/rs schedule resolve <run-id> <succeeded|failed>"
 ].join("\n");
 
 export function runScheduleCommand(
@@ -47,34 +34,15 @@ export function runScheduleCommand(
   runtimeDirectory?: string
 ): number {
   const [command, ...rest] = arguments_;
-  if (
-    command === "--help" ||
-    ((command === "create" || command === "update") && rest[0] === "--help")
-  ) {
-    if (rest.length > (command === "create" || command === "update" ? 1 : 0)) {
-      throw new Error("schedule help accepts no additional arguments");
-    }
+  if (command === "--help") {
+    if (rest.length > 0) throw new Error("schedule help accepts no additional arguments");
     output.write(`${HELP}\n`);
     return 0;
   }
-  if (command === "create") {
-    requireCount(rest, 1, "schedule create requires exactly one JSON file");
-    write(output, scheduleDetailView(createSchedule(
-      repoRoot,
-      parseScheduleFile(rest[0]!, false),
-      runtimeDirectory
-    )));
-    return 0;
-  }
-  if (command === "update") {
-    requireCount(rest, 2, "schedule update requires an id and one JSON file");
-    write(output, scheduleDetailView(updateSchedule(
-      repoRoot,
-      rest[0]!,
-      parseScheduleFile(rest[1]!, true),
-      runtimeDirectory
-    )));
-    return 0;
+  if (command === "create" || command === "update") {
+    throw new Error(
+      "legacy_trigger_write_closed: start RunIntent@1; Steward await_source owns Schedule registration"
+    );
   }
   if (command === "list") {
     requireCount(rest, 0, "schedule list accepts no arguments");
@@ -100,12 +68,12 @@ export function runScheduleCommand(
     write(output, runScheduleNow(repoRoot, rest[0]!, rest[2]!, runtimeDirectory));
     return 0;
   }
-  if (command === "runs") {
+  if (command === "occurrences" || command === "runs") {
     if (rest.length !== 1 && !(rest.length === 3 && rest[1] === "--limit")) {
-      throw new Error("schedule runs requires <id> [--limit <count>]");
+      throw new Error(`schedule ${command} requires <id> [--limit <count>]`);
     }
     const limit = rest.length === 1 ? 100 : commandInteger(rest[2], "limit");
-    write(output, listScheduledRunViews(
+    write(output, listScheduleOccurrenceViews(
       repoRoot,
       rest[0]!,
       runtimeDirectory,
@@ -115,14 +83,14 @@ export function runScheduleCommand(
   }
   if (command === "trace") {
     requireCount(rest, 1, "schedule trace requires exactly one run id");
-    write(output, traceScheduledRunView(repoRoot, rest[0]!, runtimeDirectory));
+    write(output, traceScheduleOccurrenceView(repoRoot, rest[0]!, runtimeDirectory));
     return 0;
   }
   if (command === "resolve") {
     if (rest.length !== 2 || (rest[1] !== "succeeded" && rest[1] !== "failed")) {
       throw new Error("schedule resolve requires <run-id> <succeeded|failed>");
     }
-    write(output, scheduledRunView(resolveUnknownScheduledRun(
+    write(output, scheduleOccurrenceView(resolveUnknownScheduledRun(
       repoRoot,
       rest[0]!,
       rest[1],
@@ -131,105 +99,9 @@ export function runScheduleCommand(
     return 0;
   }
   throw new Error(
-    "schedule requires create, update, list, inspect, pause, resume, cancel, " +
-    "run-now, runs, trace or resolve"
+    "schedule requires list, inspect, pause, resume, cancel, " +
+    "run-now, occurrences, runs, trace or resolve"
   );
-}
-
-function parseScheduleFile(pathInput: string, update: false): ScheduleControlInput;
-function parseScheduleFile(pathInput: string, update: true): UpdateScheduleControlInput;
-function parseScheduleFile(
-  pathInput: string,
-  update: boolean
-): ScheduleControlInput | UpdateScheduleControlInput {
-  const path = realpathSync(pathInput);
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
-  } catch (error) {
-    throw new Error(`schedule file must be valid JSON: ${message(error)}`);
-  }
-  const root = record(parsed, "schedule file");
-  exactKeys(root, [
-    "schemaVersion",
-    "agent",
-    "kind",
-    "expression",
-    "timezone",
-    "misfirePolicy",
-    "overlapPolicy",
-    "misfireGraceMilliseconds",
-    "session",
-    "prompt",
-    "callbacks",
-    "externalRefBinding",
-    ...(update ? ["expectedRevision"] : [])
-  ], "schedule file");
-  if (root.schemaVersion !== 1 && root.schemaVersion !== 2) {
-    throw new Error("schedule file schemaVersion must be 1 or 2");
-  }
-  if (root.schemaVersion === 1 && root.callbacks !== undefined) {
-    throw new Error("schedule schemaVersion 1 must not define callbacks");
-  }
-  if (root.schemaVersion === 2 && !Array.isArray(root.callbacks)) {
-    throw new Error("schedule schemaVersion 2 requires callbacks");
-  }
-  const kind = oneOf(root.kind, ["once", "cron"] as const, "kind");
-  const timezone = optionalText(root.timezone, "timezone");
-  if (kind === "cron" && timezone === undefined) {
-    throw new Error("cron schedule requires timezone");
-  }
-  if (kind === "once" && timezone !== undefined) {
-    throw new Error("once schedule must not define timezone");
-  }
-  const session = record(root.session, "session");
-  exactKeys(session, ["policy", "fixedSessionId"], "session");
-  const sessionPolicy = oneOf(
-    session.policy,
-    ["new_each_run", "fixed"] as const,
-    "session.policy"
-  );
-  const fixedSessionId = optionalText(session.fixedSessionId, "session.fixedSessionId");
-  if (sessionPolicy === "fixed" && fixedSessionId === undefined) {
-    throw new Error("fixed session policy requires session.fixedSessionId");
-  }
-  if (sessionPolicy === "new_each_run" && fixedSessionId !== undefined) {
-    throw new Error("new_each_run session policy must not define session.fixedSessionId");
-  }
-  const common: ScheduleControlInput = {
-    agent: text(root.agent, "agent"),
-    kind,
-    expression: text(root.expression, "expression"),
-    ...(timezone === undefined ? {} : { timezone }),
-    misfirePolicy: oneOf(
-      root.misfirePolicy,
-      ["skip", "run_once"] as const,
-      "misfirePolicy"
-    ),
-    overlapPolicy: oneOf(
-      root.overlapPolicy,
-      ["skip", "queue"] as const,
-      "overlapPolicy"
-    ),
-    misfireGraceMilliseconds: integer(
-      root.misfireGraceMilliseconds,
-      "misfireGraceMilliseconds"
-    ),
-    sessionPolicy,
-    ...(fixedSessionId === undefined ? {} : { fixedSessionId }),
-    prompt: text(root.prompt, "prompt"),
-    ...(root.schemaVersion === 2
-      ? { callbacks: parseProactiveCallbacks(root.callbacks) }
-      : {}),
-    ...(root.externalRefBinding === undefined
-      ? {}
-      : { externalRefBinding: parseExternalRefTriggerBinding(root.externalRefBinding) })
-  };
-  if (!update) return common;
-  return {
-    ...common,
-    expectedRevision: integer(root.expectedRevision, "expectedRevision")
-  };
 }
 
 function write(output: Output, value: unknown): void {
@@ -240,37 +112,6 @@ function requireCount(arguments_: readonly string[], count: number, error: strin
   if (arguments_.length !== count) throw new Error(error);
 }
 
-function record(value: unknown, field: string): Record<string, unknown> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error(`${field} must be an object`);
-  }
-  return value as Record<string, unknown>;
-}
-
-function exactKeys(
-  value: Readonly<Record<string, unknown>>,
-  allowed: readonly string[],
-  field: string
-): void {
-  const unknown = Object.keys(value).filter((key) => !allowed.includes(key));
-  if (unknown.length > 0) throw new Error(`${field} has unknown field: ${unknown[0]}`);
-}
-
-function text(value: unknown, field: string): string {
-  if (typeof value !== "string" || value.trim() === "") {
-    throw new Error(`${field} must be a non-empty string`);
-  }
-  return value;
-}
-
-function optionalText(value: unknown, field: string): string | undefined {
-  return value === undefined ? undefined : text(value, field);
-}
-
-function integer(value: unknown, field: string): number {
-  if (!Number.isInteger(value)) throw new Error(`${field} must be an integer`);
-  return value as number;
-}
 
 function commandInteger(value: string | undefined, field: string): number {
   if (value === undefined || !/^[0-9]+$/u.test(value)) {
@@ -279,19 +120,4 @@ function commandInteger(value: string | undefined, field: string): number {
   const parsed = Number.parseInt(value, 10);
   if (!Number.isSafeInteger(parsed)) throw new Error(`${field} must be an integer`);
   return parsed;
-}
-
-function oneOf<const T extends readonly string[]>(
-  value: unknown,
-  allowed: T,
-  field: string
-): T[number] {
-  if (typeof value !== "string" || !allowed.includes(value)) {
-    throw new Error(`${field} must be one of ${allowed.join(", ")}`);
-  }
-  return value;
-}
-
-function message(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

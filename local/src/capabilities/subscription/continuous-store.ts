@@ -18,17 +18,27 @@ import {
   type ProactiveCallbackOccurrence,
   type ProactiveCallbackOccurrenceRow
 } from "../../modules/callback/proactive-model.js";
+import { parseRunSourceBinding } from "../../modules/steward/source-contract.js";
 import type { PollObservation } from "./plugin-contract.js";
 import type {
+  BoundContinuousSubscriptionDefinition,
   ContinuousSubscription,
-  ContinuousSubscriptionDefinition
+  ContinuousSubscriptionDefinition,
+  LegacyContinuousSubscriptionDefinition
 } from "./continuous-model.js";
+import {
+  activateSubscriptionOccurrenceInTransaction,
+  parseSubscriptionOccurrenceAdmissionReceipt,
+  terminalRunStatus,
+  type SubscriptionRunBindingAdapter
+} from "./run-binding.js";
 
 interface Row {
   readonly subscription_id: string;
   readonly title: string;
-  readonly owner_agent_id: string;
+  readonly owner_agent_id: string | null;
   readonly current_revision: number;
+  readonly definition_schema: ContinuousSubscriptionDefinition["schemaVersion"];
   readonly plugin_path: string;
   readonly plugin_id: string;
   readonly plugin_config_json: string;
@@ -43,6 +53,11 @@ interface Row {
   readonly pending_observation_json: string | null;
   readonly latest_error: string | null;
   readonly external_ref_binding_json: string | null;
+  readonly source_binding_json: string | null;
+  readonly agent_run_id: string | null;
+  readonly pending_cycle_id: string | null;
+  readonly pending_admission_receipt_json: string | null;
+  readonly archived_at: string | null;
   readonly created_at: string;
   readonly updated_at: string;
 }
@@ -51,15 +66,28 @@ export class ContinuousSubscriptionStore {
   readonly #database: DatabaseSync;
   readonly #callbacks: CallbackStore;
   readonly #runtime: RuntimeStore;
+  readonly #ownsDatabase: boolean;
+  readonly #runBinding: SubscriptionRunBindingAdapter | undefined;
 
-  public constructor(databasePath: string) {
-    this.#database = openInitializedRuntimeDatabase(databasePath, migrateLocalDatabase);
-    this.#callbacks = new CallbackStore(this.#database);
-    this.#runtime = new RuntimeStore(this.#database);
+  public constructor(
+    databasePath: string | DatabaseSync,
+    options: {
+      readonly migrate?: boolean;
+      readonly runBinding?: SubscriptionRunBindingAdapter;
+    } = {}
+  ) {
+    this.#database = typeof databasePath === "string"
+      ? openInitializedRuntimeDatabase(databasePath, migrateLocalDatabase)
+      : databasePath;
+    this.#ownsDatabase = typeof databasePath === "string";
+    const nestedOptions = options.migrate === undefined ? {} : { migrate: options.migrate };
+    this.#callbacks = new CallbackStore(this.#database, nestedOptions);
+    this.#runtime = new RuntimeStore(this.#database, nestedOptions);
+    this.#runBinding = options.runBinding;
   }
 
   public create(
-    definition: ContinuousSubscriptionDefinition,
+    definition: LegacyContinuousSubscriptionDefinition,
     at = new Date().toISOString()
   ): ContinuousSubscription {
     validateDefinition(definition);
@@ -99,6 +127,55 @@ export class ContinuousSubscriptionStore {
     return this.require(subscriptionId);
   }
 
+  public createBoundInTransaction(
+    input: BoundContinuousSubscriptionDefinition & { readonly subscriptionId: string },
+    at = new Date().toISOString()
+  ): ContinuousSubscription {
+    validateBoundDefinition(input);
+    const existing = this.boundForRun(input.sourceBinding.runId);
+    if (existing !== undefined) {
+      if (existing.definition.schemaVersion !== "ContinuousSubscriptionDefinition@2" ||
+        existing.definition.revision !== input.revision ||
+        boundedJson(existing.definition.sourceBinding, "source binding") !==
+          boundedJson(input.sourceBinding, "source binding")) {
+        throw new Error("Agent Run is already bound to another Continuous Subscription");
+      }
+      return existing;
+    }
+    requireLocalId(input.subscriptionId, "sub", "subscriptionId");
+    const timestamp = iso(at);
+    const nextPollAt = new Date(Date.parse(timestamp) + input.intervalMilliseconds)
+      .toISOString();
+    this.#database.prepare(`
+      INSERT INTO continuous_subscriptions (
+        subscription_id, title, owner_agent_id, current_revision, definition_schema,
+        plugin_path, plugin_id, plugin_config_json, policy_json, interval_ms,
+        poll_count, status, next_poll_at, external_ref_binding_json,
+        source_binding_json, agent_run_id, created_at, updated_at
+      ) VALUES (?, ?, NULL, ?, 'ContinuousSubscriptionDefinition@2', ?, ?, ?, ?, ?,
+        0, 'active', ?, ?, ?, ?, ?, ?)
+    `).run(
+      input.subscriptionId, input.title.trim(), input.revision,
+      input.probe.plugin.path, input.probe.plugin.id,
+      boundedJson(input.probe.plugin.config, "plugin config"),
+      boundedJson(input.probe.policy, "probe policy"),
+      input.intervalMilliseconds, nextPollAt,
+      encodeExternalRefTriggerBinding(input.externalRefBinding),
+      boundedJson(input.sourceBinding, "source binding"), input.sourceBinding.runId,
+      timestamp, timestamp
+    );
+    return this.require(input.subscriptionId);
+  }
+
+  public boundForRun(runId: string): ContinuousSubscription | undefined {
+    const row = this.#database.prepare(`
+      SELECT * FROM continuous_subscriptions
+      WHERE definition_schema = 'ContinuousSubscriptionDefinition@2'
+        AND agent_run_id = ?
+    `).get(runId) as Row | undefined;
+    return row === undefined ? undefined : this.#map(row);
+  }
+
   public require(subscriptionId: string): ContinuousSubscription {
     const subscription = this.get(subscriptionId);
     if (subscription === undefined) {
@@ -121,6 +198,25 @@ export class ContinuousSubscriptionStore {
       SELECT * FROM continuous_subscriptions
       ORDER BY created_at DESC, subscription_id LIMIT ?
     `).all(limit) as unknown as Row[]);
+  }
+
+  public setArchived(
+    subscriptionId: string,
+    archived: boolean,
+    at = new Date().toISOString()
+  ): ContinuousSubscription {
+    const current = this.require(subscriptionId);
+    if (current.status !== "cancelled") {
+      throw new Error(
+        `Continuous Subscription cannot ${archived ? "archive" : "unarchive"} ` +
+        `from ${current.status}`
+      );
+    }
+    if ((current.archivedAt !== undefined) === archived) return current;
+    this.#database.prepare(`
+      UPDATE continuous_subscriptions SET archived_at = ? WHERE subscription_id = ?
+    `).run(archived ? iso(at) : null, subscriptionId);
+    return this.require(subscriptionId);
   }
 
   public visibleCallbacks(
@@ -182,9 +278,10 @@ export class ContinuousSubscriptionStore {
   public recordObservation(
     subscriptionId: string,
     observation: PollObservation,
-    at = new Date().toISOString()
+    at = new Date().toISOString(),
+    freshnessEvidence: readonly string[] = []
   ): { readonly subscription: ContinuousSubscription; readonly delta: boolean } {
-    const occurrenceKey = text(observation.occurrenceKey, "observation.occurrenceKey", 1_024);
+    const occurrenceKey = text(observation.occurrenceKey, "observation.occurrenceKey", 512);
     const timestamp = iso(at);
     const observationJson = boundedJson(observation, "continuous observation");
     return withImmediateTransaction(this.#database, () => {
@@ -193,6 +290,13 @@ export class ContinuousSubscriptionStore {
       if (current.pendingOccurrenceKey !== undefined &&
         current.pendingOccurrenceKey !== occurrenceKey) {
         throw new Error("Continuous Subscription already has a pending occurrence");
+      }
+      if (current.pendingOccurrenceKey === occurrenceKey) {
+        if (boundedJson(current.pendingObservation, "pending observation") !==
+          observationJson) {
+          throw new Error("Continuous occurrence key is already bound to another observation");
+        }
+        return { subscription: current, delta: true };
       }
       const delta = current.checkpointOccurrenceKey !== occurrenceKey;
       if (!delta) {
@@ -206,11 +310,38 @@ export class ContinuousSubscriptionStore {
           SET pending_occurrence_key = ?, pending_observation_json = ?, updated_at = ?
           WHERE subscription_id = ? AND pending_occurrence_key IS NULL
         `).run(occurrenceKey, observationJson, timestamp, subscriptionId);
-        this.#callbacks.materializeInTransaction({
-          kind: "continuous_subscription",
-          id: subscriptionId,
-          revision: current.definition.revision
-        }, occurrenceKey, timestamp);
+        if (current.definition.schemaVersion === "ContinuousSubscriptionDefinition@2") {
+          if (this.#runBinding === undefined) {
+            throw new Error(
+              "ContinuousSubscriptionDefinition@2 Run binding adapter is unavailable"
+            );
+          }
+          const receipt = activateSubscriptionOccurrenceInTransaction({
+            adapter: this.#runBinding,
+            binding: current.definition.sourceBinding,
+            subscriptionId,
+            occurrenceKey,
+            observation,
+            freshnessEvidence: freshnessEvidence.length === 0
+              ? [`continuous-subscription-definition:${current.definition.revision}`]
+              : freshnessEvidence,
+            at: timestamp
+          });
+          this.#database.prepare(`
+            UPDATE continuous_subscriptions
+            SET pending_cycle_id = ?, pending_admission_receipt_json = ?, updated_at = ?
+            WHERE subscription_id = ? AND pending_occurrence_key = ?
+          `).run(
+            receipt.cycleId, JSON.stringify(receipt), timestamp,
+            subscriptionId, occurrenceKey
+          );
+        } else {
+          this.#callbacks.materializeInTransaction({
+            kind: "continuous_subscription",
+            id: subscriptionId,
+            revision: current.definition.revision
+          }, occurrenceKey, timestamp);
+        }
       }
       const result = this.require(subscriptionId);
       return { subscription: result, delta };
@@ -273,6 +404,81 @@ export class ContinuousSubscriptionStore {
       }
     });
     return finalized;
+  }
+
+  public reconcileBoundOccurrences(at = new Date().toISOString()): string[] {
+    if (this.#runBinding === undefined) return [];
+    const timestamp = iso(at);
+    const changed: string[] = [];
+    const candidates = this.#mapRows(this.#database.prepare(`
+      SELECT subscription.*
+      FROM continuous_subscriptions AS subscription
+      LEFT JOIN agent_runs AS run ON run.run_id = subscription.agent_run_id
+      WHERE subscription.definition_schema = 'ContinuousSubscriptionDefinition@2'
+        AND (
+          (subscription.pending_cycle_id IS NOT NULL AND subscription.status = 'active')
+          OR
+          (subscription.status IN ('active', 'paused')
+            AND run.status IN ('succeeded', 'failed', 'needs_human', 'cancelled'))
+        )
+      ORDER BY subscription.updated_at, subscription.subscription_id
+      LIMIT 100
+    `).all() as unknown as Row[]);
+    for (const subscription of candidates) {
+      const definition = subscription.definition as BoundContinuousSubscriptionDefinition;
+      const run = this.#runBinding.runState(subscription.agentRunId!);
+      if (run !== undefined && terminalRunStatus(run.status) &&
+        (subscription.status === "active" || subscription.status === "paused")) {
+        const action = definition.sourceBinding.cancellationPolicy === "cancel_source"
+          ? "cancel"
+          : subscription.status === "active"
+            ? "pause"
+            : undefined;
+        if (action !== undefined) {
+          this.setStatus(subscription.subscriptionId, action, timestamp);
+          changed.push(subscription.subscriptionId);
+        }
+        continue;
+      }
+      if (subscription.pendingCycleId === undefined) continue;
+      const cycle = this.#runBinding.cycleState(subscription.pendingCycleId);
+      if (cycle === undefined) {
+        const update = this.#database.prepare(`
+          UPDATE continuous_subscriptions
+          SET status = 'blocked', latest_error = 'run-cycle-missing', updated_at = ?
+          WHERE subscription_id = ? AND status = 'active' AND pending_cycle_id = ?
+        `).run(timestamp, subscription.subscriptionId, subscription.pendingCycleId);
+        if (update.changes === 1) changed.push(subscription.subscriptionId);
+        continue;
+      }
+      if (cycle.status === "active") continue;
+      if (cycle.status !== "succeeded") {
+        const update = this.#database.prepare(`
+          UPDATE continuous_subscriptions
+          SET status = 'blocked', latest_error = ?, updated_at = ?
+          WHERE subscription_id = ? AND status = 'active' AND pending_cycle_id = ?
+        `).run(
+          `run-cycle-${cycle.status}`, timestamp,
+          subscription.subscriptionId, subscription.pendingCycleId
+        );
+        if (update.changes === 1) changed.push(subscription.subscriptionId);
+        continue;
+      }
+      const update = this.#database.prepare(`
+        UPDATE continuous_subscriptions
+        SET checkpoint_occurrence_key = pending_occurrence_key,
+          checkpoint_observation_json = pending_observation_json,
+          pending_occurrence_key = NULL, pending_observation_json = NULL,
+          pending_cycle_id = NULL, pending_admission_receipt_json = NULL,
+          latest_error = NULL, next_poll_at = ?, updated_at = ?
+        WHERE subscription_id = ? AND status = 'active' AND pending_cycle_id = ?
+      `).run(
+        nextPoll(subscription, timestamp), timestamp,
+        subscription.subscriptionId, subscription.pendingCycleId
+      );
+      if (update.changes === 1) changed.push(subscription.subscriptionId);
+    }
+    return changed;
   }
 
   public recordPollFailure(subscriptionId: string, error: string, at: string): void {
@@ -351,7 +557,7 @@ export class ContinuousSubscriptionStore {
 
   public close(): void {
     this.#callbacks.close();
-    this.#database.close();
+    if (this.#ownsDatabase) this.#database.close();
   }
 
   #mapRows(rows: readonly Row[]): ContinuousSubscription[] {
@@ -376,26 +582,56 @@ export class ContinuousSubscriptionStore {
     })
   ): ContinuousSubscription {
     const externalRefBinding = decodeExternalRefTriggerBinding(row.external_ref_binding_json);
+    const sourceBinding = row.source_binding_json === null
+      ? undefined
+      : parseRunSourceBinding(JSON.parse(row.source_binding_json) as unknown);
+    const pendingAdmissionReceipt = row.pending_admission_receipt_json === null
+      ? undefined
+      : parseSubscriptionOccurrenceAdmissionReceipt(
+          JSON.parse(row.pending_admission_receipt_json) as unknown
+        );
+    const definition: ContinuousSubscriptionDefinition = row.definition_schema ===
+      "ContinuousSubscriptionDefinition@1"
+      ? {
+          schemaVersion: "ContinuousSubscriptionDefinition@1",
+          revision: row.current_revision,
+          title: row.title,
+          ownerAgentId: row.owner_agent_id!,
+          probe: {
+            plugin: {
+              path: row.plugin_path,
+              id: row.plugin_id,
+              config: JSON.parse(row.plugin_config_json) as unknown
+            },
+            policy: JSON.parse(row.policy_json) as
+              LegacyContinuousSubscriptionDefinition["probe"]["policy"]
+          },
+          intervalMilliseconds: row.interval_ms,
+          callbacks,
+          ...(externalRefBinding === undefined ? {} : { externalRefBinding })
+        }
+      : {
+          schemaVersion: "ContinuousSubscriptionDefinition@2",
+          revision: row.current_revision,
+          title: row.title,
+          probe: {
+            plugin: {
+              path: row.plugin_path,
+              id: row.plugin_id,
+              config: JSON.parse(row.plugin_config_json) as unknown
+            },
+            policy: JSON.parse(row.policy_json) as
+              BoundContinuousSubscriptionDefinition["probe"]["policy"]
+          },
+          intervalMilliseconds: row.interval_ms,
+          sourceBinding: sourceBinding!,
+          ...(externalRefBinding === undefined ? {} : { externalRefBinding })
+        };
     return {
       subscriptionId: row.subscription_id,
-      definition: {
-        schemaVersion: "ContinuousSubscriptionDefinition@1",
-        revision: row.current_revision,
-        title: row.title,
-        ownerAgentId: row.owner_agent_id,
-        probe: {
-          plugin: {
-            path: row.plugin_path,
-            id: row.plugin_id,
-            config: JSON.parse(row.plugin_config_json) as unknown
-          },
-          policy: JSON.parse(row.policy_json) as ContinuousSubscriptionDefinition["probe"]["policy"]
-        },
-        intervalMilliseconds: row.interval_ms,
-        callbacks,
-        ...(externalRefBinding === undefined ? {} : { externalRefBinding })
-      },
+      definition,
       status: row.status,
+      ...(row.archived_at === null ? {} : { archivedAt: row.archived_at }),
       pollCount: row.poll_count,
       nextPollAt: row.next_poll_at,
       ...(row.checkpoint_occurrence_key === null
@@ -410,6 +646,9 @@ export class ContinuousSubscriptionStore {
       ...(row.pending_observation_json === null
         ? {}
         : { pendingObservation: JSON.parse(row.pending_observation_json) as PollObservation }),
+      ...(row.agent_run_id === null ? {} : { agentRunId: row.agent_run_id }),
+      ...(row.pending_cycle_id === null ? {} : { pendingCycleId: row.pending_cycle_id }),
+      ...(pendingAdmissionReceipt === undefined ? {} : { pendingAdmissionReceipt }),
       ...(row.latest_error === null ? {} : { latestError: row.latest_error }),
       createdAt: row.created_at,
       updatedAt: row.updated_at
@@ -432,18 +671,38 @@ function validateDefinition(definition: ContinuousSubscriptionDefinition): void 
   if (definition.schemaVersion !== "ContinuousSubscriptionDefinition@1") {
     throw new Error("continuous subscription schema is unsupported");
   }
+  validateDefinitionBase(definition);
+  requireLocalId(definition.ownerAgentId, "prn", "ownerAgentId");
+  if (definition.callbacks.length === 0) throw new Error("callbacks must not be empty");
+}
+
+function validateBoundDefinition(
+  definition: BoundContinuousSubscriptionDefinition & { readonly subscriptionId: string }
+): void {
+  if (definition.schemaVersion !== "ContinuousSubscriptionDefinition@2") {
+    throw new Error("ContinuousSubscriptionDefinition@2 schemaVersion is required");
+  }
+  validateDefinitionBase(definition);
+  const binding = parseRunSourceBinding(definition.sourceBinding);
+  if (binding.source.kind !== "continuous_subscription" ||
+    binding.source.id !== definition.subscriptionId ||
+    binding.source.definitionRevision !==
+      `ContinuousSubscriptionDefinition@2:${definition.revision}`) {
+    throw new Error("ContinuousSubscriptionDefinition@2 source binding is inconsistent");
+  }
+}
+
+function validateDefinitionBase(definition: ContinuousSubscriptionDefinition): void {
   if (!Number.isInteger(definition.revision) || definition.revision < 1) {
     throw new Error("continuous subscription revision must be positive");
   }
   text(definition.title, "title", 120);
-  requireLocalId(definition.ownerAgentId, "prn", "ownerAgentId");
   text(definition.probe.plugin.path, "plugin path", 4_096);
   text(definition.probe.plugin.id, "plugin id", 256);
   if (!Number.isInteger(definition.intervalMilliseconds) ||
     definition.intervalMilliseconds < 100 || definition.intervalMilliseconds > 86_400_000) {
     throw new Error("intervalMilliseconds must be between 100 and 86400000");
   }
-  if (definition.callbacks.length === 0) throw new Error("callbacks must not be empty");
   if (definition.externalRefBinding !== undefined) {
     parseExternalRefTriggerBinding(definition.externalRefBinding);
   }

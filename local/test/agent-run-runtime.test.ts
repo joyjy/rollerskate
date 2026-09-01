@@ -21,6 +21,11 @@ import {
   ResultHandler,
   type RuntimeAgentAdapter
 } from "../src/core/runtime/handlers.js";
+import {
+  AgentInvocationError,
+  type AgentInvocationFailure,
+  type AgentInvocationProgress
+} from "../src/core/runtime/agent-invocation.js";
 import type { RuntimeExecution } from "../src/core/runtime/model.js";
 import { RuntimeStore } from "../src/core/runtime/store.js";
 import { runtimePaths } from "../src/infrastructure/runtime/config.js";
@@ -661,6 +666,46 @@ test("startup recovery emits one adjudication request without replaying interrup
   }
 });
 
+test("Runtime exposes bounded in-flight progress without persisting streamed payloads", () => {
+  const fixture = setup();
+  const harness = runtimeHarness(fixture, new Map());
+  try {
+    const started = startStewardRun(fixture.repo, {
+      requestId: "bounded-in-flight-progress",
+      steward: "a",
+      objective: "observe one bounded provider turn"
+    }, fixture.runtimeDirectory, "2026-08-13T04:22:00.000Z");
+    const execution = claim(harness.runtime, "agent", "2026-08-13T04:22:01.000Z");
+    harness.runtime.recordAgentInvocationProgress(execution.executionId, {
+      schemaVersion: "AgentInvocationProgress@1",
+      adapterId: "fixture-progress",
+      workspace: fixture.workspace,
+      workspaceAccess: "read",
+      providerSessionId: "fixture-provider-session",
+      startedAt: "2026-08-13T04:22:01.000Z",
+      observedAt: "2026-08-13T04:22:02.000Z",
+      lastMeaningfulAt: "2026-08-13T04:22:02.000Z",
+      phase: "streaming",
+      updateCount: 4,
+      meaningfulUpdateCount: 3,
+      lastProgress: { kind: "thought" },
+      rawPayload: "streamed payload"
+    } as AgentInvocationProgress);
+
+    const audit = harness.runtime.audit(started.rootEventId)!;
+    assert.equal(audit.invocationProgress?.providerSessionId, "fixture-provider-session");
+    assert.deepEqual(audit.invocationProgress?.lastProgress, { kind: "thought" });
+    assert.equal(
+      (harness.runtime.executionReceiptJson(execution.executionId) ?? "")
+        .includes("streamed payload"),
+      false
+    );
+  } finally {
+    harness.close();
+    fixture.close();
+  }
+});
+
 test("only one evidence-backed adjudication can authorize one Agent turn retry", async () => {
   const fixture = setup();
   const agent = scriptedAgent(fixture.workspace, "retry-provider", [
@@ -703,6 +748,121 @@ test("only one evidence-backed adjudication can authorize one Agent turn retry",
     ]);
     assert.equal(requests.every((event) =>
       harness.runtime.executionForEvent(event.eventId)?.maxAttempts === 1), true);
+  } finally {
+    harness.close();
+    fixture.close();
+  }
+});
+
+test("an explicit adjudication retry resumes the exact failed read-only provider Session", async () => {
+  const fixture = setup();
+  const steward = scriptedAgent(fixture.workspace, "recovery-steward", [
+    delegate(fixture.agentIds.b, "perform one read-only provider turn"),
+    adjudicationRetry(),
+    complete("recovered child completed")
+  ]);
+  const worker = scriptedAgent(fixture.workspace, "recovery-worker", [
+    timeoutFailure({
+      adapterId: "scripted-recovery-worker",
+      workspace: fixture.workspace,
+      workspaceAccess: "read",
+      providerSessionId: "failed-read-session"
+    }),
+    complete("read-only retry completed")
+  ]);
+  const harness = runtimeHarness(fixture, new Map([
+    [fixture.agentIds.a, steward.adapter],
+    [fixture.agentIds.b, worker.adapter]
+  ]));
+  try {
+    const started = startStewardRun(fixture.repo, {
+      requestId: "explicit-read-resume",
+      steward: "a",
+      objective: "delegate one read-only turn"
+    }, fixture.runtimeDirectory, "2026-08-13T04:35:00.000Z");
+
+    await harness.agent("2026-08-13T04:35:01.000Z");
+    harness.result("2026-08-13T04:35:02.000Z");
+    await harness.agent("2026-08-13T04:35:03.000Z");
+    const childRequest = harness.runtime.eventsForRoot(started.rootEventId)
+      .find((event) => event.type === "agent.request" && event.agentId === fixture.agentIds.b)!;
+    const failureAudit = harness.runtime.audit(childRequest.eventId)!;
+    assert.equal(failureAudit.resultEvent?.outcome, "failed");
+    assert.equal(failureAudit.invocationFailure?.reason, "deadline");
+    assert.equal(failureAudit.invocationFailure?.providerSessionId, "failed-read-session");
+    assert.equal(failureAudit.invocationFailure?.lastProgress?.kind, "tool");
+    assert.equal(JSON.stringify(failureAudit.invocationFailure).includes("raw tool payload"), false);
+
+    harness.result("2026-08-13T04:35:04.000Z");
+    const adjudicationRequest = harness.runtime.eventsForRoot(started.rootEventId)
+      .find((event) => event.type === "agent.request" &&
+        event.runContext?.resultContractId === "agent-turn-adjudication@1");
+    const adjudicationPrompt = adjudicationRequest?.type === "agent.request"
+      ? adjudicationRequest.prompt
+      : "";
+    assert.match(adjudicationPrompt, /"reason": "deadline"/u);
+    assert.match(adjudicationPrompt, /"recovery": "explicit_read_only_resume"/u);
+    assert.equal(adjudicationPrompt.includes("raw tool payload"), false);
+    await harness.agent("2026-08-13T04:35:05.000Z");
+    harness.result("2026-08-13T04:35:06.000Z");
+    await harness.agent("2026-08-13T04:35:07.000Z");
+    harness.result("2026-08-13T04:35:08.000Z");
+    await harness.agent("2026-08-13T04:35:09.000Z");
+    harness.result("2026-08-13T04:35:10.000Z");
+
+    assert.equal(harness.runs.requireProjection(started.run.runId).status, "succeeded");
+    assert.deepEqual(worker.providerSessions, [undefined, "failed-read-session"]);
+  } finally {
+    harness.close();
+    fixture.close();
+  }
+});
+
+test("a timed-out write turn remains unknown outcome and cannot be replayed", async () => {
+  const fixture = setup();
+  execFileSync("git", ["init", fixture.workspace]);
+  execFileSync("git", ["-C", fixture.workspace, "-c", "user.name=Test", "-c",
+    "user.email=test@example.com", "commit", "--allow-empty", "-m", "fixture"]);
+  const steward = scriptedAgent(fixture.workspace, "write-steward", [
+    delegate(fixture.agentIds.b, "perform one write-capable provider turn"),
+    adjudicationRetry()
+  ]);
+  const worker = scriptedAgent(fixture.workspace, "write-worker", [
+    timeoutFailure({
+      adapterId: "scripted-write-worker",
+      workspace: fixture.workspace,
+      workspaceAccess: "write",
+      providerSessionId: "failed-write-session"
+    }),
+    complete("must never replay")
+  ]);
+  const harness = runtimeHarness(fixture, new Map([
+    [fixture.agentIds.a, steward.adapter],
+    [fixture.agentIds.b, worker.adapter]
+  ]));
+  try {
+    const started = startStewardRun(fixture.repo, {
+      requestId: "write-timeout-no-replay",
+      steward: "a",
+      objective: "delegate one write-capable turn",
+      workspace: {
+        root: fixture.workspace,
+        access: "write",
+        effect: "may_remain_unchanged"
+      }
+    }, fixture.runtimeDirectory, "2026-08-13T04:36:00.000Z");
+
+    await harness.agent("2026-08-13T04:36:01.000Z");
+    harness.result("2026-08-13T04:36:02.000Z");
+    await harness.agent("2026-08-13T04:36:03.000Z");
+    harness.result("2026-08-13T04:36:04.000Z");
+    await harness.agent("2026-08-13T04:36:05.000Z");
+    harness.result("2026-08-13T04:36:06.000Z");
+
+    const run = harness.runs.requireProjection(started.run.runId);
+    assert.equal(run.status, "needs_human");
+    assert.match(run.terminalSummary ?? "", /unknown outcome.*cannot be replayed/);
+    assert.deepEqual(worker.providerSessions, [undefined]);
   } finally {
     harness.close();
     fixture.close();
@@ -946,6 +1106,38 @@ function scriptedAgent(
       }
     }
   };
+}
+
+function timeoutFailure(input: {
+  readonly adapterId: string;
+  readonly workspace: string;
+  readonly workspaceAccess: "read" | "write";
+  readonly providerSessionId: string;
+}): AgentInvocationError {
+  const failure = {
+    schemaVersion: "AgentInvocationFailure@1",
+    adapterId: input.adapterId,
+    workspace: input.workspace,
+    workspaceAccess: input.workspaceAccess,
+    providerSessionId: input.providerSessionId,
+    startedAt: "2026-08-13T04:35:03.000Z",
+    observedAt: "2026-08-13T04:35:04.000Z",
+    lastMeaningfulAt: "2026-08-13T04:35:03.500Z",
+    phase: "cancelling",
+    updateCount: 3,
+    meaningfulUpdateCount: 2,
+    lastProgress: { kind: "tool" },
+    failedAt: "2026-08-13T04:35:04.000Z",
+    reason: "deadline",
+    totalTimeoutMilliseconds: 300_000,
+    meaningfulOutputTimeoutMilliseconds: 120_000,
+    protocolStop: "requested",
+    recovery: input.workspaceAccess === "write"
+      ? "unknown_outcome_no_replay"
+      : "explicit_read_only_resume",
+    rawPayload: "raw tool payload"
+  } as AgentInvocationFailure;
+  return new AgentInvocationError("agent invocation timed out", failure);
 }
 
 function delegate(targetAgentId: string, objective: string): string {

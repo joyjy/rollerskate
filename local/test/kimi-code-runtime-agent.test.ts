@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import type { AgentInputEvent, ChatDispatchEvent } from "../src/core/event/model.js";
+import { AgentInvocationError } from "../src/core/runtime/agent-invocation.js";
 import { KimiCodeRuntimeAgent } from "../src/integrations/agent/kimi-code.js";
 import { providerPolicyObservationFromArgv } from
   "../src/integrations/agent/provider-policy.js";
@@ -155,14 +156,100 @@ test("Kimi Code stalls when ACP emits only non-meaningful updates", async () => 
     executable: fixture.executable,
     projectRoot: fixture.workspace,
     environment: {},
+    timeoutMilliseconds: 1_500,
+    meaningfulOutputTimeoutMilliseconds: 500
+  });
+
+  await assert.rejects(agent.invoke({ event: runEvent() }), (error: unknown) => {
+    assert.equal(error instanceof AgentInvocationError, true);
+    assert.equal((error as AgentInvocationError).failure.reason, "stall");
+    return true;
+  });
+  assert.equal(methodCount(invocation(fixture.invocation).messages, "session/cancel"), 1);
+});
+
+test("Kimi Code honors an explicit Run deadline without extending it for progress", async () => {
+  const fixture = kimiFixture({ meaningfulForever: true });
+  const agent = new KimiCodeRuntimeAgent({
+    executable: fixture.executable,
+    projectRoot: fixture.workspace,
+    environment: {},
     timeoutMilliseconds: 1_000,
-    meaningfulOutputTimeoutMilliseconds: 50
+    meaningfulOutputTimeoutMilliseconds: 500
+  });
+  const progress: unknown[] = [];
+
+  await assert.rejects(
+    agent.invoke({
+      event: runEvent(undefined, "read", 500),
+      reportProgress: (update) => progress.push(update)
+    }),
+    (error: unknown) => {
+      assert.equal(error instanceof AgentInvocationError, true);
+      const failure = (error as AgentInvocationError).failure;
+      assert.equal(failure.reason, "deadline");
+      assert.equal(failure.totalTimeoutMilliseconds, 500);
+      assert.equal(failure.recovery, "explicit_read_only_resume");
+      assert.equal(failure.providerSessionId,
+        "rollerskate-kimi-session-v1:read:session_fixture");
+      assert.deepEqual(failure.lastProgress, { kind: "thought" });
+      assert.equal(JSON.stringify(failure).includes("thinking fixture"), false);
+      return true;
+    }
+  );
+  assert.equal(progress.length > 1, true);
+  assert.equal(methodCount(invocation(fixture.invocation).messages, "session/cancel"), 1);
+});
+
+test("Kimi Code rejects malformed or out-of-range Run deadlines", async () => {
+  const fixture = kimiFixture({ toolKind: "read" });
+  const agent = new KimiCodeRuntimeAgent({
+    executable: fixture.executable,
+    projectRoot: fixture.workspace,
+    environment: {},
+    timeoutMilliseconds: 1_000
   });
 
   await assert.rejects(
-    agent.invoke({ event: runEvent() }),
-    /stalled without meaningful output/
+    agent.invoke({ event: runEvent(undefined, "read", 1.5) }),
+    /integer between 1 and 900000/
   );
+  await assert.rejects(
+    agent.invoke({ event: runEvent(undefined, "read", 900_001) }),
+    /integer between 1 and 900000/
+  );
+});
+
+test("Kimi Code distinguishes provider cancellation from protocol exit", async () => {
+  const cancelledFixture = kimiFixture({ cancelled: true });
+  const cancelledAgent = new KimiCodeRuntimeAgent({
+    executable: cancelledFixture.executable,
+    projectRoot: cancelledFixture.workspace,
+    environment: {},
+    timeoutMilliseconds: 5_000
+  });
+  await assert.rejects(cancelledAgent.invoke({ event: runEvent() }), (error: unknown) => {
+    assert.equal(error instanceof AgentInvocationError, true);
+    assert.equal((error as AgentInvocationError).failure.reason, "cancelled");
+    assert.equal((error as AgentInvocationError).failure.protocolStop, "acknowledged");
+    return true;
+  });
+
+  const exitedFixture = kimiFixture({ exitBeforeSettlement: true });
+  const exitedAgent = new KimiCodeRuntimeAgent({
+    executable: exitedFixture.executable,
+    projectRoot: exitedFixture.workspace,
+    environment: {},
+    timeoutMilliseconds: 5_000
+  });
+  await assert.rejects(exitedAgent.invoke({ event: runEvent() }), (error: unknown) => {
+    assert.equal(error instanceof AgentInvocationError, true);
+    const failure = (error as AgentInvocationError).failure;
+    assert.equal(failure.reason, "protocol_exit");
+    assert.equal(failure.phase, "terminated");
+    assert.equal(failure.protocolStop, "unavailable");
+    return true;
+  });
 });
 
 test("Kimi ACP policy fingerprint covers both bundled prompt policies", () => {
@@ -208,6 +295,9 @@ function kimiFixture(options: {
   readonly oversizedTraceBytes?: number;
   readonly multipleMessages?: boolean;
   readonly stall?: boolean;
+  readonly meaningfulForever?: boolean;
+  readonly cancelled?: boolean;
+  readonly exitBeforeSettlement?: boolean;
 }): { readonly workspace: string; readonly executable: string; readonly invocation: string } {
   const workspace = mkdtempSync(join(tmpdir(), "rollerskate-kimi-acp-"));
   const executable = join(workspace, "kimi-fixture");
@@ -256,7 +346,7 @@ process.stdin.on("data", (chunk) => {
     }
     if (message.method === "session/prompt") {
       promptRequest = message;
-      ${options.stall === true ? `setInterval(() => update({ sessionUpdate: "session_info_update", title: "noise" }), 5);` : `
+      ${options.cancelled === true ? `send({ jsonrpc: "2.0", id: promptRequest.id, result: { stopReason: "cancelled" } });` : options.exitBeforeSettlement === true ? `process.exit(143);` : options.stall === true ? `setInterval(() => update({ sessionUpdate: "session_info_update", title: "noise" }), 5);` : options.meaningfulForever === true ? `setInterval(() => update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "thinking fixture" } }), 5);` : `
       update({ sessionUpdate: "tool_call", toolCallId: "tool_1", title: "Read fixture", kind: ${JSON.stringify(options.toolKind ?? "read")}, status: "pending"${options.oversizedTraceBytes === undefined ? "" : `, rawInput: "x".repeat(${options.oversizedTraceBytes})`} });
       send({ jsonrpc: "2.0", id: "permission", method: "session/request_permission", params: {
         sessionId: "session_fixture",
@@ -267,6 +357,7 @@ process.stdin.on("data", (chunk) => {
         ]
       }});`}
     }
+    if (message.method === "session/cancel") process.exit(0);
     if (message.id === "permission" && message.result) completePrompt();
   }
 });
@@ -302,7 +393,11 @@ function permissionOutcome(messages: readonly Record<string, unknown>[]): string
     ?.outcome?.optionId;
 }
 
-function runEvent(workspace?: string, access: "read" | "write" = "write"): AgentInputEvent {
+function runEvent(
+  workspace?: string,
+  access: "read" | "write" = "write",
+  totalTimeoutMilliseconds?: number
+): AgentInputEvent {
   const eventId = "evt_019f92c9-0000-7000-8000-000000000011";
   return {
     eventId,
@@ -312,19 +407,27 @@ function runEvent(workspace?: string, access: "read" | "write" = "write"): Agent
     destinationIds: [],
     causality: { rootEventId: eventId, hop: 0 },
     prompt: "use Kimi",
-    ...(workspace === undefined ? {} : {
+    ...(workspace === undefined && totalTimeoutMilliseconds === undefined ? {} : {
       runContext: {
         schemaVersion: "AgentRunContext@1",
         resultContractId: "agent-turn-result@1",
         runId: "run_019f92c9-0000-7000-8000-000000000011",
         stepId: "stp_019f92c9-0000-7000-8000-000000000011",
         depth: 0,
-        workspaceGrant: {
-          schemaVersion: "ExternalWorkspaceGrant@1",
-          root: workspace,
-          access,
-          revision: "wrk1_initial"
-        }
+        ...(totalTimeoutMilliseconds === undefined ? {} : {
+          invocationBudget: {
+            schemaVersion: "AgentInvocationBudget@1" as const,
+            totalTimeoutMilliseconds
+          }
+        }),
+        ...(workspace === undefined ? {} : {
+          workspaceGrant: {
+            schemaVersion: "ExternalWorkspaceGrant@1" as const,
+            root: workspace,
+            access,
+            revision: "wrk1_initial"
+          }
+        })
       }
     }),
     createdAt: "2026-07-25T00:00:00.000Z"

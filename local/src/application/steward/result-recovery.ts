@@ -1,4 +1,7 @@
-import type { AgentInvocationDiagnostics } from
+import type {
+  AgentInvocationDiagnostics,
+  AgentInvocationFailure
+} from
   "../../core/runtime/agent-invocation.js";
 import type {
   AgentRequestEvent,
@@ -84,7 +87,8 @@ export function requestAgentTurnAdjudicationInTransaction(input: {
       terminalEvidence: terminalEvidence(
         input.result,
         originalAudit?.execution,
-        originalAudit?.invocation
+        originalAudit?.invocation,
+        originalAudit?.invocationFailure
       ),
       ...(input.run.workspaceGrant === undefined || input.observedWorkspace === undefined
         ? {}
@@ -228,8 +232,17 @@ class AgentTurnAdjudicationContinuation implements RuntimeAgentResultContinuatio
         return;
       }
       const retrySessionId = original.result.sessionId ??
-        (request.agentId === original.request.agentId ? result.sessionId : undefined) ??
-        original.request.sessionId;
+        original.request.sessionId ??
+        (() => {
+          const originalExecution = this.#runtime.executionForEvent(original.request.eventId);
+          return originalExecution === undefined
+            ? undefined
+            : this.#runtime.recoverReadOnlySessionInTransaction(
+                originalExecution.executionId,
+                at
+              )?.sessionId;
+        })() ??
+        (request.agentId === original.request.agentId ? result.sessionId : undefined);
       const retry = this.#runtime.appendEventInTransaction({
         type: "agent.request",
         source: {
@@ -422,7 +435,8 @@ function normalizedTurnResultEvent(
 function terminalEvidence(
   result: AgentResultEvent,
   execution: RuntimeExecution | undefined,
-  invocation: AgentInvocationDiagnostics | undefined
+  invocation: AgentInvocationDiagnostics | undefined,
+  invocationFailure: AgentInvocationFailure | undefined
 ): Readonly<Record<string, unknown>> {
   const output = result.output ?? "";
   return {
@@ -456,6 +470,28 @@ function terminalEvidence(
             ...(invocation.turnCount === undefined
               ? {}
               : { turnCount: invocation.turnCount })
+          }
+        }),
+    ...(invocationFailure === undefined
+      ? {}
+      : {
+          invocationFailure: {
+            reason: invocationFailure.reason,
+            startedAt: invocationFailure.startedAt,
+            failedAt: invocationFailure.failedAt,
+            lastMeaningfulAt: invocationFailure.lastMeaningfulAt,
+            phase: invocationFailure.phase,
+            updateCount: invocationFailure.updateCount,
+            meaningfulUpdateCount: invocationFailure.meaningfulUpdateCount,
+            ...(invocationFailure.lastProgress === undefined
+              ? {}
+              : { lastProgress: invocationFailure.lastProgress }),
+            totalTimeoutMilliseconds: invocationFailure.totalTimeoutMilliseconds,
+            meaningfulOutputTimeoutMilliseconds:
+              invocationFailure.meaningfulOutputTimeoutMilliseconds,
+            protocolStop: invocationFailure.protocolStop,
+            recovery: invocationFailure.recovery,
+            providerSessionAvailable: invocationFailure.providerSessionId !== undefined
           }
         })
   };
@@ -500,6 +536,10 @@ function retrySafetyBlocker(
   runtime: RuntimeStore
 ): string | undefined {
   const grant = originalRequest.runContext?.workspaceGrant;
+  const failure = runtime.audit(originalRequest.eventId)?.invocationFailure;
+  if (failure?.recovery === "unknown_outcome_no_replay") {
+    return "the timed-out write-capable turn has an unknown outcome and cannot be replayed";
+  }
   if (grant?.networkAccess === true) {
     return "the original turn had external network authority";
   }

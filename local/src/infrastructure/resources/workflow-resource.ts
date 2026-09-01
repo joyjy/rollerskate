@@ -1,13 +1,20 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 
 import type {
   RunMandateSnapshot,
   WorkflowRunMandateSnapshot
 } from "../../modules/steward/state-machine.js";
+import {
+  parseSpecRef,
+  resolveSpecToken,
+  verifySpecArtifact
+} from "../../modules/spec/registry.js";
 
 const MAX_OBJECTIVE = 16_384;
 const MAX_INPUT_BYTES = 32_768;
 const MAX_RENDERED_INSTRUCTION = 65_536;
+const MAX_INVOCATION_TIMEOUT_MILLISECONDS = 900_000;
 
 export function inlineMandateSnapshot(objectiveInput: string): RunMandateSnapshot {
   const objective = text(objectiveInput, "objective", MAX_OBJECTIVE);
@@ -31,14 +38,18 @@ export function workflowMandateSnapshot(
   inputsInput: Readonly<Record<string, unknown>>
 ): WorkflowRunMandateSnapshot {
   const workflowRef = text(workflowRefInput, "workflowRef", 256);
-  const match = /^([a-z][a-z0-9-]{0,63})@([1-9][0-9]{0,5})$/.exec(workflowRef);
-  if (match === null) throw new Error("workflowRef must use <id>@<version>");
-  const workflowId = match[1]!;
-  const workflowVersion = Number(match[2]);
+  const entry = resolveSpecToken(workflowRef, { kind: "workflow" });
+  const identity = parseSpecRef(entry.ref);
+  const workflowId = identity.name;
+  const workflowVersion = identity.major;
   const inputs = boundedInputs(inputsInput);
   const source = readFileSync(
     new URL(`../../../resources/workflows/${workflowId}.md`, import.meta.url),
     "utf8"
+  );
+  verifySpecArtifact(
+    entry.ref,
+    `sha256:${createHash("sha256").update(source).digest("hex")}`
   );
   const { metadata, body } = frontmatter(source);
   if (metadata.type !== "Workflow" ||
@@ -56,6 +67,7 @@ export function workflowMandateSnapshot(
   if (renderedInstruction.length > MAX_RENDERED_INSTRUCTION) {
     throw new Error(`Workflow ${workflowRef} exceeds rendered instruction budget`);
   }
+  const invocationBudget = workflowInvocationBudget(metadata);
   return {
     schemaVersion: "RunMandateSnapshot@1",
     kind: "workflow",
@@ -63,7 +75,30 @@ export function workflowMandateSnapshot(
     workflowId,
     workflowVersion,
     inputs,
-    renderedInstruction
+    renderedInstruction,
+    ...(invocationBudget === undefined ? {} : { invocationBudget })
+  };
+}
+
+export function workflowInvocationBudget(
+  metadata: Readonly<Record<string, string>>
+): { readonly schemaVersion: "AgentInvocationBudget@1"; readonly totalTimeoutMilliseconds: number } |
+  undefined {
+  const raw = metadata["invocation-timeout-milliseconds"];
+  if (raw === undefined) return undefined;
+  if (!/^[1-9][0-9]*$/u.test(raw)) {
+    throw new Error("Workflow invocation-timeout-milliseconds must be an integer");
+  }
+  const totalTimeoutMilliseconds = Number(raw);
+  if (!Number.isSafeInteger(totalTimeoutMilliseconds) ||
+    totalTimeoutMilliseconds > MAX_INVOCATION_TIMEOUT_MILLISECONDS) {
+    throw new Error(
+      "Workflow invocation-timeout-milliseconds must be between 1 and 900000"
+    );
+  }
+  return {
+    schemaVersion: "AgentInvocationBudget@1",
+    totalTimeoutMilliseconds
   };
 }
 

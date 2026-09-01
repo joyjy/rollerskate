@@ -12,11 +12,13 @@ import { fileURLToPath } from "node:url";
 
 import { listRuntimeFailures } from "../src/application/runtime/failure-query.js";
 import {
-  createSchedule,
-  runScheduleNow
+  createSchedule
 } from "../src/application/schedule/control.js";
-import { listScheduleViews } from "../src/application/schedule/query.js";
-import { startStewardRun } from "../src/application/steward/control.js";
+import { pageScheduleViews } from "../src/application/schedule/query.js";
+import {
+  cancelStewardRun,
+  startStewardRun
+} from "../src/application/steward/control.js";
 import { latestStewardRunView } from "../src/application/steward/query.js";
 import { ScheduledTaskStore } from "../src/capabilities/scheduled-task/store.js";
 import { startUiServer } from "../src/entrypoints/console/launcher.js";
@@ -47,6 +49,7 @@ test("Steward and Schedule Console controls remain guarded", async () => {
 
     const foundation = new LocalFoundationStore(paths.database);
     foundation.addAgent("scheduler", "codex", "2026-07-25T00:00:00.000Z");
+    foundation.addAgent("codex", "codex", "2026-07-25T00:00:00.000Z");
     foundation.addAgent("steward", "codex", "2026-07-25T00:00:00.000Z");
     foundation.addAgent("reviewer", "codex", "2026-07-25T00:00:00.000Z");
     foundation.addAgent("implementer", "codex", "2026-07-25T00:00:00.000Z");
@@ -72,14 +75,28 @@ test("Steward and Schedule Console controls remain guarded", async () => {
       prompt: "Run fixture"
     }, runtimeDirectory, "2026-07-25T00:02:00.000Z");
     const scheduleId = schedule.schedule.definition.scheduleId;
-    const run = runScheduleNow(
-      repo,
-      scheduleId,
-      "operations-ui-run",
-      runtimeDirectory,
-      "2026-07-25T00:03:00.000Z"
-    ).run;
+    for (let index = 0; index < 21; index += 1) {
+      createSchedule(repo, {
+        agent: "scheduler",
+        kind: "once",
+        expression: `2099-08-${String(index + 1).padStart(2, "0")}T01:00:00.000Z`,
+        misfirePolicy: "run_once",
+        overlapPolicy: "queue",
+        misfireGraceMilliseconds: 60_000,
+        sessionPolicy: "new_each_run",
+        prompt: `Paged fixture ${index}`
+      }, runtimeDirectory, `2026-07-25T00:00:${String(index).padStart(2, "0")}.000Z`);
+    }
     const schedules = new ScheduledTaskStore(paths.database);
+    const run = schedules.insertRun({
+      scheduleId,
+      occurrenceKey: "manual:legacy-diagnostics",
+      scheduledFor: "2026-07-25T00:03:00.000Z",
+      scheduleRevision: schedule.schedule.definition.currentRevision,
+      status: "queued",
+      decisionReason: "legacy-diagnostics-fixture",
+      createdAt: "2026-07-25T00:03:00.000Z"
+    }).run;
     schedules.patchRun(run.runId, {
       status: "unknown",
       decisionReason: "provider-outcome-unknown"
@@ -108,6 +125,30 @@ test("Steward and Schedule Console controls remain guarded", async () => {
       assert.equal((await runResponse.json() as {
         summary: { runId: string; status: string };
       }).summary.runId, agentRun.run.runId);
+      cancelStewardRun(repo, agentRun.run.runId, runtimeDirectory);
+      const rejectedArchive = await fetch(
+        `${origin}/api/runs/${agentRun.run.runId}/archive`,
+        { method: "POST" }
+      );
+      assert.equal(rejectedArchive.status, 403);
+      const archived = await fetch(
+        `${origin}/api/runs/${agentRun.run.runId}/archive`,
+        {
+          method: "POST",
+          headers: { "X-Rollerskate-Request": "console" }
+        }
+      );
+      assert.equal(archived.status, 200);
+      assert.equal((await archived.json() as { status: string }).status, "archived");
+      assert.deepEqual(await (await fetch(`${origin}/api/runs`)).json(), {
+        items: [], total: 0, page: 1, pageSize: 20
+      });
+      assert.equal((await (await fetch(
+        `${origin}/api/runs?archive=archived`
+      )).json() as { items: Array<{ runId: string }> }).items[0]?.runId, agentRun.run.runId);
+      assert.equal((await (await fetch(
+        `${origin}/api/runs?archive=archived&q=${encodeURIComponent("acceptance.md")}`
+      )).json() as { total: number }).total, 1);
       const rejectedCallerAuthority = await fetch(`${origin}/api/runs`, {
         method: "POST",
         headers: {
@@ -122,6 +163,25 @@ test("Steward and Schedule Console controls remain guarded", async () => {
         })
       });
       assert.equal(rejectedCallerAuthority.status, 400);
+      const admittedIntent = await fetch(`${origin}/api/runs`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Rollerskate-Request": "console"
+        },
+        body: JSON.stringify({
+          schemaVersion: "RunIntent@1",
+          requestId: "operations-ui-intent",
+          objective: "Inspect the Console admission boundary",
+          acceptance: ["Return exact evidence"],
+          contextRefs: ["console:test"],
+          terminalEvidence: ["Run receipt"]
+        })
+      });
+      assert.equal(admittedIntent.status, 200);
+      assert.equal((await admittedIntent.json() as {
+        run: { orchestratorBinding?: { schemaVersion: string } };
+      }).run.orchestratorBinding?.schemaVersion, "OrchestratorBinding@3");
       const rejectedDecision = await fetch(
         `${origin}/api/runs/${agentRun.run.runId}/decide`,
         {
@@ -135,8 +195,14 @@ test("Steward and Schedule Console controls remain guarded", async () => {
       assert.equal(scheduleResponse.status, 200);
       assert.deepEqual(
         await scheduleResponse.json(),
-        listScheduleViews(repo, runtimeDirectory)
+        pageScheduleViews(repo, {}, runtimeDirectory)
       );
+      const schedulePageTwo = await (await fetch(
+        `${origin}/api/schedules?page=2&pageSize=20`
+      )).json() as { items: unknown[]; total: number; page: number };
+      assert.equal(schedulePageTwo.total, 22);
+      assert.equal(schedulePageTwo.items.length, 2);
+      assert.equal(schedulePageTwo.page, 2);
       const scheduleDetail = await fetch(`${origin}/api/schedules/${scheduleId}`);
       assert.equal(scheduleDetail.status, 200);
       const scheduleView = await scheduleDetail.json() as {
@@ -200,6 +266,23 @@ test("Steward and Schedule Console controls remain guarded", async () => {
       assert.equal((await resolved.json() as {
         run: { status: string; availableActions: { resolveFailed: boolean } };
       }).run.status, "succeeded");
+
+      const cancelled = await fetch(`${origin}/api/schedules/${scheduleId}/cancel`, {
+        method: "POST",
+        headers: { "X-Rollerskate-Request": "console" }
+      });
+      assert.equal(cancelled.status, 200);
+      const archivedSchedule = await fetch(
+        `${origin}/api/schedules/${scheduleId}/archive`,
+        { method: "POST", headers: { "X-Rollerskate-Request": "console" } }
+      );
+      assert.equal(archivedSchedule.status, 200);
+      assert.equal((await archivedSchedule.json() as { status: string }).status, "archive");
+      const archivedSchedules = await (await fetch(
+        `${origin}/api/schedules?archive=archived&q=scheduler`
+      )).json() as { total: number; items: Array<{ scheduleId: string }> };
+      assert.equal(archivedSchedules.total, 1);
+      assert.equal(archivedSchedules.items[0]?.scheduleId, scheduleId);
     } finally {
       controller.abort();
       await server.close();

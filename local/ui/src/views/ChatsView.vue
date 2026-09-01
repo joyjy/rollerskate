@@ -1,8 +1,10 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, inject, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { routerKey } from "vue-router";
 import { requestJson } from "@/api/client";
 import {
   errorResponseSchema,
+  chatRunHandoffReceiptSchema,
   freeChatModeViewSchema,
   localChatPresenceViewSchema,
   localChatViewSchema,
@@ -22,6 +24,7 @@ import type { ChatListItem, ChatTimelineMessage } from "@/types/chat";
 import type { LocalAgent } from "@/types/local";
 
 const selectedId = ref<string>("local");
+const router = inject(routerKey, null);
 const drafts = ref<Record<string, string>>({});
 const serverIntentIds = ref<Record<string, string>>({});
 const serverSendStates = ref<Record<string, "idle" | "pending" | "sent" | "failed">>({});
@@ -50,7 +53,7 @@ const chatTimelineRef = ref<InstanceType<typeof ChatTimeline> | null>(null);
 const pollingPaused = computed(() => pending.value !== null);
 const {
   data: chatView,
-  loading: chatLoading,
+  loading,
   error: loadError,
   refresh: refreshChat
 } = useApi({
@@ -119,12 +122,23 @@ const mutation = useMutation({
     ]);
   }
 });
-const loading = computed(() => chatLoading.value || presenceQuery.loading.value ||
-  governanceQuery.loading.value || freeChatQuery.loading.value ||
-  topicSchedulesQuery.loading.value);
+const workHandoffMutation = useMutation({
+  execute(input: { eventId: string }, signal) {
+    return requestJson(
+      `/api/chat/messages/${encodeURIComponent(input.eventId)}/run`,
+      chatRunHandoffReceiptSchema,
+      {
+        method: "POST",
+        headers: { "X-Rollerskate-Request": "console" },
+        signal
+      }
+    );
+  }
+});
 const presenceAgents = computed(() => presenceQuery.data.value?.agents ?? []);
 const error = computed(() =>
-  mutation.error.value ?? intentError.value ?? loadError.value ?? presenceQuery.error.value ??
+  mutation.error.value ?? workHandoffMutation.error.value ?? intentError.value ??
+  loadError.value ?? presenceQuery.error.value ??
   governanceQuery.error.value ?? freeChatQuery.error.value ?? topicSchedulesQuery.error.value
 );
 
@@ -354,6 +368,16 @@ function mention(agent: LocalAgent) {
 
 function reply(message: ChatTimelineMessage) {
   if (selectedIsLocal.value) replyingTo.value = message;
+}
+
+async function handoffToRun(message: ChatTimelineMessage) {
+  if (pending.value || !selectedIsLocal.value || message.sender.kind !== "owner") return;
+  pending.value = `handoff:${message.eventId}`;
+  const receipt = await workHandoffMutation.execute({ eventId: message.eventId });
+  pending.value = null;
+  if (receipt !== null) {
+    await router?.push({ name: "steward", query: { runId: receipt.run.runId } });
+  }
 }
 
 async function send(body: string) {
@@ -586,7 +610,9 @@ async function setHistoryAccess(agent: LocalAgent, action: "grant" | "revoke") {
           :active-agents="activeAgents"
           :current-human-id="currentHumanId"
           :allow-reply="selectedIsLocal"
+          :allow-work-handoff="selectedIsLocal"
           @reply="reply"
+          @handoff="handoffToRun"
         />
         <div v-if="selectedIsLocal" class="conversation-bar" aria-live="polite">
           <div class="conversation-state">

@@ -14,8 +14,20 @@ import {
   encodeExternalRefTriggerBinding,
   parseExternalRefTriggerBinding
 } from "../../modules/external-resource/trigger-binding.js";
-import type { FreeSubscription, FreeSubscriptionDefinition, SubscriptionStatus } from "./model.js";
+import { parseRunSourceBinding } from "../../modules/steward/source-contract.js";
+import type {
+  BoundSubscriptionDefinition,
+  FreeSubscription,
+  FreeSubscriptionDefinition,
+  SubscriptionStatus
+} from "./model.js";
 import type { PollObservation } from "./plugin-contract.js";
+import {
+  activateSubscriptionOccurrenceInTransaction,
+  parseSubscriptionOccurrenceAdmissionReceipt,
+  terminalRunStatus,
+  type SubscriptionRunBindingAdapter
+} from "./run-binding.js";
 
 interface SubscriptionRow {
   subscription_id: string;
@@ -30,7 +42,7 @@ interface SubscriptionRow {
   max_wait_ms: number;
   max_attempts: number;
   attempt_count: number;
-  definition_schema: "SubscriptionDefinition@3";
+  definition_schema: FreeSubscription["definitionSchema"];
   definition_revision: string;
   definition_digest: string;
   callback_phase_status: FreeSubscription["callbackPhaseStatus"];
@@ -42,6 +54,11 @@ interface SubscriptionRow {
   next_poll_at: string;
   latest_error: string | null;
   external_ref_binding_json: string | null;
+  source_binding_json: string | null;
+  agent_run_id: string | null;
+  cycle_id: string | null;
+  admission_receipt_json: string | null;
+  archived_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -49,10 +66,24 @@ interface SubscriptionRow {
 export class SubscriptionStore {
   readonly #database: DatabaseSync;
   readonly #callbacks: CallbackStore;
+  readonly #ownsDatabase: boolean;
+  readonly #runBinding: SubscriptionRunBindingAdapter | undefined;
 
-  public constructor(databasePath: string) {
-    this.#database = openInitializedRuntimeDatabase(databasePath, migrateLocalDatabase);
-    this.#callbacks = new CallbackStore(this.#database);
+  public constructor(
+    databasePath: string | DatabaseSync,
+    options: {
+      readonly migrate?: boolean;
+      readonly runBinding?: SubscriptionRunBindingAdapter;
+    } = {}
+  ) {
+    this.#database = typeof databasePath === "string"
+      ? openInitializedRuntimeDatabase(databasePath, migrateLocalDatabase)
+      : databasePath;
+    this.#ownsDatabase = typeof databasePath === "string";
+    this.#callbacks = new CallbackStore(this.#database, options.migrate === undefined
+      ? {}
+      : { migrate: options.migrate });
+    this.#runBinding = options.runBinding;
   }
 
   public create(
@@ -114,10 +145,75 @@ export class SubscriptionStore {
     });
   }
 
+  public createBoundInTransaction(
+    input: BoundSubscriptionDefinition & { readonly subscriptionId: string },
+    createdAt = new Date().toISOString()
+  ): FreeSubscription {
+    validateBoundDefinition(input);
+    const existing = this.boundForRun(input.sourceBinding.runId);
+    if (existing !== undefined) {
+      if (existing.definitionSchema !== "SubscriptionDefinition@4" ||
+        existing.definitionRevision !== input.revision ||
+        stableJson(existing.sourceBinding) !== stableJson(input.sourceBinding)) {
+        throw new Error("Agent Run is already bound to another Subscription definition");
+      }
+      return existing;
+    }
+    requireLocalId(input.subscriptionId, "sub", "subscriptionId");
+    const timestamp = iso(createdAt);
+    const deadline = new Date(Date.parse(timestamp) + input.maxWaitMilliseconds).toISOString();
+    const nextPoll = new Date(Date.parse(timestamp) + input.intervalMilliseconds).toISOString();
+    const definitionDigest = sha256(stableJson({
+      schemaVersion: input.schemaVersion,
+      revision: input.revision,
+      title: input.title.trim(),
+      probe: input.probe,
+      intervalMilliseconds: input.intervalMilliseconds,
+      maxWaitMilliseconds: input.maxWaitMilliseconds,
+      maxAttempts: input.maxAttempts,
+      sourceBinding: input.sourceBinding,
+      externalRefBinding: input.externalRefBinding ?? null
+    }));
+    this.#database.prepare(`
+      INSERT INTO subscriptions (
+        subscription_id, title, owner_agent_id, plugin_path, plugin_id,
+        plugin_schema_version, plugin_config_json, policy_json, interval_ms,
+        max_wait_ms, max_attempts, attempt_count, definition_schema,
+        definition_revision, definition_digest, callback_phase_status, status,
+        started_at, deadline_at, next_poll_at, external_ref_binding_json,
+        source_binding_json, agent_run_id, created_at, updated_at
+      ) VALUES (?, ?, NULL, ?, ?, 1, ?, ?, ?, ?, ?, 0,
+        'SubscriptionDefinition@4', ?, ?, 'pending', 'active', ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      input.subscriptionId, input.title.trim(), input.probe.plugin.path,
+      input.probe.plugin.id,
+      JSON.stringify({
+        artifactRevision: input.probe.artifactRevision,
+        artifactDigest: input.probe.artifactDigest,
+        config: input.probe.plugin.config
+      }),
+      JSON.stringify(input.probe.policy), input.intervalMilliseconds,
+      input.maxWaitMilliseconds, input.maxAttempts, input.revision,
+      definitionDigest, timestamp, deadline, nextPoll,
+      encodeExternalRefTriggerBinding(input.externalRefBinding),
+      JSON.stringify(input.sourceBinding), input.sourceBinding.runId,
+      timestamp, timestamp
+    );
+    return this.require(input.subscriptionId);
+  }
+
+  public boundForRun(runId: string): FreeSubscription | undefined {
+    const row = this.#database.prepare(`
+      SELECT * FROM subscriptions
+      WHERE definition_schema = 'SubscriptionDefinition@4' AND agent_run_id = ?
+    `).get(runId) as SubscriptionRow | undefined;
+    return row === undefined ? undefined : mapSubscription(row);
+  }
+
   public get(subscriptionId: string): FreeSubscription | undefined {
     const row = this.#database.prepare(`
       SELECT * FROM subscriptions
-      WHERE subscription_id = ? AND definition_schema = 'SubscriptionDefinition@3'
+      WHERE subscription_id = ?
     `).get(subscriptionId) as SubscriptionRow | undefined;
     return row === undefined ? undefined : mapSubscription(row);
   }
@@ -132,9 +228,33 @@ export class SubscriptionStore {
 
   public list(): FreeSubscription[] {
     return (this.#database.prepare(`
-      SELECT * FROM subscriptions WHERE definition_schema = 'SubscriptionDefinition@3'
+      SELECT * FROM subscriptions
       ORDER BY created_at DESC, subscription_id ASC
     `).all() as unknown as SubscriptionRow[]).map(mapSubscription);
+  }
+
+  public setArchived(
+    subscriptionId: string,
+    archived: boolean,
+    at = new Date().toISOString()
+  ): { readonly subscription: FreeSubscription; readonly changed: boolean } {
+    const current = this.require(subscriptionId);
+    if (!["completed", "blocked", "cancelled", "expired"].includes(current.status)) {
+      throw new Error(`Only terminal Subscriptions can be archived: ${subscriptionId}`);
+    }
+    if (archived === (current.archivedAt !== undefined)) {
+      return { subscription: current, changed: false };
+    }
+    const changed = this.#database.prepare(`
+      UPDATE subscriptions
+      SET archived_at = ?
+      WHERE subscription_id = ?
+        AND ${archived ? "archived_at IS NULL" : "archived_at IS NOT NULL"}
+    `).run(archived ? iso(at) : null, subscriptionId).changes;
+    if (changed !== 1) {
+      throw new Error(`Subscription archive update failed: ${subscriptionId}`);
+    }
+    return { subscription: this.require(subscriptionId), changed: true };
   }
 
   public due(now = new Date().toISOString(), limit = 20): FreeSubscription[] {
@@ -143,8 +263,7 @@ export class SubscriptionStore {
     this.#expireExhausted(timestamp);
     return (this.#database.prepare(`
       SELECT * FROM subscriptions
-      WHERE definition_schema = 'SubscriptionDefinition@3'
-        AND status = 'active' AND julianday(next_poll_at) <= julianday(?)
+      WHERE status = 'active' AND julianday(next_poll_at) <= julianday(?)
         AND julianday(deadline_at) > julianday(?) AND attempt_count < max_attempts
       ORDER BY next_poll_at ASC, subscription_id ASC LIMIT ?
     `).all(timestamp, timestamp, limit) as unknown as SubscriptionRow[])
@@ -159,8 +278,8 @@ export class SubscriptionStore {
     const result = this.#database.prepare(`
       UPDATE subscriptions SET attempt_count = attempt_count + 1,
         latest_error = NULL, updated_at = ?
-      WHERE subscription_id = ? AND definition_schema = 'SubscriptionDefinition@3'
-        AND status = 'active' AND julianday(next_poll_at) <= julianday(?)
+      WHERE subscription_id = ? AND status = 'active'
+        AND julianday(next_poll_at) <= julianday(?)
         AND julianday(deadline_at) > julianday(?) AND attempt_count < max_attempts
     `).run(timestamp, subscriptionId, timestamp, timestamp);
     if (result.changes !== 1) throw new Error(`Subscription is not due: ${subscriptionId}`);
@@ -170,7 +289,8 @@ export class SubscriptionStore {
   public recordObservation(
     subscriptionId: string,
     observation: PollObservation,
-    observedAt = new Date().toISOString()
+    observedAt = new Date().toISOString(),
+    freshnessEvidence: readonly string[] = []
   ): FreeSubscription {
     validateObservation(observation);
     const timestamp = iso(observedAt);
@@ -193,18 +313,44 @@ export class SubscriptionStore {
       } else {
         const terminalKey = terminalOccurrenceKey(subscriptionId);
         const observationJson = terminalObservationJson(observation, terminalKey);
-        const owner = { kind: "subscription" as const, id: subscriptionId, revision: 1 };
-        const count = this.#callbacks.definitions(owner).length;
-        this.#database.prepare(`
-          UPDATE subscriptions SET status = 'completed', terminal_key = ?,
-            terminal_observation_json = ?, callback_phase_status = ?, updated_at = ?
-          WHERE subscription_id = ? AND status = 'active' AND terminal_key IS NULL
-        `).run(
-          terminalKey, observationJson, count === 0 ? "completed" : "pending",
-          timestamp, subscriptionId
-        );
-        if (count > 0) {
-          this.#callbacks.materializeInTransaction(owner, terminalKey, timestamp);
+        if (subscription.definitionSchema === "SubscriptionDefinition@4") {
+          if (this.#runBinding === undefined || subscription.sourceBinding === undefined) {
+            throw new Error("SubscriptionDefinition@4 Run binding adapter is unavailable");
+          }
+          const receipt = activateSubscriptionOccurrenceInTransaction({
+            adapter: this.#runBinding,
+            binding: subscription.sourceBinding,
+            subscriptionId,
+            occurrenceKey: terminalKey,
+            observation: JSON.parse(observationJson) as unknown,
+            freshnessEvidence: freshnessEvidence.length === 0
+              ? [`subscription-definition:${subscription.definitionRevision}`]
+              : freshnessEvidence,
+            at: timestamp
+          });
+          this.#database.prepare(`
+            UPDATE subscriptions SET status = 'completed', terminal_key = ?,
+              terminal_observation_json = ?, callback_phase_status = 'running',
+              cycle_id = ?, admission_receipt_json = ?, updated_at = ?
+            WHERE subscription_id = ? AND status = 'active' AND terminal_key IS NULL
+          `).run(
+            terminalKey, observationJson, receipt.cycleId, JSON.stringify(receipt),
+            timestamp, subscriptionId
+          );
+        } else {
+          const owner = { kind: "subscription" as const, id: subscriptionId, revision: 1 };
+          const count = this.#callbacks.definitions(owner).length;
+          this.#database.prepare(`
+            UPDATE subscriptions SET status = 'completed', terminal_key = ?,
+              terminal_observation_json = ?, callback_phase_status = ?, updated_at = ?
+            WHERE subscription_id = ? AND status = 'active' AND terminal_key IS NULL
+          `).run(
+            terminalKey, observationJson, count === 0 ? "completed" : "pending",
+            timestamp, subscriptionId
+          );
+          if (count > 0) {
+            this.#callbacks.materializeInTransaction(owner, terminalKey, timestamp);
+          }
         }
       }
       return this.require(subscriptionId);
@@ -240,8 +386,7 @@ export class SubscriptionStore {
     const result = this.#database.prepare(`
       UPDATE subscriptions
       SET status = 'blocked', callback_phase_status = 'blocked', latest_error = ?, updated_at = ?
-      WHERE subscription_id = ? AND definition_schema = 'SubscriptionDefinition@3'
-        AND status = 'active'
+      WHERE subscription_id = ? AND status = 'active'
     `).run(`external-ref-trigger:${reason}`.slice(0, 4_096), timestamp, subscriptionId);
     if (result.changes !== 1) return this.require(subscriptionId);
     return this.require(subscriptionId);
@@ -263,12 +408,71 @@ export class SubscriptionStore {
     const result = this.#database.prepare(`
       UPDATE subscriptions SET status = ?, updated_at = ?,
         next_poll_at = CASE WHEN ? = 'active' THEN ? ELSE next_poll_at END
-      WHERE subscription_id = ? AND definition_schema = 'SubscriptionDefinition@3'
-        AND status IN (${placeholders})
+      WHERE subscription_id = ? AND status IN (${placeholders})
     `).run(target[action], timestamp, target[action], timestamp,
       subscriptionId, ...allowed[action]);
     if (result.changes !== 1) throw new Error(`Subscription cannot ${action}: ${subscriptionId}`);
     return this.require(subscriptionId);
+  }
+
+  public reconcileBoundSources(at = new Date().toISOString()): string[] {
+    if (this.#runBinding === undefined) return [];
+    const timestamp = iso(at);
+    const changed: string[] = [];
+    const candidates = (this.#database.prepare(`
+      SELECT subscription.*
+      FROM subscriptions AS subscription
+      LEFT JOIN agent_runs AS run ON run.run_id = subscription.agent_run_id
+      WHERE subscription.definition_schema = 'SubscriptionDefinition@4'
+        AND (
+          (subscription.cycle_id IS NOT NULL
+            AND subscription.callback_phase_status IN ('pending', 'running'))
+          OR
+          (subscription.status IN ('active', 'paused')
+            AND run.status IN ('succeeded', 'failed', 'needs_human', 'cancelled'))
+        )
+      ORDER BY subscription.updated_at, subscription.subscription_id
+      LIMIT 100
+    `).all() as unknown as SubscriptionRow[]).map(mapSubscription);
+    for (const subscription of candidates) {
+      const runId = subscription.agentRunId!;
+      const run = this.#runBinding.runState(runId);
+      if (run !== undefined && terminalRunStatus(run.status) &&
+        (subscription.status === "active" || subscription.status === "paused")) {
+        const action = subscription.sourceBinding!.cancellationPolicy === "cancel_source"
+          ? "cancel"
+          : subscription.status === "active"
+            ? "pause"
+            : undefined;
+        if (action !== undefined) {
+          this.setStatus(subscription.subscriptionId, action, timestamp);
+          changed.push(subscription.subscriptionId);
+        }
+        continue;
+      }
+      if (subscription.cycleId === undefined) continue;
+      const cycle = this.#runBinding.cycleState(subscription.cycleId);
+      if (cycle === undefined || cycle.status === "active") continue;
+      const phase = cycle.status === "succeeded"
+        ? "completed"
+        : cycle.status === "failed"
+          ? "completed_with_errors"
+          : "completed_with_unknown";
+      const error = phase === "completed"
+        ? null
+        : `run-cycle-${cycle.status}`;
+      const update = this.#database.prepare(`
+        UPDATE subscriptions
+        SET callback_phase_status = ?, latest_error = ?, updated_at = ?
+        WHERE subscription_id = ? AND definition_schema = 'SubscriptionDefinition@4'
+          AND cycle_id = ? AND callback_phase_status != ?
+      `).run(
+        phase, error, timestamp, subscription.subscriptionId,
+        subscription.cycleId, phase
+      );
+      if (update.changes === 1) changed.push(subscription.subscriptionId);
+    }
+    return changed;
   }
 
   public reconcileCallbacks(at = new Date().toISOString()): number {
@@ -318,13 +522,14 @@ export class SubscriptionStore {
   }
 
   public close(): void {
-    this.#database.close();
+    this.#callbacks.close();
+    if (this.#ownsDatabase) this.#database.close();
   }
 
   #expireExhausted(at: string): void {
     this.#database.prepare(`
       UPDATE subscriptions SET status = 'expired', updated_at = ?
-      WHERE definition_schema = 'SubscriptionDefinition@3' AND status = 'active' AND (
+      WHERE status = 'active' AND (
         julianday(deadline_at) <= julianday(?) OR attempt_count >= max_attempts
       )
     `).run(at, at);
@@ -338,13 +543,27 @@ function mapSubscription(row: SubscriptionRow): FreeSubscription {
     config: unknown;
   };
   const externalRefBinding = decodeExternalRefTriggerBinding(row.external_ref_binding_json);
+  const sourceBinding = row.source_binding_json === null
+    ? undefined
+    : parseRunSourceBinding(JSON.parse(row.source_binding_json) as unknown);
+  const admissionReceipt = row.admission_receipt_json === null
+    ? undefined
+    : parseSubscriptionOccurrenceAdmissionReceipt(
+        JSON.parse(row.admission_receipt_json) as unknown
+      );
   return {
     subscriptionId: row.subscription_id,
     definitionSchema: row.definition_schema,
     definitionRevision: row.definition_revision,
     definitionDigest: row.definition_digest,
     title: row.title,
-    ownerAgentId: requireNonEmpty(row.owner_agent_id ?? "", "ownerAgentId"),
+    ...(row.owner_agent_id === null ? {} : {
+      ownerAgentId: requireNonEmpty(row.owner_agent_id, "ownerAgentId")
+    }),
+    ...(sourceBinding === undefined ? {} : { sourceBinding }),
+    ...(row.agent_run_id === null ? {} : { agentRunId: row.agent_run_id }),
+    ...(row.cycle_id === null ? {} : { cycleId: row.cycle_id }),
+    ...(admissionReceipt === undefined ? {} : { admissionReceipt }),
     probe: {
       plugin: {
         path: row.plugin_path,
@@ -362,6 +581,7 @@ function mapSubscription(row: SubscriptionRow): FreeSubscription {
     maxAttempts: row.max_attempts,
     attemptCount: row.attempt_count,
     status: row.status,
+    ...(row.archived_at === null ? {} : { archivedAt: row.archived_at }),
     callbackPhaseStatus: row.callback_phase_status,
     startedAt: row.started_at,
     deadlineAt: row.deadline_at,
@@ -376,12 +596,38 @@ function mapSubscription(row: SubscriptionRow): FreeSubscription {
   };
 }
 
+function validateBoundDefinition(
+  input: BoundSubscriptionDefinition & { readonly subscriptionId: string }
+): void {
+  if (input.schemaVersion !== "SubscriptionDefinition@4") {
+    throw new Error("SubscriptionDefinition@4 schemaVersion is required");
+  }
+  validateDefinitionBase(input);
+  const binding = parseRunSourceBinding(input.sourceBinding);
+  if (binding.source.kind !== "subscription" || binding.source.id !== input.subscriptionId ||
+    binding.source.definitionRevision !== `SubscriptionDefinition@4:${input.revision}`) {
+    throw new Error("SubscriptionDefinition@4 source binding is inconsistent");
+  }
+}
+
 function validateDefinition(input: FreeSubscriptionDefinition): void {
   if (input.schemaVersion !== 3) throw new Error("schemaVersion must be 3");
+  validateDefinitionBase(input);
+  requireRuntimeId(input.ownerAgentId, "prn", "ownerAgentId");
+  if (input.callbacks.length > 16) throw new Error("callbacks must contain at most 16 items");
+  const ids = new Set<string>();
+  for (const callback of input.callbacks) {
+    requireLocalId(callback.callbackId, "scb", "callback.callbackId");
+    if (ids.has(callback.callbackId)) throw new Error(`Duplicate callbackId: ${callback.callbackId}`);
+    ids.add(callback.callbackId);
+    validateProactiveCallback(callback);
+  }
+}
+
+function validateDefinitionBase(input: FreeSubscriptionDefinition | BoundSubscriptionDefinition): void {
   requireNonEmpty(input.revision, "revision");
   const title = requireNonEmpty(input.title, "title");
   if (title.length > 120) throw new Error("title must be at most 120 characters");
-  requireRuntimeId(input.ownerAgentId, "prn", "ownerAgentId");
   requireNonEmpty(input.probe.plugin.path, "probe.plugin.path");
   requireNonEmpty(input.probe.plugin.id, "probe.plugin.id");
   requireNonEmpty(input.probe.artifactRevision, "probe.artifactRevision");
@@ -394,14 +640,6 @@ function validateDefinition(input: FreeSubscriptionDefinition): void {
   bounded(input.maxAttempts, 1, 100_000, "maxAttempts");
   if (input.externalRefBinding !== undefined) {
     parseExternalRefTriggerBinding(input.externalRefBinding);
-  }
-  if (input.callbacks.length > 16) throw new Error("callbacks must contain at most 16 items");
-  const ids = new Set<string>();
-  for (const callback of input.callbacks) {
-    requireLocalId(callback.callbackId, "scb", "callback.callbackId");
-    if (ids.has(callback.callbackId)) throw new Error(`Duplicate callbackId: ${callback.callbackId}`);
-    ids.add(callback.callbackId);
-    validateProactiveCallback(callback);
   }
 }
 
@@ -459,8 +697,10 @@ function stableJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
-function requireNonEmpty(value: string, field: string): string {
-  if (value.trim() === "") throw new Error(`${field} must be a non-empty string`);
+function requireNonEmpty(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error(`${field} must be a non-empty string`);
+  }
   return value;
 }
 

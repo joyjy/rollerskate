@@ -10,18 +10,27 @@ import { formatDateTime } from "@/utils/format";
 const props = defineProps<{
   run: AgentRunDetailViewOutput;
   cancelling?: boolean;
+  archiving?: boolean;
   cycleId?: string;
   outputId?: string;
 }>();
 
 const emit = defineEmits<{
   cancel: [runId: string];
+  archive: [runId: string, archived: boolean];
 }>();
 
 const canCancel = computed(() =>
   props.run.summary.status === "active" ||
   props.run.summary.status === "waiting" ||
+  props.run.summary.status === "awaiting_source" ||
   props.run.summary.status === "awaiting_orchestrator"
+);
+const canArchive = computed(() =>
+  props.run.summary.status === "succeeded" ||
+  props.run.summary.status === "failed" ||
+  props.run.summary.status === "needs_human" ||
+  props.run.summary.status === "cancelled"
 );
 const exchangeTotal = computed(() =>
   props.run.exchangeCounts.reduce((total, exchange) => total + exchange.total, 0)
@@ -45,6 +54,17 @@ function stepDepthPadding(step: AgentRunStepOutput): string {
           <div class="dim">{{ formatDateTime(run.summary.updatedAt) }}</div>
         </div>
         <div class="run-actions">
+          <button
+            v-if="canArchive"
+            type="button"
+            class="archive-button"
+            :disabled="archiving"
+            @click="emit(
+              'archive',
+              run.summary.runId,
+              run.summary.archivedAt === null
+            )"
+          >{{ run.summary.archivedAt === null ? "Archive" : "Restore" }}</button>
           <button
             v-if="canCancel"
             type="button"
@@ -86,6 +106,32 @@ function stepDepthPadding(step: AgentRunStepOutput): string {
         <strong>Awaiting Caller decision</strong>
         <span>{{ run.checkpoint.result.outcome }} · {{ run.checkpoint.result.summary }}</span>
         <span class="mono">run version {{ run.projection.version }} · {{ run.decisions.length }} accepted decision{{ run.decisions.length === 1 ? "" : "s" }}</span>
+      </div>
+
+      <div v-if="run.triggerSource" class="source-card">
+        <div class="source-head">
+          <div>
+            <span class="label">Trigger source</span>
+            <strong>{{ run.triggerSource.kind }} · {{ run.triggerSource.status }}</strong>
+          </div>
+          <RouterLink class="trace-link" :to="run.triggerSource.diagnosticsRoute">Open trigger diagnostics</RouterLink>
+        </div>
+        <dl class="source-grid">
+          <dt>Definition</dt><dd class="mono">{{ run.triggerSource.id }} · {{ run.triggerSource.definitionRevision }}</dd>
+          <dt>Reconcile</dt><dd>{{ run.triggerSource.reconcileStatus }}</dd>
+          <dt>Pending</dt><dd class="mono">{{ run.triggerSource.pendingOccurrenceKey ?? "none" }}</dd>
+          <dt>Checkpoint</dt><dd class="mono">{{ run.triggerSource.checkpointOccurrenceKey ?? "none" }}</dd>
+          <dt>Next source action</dt><dd>{{ run.triggerSource.nextActionAt ? formatDateTime(run.triggerSource.nextActionAt) : "none" }}</dd>
+          <template v-if="run.triggerSource.lastOccurrence">
+            <dt>Last occurrence</dt>
+            <dd class="mono">
+              {{ run.triggerSource.lastOccurrence.occurrenceKey }} ·
+              {{ run.triggerSource.lastOccurrence.cycleId ?? "no cycle" }} ·
+              {{ run.triggerSource.lastOccurrence.status }}
+            </dd>
+          </template>
+        </dl>
+        <div v-if="run.triggerSource.latestError" class="source-error">{{ run.triggerSource.latestError }}</div>
       </div>
 
       <div
@@ -149,7 +195,8 @@ function stepDepthPadding(step: AgentRunStepOutput): string {
 .run-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
 .run-actions { display: flex; align-items: center; gap: 10px; }
 .cancel-button { border: 1px solid var(--border); border-radius: 6px; padding: 5px 9px; background: transparent; color: var(--warning); cursor: pointer; }
-.cancel-button:disabled { cursor: wait; opacity: .55; }
+.archive-button { border: 1px solid var(--border); border-radius: 6px; padding: 5px 9px; background: transparent; color: var(--text-secondary); cursor: pointer; }
+.cancel-button:disabled, .archive-button:disabled { cursor: wait; opacity: .55; }
 .dim { margin-top: 3px; color: var(--text-dim); font-size: 11px; }
 .trace-link { color: var(--primary); font-size: 12px; font-weight: 700; text-decoration: none; }
 .run-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
@@ -161,6 +208,13 @@ function stepDepthPadding(step: AgentRunStepOutput): string {
 .terminal.failed, .terminal.needs_human { background: var(--warning-soft); color: var(--warning); }
 .terminal.cancelled { background: var(--muted-soft); color: var(--muted); }
 .checkpoint { display: grid; gap: 4px; margin-top: 10px; padding: 10px; border: 1px solid var(--primary); border-radius: 7px; background: var(--primary-soft); color: var(--text); font-size: 12px; }
+.source-card { display: grid; gap: 10px; margin-top: 10px; padding: 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-2); font-size: 12px; }
+.source-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.source-head > div { display: grid; gap: 3px; }
+.source-grid { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 5px 10px; margin: 0; }
+.source-grid dt { color: var(--text-dim); }
+.source-grid dd { margin: 0; overflow-wrap: anywhere; }
+.source-error { padding: 7px 8px; border-radius: 6px; background: var(--warning-soft); color: var(--warning); }
 .steps-section { margin-top: 16px; }
 .section-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--text-secondary); margin-bottom: 10px; }
 .step-count { margin-left: 6px; padding: 1px 6px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); font-size: 10px; }
@@ -172,5 +226,7 @@ function stepDepthPadding(step: AgentRunStepOutput): string {
   .run-head { flex-direction: column; }
   .run-grid { grid-template-columns: 1fr; }
   .terminal { flex-direction: column; }
+  .source-head { align-items: flex-start; flex-direction: column; }
+  .source-grid { grid-template-columns: 1fr; }
 }
 </style>

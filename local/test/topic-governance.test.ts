@@ -349,7 +349,7 @@ test("governance validation rejects invalid theme policy and participant state",
   }), /receiptId must match/);
 });
 
-test("schema v63 upgrades v53 and materializes governance from existing active Agents", () => {
+test("schema v69 upgrades v53 and materializes governance from existing active Agents", () => {
   const fixture = runtimeFixture("migration");
   try {
     const foundation = localRuntimeSnapshot(fixture.repo, fixture.options).foundation;
@@ -373,8 +373,8 @@ test("schema v63 upgrades v53 and materializes governance from existing active A
     legacy.close();
 
     const diagnostics = initializeRuntimeSchema(databasePath);
-    assert.equal(diagnostics.schemaVersion, 63);
-    assert.equal(diagnostics.tables.length, 28);
+    assert.equal(diagnostics.schemaVersion, 69);
+    assert.equal(diagnostics.tables.length, 29);
     const store = new TopicGovernanceStore(databasePath);
     try {
       const governance = store.require(foundation.topicId);

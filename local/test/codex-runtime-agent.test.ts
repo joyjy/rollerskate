@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import type { AgentInputEvent, ChatDispatchEvent } from "../src/core/event/model.js";
+import { AgentInvocationError } from "../src/core/runtime/agent-invocation.js";
 import { CodexRuntimeAgent } from "../src/integrations/agent/codex.js";
 import { CodexAppServerRunner } from
   "../src/integrations/agent/runner/codex-app-server.js";
@@ -174,6 +175,7 @@ rl.on("line", (line) => {
     environment: {},
     workingDirectory: workspace,
     timeoutMilliseconds: 3_000,
+    meaningfulOutputTimeoutMilliseconds: 1_000,
     maxOutputBytes: 1_024,
     threadParameters: {
       cwd: workspace,
@@ -185,6 +187,134 @@ rl.on("line", (line) => {
     runner.invoke({ prompt: "test", workspaceAccess: "read" }),
     /unexpectedly requested item\/commandExecution\/requestApproval/
   );
+});
+
+test("Codex progress renews idle only and cannot extend the Run deadline", async () => {
+  const fixture = codexFixture({ meaningfulForever: true });
+  const agent = new CodexRuntimeAgent({
+    executable: fixture.executable,
+    projectRoot: fixture.workspace,
+    environment: {},
+    timeoutMilliseconds: 3_000,
+    meaningfulOutputTimeoutMilliseconds: 1_000
+  });
+  const progress: unknown[] = [];
+
+  await assert.rejects(
+    agent.invoke({
+      event: boundedRunEvent(650),
+      reportProgress: (update) => progress.push(update)
+    }),
+    (error: unknown) => {
+      assert.equal(error instanceof AgentInvocationError, true);
+      const failure = (error as AgentInvocationError).failure;
+      assert.equal(failure.reason, "deadline");
+      assert.equal(failure.totalTimeoutMilliseconds, 650);
+      assert.equal(failure.recovery, "explicit_read_only_resume");
+      assert.equal(failure.providerSessionId, "provider-session");
+      assert.deepEqual(failure.lastProgress, { kind: "assistant" });
+      assert.equal(failure.protocolStop, "requested");
+      assert.equal(JSON.stringify(failure).includes("streamed fixture"), false);
+      return true;
+    }
+  );
+  assert.equal(progress.length > 1, true);
+  assert.deepEqual(
+    codexInvocation(fixture.invocation).messages.find(
+      (candidate) => candidate.method === "turn/interrupt"
+    )?.params,
+    { threadId: "provider-session", turnId: "turn-fixture" }
+  );
+});
+
+test("Codex stalls on protocol-only updates and interrupts the active Turn", async () => {
+  const fixture = codexFixture({ stall: true });
+  const agent = new CodexRuntimeAgent({
+    executable: fixture.executable,
+    projectRoot: fixture.workspace,
+    environment: {},
+    timeoutMilliseconds: 2_000,
+    meaningfulOutputTimeoutMilliseconds: 500
+  });
+
+  await assert.rejects(agent.invoke({ event: boundedRunEvent() }), (error: unknown) => {
+    assert.equal(error instanceof AgentInvocationError, true);
+    const failure = (error as AgentInvocationError).failure;
+    assert.equal(failure.reason, "stall");
+    assert.equal(failure.protocolStop, "requested");
+    assert.deepEqual(failure.lastProgress, { kind: "protocol" });
+    return true;
+  });
+  assert.equal(codexInvocation(fixture.invocation).messages.some(
+    (candidate) => candidate.method === "turn/interrupt"
+  ), true);
+});
+
+test("Codex distinguishes provider interruption from protocol exit", async () => {
+  const cancelledFixture = codexFixture({ cancelled: true });
+  const cancelledAgent = new CodexRuntimeAgent({
+    executable: cancelledFixture.executable,
+    projectRoot: cancelledFixture.workspace,
+    environment: {},
+    timeoutMilliseconds: 1_000
+  });
+  await assert.rejects(cancelledAgent.invoke({ event: boundedRunEvent() }),
+    (error: unknown) => {
+      assert.equal(error instanceof AgentInvocationError, true);
+      const failure = (error as AgentInvocationError).failure;
+      assert.equal(failure.reason, "cancelled");
+      assert.equal(failure.phase, "terminated");
+      assert.equal(failure.protocolStop, "acknowledged");
+      return true;
+    });
+
+  const exitedFixture = codexFixture({ exitBeforeSettlement: true });
+  const exitedAgent = new CodexRuntimeAgent({
+    executable: exitedFixture.executable,
+    projectRoot: exitedFixture.workspace,
+    environment: {},
+    timeoutMilliseconds: 1_000
+  });
+  await assert.rejects(exitedAgent.invoke({ event: boundedRunEvent() }),
+    (error: unknown) => {
+      assert.equal(error instanceof AgentInvocationError, true);
+      const failure = (error as AgentInvocationError).failure;
+      assert.equal(failure.reason, "protocol_exit");
+      assert.equal(failure.phase, "terminated");
+      assert.equal(failure.protocolStop, "unavailable");
+      return true;
+    });
+  assert.equal(codexInvocation(exitedFixture.invocation).messages.some(
+    (candidate) => candidate.method === "turn/interrupt"
+  ), false);
+});
+
+test("Codex fails closed when a resumed Thread changes identity", async () => {
+  const fixture = codexFixture({});
+  const agent = new CodexRuntimeAgent({
+    executable: fixture.executable,
+    projectRoot: fixture.workspace,
+    environment: {},
+    timeoutMilliseconds: 1_000
+  });
+
+  await assert.rejects(
+    agent.invoke({
+      event: boundedRunEvent(),
+      providerSessionId: "requested-session"
+    }),
+    (error: unknown) => {
+      assert.equal(error instanceof AgentInvocationError, true);
+      const failure = (error as AgentInvocationError).failure;
+      assert.equal(failure.reason, "protocol_error");
+      assert.equal(failure.providerSessionId, undefined);
+      assert.equal(failure.recovery, "none");
+      return true;
+    }
+  );
+  assert.equal(codexInvocation(fixture.invocation).messages.some(
+    (candidate) => candidate.method === "turn/start"
+  ), false);
 });
 
 function message(
@@ -204,6 +334,25 @@ function event(eventId: string): AgentInputEvent {
     causality: { rootEventId: eventId, hop: 0 },
     prompt: "respond",
     createdAt: "2026-07-24T00:00:00.000Z"
+  };
+}
+
+function boundedRunEvent(totalTimeoutMilliseconds?: number): AgentInputEvent {
+  const base = event("evt_019f92c9-0000-7000-8000-000000000010");
+  if (base.type !== "agent.request") throw new Error("fixture must be agent.request");
+  return totalTimeoutMilliseconds === undefined ? base : {
+    ...base,
+    runContext: {
+      schemaVersion: "AgentRunContext@1",
+      resultContractId: "agent-turn-result@1",
+      runId: "run_019f92c9-0000-7000-8000-000000000010",
+      stepId: "stp_019f92c9-0000-7000-8000-000000000010",
+      depth: 0,
+      invocationBudget: {
+        schemaVersion: "AgentInvocationBudget@1",
+        totalTimeoutMilliseconds
+      }
+    }
   };
 }
 
@@ -268,5 +417,93 @@ function subscriptionEvent(eventId: string, workspace: string): AgentInputEvent 
       },
       networkAccess: true
     }
+  };
+}
+
+function codexFixture(options: {
+  readonly meaningfulForever?: boolean;
+  readonly stall?: boolean;
+  readonly cancelled?: boolean;
+  readonly exitBeforeSettlement?: boolean;
+}): {
+  readonly workspace: string;
+  readonly executable: string;
+  readonly invocation: string;
+} {
+  const workspace = mkdtempSync(join(tmpdir(), "rollerskate-codex-streaming-"));
+  const executable = join(workspace, "codex-fixture");
+  const invocation = join(workspace, "invocation.json");
+  writeFileSync(executable, `#!${process.execPath}
+const fs = require("node:fs");
+const readline = require("node:readline");
+const messages = [];
+const save = () => fs.writeFileSync(${JSON.stringify(invocation)}, JSON.stringify({ messages }));
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+const rl = readline.createInterface({ input: process.stdin });
+let updates;
+save();
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  messages.push(message);
+  save();
+  if (message.id === 0) send({ id: 0, result: {} });
+  if (message.id === 1) send({ id: 1, result: { thread: { id: "provider-session" } } });
+  if (message.id === 2) {
+    send({ id: 2, result: { turn: {
+      id: "turn-fixture", items: [], status: "inProgress"
+    } } });
+    ${options.exitBeforeSettlement === true ? "process.exit(143);" : options.cancelled === true ? `send({ method: "turn/completed", params: {
+      threadId: "provider-session",
+      turn: { id: "turn-fixture", items: [], status: "interrupted" }
+    } });` : options.stall === true ? `updates = setInterval(() => {
+      send({
+        method: "thread/tokenUsage/updated",
+        params: { threadId: "provider-session", turnId: "turn-fixture", tokenUsage: {
+          last: { inputTokens: 1, outputTokens: 0, totalTokens: 1 },
+          total: { inputTokens: 1, outputTokens: 0, totalTokens: 1 }
+        } }
+      });
+      send({
+        method: "item/agentMessage/delta",
+        params: { threadId: "unrelated-session", turnId: "unrelated-turn",
+          itemId: "unrelated-message", delta: "unrelated fixture" }
+      });
+    }, 5);` : options.meaningfulForever === true ? `updates = setInterval(() => send({
+      method: "item/agentMessage/delta",
+      params: { threadId: "provider-session", turnId: "turn-fixture",
+        itemId: "message-fixture", delta: "streamed fixture" }
+    }), 5);` : ""}
+  }
+  if (message.method === "turn/interrupt") {
+    if (updates !== undefined) clearInterval(updates);
+    send({ id: message.id, result: {} });
+    send({ method: "turn/completed", params: {
+      threadId: "provider-session",
+      turn: { id: "turn-fixture", items: [], status: "interrupted" }
+    } });
+  }
+});
+rl.on("close", () => {
+  if (updates !== undefined) clearInterval(updates);
+  save();
+});
+`);
+  chmodSync(executable, 0o700);
+  return { workspace, executable, invocation };
+}
+
+function codexInvocation(path: string): {
+  readonly messages: Array<{
+    readonly id?: number;
+    readonly method?: string;
+    readonly params?: Readonly<Record<string, unknown>>;
+  }>;
+} {
+  return JSON.parse(readFileSync(path, "utf8")) as {
+    readonly messages: Array<{
+      readonly id?: number;
+      readonly method?: string;
+      readonly params?: Readonly<Record<string, unknown>>;
+    }>;
   };
 }

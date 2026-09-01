@@ -39,8 +39,12 @@ import {
   annealedRetryAt,
   bounded,
   iso,
+  normalizeAgentInvocationFailure,
+  normalizeAgentInvocationProgress,
+  parseAgentInvocationFailureReceipt,
   requireText
 } from "./store/codec.js";
+import type { AgentInvocationProgress } from "./agent-invocation.js";
 import { RuntimeStoreQuery } from "./store/query.js";
 import { RuntimeChatStore } from "./store/chat.js";
 import { RuntimeDeliveryStore } from "./store/delivery.js";
@@ -51,6 +55,7 @@ import type {
   AppendRuntimeEventReceipt,
   CompleteRuntimeExecution,
   CreateChatActivation,
+  FailRuntimeExecutionOptions,
   RuntimeAudit,
   RuntimeExecutionOutcome
 } from "./store/types.js";
@@ -75,7 +80,10 @@ export class RuntimeStore {
   readonly #eventStore: RuntimeEventStore;
   readonly #audit: RuntimeAuditQuery;
 
-  public constructor(database: string | DatabaseSync) {
+  public constructor(
+    database: string | DatabaseSync,
+    options: { readonly migrate?: boolean } = {}
+  ) {
     if (typeof database === "string") {
       const absolutePath = resolve(database);
       mkdirSync(dirname(absolutePath), { recursive: true });
@@ -87,7 +95,7 @@ export class RuntimeStore {
     } else {
       this.#database = database;
       this.#ownsDatabase = false;
-      migrateRuntimeDatabase(this.#database);
+      if (options.migrate !== false) migrateRuntimeDatabase(this.#database);
     }
     this.#query = new RuntimeStoreQuery(this.#database, this.#destinationCache);
     this.#chat = new RuntimeChatStore(this.#database, this.#query);
@@ -384,26 +392,38 @@ export class RuntimeStore {
     executionId: string,
     error: string,
     at = new Date().toISOString(),
-    retryBaseMilliseconds = 1_000
+    retryBaseMilliseconds = 1_000,
+    options: FailRuntimeExecutionOptions = {}
   ): { readonly execution: RuntimeExecution; readonly resultEvent?: AgentResultEvent } {
     const failure = requireText(error, "error").slice(0, 4_096);
     const timestamp = iso(at);
     return runImmediateTransaction(this.#database, () => {
       const execution = this.#requireExecution(executionId);
       if (execution.status !== "running") throw new Error(`execution is not running: ${executionId}`);
-      if (execution.attemptCount < execution.maxAttempts) {
+      const normalizedTrace = options.trace === undefined
+        ? undefined
+        : normalizeAgentInvocationFailure(options.trace);
+      const traceJson = normalizedTrace === undefined
+        ? null
+        : JSON.stringify({ schema: "AgentInvocationFailureReceipt@1", trace: normalizedTrace });
+      if (traceJson !== null && Buffer.byteLength(traceJson, "utf8") > 65_536) {
+        throw new Error("Agent invocation failure receipt exceeds 65536 bytes");
+      }
+      if (options.retry !== "never" && execution.attemptCount < execution.maxAttempts) {
         const next = annealedRetryAt(timestamp, execution.attemptCount, retryBaseMilliseconds);
         this.#database.prepare(`
           UPDATE executions SET status = 'retry_wait', next_attempt_at = ?, last_error = ?,
-            started_at = NULL, updated_at = ? WHERE execution_id = ?
-        `).run(next, failure, timestamp, executionId);
+            started_at = NULL, updated_at = ?, receipt_json = COALESCE(?, receipt_json)
+          WHERE execution_id = ?
+        `).run(next, failure, timestamp, traceJson, executionId);
         const retried = this.#requireExecution(executionId);
         return { execution: retried };
       }
       this.#database.prepare(`
-        UPDATE executions SET status = 'failed', last_error = ?, completed_at = ?, updated_at = ?
+        UPDATE executions SET status = 'failed', last_error = ?, completed_at = ?, updated_at = ?,
+          receipt_json = COALESCE(?, receipt_json)
         WHERE execution_id = ?
-      `).run(failure, timestamp, timestamp, executionId);
+      `).run(failure, timestamp, timestamp, traceJson, executionId);
       const event = this.#requireEvent(execution.eventId);
       const failed = this.#requireExecution(executionId);
       const resultEvent = execution.handler === "agent" &&
@@ -553,6 +573,70 @@ export class RuntimeStore {
       UPDATE executions SET receipt_json = ? WHERE execution_id = ?
     `).run(encoded, requireRuntimeId(executionId, "exe", "executionId"));
     if (changed.changes !== 1) throw new Error(`Execution not found: ${executionId}`);
+  }
+
+  public recordAgentInvocationProgress(
+    executionId: string,
+    progress: AgentInvocationProgress
+  ): void {
+    const normalized = normalizeAgentInvocationProgress(progress);
+    const encoded = JSON.stringify({
+      schema: "AgentInvocationProgressReceipt@1",
+      trace: normalized
+    });
+    if (Buffer.byteLength(encoded, "utf8") > 65_536) {
+      throw new Error("Agent invocation progress receipt exceeds 65536 bytes");
+    }
+    const changed = this.#database.prepare(`
+      UPDATE executions SET receipt_json = ?, updated_at = ?
+      WHERE execution_id = ? AND status = 'running' AND handler = 'agent'
+    `).run(
+      encoded,
+      normalized.observedAt,
+      requireRuntimeId(executionId, "exe", "executionId")
+    );
+    if (changed.changes !== 1) {
+      throw new Error(`Agent execution is not running: ${executionId}`);
+    }
+  }
+
+  public recoverReadOnlySessionInTransaction(
+    executionId: string,
+    at = new Date().toISOString()
+  ): RuntimeSession | undefined {
+    const execution = this.#requireExecution(executionId);
+    const event = this.#requireEvent(execution.eventId);
+    if (!isAgentInputEvent(event) || event.type !== "agent.request" ||
+      event.runContext === undefined) return undefined;
+    if (event.runContext?.workspaceGrant?.access === "write") return undefined;
+    if (event.sessionId !== undefined) return this.#requireSession(event.sessionId);
+    const trace = parseAgentInvocationFailureReceipt(
+      this.executionReceiptJson(execution.executionId)
+    );
+    if (trace?.recovery !== "explicit_read_only_resume" ||
+      trace.workspaceAccess !== "read" || trace.providerSessionId === undefined) return undefined;
+    const existing = this.sessionForProvider(trace.adapterId, trace.providerSessionId);
+    if (existing !== undefined) {
+      if (existing.agentId !== event.agentId ||
+        existing.runId !== event.runContext.runId ||
+        existing.cycleId !== event.runContext.cycleId ||
+        existing.adapterId !== trace.adapterId ||
+        existing.workspace !== trace.workspace) {
+        throw new Error("Recoverable provider Session belongs to a different Runtime scope");
+      }
+      return existing;
+    }
+    return this.#createSession(
+      event.agentId,
+      event.runContext?.runId,
+      event.runContext?.cycleId,
+      {
+        adapterId: trace.adapterId,
+        workspace: trace.workspace,
+        providerSessionId: trace.providerSessionId
+      },
+      iso(at)
+    );
   }
 
   public forceTerminalAgentFailure(
@@ -706,6 +790,13 @@ export class RuntimeStore {
     at = new Date().toISOString()
   ): RuntimeDelivery {
     return this.#delivery.succeeded(deliveryId, receipt, at);
+  }
+
+  public retryFailedDelivery(
+    deliveryId: string,
+    at = new Date().toISOString()
+  ): RuntimeDelivery {
+    return this.#delivery.retryFailed(deliveryId, at);
   }
 
   public deliveryFailed(

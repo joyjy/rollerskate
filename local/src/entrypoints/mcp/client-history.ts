@@ -100,7 +100,7 @@ async function main(): Promise<void> {
   const context = serverContext(process.argv.slice(2), process.env);
   await runStdioMcpToolServer({
     name: "rollerskate-client-history",
-    version: "0.5.4",
+    version: "0.5.6",
     tools: clientHistoryToolDefinitions(context.now),
     call: (name, args) => callClientHistoryTool(context, name, args)
   });

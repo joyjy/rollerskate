@@ -27,6 +27,7 @@ import type {
   AgentAdapterInvocation,
   ProviderPolicyObservationSnapshot
 } from "./agent-invocation.js";
+import { AgentInvocationError } from "./agent-invocation.js";
 import type { ChatReplyRoute } from "./store/types.js";
 
 export interface RuntimeAgentAdapter {
@@ -109,6 +110,7 @@ export class AgentHandler {
       throw new Error(`AgentHandler requires an Agent input Event: ${event.eventId}`);
     }
     const invocationAt = at ?? new Date().toISOString();
+    let invocationAdapter: RuntimeAgentAdapter | undefined;
     const blocked = this.#blocked(event, invocationAt);
     if (blocked !== undefined) {
       const completedAt = invocationAt;
@@ -142,6 +144,8 @@ export class AgentHandler {
         controlledWorkspace ?? session?.workspace
       );
       if (adapter === undefined) throw new Error(`Agent adapter not available: ${event.agentId}`);
+      invocationAdapter = adapter;
+      const workspaceAccess = invocationWorkspaceAccess(event);
       if (session !== undefined && (session.agentId !== event.agentId ||
         session.adapterId !== adapter.adapterId || session.workspace !== adapter.workspace)) {
         throw new Error(
@@ -157,7 +161,11 @@ export class AgentHandler {
           : `session:${session.sessionId}`,
         () => adapter.invoke({
           event,
-          ...(session === undefined ? {} : { providerSessionId: session.providerSessionId })
+          ...(session === undefined ? {} : { providerSessionId: session.providerSessionId }),
+          reportProgress: (progress) => this.#store.recordAgentInvocationProgress(
+            execution.executionId,
+            assertInvocationIdentity(progress, adapter, workspaceAccess)
+          )
         })
       );
       const completedAt = at ?? new Date().toISOString();
@@ -192,6 +200,32 @@ export class AgentHandler {
           execution.executionId,
           retryBlocked,
           at ?? new Date().toISOString()
+        ).resultEvent;
+      }
+      if (error instanceof AgentInvocationError) {
+        if (invocationAdapter === undefined ||
+          error.failure.adapterId !== invocationAdapter.adapterId ||
+          error.failure.workspace !== invocationAdapter.workspace ||
+          !validFailureRecovery(error.failure, invocationWorkspaceAccess(event))) {
+          return this.#store.failExecution(
+            execution.executionId,
+            "Agent invocation failure identity does not match the selected adapter",
+            at ?? new Date().toISOString(),
+            this.#retryBaseMilliseconds
+          ).resultEvent;
+        }
+        return this.#store.failExecution(
+          execution.executionId,
+          error.message,
+          at ?? new Date().toISOString(),
+          this.#retryBaseMilliseconds,
+          {
+            trace: error.failure,
+            retry: event.type === "agent.request" ||
+              error.failure.recovery === "unknown_outcome_no_replay"
+              ? "never"
+              : "default"
+          }
         ).resultEvent;
       }
       return this.#store.failExecution(
@@ -238,6 +272,43 @@ export class AgentHandler {
     }
   }
 
+}
+
+function assertInvocationIdentity<T extends {
+  readonly adapterId: string;
+  readonly workspace: string;
+  readonly workspaceAccess: "read" | "write";
+}>(
+  progress: T,
+  adapter: RuntimeAgentAdapter,
+  workspaceAccess: "read" | "write"
+): T {
+  if (progress.adapterId !== adapter.adapterId || progress.workspace !== adapter.workspace ||
+    progress.workspaceAccess !== workspaceAccess) {
+    throw new Error("Agent invocation progress identity does not match the selected adapter");
+  }
+  return progress;
+}
+
+function invocationWorkspaceAccess(
+  event: AgentInputEvent | ChatDispatchEvent
+): "read" | "write" {
+  if (event.type === "agent.request") {
+    return event.runContext?.workspaceGrant?.access ?? "read";
+  }
+  if (event.type === "subscription.fire") return event.invocation?.workspaceGrant.access ?? "read";
+  return "read";
+}
+
+function validFailureRecovery(
+  failure: AgentInvocationError["failure"],
+  workspaceAccess: "read" | "write"
+): boolean {
+  if (failure.workspaceAccess !== workspaceAccess) return false;
+  if (workspaceAccess === "write") return failure.recovery === "unknown_outcome_no_replay";
+  return failure.recovery === (failure.providerSessionId === undefined
+    ? "none"
+    : "explicit_read_only_resume");
 }
 
 export class ResultHandler {

@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 
 import { runtimePaths } from "../../infrastructure/runtime/config.js";
 import { LocalFoundationStore } from "../../infrastructure/sqlite/foundation-store.js";
@@ -122,10 +123,10 @@ function actionFor(
   if (owner === "notice") {
     const noticeId = noticeIdForDelivery(fact.objectRef);
     return {
-      kind: "inspect",
+      kind: "recover",
       available: true,
       consoleRoute: noticeConsoleRoute(noticeId),
-      cliHint: `scripts/rs notice inspect ${noticeId}`
+      cliHint: `scripts/rs failure retry failure:delivery:${fact.objectRef}`
     };
   }
   if (fact.eventId !== undefined) {
@@ -167,7 +168,8 @@ export function runtimeFailureConsoleRoute(
 
 function agentReadinessFailure(database: string): RuntimeFailureSummary | undefined {
   if (!existsSync(database)) return undefined;
-  const store = new LocalFoundationStore(database);
+  const connection = new DatabaseSync(database, { readOnly: true });
+  const store = new LocalFoundationStore(connection, { migrate: false });
   try {
     const foundation = store.foundation();
     if (foundation === undefined) return undefined;
@@ -189,6 +191,7 @@ function agentReadinessFailure(database: string): RuntimeFailureSummary | undefi
     };
   } finally {
     store.close();
+    connection.close();
   }
 }
 

@@ -13,6 +13,7 @@ import {
   inspectNoticeView,
   listNoticeViews
 } from "../../application/notice/query.js";
+import { retryRuntimeFailure } from "../../application/runtime/failure-control.js";
 import {
   inspectRuntimeFailure,
   listRuntimeFailures
@@ -116,7 +117,16 @@ export function runFailureCommand(
     ), null, 2)}\n`);
     return 0;
   }
-  throw new Error("failure requires list or inspect");
+  if (command === "retry") {
+    requireCount(rest, 1, "failure retry requires exactly one Delivery failure ref");
+    output.write(`${JSON.stringify(retryRuntimeFailure(
+      repoRoot,
+      rest[0]!,
+      runtimeDirectory
+    ), null, 2)}\n`);
+    return 0;
+  }
+  throw new Error("failure requires list, inspect, or retry");
 }
 
 export function runNoticeCommand(

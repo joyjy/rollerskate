@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import type { ListPageInput } from "../../application/list-page.js";
 
 export type ConsoleRequestMarker = string | readonly string[] | undefined;
 
@@ -62,6 +63,25 @@ export function parseBoundedQueryInteger(
     throw new Error(`${field} must be an integer between ${minimum} and ${maximum}`);
   }
   return parsed;
+}
+
+export function parseListPageQuery(url: URL): ListPageInput {
+  const pageValue = url.searchParams.get("page");
+  const pageSizeValue = url.searchParams.get("pageSize");
+  const archive = url.searchParams.get("archive") ?? "current";
+  if (archive !== "current" && archive !== "archived" && archive !== "all") {
+    throw new Error("archive must be current, archived or all");
+  }
+  return {
+    page: pageValue === null
+      ? 1
+      : parseBoundedQueryInteger(pageValue, "page", 1, 100_000),
+    pageSize: pageSizeValue === null
+      ? 20
+      : parseBoundedQueryInteger(pageSizeValue, "pageSize", 1, 100),
+    search: url.searchParams.get("q") ?? "",
+    archive
+  };
 }
 
 export function json(

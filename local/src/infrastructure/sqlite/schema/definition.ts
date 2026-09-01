@@ -308,6 +308,13 @@ export function createSchema(database: DatabaseSync): void {
           AND length(orchestrator_binding_json) <= 16384
         )
       ),
+      source_binding_json TEXT CHECK(
+        source_binding_json IS NULL OR (
+          json_valid(source_binding_json)
+          AND length(source_binding_json) <= 16384
+          AND series_key IS NOT NULL
+        )
+      ),
       status TEXT NOT NULL CHECK(status IN (
         'active', 'waiting', 'awaiting_orchestrator',
         'awaiting_source', 'succeeded', 'failed', 'needs_human', 'cancelled'
@@ -326,6 +333,7 @@ export function createSchema(database: DatabaseSync): void {
       ),
       terminal_summary TEXT,
       cancelled_at TEXT,
+      archived_at TEXT,
       version INTEGER NOT NULL DEFAULT 1 CHECK(version >= 1),
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
@@ -409,6 +417,12 @@ export function createSchema(database: DatabaseSync): void {
           AND length(workspace_grant_json) <= 16384
         )
       ),
+      source_envelope_json TEXT CHECK(
+        source_envelope_json IS NULL OR (
+          json_valid(source_envelope_json)
+          AND length(source_envelope_json) <= 65536
+        )
+      ),
       status TEXT NOT NULL CHECK(status IN (
         'active', 'succeeded', 'failed', 'needs_human', 'superseded', 'cancelled'
       )),
@@ -426,6 +440,12 @@ export function createSchema(database: DatabaseSync): void {
     );
     CREATE INDEX IF NOT EXISTS agent_run_cycles_run_created
       ON agent_run_cycles(run_id, created_at DESC, cycle_id DESC);
+    CREATE UNIQUE INDEX IF NOT EXISTS agent_run_cycles_run_occurrence
+      ON agent_run_cycles(
+        run_id,
+        json_extract(source_envelope_json, '$.occurrenceKey')
+      )
+      WHERE source_envelope_json IS NOT NULL;
     CREATE TABLE IF NOT EXISTS agent_run_decisions (
       run_id TEXT NOT NULL REFERENCES agent_runs(run_id),
       request_id TEXT NOT NULL,
@@ -443,6 +463,26 @@ export function createSchema(database: DatabaseSync): void {
     );
     CREATE INDEX IF NOT EXISTS agent_run_decisions_run_version
       ON agent_run_decisions(run_id, resulting_run_version DESC);
+    CREATE TABLE IF NOT EXISTS legacy_trigger_migration_receipts (
+      source_kind TEXT NOT NULL CHECK(source_kind IN (
+        'schedule', 'subscription', 'continuous_subscription'
+      )),
+      source_id TEXT NOT NULL,
+      definition_revision TEXT NOT NULL,
+      proposal_digest TEXT NOT NULL CHECK(
+        proposal_digest GLOB 'sha256:[0-9a-f]*' AND length(proposal_digest) = 71
+      ),
+      migration_request_id TEXT NOT NULL UNIQUE,
+      run_id TEXT NOT NULL UNIQUE REFERENCES agent_runs(run_id),
+      admission_digest TEXT NOT NULL CHECK(
+        admission_digest GLOB 'sha256:[0-9a-f]*' AND length(admission_digest) = 71
+      ),
+      old_definition_status TEXT NOT NULL CHECK(
+        old_definition_status IN ('active', 'paused')
+      ),
+      applied_at TEXT NOT NULL,
+      PRIMARY KEY(source_kind, source_id, definition_revision)
+    );
     CREATE TABLE IF NOT EXISTS chat_messages (
       event_id TEXT PRIMARY KEY REFERENCES events(event_id),
       topic_id TEXT NOT NULL,
@@ -641,7 +681,7 @@ export function createSchema(database: DatabaseSync): void {
     CREATE TABLE IF NOT EXISTS subscriptions (
       subscription_id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
-      owner_agent_id TEXT NOT NULL REFERENCES agents(principal_id),
+      owner_agent_id TEXT REFERENCES agents(principal_id),
       plugin_path TEXT NOT NULL,
       plugin_id TEXT NOT NULL,
       plugin_schema_version INTEGER NOT NULL CHECK(plugin_schema_version = 1),
@@ -652,7 +692,7 @@ export function createSchema(database: DatabaseSync): void {
       max_attempts INTEGER NOT NULL,
       attempt_count INTEGER NOT NULL DEFAULT 0,
       definition_schema TEXT NOT NULL CHECK(
-        definition_schema = 'SubscriptionDefinition@3'
+        definition_schema IN ('SubscriptionDefinition@3', 'SubscriptionDefinition@4')
       ),
       definition_revision TEXT NOT NULL,
       definition_digest TEXT NOT NULL,
@@ -676,16 +716,59 @@ export function createSchema(database: DatabaseSync): void {
           json_valid(external_ref_binding_json) AND length(external_ref_binding_json) <= 16384
         )
       ),
+      source_binding_json TEXT CHECK(
+        source_binding_json IS NULL OR (
+          json_valid(source_binding_json) AND length(source_binding_json) <= 16384
+        )
+      ),
+      agent_run_id TEXT REFERENCES agent_runs(run_id),
+      cycle_id TEXT UNIQUE REFERENCES agent_run_cycles(cycle_id),
+      admission_receipt_json TEXT CHECK(
+        admission_receipt_json IS NULL OR (
+          json_valid(admission_receipt_json) AND length(admission_receipt_json) <= 16384
+        )
+      ),
+      archived_at TEXT,
       created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
+      updated_at TEXT NOT NULL,
+      CHECK(
+        (definition_schema = 'SubscriptionDefinition@3'
+          AND owner_agent_id IS NOT NULL AND source_binding_json IS NULL
+          AND agent_run_id IS NULL AND cycle_id IS NULL
+          AND admission_receipt_json IS NULL)
+        OR (definition_schema = 'SubscriptionDefinition@4'
+          AND owner_agent_id IS NULL AND source_binding_json IS NOT NULL
+          AND agent_run_id IS NOT NULL
+          AND json_extract(source_binding_json, '$.schemaVersion') = 'RunSourceBinding@1'
+          AND json_extract(source_binding_json, '$.runId') = agent_run_id
+          AND json_extract(source_binding_json, '$.source.kind') = 'subscription'
+          AND json_extract(source_binding_json, '$.source.id') = subscription_id
+          AND json_extract(source_binding_json, '$.source.definitionRevision') =
+            'SubscriptionDefinition@4:' || definition_revision)
+      ),
+      CHECK(
+        (cycle_id IS NULL AND admission_receipt_json IS NULL)
+        OR (cycle_id IS NOT NULL AND admission_receipt_json IS NOT NULL
+          AND json_extract(admission_receipt_json, '$.schemaVersion') =
+            'SubscriptionOccurrenceAdmissionReceipt@1'
+          AND json_extract(admission_receipt_json, '$.subscriptionId') = subscription_id
+          AND json_extract(admission_receipt_json, '$.occurrenceKey') = terminal_key
+          AND json_extract(admission_receipt_json, '$.agentRunId') = agent_run_id
+          AND json_extract(admission_receipt_json, '$.cycleId') = cycle_id)
+      )
     );
     CREATE INDEX IF NOT EXISTS subscriptions_due
       ON subscriptions(status, next_poll_at);
     CREATE TABLE IF NOT EXISTS continuous_subscriptions (
       subscription_id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
-      owner_agent_id TEXT NOT NULL REFERENCES agents(principal_id),
+      owner_agent_id TEXT REFERENCES agents(principal_id),
       current_revision INTEGER NOT NULL CHECK(current_revision >= 1),
+      definition_schema TEXT NOT NULL DEFAULT 'ContinuousSubscriptionDefinition@1' CHECK(
+        definition_schema IN (
+          'ContinuousSubscriptionDefinition@1', 'ContinuousSubscriptionDefinition@2'
+        )
+      ),
       plugin_path TEXT NOT NULL,
       plugin_id TEXT NOT NULL,
       plugin_config_json TEXT NOT NULL CHECK(
@@ -718,11 +801,53 @@ export function createSchema(database: DatabaseSync): void {
           json_valid(external_ref_binding_json) AND length(external_ref_binding_json) <= 16384
         )
       ),
+      source_binding_json TEXT CHECK(
+        source_binding_json IS NULL OR (
+          json_valid(source_binding_json) AND length(source_binding_json) <= 16384
+        )
+      ),
+      agent_run_id TEXT REFERENCES agent_runs(run_id),
+      pending_cycle_id TEXT UNIQUE REFERENCES agent_run_cycles(cycle_id),
+      pending_admission_receipt_json TEXT CHECK(
+        pending_admission_receipt_json IS NULL OR (
+          json_valid(pending_admission_receipt_json)
+          AND length(pending_admission_receipt_json) <= 16384
+        )
+      ),
+      archived_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       CHECK(
         (pending_occurrence_key IS NULL AND pending_observation_json IS NULL)
         OR (pending_occurrence_key IS NOT NULL AND pending_observation_json IS NOT NULL)
+      ),
+      CHECK(
+        (definition_schema = 'ContinuousSubscriptionDefinition@1'
+          AND owner_agent_id IS NOT NULL AND source_binding_json IS NULL
+          AND agent_run_id IS NULL AND pending_cycle_id IS NULL
+          AND pending_admission_receipt_json IS NULL)
+        OR (definition_schema = 'ContinuousSubscriptionDefinition@2'
+          AND owner_agent_id IS NULL AND source_binding_json IS NOT NULL
+          AND agent_run_id IS NOT NULL
+          AND json_extract(source_binding_json, '$.schemaVersion') = 'RunSourceBinding@1'
+          AND json_extract(source_binding_json, '$.runId') = agent_run_id
+          AND json_extract(source_binding_json, '$.source.kind') =
+            'continuous_subscription'
+          AND json_extract(source_binding_json, '$.source.id') = subscription_id
+          AND json_extract(source_binding_json, '$.source.definitionRevision') =
+            'ContinuousSubscriptionDefinition@2:' || current_revision)
+      ),
+      CHECK(
+        (pending_cycle_id IS NULL AND pending_admission_receipt_json IS NULL)
+        OR (pending_occurrence_key IS NOT NULL AND pending_cycle_id IS NOT NULL
+          AND pending_admission_receipt_json IS NOT NULL
+          AND json_extract(pending_admission_receipt_json, '$.schemaVersion') =
+            'SubscriptionOccurrenceAdmissionReceipt@1'
+          AND json_extract(pending_admission_receipt_json, '$.subscriptionId') = subscription_id
+          AND json_extract(pending_admission_receipt_json, '$.occurrenceKey') =
+            pending_occurrence_key
+          AND json_extract(pending_admission_receipt_json, '$.agentRunId') = agent_run_id
+          AND json_extract(pending_admission_receipt_json, '$.cycleId') = pending_cycle_id)
       )
     );
     CREATE INDEX IF NOT EXISTS continuous_subscriptions_due
@@ -807,7 +932,10 @@ export function createSchema(database: DatabaseSync): void {
       next_occurrence_key TEXT,
       next_occurrence_missing INTEGER NOT NULL DEFAULT 0
         CHECK(next_occurrence_missing IN (0, 1)),
-      agent_id TEXT NOT NULL REFERENCES agents(principal_id),
+      definition_schema TEXT NOT NULL DEFAULT 'ScheduleRevision@1' CHECK(
+        definition_schema IN ('ScheduleRevision@1', 'ScheduleRevision@2')
+      ),
+      agent_id TEXT REFERENCES agents(principal_id),
       kind TEXT NOT NULL CHECK(kind IN ('once', 'cron')),
       expression TEXT NOT NULL,
       expression_version TEXT NOT NULL CHECK(
@@ -819,16 +947,22 @@ export function createSchema(database: DatabaseSync): void {
       misfire_grace_ms INTEGER NOT NULL CHECK(
         misfire_grace_ms BETWEEN 0 AND 604800000
       ),
-      session_policy TEXT NOT NULL CHECK(session_policy IN ('new_each_run', 'fixed')),
+      session_policy TEXT CHECK(session_policy IN ('new_each_run', 'fixed')),
       fixed_session_id TEXT REFERENCES agent_sessions(session_id),
-      prompt TEXT NOT NULL,
-      workspace TEXT NOT NULL,
+      prompt TEXT,
+      workspace TEXT,
+      source_binding_json TEXT CHECK(
+        source_binding_json IS NULL OR (
+          json_valid(source_binding_json) AND length(source_binding_json) <= 16384
+        )
+      ),
       external_ref_binding_json TEXT CHECK(
         external_ref_binding_json IS NULL OR (
           json_valid(external_ref_binding_json) AND length(external_ref_binding_json) <= 16384
         )
       ),
       revision_created_at TEXT NOT NULL,
+      archived_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       CHECK(
@@ -840,12 +974,30 @@ export function createSchema(database: DatabaseSync): void {
         OR (kind = 'cron' AND expression_version = 'cron-v1' AND timezone IS NOT NULL)
       ),
       CHECK(
-        (session_policy = 'new_each_run' AND fixed_session_id IS NULL)
-        OR (session_policy = 'fixed' AND fixed_session_id IS NOT NULL)
+        (definition_schema = 'ScheduleRevision@1'
+          AND agent_id IS NOT NULL AND session_policy IS NOT NULL
+          AND prompt IS NOT NULL AND workspace IS NOT NULL
+          AND source_binding_json IS NULL
+          AND (
+            (session_policy = 'new_each_run' AND fixed_session_id IS NULL)
+            OR (session_policy = 'fixed' AND fixed_session_id IS NOT NULL)
+          ))
+        OR (definition_schema = 'ScheduleRevision@2'
+          AND agent_id IS NULL AND session_policy IS NULL
+          AND fixed_session_id IS NULL AND prompt IS NULL AND workspace IS NULL
+          AND source_binding_json IS NOT NULL
+          AND json_extract(source_binding_json, '$.schemaVersion') = 'RunSourceBinding@1'
+          AND json_extract(source_binding_json, '$.source.kind') = 'schedule'
+          AND json_extract(source_binding_json, '$.source.id') = schedule_id
+          AND json_extract(source_binding_json, '$.source.definitionRevision') =
+            'ScheduleRevision@2:' || current_revision)
       )
     );
     CREATE INDEX IF NOT EXISTS schedules_due
       ON schedules(status, next_run_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS schedules_bound_run
+      ON schedules(json_extract(source_binding_json, '$.runId'))
+      WHERE source_binding_json IS NOT NULL;
     CREATE TABLE IF NOT EXISTS scheduled_runs (
       run_id TEXT PRIMARY KEY,
       schedule_id TEXT NOT NULL,
@@ -864,11 +1016,40 @@ export function createSchema(database: DatabaseSync): void {
       event_id TEXT UNIQUE REFERENCES events(event_id),
       execution_id TEXT UNIQUE REFERENCES executions(execution_id),
       session_id TEXT REFERENCES agent_sessions(session_id),
+      agent_run_id TEXT REFERENCES agent_runs(run_id),
+      cycle_id TEXT UNIQUE REFERENCES agent_run_cycles(cycle_id),
+      admission_receipt_json TEXT CHECK(
+        admission_receipt_json IS NULL OR (
+          json_valid(admission_receipt_json) AND length(admission_receipt_json) <= 16384
+        )
+      ),
       decision_reason TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       completed_at TEXT,
-      UNIQUE(schedule_id, occurrence_key)
+      UNIQUE(schedule_id, occurrence_key),
+      CHECK(
+        (cycle_id IS NULL AND admission_receipt_json IS NULL)
+        OR (agent_run_id IS NOT NULL AND cycle_id IS NOT NULL
+          AND admission_receipt_json IS NOT NULL
+          AND json_extract(admission_receipt_json, '$.schemaVersion') =
+            'ScheduleOccurrenceAdmissionReceipt@1'
+          AND json_extract(admission_receipt_json, '$.scheduleId') = schedule_id
+          AND json_extract(admission_receipt_json, '$.occurrenceId') = run_id
+          AND json_extract(admission_receipt_json, '$.agentRunId') = agent_run_id
+          AND json_extract(admission_receipt_json, '$.cycleId') = cycle_id)
+      ),
+      CHECK(
+        agent_run_id IS NULL OR (
+          event_id IS NULL AND execution_id IS NULL AND session_id IS NULL
+        )
+      ),
+      CHECK(
+        (json_extract(definition_snapshot_json, '$.schema') =
+          'ScheduleDefinitionSnapshot@1' AND agent_run_id IS NULL)
+        OR (json_extract(definition_snapshot_json, '$.schema') =
+          'ScheduleDefinitionSnapshot@2' AND agent_run_id IS NOT NULL)
+      )
     );
     CREATE INDEX IF NOT EXISTS scheduled_runs_schedule
       ON scheduled_runs(schedule_id, created_at DESC);
@@ -912,6 +1093,32 @@ export function createSchema(database: DatabaseSync): void {
       ${noticeProjectionSql("NEW.delivery_id")}
     END;
   `);
+  const runColumns = database.prepare("PRAGMA table_info(agent_runs)").all() as
+    unknown as Array<{ name: string }>;
+  if (runColumns.some(({ name }) => name === "archived_at")) {
+    database.exec(`
+      CREATE INDEX IF NOT EXISTS agent_runs_archive_updated
+        ON agent_runs(archived_at, updated_at DESC, run_id DESC)
+    `);
+  }
+  for (const [table, idColumn, index] of [
+    ["schedules", "schedule_id", "schedules_archive_updated"],
+    ["subscriptions", "subscription_id", "subscriptions_archive_updated"],
+    [
+      "continuous_subscriptions",
+      "subscription_id",
+      "continuous_subscriptions_archive_updated"
+    ]
+  ] as const) {
+    const columns = database.prepare(`PRAGMA table_info(${table})`).all() as
+      unknown as Array<{ name: string }>;
+    if (columns.some(({ name }) => name === "archived_at")) {
+      database.exec(`
+        CREATE INDEX IF NOT EXISTS ${index}
+          ON ${table}(archived_at, updated_at DESC, ${idColumn} DESC)
+      `);
+    }
+  }
 }
 function noticeProjectionSql(deliveryIdExpression: string): string {
   return `

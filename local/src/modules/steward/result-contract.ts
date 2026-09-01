@@ -1,4 +1,5 @@
 import { parseBoundedJsonObject } from "../agent/result-envelope.js";
+import { assertSpecCompatibility, resolveSpecToken } from "../spec/registry.js";
 
 const MAX_SUMMARY = 4_096;
 const MAX_OBJECTIVE = 16_384;
@@ -53,6 +54,11 @@ export function parseAgentTurnResult(input: string): AgentTurnResult {
   const parsed = parseBoundedJsonObject(
     input,
     "AgentTurnResult@1 output must be one JSON object"
+  );
+  assertSpecCompatibility(
+    "spec:rollerskate/agent-turn-result@1",
+    parsed.schemaVersion,
+    { kind: "result-contract" }
   );
   if (parsed.schemaVersion !== "AgentTurnResult@1") {
     throw new Error("AgentTurnResult@1 schemaVersion is required");
@@ -182,6 +188,7 @@ function mandate(value: unknown): AgentTurnMandate {
   if (Buffer.byteLength(encoded, "utf8") > MAX_INPUT_BYTES) {
     throw new Error(`mandate.inputs must be at most ${MAX_INPUT_BYTES} bytes`);
   }
+  resolveSpecToken(value.workflowRef, { kind: "workflow" });
   return {
     kind: "workflow",
     workflowRef: text(value.workflowRef, "mandate.workflowRef", 256),

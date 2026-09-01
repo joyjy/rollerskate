@@ -17,11 +17,16 @@ describe("StewardView", () => {
     const runB = summary({
       runId: "run_b",
       updatedAt: "2026-07-25T00:00:01.000Z",
-      mandate: { kind: "objective", label: "second run", workflowRef: null }
+      mandate: { kind: "objective", label: "second run", workflowRef: null },
+      source: {
+        kind: "schedule",
+        id: "sch_bound",
+        definitionRevision: "ScheduleRevision@2:1"
+      }
     });
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
-      if (url === "/api/runs") return Response.json([runA, runB]);
+      if (url.startsWith("/api/runs?")) return Response.json(runPage(url, [runA, runB]));
       if (url === `/api/runs/${runB.runId}`) return Response.json(detail({ summary: runB }));
       return Response.json({ error: "unexpected" }, { status: 500 });
     });
@@ -35,6 +40,7 @@ describe("StewardView", () => {
     expect(router.currentRoute.value.name).toBe("steward");
     expect(router.currentRoute.value.query.runId).toBe(runB.runId);
     expect(wrapper.text()).toContain("second run");
+    expect(wrapper.text()).toContain("schedule · sch_bound");
     expect(wrapper.text()).toContain("@steward");
     expect(wrapper.text()).toContain("succeeded");
     wrapper.unmount();
@@ -43,7 +49,7 @@ describe("StewardView", () => {
   it("does not fetch a placeholder detail or render a schema error when the list is empty", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
-      if (url === "/api/runs") return Response.json([]);
+      if (url.startsWith("/api/runs?")) return Response.json(runPage(url, []));
       return Response.json({ error: "not_found" }, { status: 404 });
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -71,7 +77,7 @@ describe("StewardView", () => {
     });
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
-      if (url === "/api/runs") return Response.json([runA, runB]);
+      if (url.startsWith("/api/runs?")) return Response.json(runPage(url, [runA, runB]));
       const detailMatch = url.match(/^\/api\/runs\/([^/]+)$/);
       if (detailMatch !== null) {
         const runId = detailMatch[1]!;
@@ -109,7 +115,7 @@ describe("StewardView", () => {
     wrapper.unmount();
   });
 
-  it("paginates ten Runs and supports numeric, Previous, and Next navigation", async () => {
+  it("paginates twenty Runs and supports Previous and Next navigation", async () => {
     const runs = Array.from({ length: 23 }, (_, index) => summary({
       runId: `run_${String(index).padStart(2, "0")}`,
       updatedAt: `2026-07-25T00:00:${String(index).padStart(2, "0")}.000Z`,
@@ -117,7 +123,7 @@ describe("StewardView", () => {
     }));
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
-      if (url === "/api/runs") return Response.json(runs);
+      if (url.startsWith("/api/runs?")) return Response.json(runPage(url, runs));
       const runId = url.match(/^\/api\/runs\/([^/]+)$/)?.[1];
       const run = runs.find((candidate) => candidate.runId === runId);
       return run
@@ -131,23 +137,21 @@ describe("StewardView", () => {
     const wrapper = mount(StewardView, { global: { plugins: [router] } });
     await flushPromises();
 
-    expect(wrapper.findAll(".operation-row")).toHaveLength(10);
-    expect(wrapper.find(".pagination-info").text()).toBe("Page 1/3");
+    expect(wrapper.findAll(".operation-row")).toHaveLength(20);
+    expect(wrapper.find(".pagination-info").text()).toBe("Page 1/2");
 
     await wrapper.find('[aria-label="Next page"]').trigger("click");
-    expect(wrapper.find(".pagination-info").text()).toBe("Page 2/3");
-    expect(wrapper.findAll(".operation-row")).toHaveLength(10);
-
-    await wrapper.find('[aria-label="Page 3"]').trigger("click");
-    expect(wrapper.find(".pagination-info").text()).toBe("Page 3/3");
+    await flushPromises();
+    expect(wrapper.find(".pagination-info").text()).toBe("Page 2/2");
     expect(wrapper.findAll(".operation-row")).toHaveLength(3);
 
     await wrapper.find('[aria-label="Previous page"]').trigger("click");
-    expect(wrapper.find(".pagination-info").text()).toBe("Page 2/3");
+    await flushPromises();
+    expect(wrapper.find(".pagination-info").text()).toBe("Page 1/2");
     wrapper.unmount();
   });
 
-  it("searches Run fields, resets pagination, and preserves detail for no matches", async () => {
+  it("searches Run fields and clears selection when there are no matches", async () => {
     const selectedRun = summary({
       runId: "run_selected",
       updatedAt: "2026-07-25T00:01:00.000Z",
@@ -166,7 +170,7 @@ describe("StewardView", () => {
     const runs = [selectedRun, searchRun, ...fillerRuns];
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
-      if (url === "/api/runs") return Response.json(runs);
+      if (url.startsWith("/api/runs?")) return Response.json(runPage(url, runs));
       const runId = url.match(/^\/api\/runs\/([^/]+)$/)?.[1];
       const run = runs.find((candidate) => candidate.runId === runId);
       return run
@@ -180,12 +184,10 @@ describe("StewardView", () => {
     const wrapper = mount(StewardView, { global: { plugins: [router] } });
     await flushPromises();
 
-    await wrapper.find('[aria-label="Next page"]').trigger("click");
-    expect(wrapper.find(".pagination-info").text()).toBe("Page 2/2");
-
-    const search = wrapper.find<HTMLInputElement>('[aria-label="Search Steward Runs"]');
+    const search = wrapper.find<HTMLInputElement>('[aria-label="Search Steward"]');
     for (const query of ["SPECIAL LABEL", "RUN_SEARCH_ID", "SEARCHHANDLE", "FAILED"]) {
       await search.setValue(query);
+      await flushPromises();
       expect(wrapper.find(".pagination-info").text()).toBe("Page 1/1");
       expect(wrapper.findAll(".operation-row")).toHaveLength(1);
       expect(wrapper.find(".operation-row").text()).toContain("run_search_id");
@@ -193,16 +195,16 @@ describe("StewardView", () => {
 
     await search.setValue("definitely-no-match");
     await flushPromises();
-    expect(wrapper.text()).toContain("No matches.");
+    expect(wrapper.text()).toContain("No Steward Run has been created");
     expect(wrapper.find(".pagination-info").text()).toBe("0 results");
-    expect(router.currentRoute.value.query.runId).toBe(selectedRun.runId);
-    expect(wrapper.text()).toContain("selected detail");
+    expect(router.currentRoute.value.query.runId).toBeUndefined();
+    expect(wrapper.text()).toContain("Select a Steward Run");
     expect(wrapper.find('[aria-label="Previous page"]').attributes("disabled")).toBeDefined();
     expect(wrapper.find('[aria-label="Next page"]').attributes("disabled")).toBeDefined();
     wrapper.unmount();
   });
 
-  it("opens the page containing a deep-linked Run", async () => {
+  it("loads a deep-linked Run independently from the current list query", async () => {
     const runs = Array.from({ length: 12 }, (_, index) => summary({
       runId: `run_deep_${index}`,
       updatedAt: `2026-07-25T00:00:${String(index).padStart(2, "0")}.000Z`
@@ -210,7 +212,7 @@ describe("StewardView", () => {
     const deepLinkedRun = runs[0]!;
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
-      if (url === "/api/runs") return Response.json(runs);
+      if (url.startsWith("/api/runs?")) return Response.json(runPage(url, runs));
       if (url === `/api/runs/${deepLinkedRun.runId}`) {
         return Response.json(detail({ summary: deepLinkedRun }));
       }
@@ -223,7 +225,7 @@ describe("StewardView", () => {
     const wrapper = mount(StewardView, { global: { plugins: [router] } });
     await flushPromises();
 
-    expect(wrapper.find(".pagination-info").text()).toBe("Page 2/2");
+    expect(wrapper.find(".pagination-info").text()).toBe("Page 1/1");
     expect(wrapper.find(".operation-row.active").text()).toContain(deepLinkedRun.runId);
     wrapper.unmount();
   });
@@ -232,7 +234,7 @@ describe("StewardView", () => {
     const run = summary({ runId: "run_linked", status: "awaiting_source" });
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
-      if (url === "/api/runs") return Response.json([run]);
+      if (url.startsWith("/api/runs?")) return Response.json(runPage(url, [run]));
       if (url === `/api/runs/${run.runId}`) return Response.json(detail({ summary: run }));
       return Response.json({ error: "unexpected" }, { status: 500 });
     });
@@ -296,7 +298,7 @@ describe("StewardView", () => {
     });
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
-      if (url === "/api/runs") return Response.json([activeRun]);
+      if (url.startsWith("/api/runs?")) return Response.json(runPage(url, [activeRun]));
       if (url === `/api/runs/${activeRun.runId}`) return Response.json(activeDetail);
       return Response.json({ error: "unexpected" }, { status: 500 });
     });
@@ -322,7 +324,7 @@ describe("StewardView", () => {
     const activeDetail = detail({ summary: activeRun });
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      if (url === "/api/runs") return Response.json([activeRun]);
+      if (url.startsWith("/api/runs?")) return Response.json(runPage(url, [activeRun]));
       if (url === `/api/runs/${activeRun.runId}`) return Response.json(activeDetail);
       if (url === `/api/runs/${activeRun.runId}/cancel` && init?.method === "POST") {
         return Response.json({
@@ -347,6 +349,52 @@ describe("StewardView", () => {
       `/api/runs/${activeRun.runId}/cancel`,
       expect.objectContaining({ method: "POST" })
     );
+    wrapper.unmount();
+  });
+
+  it("archives terminal Runs and switches to the archived view", async () => {
+    const terminalRun = summary({ runId: "run_terminal" });
+    const archivedRun = summary({
+      runId: terminalRun.runId,
+      archivedAt: "2026-07-25T01:00:00.000Z"
+    });
+    let archived = false;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.startsWith("/api/runs?")) {
+        return Response.json(runPage(url, [archived ? archivedRun : terminalRun]));
+      }
+      if (url === `/api/runs/${terminalRun.runId}`) {
+        return Response.json(detail({ summary: archived ? archivedRun : terminalRun }));
+      }
+      if (url === `/api/runs/${terminalRun.runId}/archive` && init?.method === "POST") {
+        archived = true;
+        return Response.json({
+          status: "archived",
+          run: { ...terminalRun, archivedAt: archivedRun.archivedAt }
+        });
+      }
+      return Response.json({ error: "unexpected" }, { status: 500 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const router = createConsoleRouter(createMemoryHistory());
+    await router.push(`/console/steward?runId=${terminalRun.runId}`);
+    const wrapper = mount(StewardView, { global: { plugins: [router] } });
+    await flushPromises();
+
+    await wrapper.find(".archive-button").trigger("click");
+    await flushPromises();
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/runs/${terminalRun.runId}/archive`,
+      expect.objectContaining({ method: "POST" })
+    );
+    expect(wrapper.text()).toContain("No Steward Run has been created");
+
+    await wrapper.find(".archive-filter").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".operation-row").text()).toContain(terminalRun.runId);
+    expect(wrapper.find(".archive-button").text()).toBe("Restore");
     wrapper.unmount();
   });
 
@@ -376,6 +424,7 @@ function summary(
     workspace: null,
     progress: { steps: 1, maxSteps: 8, maxDepth: 3 },
     terminalSummary: null,
+    archivedAt: null,
     updatedAt: "2026-07-25T00:00:00.000Z",
     ...rest
   };
@@ -409,5 +458,29 @@ function detail(
     currentWorkspaceRevision: null,
     workspaceRevisionError: null,
     ...rest
+  };
+}
+
+function runPage(url: string, candidates: AgentRunSummaryViewOutput[]) {
+  const parameters = new URL(url, "http://localhost").searchParams;
+  const archived = parameters.get("archive") === "archived";
+  const search = (parameters.get("q") ?? "").toLowerCase();
+  const page = Number(parameters.get("page") ?? 1);
+  const pageSize = Number(parameters.get("pageSize") ?? 20);
+  const filtered = candidates
+    .filter((run) => (run.archivedAt !== null) === archived)
+    .filter((run) => search === "" || [
+      run.mandate.label,
+      run.runId,
+      run.steward.handle,
+      run.status
+    ].some((value) => value.toLowerCase().includes(search)))
+    .sort((left, right) =>
+      right.updatedAt.localeCompare(left.updatedAt) || right.runId.localeCompare(left.runId));
+  return {
+    items: filtered.slice((page - 1) * pageSize, page * pageSize),
+    total: filtered.length,
+    page,
+    pageSize
   };
 }

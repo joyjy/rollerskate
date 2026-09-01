@@ -10,7 +10,7 @@ timestamp: 2026-07-26
 
 ## 30 秒架构
 
-Rollerskate 是 Local-first Agent proactive system。每台电脑运行一个 Local Runtime，拥有本机 identity、workspace、Chat、Agent、durable state 和唯一 core loop；首次启动不依赖 Server、OIDC 或 Device enrollment。可选 Server control plane 提供 Human/Device/Agent authentication、公开 Agent/Topic/Integration authority、原生 Topic fanout 与在线 Agent work request，但不接管本机 workspace、权限、执行与停止权。schema v63 继续复用唯一 loop；Steward Run 可由 autonomous Agent callback、manual caller decision，或默认 Codex Orchestrator 的 strict decision 推进，autonomous series 还可按 source revision 建 cycle。Schedule/Subscription 可在既有 lifecycle 内固定受 Integration authority 约束的 ExternalRef revision。Work request 只有在目标 Local owner 显式接受后才进入既有 Steward Run，离线或旧 Runtime route 不补推。
+Rollerskate 是 Local-first Agent proactive system。每台电脑运行一个 Local Runtime，拥有本机 identity、workspace、Chat、Agent、durable state 和唯一 core loop；首次启动不依赖 Server、OIDC 或 Device enrollment。可选 Server control plane 提供 Human/Device/Agent authentication、公开 Agent/Topic/Integration authority、原生 Topic fanout 与在线 Agent work request，但不接管本机 workspace、权限、执行与停止权。schema v69 继续复用唯一 loop，并为 Steward Run 增加 single-source binding、immutable cycle occurrence envelope 与 durable legacy migration receipt；terminal Steward Run、Schedule 与 Subscription 的可逆 archive visibility 保持独立。Steward Run 可由 autonomous Agent callback、manual caller decision、既有 Codex `RunDecision@2`，或 admission-bound Codex `RunDecision@3` 推进；`@3` 可以等待一个内部 source，并以显式 cycle/run scope 完成。`ScheduleRevision@2`、`SubscriptionDefinition@4` 与 `ContinuousSubscriptionDefinition@2` 通过 exact occurrence envelope 原子激活绑定 Run cycle，各 source 仍独立拥有 timing/poll/checkpoint/freshness lifecycle。Work request 只有在目标 Local owner 显式接受后才进入既有 Steward Run，离线或旧 Runtime route 不补推。
 
 ```text
 Owner / Console / fixed ingress
@@ -24,7 +24,7 @@ Optional remote control
   -> Server BFF -> Matrix -> Local Runtime admission
 ```
 
-最近完整 release baseline 是 [v0.5.4 verification](../verification/v0.5.4.md)。未发布的 v0.5.3 Project/effect 候选已经降级：Project policy/effect 硬集成退出当前架构，保留 read-only Connector、Integration binding、普通 Vikunja Task writeback 与通用 Steward Orchestrator。其余未实现工作只从 [Active plan](../plan/index.md) 进入。
+最近 release baseline 是 [v0.5.6 verification](../verification/v0.5.6.md)；隔离与默认 Runtime freshness 均已通过，默认实例已加载 final v0.5.6 artifact。未发布的 v0.5.3 Project/effect 候选已经降级：Project policy/effect 硬集成退出当前架构，保留 read-only Connector、Integration binding、普通 Vikunja Task writeback 与通用 Steward Orchestrator。其余未实现工作只从 [Active plan](../plan/index.md) 进入。
 
 ## 默认阅读路径
 
@@ -51,6 +51,7 @@ ADR、Source map 和 Event Reference 都是按需材料，不是理解系统的�
 - Topic scheduled activation：`TopicActivationSchedule` 属于 Topic application vertical，只调度 conversation intent 与 candidate policy，不接受 arbitrary prompt/callback；运行时复用 canonical Chat activation。
 - Interactive Channel：Agent-scoped Local/Server channel allowlist、幂等 send receipt、cursor/follow token 与可选 exact idle `ses_*` callback；不开放 generic channel identity 或远端执行入口。
 - [Local Steward And Review Workflow](./local-review.md)：Steward Run 的 autonomous/manual caller/default Codex Orchestrator、长期 series/revision cycle、cycle-scoped Session、checkpoint/decision、external workspace grant 与 versioned workflow。
+- [Canonical Spec Registry](./spec-registry.md)：`SpecRef@1`、Run 主链 registry、compatibility 与 artifact digest 边界。
 
 只在修改对应领域时读取这些专题；它们不是默认架构阅读路径。
 
@@ -64,7 +65,7 @@ ADR、Source map 和 Event Reference 都是按需材料，不是理解系统的�
 
 - [Source map](./source-map.md)：workspace、源码 root、ownership、共享 contract、生成关系与验证入口。
 - [Event Reference](./event-reference.md)：Local canonical Event、Runtime object 与 Server/Matrix EventEnvelope。
-- [Database Reference](./db-reference.md)：Event / index / object 建模规范，以及 Local SQLite schema v63 的 28 张物理 table、ownership、authority 与迁移规则。
+- [Database Reference](./db-reference.md)：Event / index / object 建模规范，以及 Local SQLite schema v69 的 29 张物理 table、ownership、authority 与迁移规则。
 
 Source map 只在修改 source root、ownership、共享 contract、生成关系或验证入口时读取；Event Reference 只在查询或修改 Event schema/type 与 Runtime object 时读取；Database Reference 在设计或修改 Local SQLite table、migration、materialized index/projection 或 durable object/state 时读取。
 

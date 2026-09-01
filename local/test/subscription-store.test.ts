@@ -92,6 +92,34 @@ test("cancelled Subscription ignores a late terminal observation", () => {
   }
 });
 
+test("Subscription archive visibility is reversible and limited to terminal state", () => {
+  const database = testDatabase();
+  const store = new SubscriptionStore(database);
+  try {
+    const subscriptionId = store.create(
+      definition(seedAgent(database)),
+      "2026-07-22T10:00:00.000Z"
+    ).subscriptionId;
+    assert.throws(
+      () => store.setArchived(subscriptionId, true),
+      /Only terminal Subscriptions can be archived/
+    );
+    store.setStatus(subscriptionId, "cancel", "2026-07-22T10:00:01.000Z");
+    const archived = store.setArchived(
+      subscriptionId,
+      true,
+      "2026-07-22T10:00:02.000Z"
+    );
+    assert.equal(archived.changed, true);
+    assert.equal(archived.subscription.archivedAt, "2026-07-22T10:00:02.000Z");
+    const unarchived = store.setArchived(subscriptionId, false);
+    assert.equal(unarchived.subscription.archivedAt, undefined);
+    assert.equal(unarchived.subscription.status, "cancelled");
+  } finally {
+    store.close();
+  }
+});
+
 test("terminal observations remain bounded", () => {
   const database = testDatabase();
   const store = new SubscriptionStore(database);

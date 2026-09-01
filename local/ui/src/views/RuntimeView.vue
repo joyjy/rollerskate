@@ -202,6 +202,9 @@ async function control(action: "pause" | "resume" | "recover") {
       <div class="diagnostics-body">
         <div><strong>Version:</strong> v{{ runtime.version }}</div>
         <div><strong>Schema:</strong> v{{ runtime.schemaVersion ?? "—" }}</div>
+        <div><strong>Runtime revision:</strong> <span class="mono">{{ runtime.runtimeRevision.running ?? "unknown" }}</span></div>
+        <div><strong>Expected revision:</strong> <span class="mono">{{ runtime.runtimeRevision.expected }}</span></div>
+        <div><strong>Revision match:</strong> {{ runtime.runtimeRevision.matchesExpected ? "yes" : "no" }}</div>
         <div><strong>Runtime root:</strong> <span class="mono secret">{{ runtime.runtimeRoot }}</span></div>
         <div><strong>Workspace:</strong> <span class="mono secret">{{ runtime.workspaceRoot }}</span></div>
         <div><strong>Started:</strong> {{ formatDateTime(runtime.startedAt) }}</div>

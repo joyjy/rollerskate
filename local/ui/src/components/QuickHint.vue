@@ -12,6 +12,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: "action", action: "pause" | "resume" | "cancel"): void;
+  (e: "archive", archived: boolean): void;
 }>();
 
 interface Hint { title: string; body: string; variant: "" | "unknown" | "failed"; }
@@ -26,6 +27,9 @@ const hints: Record<SubscriptionStatus, Hint> = {
 };
 
 const hint = computed(() => hints[props.subscription.status]);
+const runBound = computed(() => props.subscription.kind === "free"
+  ? props.subscription.definition.schema === "SubscriptionDefinition@4"
+  : props.subscription.definition.schemaVersion === "ContinuousSubscriptionDefinition@2");
 
 const canPause = computed(() => props.subscription.status === "active");
 const canResume = computed(() => props.subscription.status === "paused");
@@ -46,9 +50,10 @@ const canCancel = computed(() => ["active", "paused"].includes(props.subscriptio
       <dt>Title</dt>
       <dd>{{ subscription.title }}</dd>
       <dt>Owner</dt>
-      <dd>@{{ subscription.owner.handle }} · {{ subscription.owner.client }}</dd>
+      <dd v-if="subscription.owner">@{{ subscription.owner.handle }} · {{ subscription.owner.client }}</dd>
+      <dd v-else>Run-owned source</dd>
       <dt>Provider Session</dt>
-      <dd>{{ subscription.kind === "free" ? "per callback" : "continuous callbacks" }}</dd>
+      <dd>{{ runBound ? "Run execution" : (subscription.kind === "free" ? "legacy per callback" : "legacy continuous callbacks") }}</dd>
       <dt>Local Session</dt>
       <dd>{{ subscription.kind === "free" ? subscription.definition.callbackPhaseStatus : (subscription.pendingOccurrenceKey ?? "checkpointed") }}</dd>
       <dt>Plugin</dt>
@@ -63,6 +68,8 @@ const canCancel = computed(() => ["active", "paused"].includes(props.subscriptio
       <button type="button" class="primary-button action-button" :disabled="busy || !canPause" @click="emit('action', 'pause')">Pause</button>
       <button type="button" class="secondary-button action-button" :disabled="busy || !canResume" @click="emit('action', 'resume')">Resume</button>
       <button type="button" class="secondary-button warning action-button" :disabled="busy || !canCancel" @click="emit('action', 'cancel')">Cancel</button>
+      <button v-if="subscription.availableActions.archive" type="button" class="secondary-button action-button" :disabled="busy" @click="emit('archive', true)">Archive</button>
+      <button v-if="subscription.availableActions.unarchive" type="button" class="secondary-button action-button" :disabled="busy" @click="emit('archive', false)">Unarchive</button>
     </div>
   </div>
 </template>

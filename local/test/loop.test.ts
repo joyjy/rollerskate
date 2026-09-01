@@ -28,6 +28,7 @@ import { runLocalApp } from "../src/entrypoints/cli/main.js";
 import { RuntimeStore } from "../src/core/runtime/store.js";
 import { startUiServer } from "../src/entrypoints/console/launcher.js";
 import { addLocalAgent } from "../src/application/agent/control.js";
+import { enqueueAgentRequest } from "../src/application/agent/server-control.js";
 import { runtimeOperationsView } from "../src/application/runtime/query.js";
 import {
   localChatView,
@@ -147,11 +148,9 @@ test("offline agent request enters SQLite and is handled without Device, Room or
       "offline result"
     ));
     chmodSync(executable, 0o700);
-    let requestOutput = "";
-    assert.equal(await runLocalApp(repo, [
-      "--runtime", runtime, "agent", "request", "alice", "work", "offline"
-    ], {}, { write(text) { requestOutput += text; } }), 0);
-    const eventId = (JSON.parse(requestOutput) as { eventId: string }).eventId;
+    const eventId = enqueueAgentRequest(repo, "alice", "work offline", {
+      runtimeDirectory: runtime
+    }).event.eventId;
 
     const controller = new AbortController();
     let loopOutput = "";
@@ -173,7 +172,7 @@ test("offline agent request enters SQLite and is handled without Device, Room or
       try {
         assert.equal((schemaVersion.prepare(`
           SELECT value FROM schema_meta WHERE key = 'schema_version'
-        `).get() as { value: string }).value, "63");
+        `).get() as { value: string }).value, "69");
       } finally {
         schemaVersion.close();
       }

@@ -61,12 +61,17 @@ export class CallbackStore {
   readonly #runtime: RuntimeStore;
   readonly #ownsDatabase: boolean;
 
-  public constructor(database: string | DatabaseSync) {
+  public constructor(
+    database: string | DatabaseSync,
+    options: { readonly migrate?: boolean } = {}
+  ) {
     this.#database = typeof database === "string"
       ? openInitializedRuntimeDatabase(database, migrateLocalDatabase)
       : database;
     this.#ownsDatabase = typeof database === "string";
-    this.#runtime = new RuntimeStore(this.#database);
+    this.#runtime = new RuntimeStore(this.#database, options.migrate === undefined
+      ? {}
+      : { migrate: options.migrate });
   }
 
   public registerDefinitions(

@@ -4,6 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import { readLoopStatus, type LoopState } from "../../core/loop.js";
 import { LoopControlStore } from "../../infrastructure/files/loop-control-store.js";
 import { runtimePaths } from "../../infrastructure/runtime/config.js";
+import { runtimeArtifactRevision } from "../../infrastructure/runtime/revision.js";
 import { LocalFoundationStore } from "../../infrastructure/sqlite/foundation-store.js";
 import {
   countRecoverableRuntimeWork,
@@ -47,6 +48,11 @@ export interface RuntimeOperationsView {
   readonly pid: number | null;
   readonly startedAt: string | null;
   readonly schemaVersion: number | null;
+  readonly runtimeRevision: {
+    readonly expected: string;
+    readonly running: string | null;
+    readonly matchesExpected: boolean;
+  };
   readonly consoleAddress: string;
   readonly lastRefreshedAt: string;
   readonly stale: boolean;
@@ -84,6 +90,7 @@ export function runtimeOperationsView(
   const refreshedAt = now().toISOString();
   const loop = readLoopStatus(paths.loopState);
   const state = loop.state as ObservableLoopState | undefined;
+  const expectedRuntimeRevision = runtimeArtifactRevision(repoRoot);
   const paused = new LoopControlStore(paths.loopControl).paused();
   const stale = loop.running && state !== undefined &&
     Date.parse(refreshedAt) - Date.parse(state.updatedAt) > 15_000;
@@ -111,6 +118,11 @@ export function runtimeOperationsView(
     pid: loop.running ? state?.pid ?? null : null,
     startedAt: state?.startedAt ?? null,
     schemaVersion: databaseSchemaVersion(paths.database),
+    runtimeRevision: {
+      expected: expectedRuntimeRevision,
+      running: state?.runtimeRevision ?? null,
+      matchesExpected: loop.running && state?.runtimeRevision === expectedRuntimeRevision
+    },
     consoleAddress,
     lastRefreshedAt: refreshedAt,
     stale,
@@ -167,11 +179,13 @@ function recommendedAction(
 
 function workspaceRoot(database: string): string {
   if (!existsSync(database)) return "No registered workspace";
-  const store = new LocalFoundationStore(database);
+  const connection = new DatabaseSync(database, { readOnly: true });
+  const store = new LocalFoundationStore(connection, { migrate: false });
   try {
     return store.foundation()?.workspacePath ?? "No registered workspace";
   } finally {
     store.close();
+    connection.close();
   }
 }
 

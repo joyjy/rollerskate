@@ -133,6 +133,39 @@ test("pause and resume deliberately calculate from resume time", () => {
   }
 });
 
+test("Schedule archive visibility is reversible and limited to terminal state", () => {
+  const fixture = setup();
+  const store = new ScheduledTaskStore(fixture.database);
+  try {
+    const schedule = store.create(
+      scheduleInput(fixture.agentId),
+      "2026-07-24T00:00:00.000Z"
+    );
+    assert.throws(
+      () => store.setArchived(schedule.definition.scheduleId, true),
+      /Only terminal Schedules can be archived/
+    );
+    store.setStatus(schedule.definition.scheduleId, "cancel", "2026-07-24T00:01:00.000Z");
+    const archived = store.setArchived(
+      schedule.definition.scheduleId,
+      true,
+      "2026-07-24T00:02:00.000Z"
+    );
+    assert.equal(archived.changed, true);
+    assert.equal(archived.schedule.definition.archivedAt, "2026-07-24T00:02:00.000Z");
+    assert.equal(
+      store.setArchived(schedule.definition.scheduleId, true).changed,
+      false
+    );
+    const unarchived = store.setArchived(schedule.definition.scheduleId, false);
+    assert.equal(unarchived.schedule.definition.archivedAt, undefined);
+    assert.equal(unarchived.schedule.definition.status, "cancelled");
+  } finally {
+    store.close();
+    fixture.close();
+  }
+});
+
 test("stale due admission and advance cannot overwrite a newer revision", () => {
   const fixture = setup();
   const store = new ScheduledTaskStore(fixture.database);

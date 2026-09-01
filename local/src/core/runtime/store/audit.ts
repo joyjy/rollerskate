@@ -1,4 +1,8 @@
-import { parseAgentInvocationReceipt } from "./codec.js";
+import {
+  parseAgentInvocationFailureReceipt,
+  parseAgentInvocationProgressReceipt,
+  parseAgentInvocationReceipt
+} from "./codec.js";
 import { RuntimeStoreQuery } from "./query.js";
 import type { RuntimeAudit } from "./types.js";
 
@@ -49,6 +53,8 @@ export class RuntimeAuditQuery {
       (event.type === "chat.dispatch"
         ? parseAgentInvocationReceipt(receiptJson, true)
         : undefined);
+    const invocationProgress = parseAgentInvocationProgressReceipt(receiptJson);
+    const invocationFailure = parseAgentInvocationFailureReceipt(receiptJson);
     return {
       event,
       ...(execution === undefined ? {} : { execution }),
@@ -56,6 +62,8 @@ export class RuntimeAuditQuery {
       ...(resultExecution === undefined ? {} : { resultExecution }),
       ...(session === undefined ? {} : { session }),
       ...(invocation === undefined ? {} : { invocation }),
+      ...(invocationProgress === undefined ? {} : { invocationProgress }),
+      ...(invocationFailure === undefined ? {} : { invocationFailure }),
       deliveries,
       ...(chat === undefined ? {} : { chat })
     };

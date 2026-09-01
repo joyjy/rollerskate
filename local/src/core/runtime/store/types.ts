@@ -12,7 +12,11 @@ import type {
   ChatMessageEvent,
   Event
 } from "../../event/model.js";
-import type { AgentInvocationDiagnostics } from "../agent-invocation.js";
+import type {
+  AgentInvocationDiagnostics,
+  AgentInvocationFailure,
+  AgentInvocationProgress
+} from "../agent-invocation.js";
 import type {
   RuntimeDelivery,
   RuntimeDestination,
@@ -35,6 +39,11 @@ export interface CompleteRuntimeExecution {
   readonly chatDecision?: ChatTurnDecision;
   readonly chatReplyRoute?: ChatReplyRoute;
   readonly invocation?: AgentInvocationDiagnostics;
+}
+
+export interface FailRuntimeExecutionOptions {
+  readonly trace?: AgentInvocationFailure;
+  readonly retry?: "default" | "never";
 }
 
 export interface ChatReplyRoute {
@@ -78,6 +87,8 @@ export interface RuntimeAudit {
   readonly resultExecution?: RuntimeExecution;
   readonly session?: RuntimeSession;
   readonly invocation?: AgentInvocationDiagnostics;
+  readonly invocationProgress?: AgentInvocationProgress;
+  readonly invocationFailure?: AgentInvocationFailure;
   readonly deliveries: ReadonlyArray<{
     readonly delivery: RuntimeDelivery;
     readonly destination: RuntimeDestination;

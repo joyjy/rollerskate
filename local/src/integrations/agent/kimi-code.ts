@@ -6,11 +6,15 @@ import type { AgentInputEvent, ChatDispatchEvent } from "../../core/event/model.
 import type { RuntimeAgentAdapter } from "../../core/runtime/handlers.js";
 import { runtimeAgentEventPrompt } from "./event-prompt.js";
 import {
+  agentInvocationFailure,
+  agentInvocationProgress,
   BoundedToolUsage,
   finiteNonNegative,
+  invocationTimeoutMilliseconds,
   invocationDiagnostics,
   type ProviderInvocationDiagnostics
 } from "./invocation-diagnostics.js";
+import { AgentInvocationError } from "../../core/runtime/agent-invocation.js";
 import {
   AcpRunner,
   kimiMode,
@@ -21,6 +25,8 @@ import {
   runnerToolNames,
   runnerTurnCount,
   runnerUsage,
+  DEFAULT_MEANINGFUL_OUTPUT_TIMEOUT_MILLISECONDS,
+  RunnerInvocationError,
   type RunnerTurnReceipt,
   type RunnerUsage
 } from "./runner/protocol.js";
@@ -81,13 +87,17 @@ export class KimiCodeRuntimeAgent implements RuntimeAgentAdapter {
       maxOutputBytes: options.maxOutputBytes ?? 1_048_576,
       meaningfulOutputTimeoutMilliseconds:
         options.meaningfulOutputTimeoutMilliseconds ??
-        Math.min(options.timeoutMilliseconds, 120_000)
+        DEFAULT_MEANINGFUL_OUTPUT_TIMEOUT_MILLISECONDS
     });
   }
 
   public async invoke(input: Parameters<RuntimeAgentAdapter["invoke"]>[0]):
   Promise<Awaited<ReturnType<RuntimeAgentAdapter["invoke"]>>> {
     const access = kimiWorkspaceAccess(input.event);
+    const totalTimeoutMilliseconds = invocationTimeoutMilliseconds(
+      input.event,
+      this.#client.defaultTimeoutMilliseconds
+    );
     const providerSessionId = kimiProviderSessionId(input.providerSessionId, access);
     providerPolicyObservationFromArgv(
       "kimi-code",
@@ -96,17 +106,47 @@ export class KimiCodeRuntimeAgent implements RuntimeAgentAdapter {
       this.#resources,
       access
     );
-    const result = await this.#client.invoke({
-      prompt: kimiPrompt(
-        access === "write"
-          ? this.#resources.kimiWritableAgent!
-          : this.#resources.kimiReadOnlyAgent!,
-        input.event
-      ),
-      workspaceAccess: access,
-      ...(providerSessionId === undefined ? {} : { sessionId: providerSessionId }),
-      ...(this.#model === undefined ? {} : { model: this.#model })
-    });
+    let result: RunnerTurnReceipt;
+    try {
+      result = await this.#client.invoke({
+        prompt: kimiPrompt(
+          access === "write"
+            ? this.#resources.kimiWritableAgent!
+            : this.#resources.kimiReadOnlyAgent!,
+          input.event
+        ),
+        workspaceAccess: access,
+        totalTimeoutMilliseconds,
+        meaningfulOutputTimeoutMilliseconds:
+          this.#client.defaultMeaningfulOutputTimeoutMilliseconds,
+        ...(providerSessionId === undefined ? {} : { sessionId: providerSessionId }),
+        ...(this.#model === undefined ? {} : { model: this.#model }),
+        ...(input.reportProgress === undefined
+          ? {}
+          : {
+              onProgress: (progress) => input.reportProgress!(agentInvocationProgress({
+                adapterId: this.adapterId,
+                workspace: this.workspace,
+                workspaceAccess: access,
+                progress,
+                ...(progress.sessionId === undefined
+                  ? {}
+                  : { providerSessionId: kimiSessionReference(access, progress.sessionId) })
+              }))
+            })
+      });
+    } catch (error) {
+      if (!(error instanceof RunnerInvocationError)) throw error;
+      throw new AgentInvocationError(error.message, agentInvocationFailure({
+        adapterId: this.adapterId,
+        workspace: this.workspace,
+        workspaceAccess: access,
+        trace: error.trace,
+        ...(error.trace.sessionId === undefined
+          ? {}
+          : { providerSessionId: kimiSessionReference(access, error.trace.sessionId) })
+      }));
+    }
     const response = kimiResponse(result, input.event.type === "chat.dispatch");
     return {
       providerSessionId: kimiSessionReference(access, response.providerSessionId),

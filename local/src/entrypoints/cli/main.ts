@@ -29,7 +29,12 @@ import { runScheduleCommand } from "./schedule.js";
 import { collectSetupInput } from "./setup.js";
 import type { AppOutput, LocalAppDependencies } from "./shared.js";
 import { rejectArguments, requireCount } from "./shared.js";
-import { parseStartOptions, runStartForeground } from "./start.js";
+import {
+  parseStartOptions,
+  runStartDaemon,
+  runStartForeground,
+  stopRuntimeDaemon
+} from "./start.js";
 import { runSubscriptionCommand } from "./subscription.js";
 import { runTopicCommand } from "./topic.js";
 import { runWorkRequestCommand } from "./work-request.js";
@@ -51,13 +56,15 @@ const HELP = [
   "Usage:",
   "  scripts/rs [--runtime <absolute-path>] [command]",
   "  scripts/rs --help",
-  "  scripts/rs start [--no-open] [--ui-port <port>]  run Local Runtime loop + Vite Console",
+  "  scripts/rs start [--foreground] [--no-open] [--ui-port <port>]  start Local Runtime + Console",
+  "  scripts/rs restart [--foreground] [--no-open] [--ui-port <port>]  restart on current sources",
+  "  scripts/rs stop          stop Local Runtime daemon gracefully",
   "  scripts/rs doctor --local  validate Local-first state without legacy Matrix config",
   "  scripts/rs status         inspect Local Runtime loop state",
   "  scripts/rs trace <event-id>",
   "  scripts/rs event list|trace ...",
   "  scripts/rs workload status",
-  "  scripts/rs failure list|inspect ...",
+  "  scripts/rs failure list|inspect|retry ...",
   "  scripts/rs recover        reconcile interrupted Runtime work",
   "  scripts/rs pause          pause Local Runtime cycles",
   "  scripts/rs resume         resume Local Runtime cycles",
@@ -67,7 +74,6 @@ const HELP = [
   "  scripts/rs agent list",
   "  scripts/rs agent rename <handle> <new-handle>",
   "  scripts/rs agent suspend|resume <handle>",
-  "  scripts/rs agent request <name> [--session <ses_uuidv7>] <prompt...>",
   "  scripts/rs agent profile <handle> [update <json-file>]",
   "  scripts/rs activity access grant|status|revoke <agent-handle>",
   "  scripts/rs topic list|history [topic-id]  inspect passive Server Topic inbox",
@@ -91,11 +97,9 @@ const HELP = [
   "  scripts/rs notice inspect <notice-id>",
   "  scripts/rs notice mark-read|ack <notice-id>",
   "  scripts/rs notice rebuild",
-  "  scripts/rs subscription add <json-file>",
   "  scripts/rs subscription list|inspect|pause|resume|cancel ...",
-  "  scripts/rs schedule create|update|list|inspect ...",
-  "  scripts/rs schedule pause|resume|cancel|run-now|runs|trace|resolve ...",
-  "  scripts/rs run start|list|inspect|trace|decide|close|cancel ...",
+  "  scripts/rs schedule list|inspect|pause|resume|cancel|run-now|occurrences|runs|trace|resolve ...",
+  "  scripts/rs run preflight|start|list|legacy-inventory|legacy-migration-plan|legacy-migrate|inspect|trace|decide|close|cancel|archive|unarchive ...",
   "  scripts/rs work-request inspect|accept|reject|await-owner ...",
   "",
   "Runtime: ~/.rollerskate, or the path selected with --runtime"
@@ -126,15 +130,49 @@ export async function runLocalApp(
     return 0;
   }
   if (command === "start") {
-    const { noOpen, uiPort } = parseStartOptions(rest);
+    const options = parseStartOptions(rest);
     assertRuntimeSchemaUpgradeAllowed(repoRoot, global.runtimeDirectory);
-    return runStartForeground(
-      repoRoot,
-      global.runtimeDirectory,
-      environment,
-      output,
-      { noOpen, uiPort }
-    );
+    return options.foreground
+      ? runStartForeground(
+        repoRoot,
+        global.runtimeDirectory,
+        environment,
+        output,
+        options
+      )
+      : runStartDaemon(
+        repoRoot,
+        global.runtimeDirectory,
+        environment,
+        output,
+        options,
+        invokedPath
+      );
+  }
+  if (command === "stop") {
+    rejectArguments(rest);
+    return stopRuntimeDaemon(repoRoot, global.runtimeDirectory, output);
+  }
+  if (command === "restart") {
+    const options = parseStartOptions(rest);
+    await stopRuntimeDaemon(repoRoot, global.runtimeDirectory, output);
+    assertRuntimeSchemaUpgradeAllowed(repoRoot, global.runtimeDirectory);
+    return options.foreground
+      ? runStartForeground(
+        repoRoot,
+        global.runtimeDirectory,
+        environment,
+        output,
+        options
+      )
+      : runStartDaemon(
+        repoRoot,
+        global.runtimeDirectory,
+        environment,
+        output,
+        options,
+        invokedPath
+      );
   }
   if (!RUNTIME_COMMANDS.has(command)) {
     throw new Error(`unknown command: ${command}`);
@@ -185,6 +223,9 @@ export async function runLocalApp(
         `Local Runtime: ${status.status}`,
         `Core Loop: ${status.loop.phase}`,
         `PID: ${status.pid ?? "none"}`,
+        `Runtime revision: ${status.runtimeRevision.running ?? "unknown"}`,
+        `Expected revision: ${status.runtimeRevision.expected}`,
+        `Revision match: ${status.runtimeRevision.matchesExpected ? "yes" : "no"}`,
         `Cycles: ${status.loop.totalCycles}`,
         `Workload: ${status.workload.state}`,
         `Failures: ${status.failures.length}`,
@@ -253,8 +294,7 @@ export async function runLocalApp(
         repoRoot,
         rest,
         output,
-        global.runtimeDirectory,
-        dependencies.cwd ?? process.cwd()
+        global.runtimeDirectory
       );
     case "schedule":
       return runScheduleCommand(repoRoot, rest, output, global.runtimeDirectory);

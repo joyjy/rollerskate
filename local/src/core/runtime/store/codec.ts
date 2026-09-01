@@ -14,7 +14,11 @@ import {
   type CreateEvent,
   type SubscriptionAgentInvocation
 } from "../../event/model.js";
-import type { AgentInvocationDiagnostics } from "../agent-invocation.js";
+import type {
+  AgentInvocationDiagnostics,
+  AgentInvocationFailure,
+  AgentInvocationProgress
+} from "../agent-invocation.js";
 import type { AgentRunContext, RuntimeDestination } from "../model.js";
 
 export interface DestinationSnapshot {
@@ -95,6 +99,17 @@ function validateAgentRunContext(context: AgentRunContext): void {
   bounded(context.depth, 0, 100, "runContext.depth");
   if (context.parentStepId !== undefined) {
     requireText(context.parentStepId, "runContext.parentStepId");
+  }
+  if (context.invocationBudget !== undefined) {
+    if (context.invocationBudget.schemaVersion !== "AgentInvocationBudget@1") {
+      throw new Error("runContext invocation budget is malformed");
+    }
+    bounded(
+      context.invocationBudget.totalTimeoutMilliseconds,
+      1,
+      900_000,
+      "runContext.invocationBudget.totalTimeoutMilliseconds"
+    );
   }
   if (context.workspaceGrant !== undefined) {
     requireText(context.workspaceGrant.root, "runContext.workspaceGrant.root");
@@ -311,6 +326,144 @@ export function parseAgentInvocationReceipt(
       : { toolUsage: toolUsage as unknown as NonNullable<AgentInvocationDiagnostics["toolUsage"]> }),
     ...(candidate.turnCount === undefined ? {} : { turnCount: candidate.turnCount })
   };
+}
+
+export function parseAgentInvocationProgressReceipt(
+  value: string | null
+): AgentInvocationProgress | undefined {
+  const candidate = invocationTraceCandidate(value, "AgentInvocationProgressReceipt@1");
+  if (candidate === undefined) return undefined;
+  return normalizeAgentInvocationProgress(candidate as unknown as AgentInvocationProgress);
+}
+
+export function parseAgentInvocationFailureReceipt(
+  value: string | null
+): AgentInvocationFailure | undefined {
+  const candidate = invocationTraceCandidate(value, "AgentInvocationFailureReceipt@1");
+  if (candidate === undefined) return undefined;
+  return normalizeAgentInvocationFailure(candidate as unknown as AgentInvocationFailure);
+}
+
+export function normalizeAgentInvocationProgress(
+  value: AgentInvocationProgress
+): AgentInvocationProgress {
+  const candidate = value as unknown as Readonly<Record<string, unknown>>;
+  if (candidate.schemaVersion !== "AgentInvocationProgress@1") {
+    throw new Error("Agent invocation progress receipt is malformed");
+  }
+  return {
+    schemaVersion: "AgentInvocationProgress@1",
+    ...normalizedAgentInvocationProgress(candidate)
+  };
+}
+
+export function normalizeAgentInvocationFailure(
+  value: AgentInvocationFailure
+): AgentInvocationFailure {
+  const candidate = value as unknown as Readonly<Record<string, unknown>>;
+  if (candidate.schemaVersion !== "AgentInvocationFailure@1") {
+    throw new Error("Agent invocation failure receipt is malformed");
+  }
+  const progress = normalizedAgentInvocationProgress(candidate);
+  if (typeof candidate.failedAt !== "string" ||
+    !["stall", "deadline", "protocol_exit", "cancelled", "protocol_error"]
+      .includes(candidate.reason as string) ||
+    !validBoundedInteger(candidate.totalTimeoutMilliseconds, 1, 900_000) ||
+    !validBoundedInteger(candidate.meaningfulOutputTimeoutMilliseconds, 1, 900_000) ||
+    !["requested", "acknowledged", "unavailable"]
+      .includes(candidate.protocolStop as string) ||
+    !["explicit_read_only_resume", "unknown_outcome_no_replay", "none"]
+      .includes(candidate.recovery as string)) {
+    throw new Error("Agent invocation failure receipt is malformed");
+  }
+  if (progress.workspaceAccess === "write"
+    ? candidate.recovery !== "unknown_outcome_no_replay"
+    : candidate.recovery !== (progress.providerSessionId === undefined
+        ? "none"
+        : "explicit_read_only_resume")) {
+    throw new Error("Agent invocation failure recovery is inconsistent");
+  }
+  const failedAt = iso(candidate.failedAt);
+  return {
+    schemaVersion: "AgentInvocationFailure@1",
+    ...progress,
+    failedAt,
+    reason: candidate.reason as AgentInvocationFailure["reason"],
+    totalTimeoutMilliseconds: candidate.totalTimeoutMilliseconds as number,
+    meaningfulOutputTimeoutMilliseconds:
+      candidate.meaningfulOutputTimeoutMilliseconds as number,
+    protocolStop: candidate.protocolStop as AgentInvocationFailure["protocolStop"],
+    recovery: candidate.recovery as AgentInvocationFailure["recovery"]
+  };
+}
+
+function invocationTraceCandidate(
+  value: string | null,
+  schema: string
+): Readonly<Record<string, unknown>> | undefined {
+  if (value === null) return undefined;
+  const receipt = parseJsonObject(value, "Execution receipt");
+  if (receipt.schema !== schema) return undefined;
+  if (!isRecord(receipt.trace)) throw new Error("Agent invocation trace receipt is malformed");
+  return receipt.trace;
+}
+
+function normalizedAgentInvocationProgress(
+  candidate: Readonly<Record<string, unknown>>
+): Omit<AgentInvocationProgress, "schemaVersion"> {
+  if (typeof candidate.adapterId !== "string" || candidate.adapterId.trim() === "" ||
+    typeof candidate.workspace !== "string" || candidate.workspace.trim() === "" ||
+    (candidate.workspaceAccess !== "read" && candidate.workspaceAccess !== "write") ||
+    (candidate.providerSessionId !== undefined &&
+      (typeof candidate.providerSessionId !== "string" ||
+        candidate.providerSessionId.trim() === "")) ||
+    typeof candidate.startedAt !== "string" || typeof candidate.observedAt !== "string" ||
+    typeof candidate.lastMeaningfulAt !== "string" ||
+    !["starting", "session_ready", "prompting", "streaming", "cancelling", "terminated"]
+      .includes(candidate.phase as string) ||
+    !validBoundedInteger(candidate.updateCount, 0, Number.MAX_SAFE_INTEGER) ||
+    !validBoundedInteger(candidate.meaningfulUpdateCount, 0, Number.MAX_SAFE_INTEGER)) {
+    throw new Error("Agent invocation progress receipt is malformed");
+  }
+  if (candidate.lastProgress !== undefined && (!isRecord(candidate.lastProgress) ||
+    !["session", "assistant", "thought", "tool", "plan", "protocol"]
+      .includes(candidate.lastProgress.kind as string))) {
+    throw new Error("Agent invocation progress receipt is malformed");
+  }
+  if ((candidate.meaningfulUpdateCount as number) > (candidate.updateCount as number)) {
+    throw new Error("Agent invocation progress counters are inconsistent");
+  }
+  const startedAt = iso(candidate.startedAt as string);
+  const observedAt = iso(candidate.observedAt as string);
+  const lastMeaningfulAt = iso(candidate.lastMeaningfulAt as string);
+  return {
+    adapterId: candidate.adapterId as string,
+    workspace: candidate.workspace as string,
+    workspaceAccess: candidate.workspaceAccess as "read" | "write",
+    ...(candidate.providerSessionId === undefined
+      ? {}
+      : { providerSessionId: candidate.providerSessionId as string }),
+    startedAt,
+    observedAt,
+    lastMeaningfulAt,
+    phase: candidate.phase as AgentInvocationProgress["phase"],
+    updateCount: candidate.updateCount as number,
+    meaningfulUpdateCount: candidate.meaningfulUpdateCount as number,
+    ...(candidate.lastProgress === undefined
+      ? {}
+      : {
+          lastProgress: {
+            kind: candidate.lastProgress.kind as NonNullable<
+              AgentInvocationProgress["lastProgress"]
+            >["kind"]
+          }
+        })
+  };
+}
+
+function validBoundedInteger(value: unknown, minimum: number, maximum: number): boolean {
+  return typeof value === "number" && Number.isInteger(value) &&
+    value >= minimum && value <= maximum;
 }
 
 function validOptionalNumbers(

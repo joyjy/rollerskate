@@ -62,6 +62,8 @@ export interface RuntimePaths {
   readonly activityAccess: string;
   readonly clientHistoryAccess: string;
   readonly topicInbox: string;
+  readonly subscriptionPlugins: string;
+  readonly legacyTriggerWorkflows: string;
 }
 
 export interface SetupInput {
@@ -107,7 +109,9 @@ export function runtimePaths(repoRoot: string, configuredRuntimeDirectory?: stri
     matrixPolicy: join(runtimeDirectory, "matrix-policy.json"),
     activityAccess: join(runtimeDirectory, "activity-access.json"),
     clientHistoryAccess: join(runtimeDirectory, "client-history-access.json"),
-    topicInbox: join(runtimeDirectory, "topic-inbox.json")
+    topicInbox: join(runtimeDirectory, "topic-inbox.json"),
+    subscriptionPlugins: join(runtimeDirectory, "subscription-plugins.json"),
+    legacyTriggerWorkflows: join(runtimeDirectory, "legacy-trigger-workflows.json")
   };
 }
 

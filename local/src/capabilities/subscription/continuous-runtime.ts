@@ -15,9 +15,11 @@ export class ContinuousSubscriptionRuntime {
   readonly #pluginRunner: PollPluginRunner;
   readonly #probeExecutor: PollProbeExecutor;
   readonly #externalRefGuard: ExternalRefTriggerGuard | undefined;
+  readonly #store: ContinuousSubscriptionStore | undefined;
 
   public constructor(options: {
     readonly databasePath: string;
+    readonly store?: ContinuousSubscriptionStore;
     readonly pluginRunner?: PollPluginRunner;
     readonly probeExecutor?: PollProbeExecutor;
     readonly externalRefGuard?: ExternalRefTriggerGuard;
@@ -26,18 +28,22 @@ export class ContinuousSubscriptionRuntime {
     this.#pluginRunner = options.pluginRunner ?? new PollPluginRunner();
     this.#probeExecutor = options.probeExecutor ?? new PollProbeExecutor();
     this.#externalRefGuard = options.externalRefGuard;
+    this.#store = options.store;
   }
 
   public async runCycle(
     signal: AbortSignal,
     at = new Date().toISOString()
   ): Promise<ContinuousSubscriptionCycleResult> {
-    const store = new ContinuousSubscriptionStore(this.#databasePath);
+    const store = this.#store ?? new ContinuousSubscriptionStore(this.#databasePath);
     try {
       const result = {
         polled: [] as string[],
         deltas: [] as string[],
-        checkpointed: store.finalizeCallbacks(at),
+        checkpointed: [
+          ...store.finalizeCallbacks(at),
+          ...store.reconcileBoundOccurrences(at)
+        ],
         failed: [] as string[]
       };
       for (const candidate of store.due(at)) {
@@ -45,6 +51,9 @@ export class ContinuousSubscriptionRuntime {
         const subscription = store.beginPoll(candidate.subscriptionId, at);
         result.polled.push(subscription.subscriptionId);
         try {
+          const freshnessEvidence = [
+            `continuous-subscription-definition:${subscription.definition.revision}`
+          ];
           if (subscription.definition.externalRefBinding !== undefined) {
             if (this.#externalRefGuard === undefined) {
               store.blockExternalRefTrigger(subscription.subscriptionId, "guard-unavailable", at);
@@ -59,6 +68,9 @@ export class ContinuousSubscriptionRuntime {
               result.failed.push(subscription.subscriptionId);
               continue;
             }
+            freshnessEvidence.push(
+              `external-ref:${subscription.definition.externalRefBinding.ref.revision}`
+            );
           }
           const context = {
             subscriptionId: subscription.subscriptionId,
@@ -87,7 +99,12 @@ export class ContinuousSubscriptionRuntime {
             context,
             probeResult
           );
-          const recorded = store.recordObservation(subscription.subscriptionId, observation, at);
+          const recorded = store.recordObservation(
+            subscription.subscriptionId,
+            observation,
+            at,
+            freshnessEvidence
+          );
           if (recorded.delta) result.deltas.push(subscription.subscriptionId);
         } catch (error) {
           store.recordPollFailure(
@@ -100,7 +117,7 @@ export class ContinuousSubscriptionRuntime {
       }
       return result;
     } finally {
-      store.close();
+      if (this.#store === undefined) store.close();
     }
   }
 }

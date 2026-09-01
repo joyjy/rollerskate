@@ -83,7 +83,7 @@ async function main(): Promise<void> {
   const { context, history } = serverContext(process.argv.slice(2));
   await runStdioMcpToolServer({
     name: "rollerskate-chat-history",
-    version: "0.5.4",
+    version: "0.5.6",
     tools: chatHistoryToolDefinitions,
     call: (name, args) => callChatHistoryTool(context, name, args),
     close: () => history.close()

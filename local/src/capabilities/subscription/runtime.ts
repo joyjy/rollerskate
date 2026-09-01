@@ -14,6 +14,7 @@ export interface SubscriptionCycleResult {
 
 export interface SubscriptionRuntimeOptions {
   readonly databasePath: string;
+  readonly store?: SubscriptionStore;
   readonly pluginRunner?: PollPluginRunner;
   readonly probeExecutor?: PollProbeExecutor;
   readonly pollLimit?: number;
@@ -26,6 +27,7 @@ export class SubscriptionRuntime {
   readonly #probeExecutor: PollProbeExecutor;
   readonly #pollLimit: number;
   readonly #externalRefGuard: ExternalRefTriggerGuard | undefined;
+  readonly #store: SubscriptionStore | undefined;
 
   public constructor(options: SubscriptionRuntimeOptions) {
     this.#databasePath = options.databasePath;
@@ -33,14 +35,15 @@ export class SubscriptionRuntime {
     this.#probeExecutor = options.probeExecutor ?? new PollProbeExecutor();
     this.#pollLimit = options.pollLimit ?? 20;
     this.#externalRefGuard = options.externalRefGuard;
+    this.#store = options.store;
   }
 
   public reconcileInterrupted(): number {
-    const store = new SubscriptionStore(this.#databasePath);
+    const store = this.#store ?? new SubscriptionStore(this.#databasePath);
     try {
-      return store.reconcileCallbacks();
+      return store.reconcileCallbacks() + store.reconcileBoundSources().length;
     } finally {
-      store.close();
+      if (this.#store === undefined) store.close();
     }
   }
 
@@ -52,14 +55,18 @@ export class SubscriptionRuntime {
       polled: string[];
       failed: Array<{ subscriptionId: string; phase: "poll"; error: string }>;
     } = { polled: [], failed: [] };
-    const store = new SubscriptionStore(this.#databasePath);
+    const store = this.#store ?? new SubscriptionStore(this.#databasePath);
     try {
       store.reconcileCallbacks(now);
+      store.reconcileBoundSources(now);
       for (const candidate of store.due(now, this.#pollLimit)) {
         if (signal.aborted) break;
         const subscription = store.beginAttempt(candidate.subscriptionId, now);
         result.polled.push(subscription.subscriptionId);
         try {
+          const freshnessEvidence = [
+            `subscription-definition:${subscription.definitionRevision}`
+          ];
           if (subscription.externalRefBinding !== undefined) {
             if (this.#externalRefGuard === undefined) {
               store.blockExternalRefTrigger(subscription.subscriptionId, "guard-unavailable", now);
@@ -80,6 +87,9 @@ export class SubscriptionRuntime {
               });
               continue;
             }
+            freshnessEvidence.push(
+              `external-ref:${subscription.externalRefBinding.ref.revision}`
+            );
           }
           const context = {
             subscriptionId: subscription.subscriptionId,
@@ -105,7 +115,12 @@ export class SubscriptionRuntime {
             context,
             probeResult
           );
-          store.recordObservation(subscription.subscriptionId, observation, now);
+          store.recordObservation(
+            subscription.subscriptionId,
+            observation,
+            now,
+            freshnessEvidence
+          );
         } catch (error) {
           const failure = message(error);
           store.recordPollFailure(subscription.subscriptionId, failure, now);
@@ -118,7 +133,7 @@ export class SubscriptionRuntime {
       }
       return result;
     } finally {
-      store.close();
+      if (this.#store === undefined) store.close();
     }
   }
 }

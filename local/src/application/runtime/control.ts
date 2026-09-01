@@ -67,12 +67,19 @@ export function runtimeStatus(
   runtimeDirectory?: string
 ): RuntimeStatus {
   const paths = runtimePaths(repoRoot, runtimeDirectory);
-  const status = readLoopStatus(paths.loopState);
+  const status = runtimeProcessStatus(repoRoot, runtimeDirectory);
   const activity = readActivity(paths.database);
   return {
     ...status,
     ...(activity === undefined ? {} : { activity })
   };
+}
+
+export function runtimeProcessStatus(
+  repoRoot: string,
+  runtimeDirectory?: string
+): LoopStatus {
+  return readLoopStatus(runtimePaths(repoRoot, runtimeDirectory).loopState);
 }
 
 export function reconcileRuntime(

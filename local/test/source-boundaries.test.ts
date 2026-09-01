@@ -52,6 +52,13 @@ test("Local source layers preserve the core and Capability dependency boundary",
   ]));
 });
 
+test("one modules owner provides canonical Rollerskate spec resolution", () => {
+  const registryOwners = sourceFiles(sourceRoot)
+    .filter((file) => readFileSync(file, "utf8").includes("class SpecRegistry"))
+    .map((file) => relative(sourceRoot, file));
+  assert.deepEqual(registryOwners, ["modules/spec/registry.ts"]);
+});
+
 test("Core and Agent adapters do not own application result schemas", () => {
   for (const file of sourceFiles(resolve(sourceRoot, "core"))) {
     const source = readFileSync(file, "utf8");
@@ -106,7 +113,7 @@ test("Client history continuation remains application-owned", () => {
   );
 });
 
-test("Steward, Schedule and Subscription keep separate conversation ownership", () => {
+test("Steward composes source diagnostics without owning Schedule or Subscription state", () => {
   assert.equal(existsSync(resolve(sourceRoot, "application/agent-run")), false);
   assert.equal(existsSync(resolve(sourceRoot, "application/steward/query.ts")), true);
   assert.equal(existsSync(resolve(sourceRoot, "modules/steward/state-machine.ts")), true);
@@ -115,7 +122,12 @@ test("Steward, Schedule and Subscription keep separate conversation ownership", 
     resolve(sourceRoot, "application/steward/query.ts"),
     "utf8"
   );
-  assert.doesNotMatch(stewardQuery, /schedule|subscription/i);
+  assert.match(stewardQuery, /inspectScheduleView/);
+  assert.match(stewardQuery, /inspectSubscriptionView/);
+  assert.doesNotMatch(
+    stewardQuery,
+    /ScheduledTaskStore|SubscriptionStore|ContinuousSubscriptionStore|schedule\/control|subscription\/control/
+  );
 
   const stewardView = readFileSync(resolve(uiRoot, "views/StewardView.vue"), "utf8");
   assert.doesNotMatch(
@@ -271,7 +283,13 @@ test("ordinary SQLite stores share one immediate transaction template", () => {
       "infrastructure/sqlite/schema/v60-migration.ts",
       "infrastructure/sqlite/schema/v61-migration.ts",
       "infrastructure/sqlite/schema/v62-migration.ts",
-      "infrastructure/sqlite/transaction.ts"
+      "infrastructure/sqlite/schema/v63-migration.ts",
+      "infrastructure/sqlite/schema/v64-migration.ts",
+      "infrastructure/sqlite/schema/v65-migration.ts",
+      "infrastructure/sqlite/schema/v66-migration.ts",
+    "infrastructure/sqlite/schema/v67-migration.ts",
+    "infrastructure/sqlite/schema/v68-migration.ts",
+    "infrastructure/sqlite/transaction.ts"
   ]);
 });
 

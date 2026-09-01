@@ -2,13 +2,17 @@ import { realpathSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 
 import type { AgentInputEvent, ChatDispatchEvent } from "../../core/event/model.js";
+import { AgentInvocationError } from "../../core/runtime/agent-invocation.js";
 import type { ProviderPolicyObservationSnapshot } from
   "../../core/runtime/agent-invocation.js";
 import type { RuntimeAgentAdapter } from "../../core/runtime/handlers.js";
 import { runtimeAgentEventPrompt } from "./event-prompt.js";
 import {
+  agentInvocationFailure,
+  agentInvocationProgress,
   countedTools,
   finiteNonNegative,
+  invocationTimeoutMilliseconds,
   invocationDiagnostics,
   type ProviderInvocationDiagnostics
 } from "./invocation-diagnostics.js";
@@ -16,6 +20,8 @@ import { type StdioMcpServer, validateStdioMcpServer } from "./mcp-server.js";
 import { codexAppServerPolicyObservation } from "./provider-policy.js";
 import { CodexAppServerRunner } from "./runner/codex-app-server.js";
 import {
+  DEFAULT_MEANINGFUL_OUTPUT_TIMEOUT_MILLISECONDS,
+  RunnerInvocationError,
   runnerAssistantMessages,
   runnerToolNames,
   runnerTurnCount,
@@ -30,6 +36,7 @@ export interface CodexRuntimeAgentOptions {
   readonly projectRoot: string;
   readonly environment: Readonly<Record<string, string>>;
   readonly timeoutMilliseconds: number;
+  readonly meaningfulOutputTimeoutMilliseconds?: number;
   readonly maxOutputBytes?: number;
   readonly launchArgs?: readonly string[];
   readonly resolveMcpServers?: (
@@ -78,6 +85,13 @@ export class CodexRuntimeAgent implements RuntimeAgentAdapter {
     } satisfies CodexMcpServerResolutionInput;
     const mcpServers = this.#options.resolveMcpServers?.(resolutionInput) ?? [];
     const access = codexWorkspaceAccess(input.event);
+    const totalTimeoutMilliseconds = invocationTimeoutMilliseconds(
+      input.event,
+      this.#options.timeoutMilliseconds
+    );
+    const meaningfulOutputTimeoutMilliseconds =
+      this.#options.meaningfulOutputTimeoutMilliseconds ??
+      DEFAULT_MEANINGFUL_OUTPUT_TIMEOUT_MILLISECONDS;
     const networkAccess = codexNetworkAccess(input.event);
     const threadParameters = codexThreadParameters(
       access,
@@ -103,16 +117,46 @@ export class CodexRuntimeAgent implements RuntimeAgentAdapter {
       environment,
       workingDirectory: this.workspace,
       timeoutMilliseconds: this.#options.timeoutMilliseconds,
+      meaningfulOutputTimeoutMilliseconds,
       maxOutputBytes: this.#options.maxOutputBytes ?? 1_048_576,
       threadParameters
     });
-    const receipt = await runner.invoke({
-      prompt: runtimeAgentEventPrompt(input.event),
-      workspaceAccess: access,
-      ...(input.providerSessionId === undefined
-        ? {}
-        : { sessionId: input.providerSessionId })
-    });
+    let receipt: RunnerTurnReceipt;
+    try {
+      receipt = await runner.invoke({
+        prompt: runtimeAgentEventPrompt(input.event),
+        workspaceAccess: access,
+        totalTimeoutMilliseconds,
+        meaningfulOutputTimeoutMilliseconds,
+        ...(input.providerSessionId === undefined
+          ? {}
+          : { sessionId: input.providerSessionId }),
+        ...(input.reportProgress === undefined
+          ? {}
+          : {
+              onProgress: (progress) => input.reportProgress!(agentInvocationProgress({
+                adapterId: this.adapterId,
+                workspace: this.workspace,
+                workspaceAccess: access,
+                progress,
+                ...(progress.sessionId === undefined
+                  ? {}
+                  : { providerSessionId: progress.sessionId })
+              }))
+            })
+      });
+    } catch (error) {
+      if (!(error instanceof RunnerInvocationError)) throw error;
+      throw new AgentInvocationError(error.message, agentInvocationFailure({
+        adapterId: this.adapterId,
+        workspace: this.workspace,
+        workspaceAccess: access,
+        trace: error.trace,
+        ...(error.trace.sessionId === undefined
+          ? {}
+          : { providerSessionId: error.trace.sessionId })
+      }));
+    }
     const response = codexResponse(receipt);
     return {
       providerSessionId: receipt.sessionId,

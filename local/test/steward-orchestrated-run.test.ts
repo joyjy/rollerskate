@@ -187,7 +187,7 @@ test("manual Owner cannot replace an active Worker as an initial decision", asyn
   }
 });
 
-test("an invalid internal decision leaves the checkpoint available to the manual caller", async () => {
+test("a historical internal decision is rejected while manual v1 fallback remains available", async () => {
   const fixture = setup();
   const codex = scriptedAgent(fixture.workspace, "codex-fallback", [
     "not-json"
@@ -212,7 +212,7 @@ test("an invalid internal decision leaves the checkpoint available to the manual
       requestId: "owner-cannot-forge-orchestrator-state",
       decision: JSON.parse(finishDecision(checkpoint.version)) as Readonly<Record<string, unknown>>
     }, fixture.runtimeDirectory, "2026-08-18T09:00:02.500Z"),
-    /Manual Owner must submit RunDecision@1/u);
+    /Historical spec requires an explicit persisted-data reader/u);
 
     const finished = submitCallerRunDecision(fixture.repo, started.run.runId, {
       requestId: "owner-recovery",

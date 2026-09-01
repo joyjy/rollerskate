@@ -170,6 +170,13 @@ test("loopback Console API manages local Agents without Server login", async () 
       headers: consoleHeaders()
     });
     assert.equal((suspended.body as { status: string }).status, "suspended");
+    const suspendedPresence = await jsonRequest(`${origin}/api/chat/presence`);
+    assert.equal(suspendedPresence.response.status, 200);
+    const suspendedPresenceAgent = (suspendedPresence.body as {
+      agents: Array<{ status: string; clientHistory?: unknown }>;
+    }).agents[0];
+    assert.equal(suspendedPresenceAgent?.status, "suspended");
+    assert.equal(suspendedPresenceAgent?.clientHistory, undefined);
     const resumed = await jsonRequest(`${origin}/api/agents/${alice.principalId}/resume`, {
       method: "POST",
       headers: consoleHeaders()
@@ -279,6 +286,31 @@ test("loopback Console API manages local Agents without Server login", async () 
       }
     );
     assert.equal((duplicate.body as { status: string }).status, "duplicate");
+
+    const codex = await jsonRequest(`${origin}/api/agents`, {
+      method: "POST",
+      headers: consoleHeaders(),
+      body: JSON.stringify({ handle: "codex", client: "codex" })
+    });
+    assert.equal(codex.response.status, 201);
+    const rejectedHandoff = await jsonRequest(
+      `${origin}/api/chat/messages/${sourceEventId}/run`,
+      { method: "POST" }
+    );
+    assert.equal(rejectedHandoff.response.status, 403);
+    const handedOff = await jsonRequest(
+      `${origin}/api/chat/messages/${sourceEventId}/run`,
+      { method: "POST", headers: consoleHeaders() }
+    );
+    assert.equal(handedOff.response.status, 201);
+    assert.equal((handedOff.body as {
+      run: { orchestratorBinding?: { schemaVersion: string } };
+    }).run.orchestratorBinding?.schemaVersion, "OrchestratorBinding@3");
+    const duplicateHandoff = await jsonRequest(
+      `${origin}/api/chat/messages/${sourceEventId}/run`,
+      { method: "POST", headers: consoleHeaders() }
+    );
+    assert.equal((duplicateHandoff.body as { status: string }).status, "duplicate");
 
     const rotated = await jsonRequest(
       `${origin}/api/chat/agents/${alice.principalId}/new-session`,

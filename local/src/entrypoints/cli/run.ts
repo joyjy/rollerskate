@@ -3,19 +3,22 @@ import { readFileSync, realpathSync } from "node:fs";
 import {
   cancelStewardRun,
   closeStewardRunSeries,
-  startStewardRun,
-  submitCallerRunDecision,
-  type StartStewardRunInput
+  setStewardRunArchived,
+  submitCallerRunDecision
 } from "../../application/steward/control.js";
+import {
+  preflightStewardRunIntent,
+  startStewardRunFromIntent
+} from "../../application/steward/intent-control.js";
 import {
   inspectStewardRunView,
   listStewardRunViews
 } from "../../application/steward/query.js";
-
-type WorkspaceEffect = Extract<
-  NonNullable<StartStewardRunInput["workspace"]>,
-  { readonly access: "write" }
->["effect"];
+import { legacyExecutionInventory } from "../../application/steward/legacy-inventory.js";
+import {
+  applyLegacyTriggerMigration,
+  legacyTriggerMigrationPlan
+} from "../../application/steward/legacy-migration.js";
 
 interface Output {
   readonly write: (text: string) => void;
@@ -29,27 +32,55 @@ export function runStewardCommand(
 ): number {
   const [command, ...rest] = arguments_;
   if (command === "start") {
-    if (rest.length !== 3 || rest[1] !== "--request-id") {
-      throw new Error("run start requires <json-file> --request-id <idempotency-key>");
-    }
-    write(output, startStewardRun(
+    requireCount(rest, 1, "run start requires one RunIntent@1 JSON file");
+    write(output, startStewardRunFromIntent(
       repoRoot,
-      {
-        ...parseRunFile(rest[0]!),
-        requestId: text(rest[2], "requestId")
-      },
+      parseRunIntentFile(rest[0]!),
+      runtimeDirectory
+    ));
+    return 0;
+  }
+  if (command === "preflight") {
+    requireCount(rest, 1, "run preflight requires one RunIntent@1 JSON file");
+    write(output, preflightStewardRunIntent(
+      repoRoot,
+      parseRunIntentFile(rest[0]!),
       runtimeDirectory
     ));
     return 0;
   }
   if (command === "list") {
-    if (rest.length !== 0 && !(rest.length === 2 && rest[0] === "--limit")) {
-      throw new Error("run list accepts [--limit <count>]");
+    const archived = rest.includes("--archived");
+    const limitOffset = rest.indexOf("--limit");
+    const validLength = (archived ? 1 : 0) + (limitOffset === -1 ? 0 : 2);
+    if (rest.length !== validLength ||
+      (limitOffset !== -1 && rest[limitOffset + 1] === undefined)) {
+      throw new Error("run list accepts [--limit <count>] [--archived]");
     }
     write(output, listStewardRunViews(
       repoRoot,
       runtimeDirectory,
-      rest.length === 0 ? 100 : integer(rest[1], "limit", 1, 1_000)
+      limitOffset === -1 ? 100 : integer(rest[limitOffset + 1], "limit", 1, 1_000),
+      archived ? "archived" : "current"
+    ));
+    return 0;
+  }
+  if (command === "legacy-inventory") {
+    requireCount(rest, 0, "run legacy-inventory accepts no arguments");
+    write(output, legacyExecutionInventory(repoRoot, runtimeDirectory));
+    return 0;
+  }
+  if (command === "legacy-migration-plan") {
+    requireCount(rest, 0, "run legacy-migration-plan accepts no arguments");
+    write(output, legacyTriggerMigrationPlan(repoRoot, runtimeDirectory));
+    return 0;
+  }
+  if (command === "legacy-migrate") {
+    requireCount(rest, 1, "run legacy-migrate requires one approval JSON file");
+    write(output, applyLegacyTriggerMigration(
+      repoRoot,
+      parseJsonFile(rest[0]!, "LegacyTriggerMigrationApproval@1"),
+      runtimeDirectory
     ));
     return 0;
   }
@@ -61,6 +92,16 @@ export function runStewardCommand(
   if (command === "cancel") {
     requireCount(rest, 1, "run cancel requires exactly one Steward Run id");
     write(output, cancelStewardRun(repoRoot, rest[0]!, runtimeDirectory));
+    return 0;
+  }
+  if (command === "archive" || command === "unarchive") {
+    requireCount(rest, 1, `run ${command} requires exactly one Steward Run id`);
+    write(output, setStewardRunArchived(
+      repoRoot,
+      rest[0]!,
+      command === "archive",
+      runtimeDirectory
+    ));
     return 0;
   }
   if (command === "close") {
@@ -90,78 +131,15 @@ export function runStewardCommand(
     ));
     return 0;
   }
-  throw new Error("run requires start, list, inspect, trace, decide, close or cancel");
+  throw new Error(
+    "run requires preflight, start, list, legacy-inventory, legacy-migration-plan, " +
+    "legacy-migrate, inspect, trace, decide, " +
+    "close, cancel, archive or unarchive"
+  );
 }
 
-function parseRunFile(pathInput: string): Omit<StartStewardRunInput, "requestId"> {
-  const path = realpathSync(pathInput);
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
-  } catch (error) {
-    throw new Error(`run file must be valid JSON: ${message(error)}`);
-  }
-  const root = record(parsed, "run file");
-  exactKeys(root, [
-    "schemaVersion",
-    "series",
-    "steward",
-    "objective",
-    "workflowRef",
-    "inputs",
-    "workspace",
-    "maxSteps",
-    "maxDepth",
-    "deadlineAt",
-    "taskUrl",
-    "participantAgentIds",
-    "orchestration"
-  ]);
-  if (root.schemaVersion !== 1) throw new Error("run file schemaVersion must be 1");
-  const workspace = root.workspace === undefined
-    ? undefined
-    : workspaceInput(root.workspace);
-  return {
-    ...(root.series === undefined ? {} : { series: seriesInput(root.series) }),
-    ...(root.steward === undefined ? {} : { steward: text(root.steward, "steward") }),
-    ...(root.objective === undefined
-      ? {}
-      : { objective: text(root.objective, "objective") }),
-    ...(root.workflowRef === undefined
-      ? {}
-      : { workflowRef: text(root.workflowRef, "workflowRef") }),
-    ...(root.inputs === undefined
-      ? {}
-      : { inputs: record(root.inputs, "inputs") }),
-    ...(workspace === undefined ? {} : { workspace }),
-    ...(root.maxSteps === undefined
-      ? {}
-      : { maxSteps: integer(root.maxSteps, "maxSteps", 1, 1_000) }),
-    ...(root.maxDepth === undefined
-      ? {}
-      : { maxDepth: integer(root.maxDepth, "maxDepth", 0, 100) }),
-    ...(root.deadlineAt === undefined
-      ? {}
-      : { deadlineAt: text(root.deadlineAt, "deadlineAt") }),
-    ...(root.taskUrl === undefined
-      ? {}
-      : { taskUrl: text(root.taskUrl, "taskUrl") }),
-    ...(root.participantAgentIds === undefined
-      ? {}
-      : { participantAgentIds: stringList(root.participantAgentIds, "participantAgentIds") }),
-    ...(root.orchestration === undefined
-      ? {}
-      : { orchestration: orchestrationInput(root.orchestration) })
-  };
-}
-
-function seriesInput(value: unknown): { readonly key: string; readonly sourceRevision: string } {
-  const series = record(value, "series");
-  exactKeys(series, ["key", "sourceRevision"]);
-  return {
-    key: text(series.key, "series.key"),
-    sourceRevision: text(series.sourceRevision, "series.sourceRevision")
-  };
+function parseRunIntentFile(pathInput: string) {
+  return parseJsonFile(pathInput, "RunIntent@1");
 }
 
 function parseJsonFile(
@@ -174,71 +152,6 @@ function parseJsonFile(
   } catch (error) {
     throw new Error(`${field} file must be valid JSON: ${message(error)}`);
   }
-}
-
-function orchestrationInput(
-  value: unknown
-): { readonly mode: "autonomous" | "caller" | "steward" } {
-  const orchestration = record(value, "orchestration");
-  exactKeys(orchestration, ["mode"]);
-  if (orchestration.mode !== "autonomous" && orchestration.mode !== "caller" &&
-    orchestration.mode !== "steward") {
-    throw new Error("orchestration.mode must be autonomous, caller or steward");
-  }
-  return { mode: orchestration.mode };
-}
-
-function stringList(value: unknown, field: string): readonly string[] {
-  if (!Array.isArray(value) || value.length === 0 || value.length > 64) {
-    throw new Error(`${field} must contain 1-64 strings`);
-  }
-  return value.map((item, index) => text(item, `${field}[${index}]`));
-}
-
-function workspaceInput(value: unknown): {
-  readonly root: string;
-  readonly access: "read";
-  readonly networkAccess?: boolean;
-} | {
-  readonly root: string;
-  readonly access: "write";
-  readonly effect: WorkspaceEffect;
-  readonly networkAccess?: boolean;
-} {
-  const workspace = record(value, "workspace");
-  exactKeys(workspace, ["root", "access", "effect", "networkAccess"]);
-  if (workspace.access !== "read" && workspace.access !== "write") {
-    throw new Error("workspace.access must be read or write");
-  }
-  if (workspace.networkAccess !== undefined &&
-    typeof workspace.networkAccess !== "boolean") {
-    throw new Error("workspace.networkAccess must be boolean");
-  }
-  if (workspace.networkAccess === true && workspace.access !== "write") {
-    throw new Error("workspace.networkAccess requires workspace.access=write");
-  }
-  if (workspace.access === "write" && workspace.effect !== "must_change" &&
-    workspace.effect !== "may_remain_unchanged") {
-    throw new Error("workspace.effect is required for write access");
-  }
-  if (workspace.access === "read" && workspace.effect !== undefined) {
-    throw new Error("workspace.effect is valid only with write access");
-  }
-  const root = text(workspace.root, "workspace.root");
-  const networkAccess = workspace.networkAccess as boolean | undefined;
-  if (workspace.access === "read") {
-    return {
-      root,
-      access: "read",
-      ...(networkAccess === undefined ? {} : { networkAccess })
-    };
-  }
-  return {
-    root,
-    access: "write",
-    effect: workspace.effect as WorkspaceEffect,
-    ...(networkAccess === undefined ? {} : { networkAccess })
-  };
 }
 
 function write(output: Output, value: unknown): void {
@@ -254,14 +167,6 @@ function record(value: unknown, field: string): Record<string, unknown> {
     throw new Error(`${field} must be an object`);
   }
   return value as Record<string, unknown>;
-}
-
-function exactKeys(
-  value: Readonly<Record<string, unknown>>,
-  allowed: readonly string[]
-): void {
-  const unknown = Object.keys(value).filter((key) => !allowed.includes(key));
-  if (unknown.length > 0) throw new Error(`run file has unknown field: ${unknown[0]}`);
 }
 
 function text(value: unknown, field: string): string {

@@ -34,6 +34,7 @@ import {
   resumeLocalTopic,
   type TopicGovernanceControlResult
 } from "../topic/governance-control.js";
+import { startStewardRunFromIntent } from "../steward/intent-control.js";
 
 export interface LocalChatView {
   readonly chat: {
@@ -339,6 +340,41 @@ export function postLocalChatMessage(
   }
 }
 
+export function handoffLocalChatMessageToRun(
+  repoRoot: string,
+  eventId: string,
+  options: LocalControlOptions = {}
+) {
+  const snapshot = localRuntimeSnapshot(repoRoot, options);
+  const chat = openChat(repoRoot, options);
+  try {
+    const message = chat.message(eventId);
+    if (message.topicId !== snapshot.foundation.topicId || message.sender.kind !== "owner") {
+      throw new Error("Only an Owner message in the Local Topic can be handed off to a Run");
+    }
+    return startStewardRunFromIntent(repoRoot, {
+      schemaVersion: "RunIntent@1",
+      requestId: `chat-work:${message.eventId}`,
+      objective: message.body,
+      acceptance: ["Complete the explicit work intent handed off from Local Chat"],
+      contextRefs: [
+        `chat-topic:${message.topicId}`,
+        `chat-message:${message.eventId}`
+      ],
+      ...(message.targets === undefined || message.targets.length === 0
+        ? {}
+        : {
+            requestedParticipantRefs: message.targets.map(
+              ({ principalId }) => `principal:${principalId}`
+            )
+          }),
+      terminalEvidence: ["Record a terminal Run receipt linked to the source Chat message"]
+    }, options.runtimeDirectory);
+  } finally {
+    chat.close();
+  }
+}
+
 export function localChatPresenceView(
   repoRoot: string,
   options: LocalControlOptions = {}
@@ -350,10 +386,14 @@ export function localChatPresenceView(
       topicId: snapshot.foundation.topicId,
       agents: snapshot.agents.map((agent) => {
         const presence = runtime.chatPresence(agent.principalId, snapshot.foundation.topicId);
-        const history = inspectClientHistoryAccess(repoRoot, agent.principalId, options);
-        const lastHistory = [...clientHistoryAudits(repoRoot, agent.principalId, options)]
-          .reverse()
-          .find((audit) => audit.action === "search" || audit.action === "read");
+        const history = agent.status === "active"
+          ? inspectClientHistoryAccess(repoRoot, agent.principalId, options)
+          : undefined;
+        const lastHistory = agent.status === "active"
+          ? [...clientHistoryAudits(repoRoot, agent.principalId, options)]
+            .reverse()
+            .find((audit) => audit.action === "search" || audit.action === "read")
+          : undefined;
         const lastDispatch = runtime.latestChatDispatch(
           snapshot.foundation.topicId,
           agent.principalId

@@ -1,14 +1,21 @@
 import type { AgentResultEvent } from "../../core/event/model.js";
 import { RuntimeStore } from "../../core/runtime/store.js";
 import { AgentRunStore } from "../../infrastructure/sqlite/agent-run-store.js";
-import { vikunjaRunResultDelivery } from
-  "../../integrations/vikunja/task-destination.js";
 import { workspaceRevision } from "../../infrastructure/workspace/revision.js";
+import { terminalRunResultDelivery } from "./result-destination.js";
 import {
   isStewardOrchestrated,
   type AgentRunDecisionReceipt,
   type AnyRunDecision
 } from "../../modules/steward/caller-contract.js";
+import {
+  parseRunSourceBinding,
+  type RunSourceBinding
+} from "../../modules/steward/source-contract.js";
+import type { StewardAwaitSourceRunDecisionV3 } from
+  "../../modules/steward/run-contract-v3.js";
+import { runAuthorityDigest } from
+  "../../modules/steward/admission-contract.js";
 import {
   newAgentStepId,
   planCallerRunDecision,
@@ -23,6 +30,14 @@ export interface AppliedRunDecision {
   readonly decision: AgentRunDecisionReceipt;
 }
 
+export interface StewardSourceBindingRegistrar {
+  (input: {
+    readonly run: AgentRunProjection;
+    readonly decision: StewardAwaitSourceRunDecisionV3;
+    readonly at: string;
+  }): RunSourceBinding;
+}
+
 export function applyRunDecisionInTransaction(input: {
   readonly runtime: RuntimeStore;
   readonly runs: AgentRunStore;
@@ -31,16 +46,20 @@ export function applyRunDecisionInTransaction(input: {
   readonly requestId: string;
   readonly sourceKind: "cli" | "handler";
   readonly parentResult?: AgentResultEvent;
+  readonly bindSource?: StewardSourceBindingRegistrar;
   readonly at: string;
 }): AppliedRunDecision {
   const { runtime, runs, run, decision, requestId, at } = input;
   if (input.sourceKind === "cli" && decision.schemaVersion !== "RunDecision@1") {
     throw new Error("Manual Owner must submit RunDecision@1");
   }
-  if (input.sourceKind === "handler" &&
-    (!isStewardOrchestrated(run.orchestratorBinding) ||
-      decision.schemaVersion !== "RunDecision@2")) {
-    throw new Error("Internal Steward Orchestrator must submit RunDecision@2");
+  if (input.sourceKind === "handler" && !isStewardOrchestrated(run.orchestratorBinding)) {
+    throw new Error("Internal Steward Orchestrator requires a Steward binding");
+  }
+  const expectedInternalDecision = run.orchestratorBinding?.schemaVersion ===
+    "OrchestratorBinding@3" ? "RunDecision@3" : "RunDecision@2";
+  if (input.sourceKind === "handler" && decision.schemaVersion !== expectedInternalDecision) {
+    throw new Error(`Internal Steward Orchestrator must submit ${expectedInternalDecision}`);
   }
   const checkpoint = run.checkpoint;
   const sourceStepId = checkpoint?.stepId ?? run.activeStepId;
@@ -49,15 +68,64 @@ export function applyRunDecisionInTransaction(input: {
   }
   const plan = planCallerRunDecision({ run, decision, now: at });
   assertWorkspaceEffectSatisfied(run, plan);
+  if (plan.kind === "await_source") {
+    if (decision.action !== "await_source" || input.bindSource === undefined) {
+      throw new Error("RunDecision await_source requires a source owner registrar");
+    }
+    const binding = parseRunSourceBinding(input.bindSource({ run, decision, at }));
+    if (binding.runId !== run.runId || binding.source.kind !== plan.sourceKind ||
+      run.orchestratorBinding?.schemaVersion !== "OrchestratorBinding@3" ||
+      binding.authorityDigest !== runAuthorityDigest(run.orchestratorBinding.authority)) {
+      throw new Error("Run source binding exceeds or mismatches admitted authority");
+    }
+    const awaiting = runs.bindSourceInTransaction({
+      runId: run.runId,
+      expectedVersion: run.version,
+      binding,
+      updatedAt: at
+    });
+    const receipt: AgentRunDecisionReceipt = {
+      schemaVersion: "AgentRunDecisionReceipt@2",
+      runId: run.runId,
+      requestId,
+      expectedRunVersion: decision.expectedRunVersion,
+      resultingRunVersion: awaiting.version,
+      sourceStepId,
+      action: "await_source",
+      resultingRunStatus: "awaiting_source",
+      sourceBinding: binding,
+      acceptedAt: at
+    };
+    runs.recordDecisionInTransaction({ runId: run.runId, requestId, decision, receipt });
+    return { status: "accepted", run: awaiting, decision: receipt };
+  }
   if (plan.kind === "terminal") {
     const terminal = runs.terminalizeInTransaction({
       runId: run.runId,
       expectedVersion: run.version,
       status: plan.status,
       summary: plan.summary,
+      scope: plan.scope,
       updatedAt: at
     });
-    const receipt: AgentRunDecisionReceipt = {
+    const receipt: AgentRunDecisionReceipt = decision.schemaVersion === "RunDecision@3" ? {
+      schemaVersion: "AgentRunDecisionReceipt@2",
+      runId: run.runId,
+      requestId,
+      expectedRunVersion: decision.expectedRunVersion,
+      resultingRunVersion: terminal.version,
+      sourceStepId,
+      action: decision.action,
+      terminalStatus: plan.status,
+      resultingRunStatus: terminal.status === "awaiting_source"
+        ? "awaiting_source"
+        : plan.status,
+      ...(decision.action === "finish" ? { finishScope: plan.scope } : {}),
+      ...(decision.action !== "finish" || run.activeCycleId === undefined
+        ? {}
+        : { cycleId: run.activeCycleId }),
+      acceptedAt: at
+    } : {
       schemaVersion: "AgentRunDecisionReceipt@1",
       runId: run.runId,
       requestId,
@@ -72,17 +140,18 @@ export function applyRunDecisionInTransaction(input: {
     if (isStewardOrchestrated(run.orchestratorBinding) &&
       run.orchestratorBinding.resultDestination !== undefined) {
       const destination = run.orchestratorBinding.resultDestination;
-      const delivery = vikunjaRunResultDelivery(destination);
+      const delivery = terminalRunResultDelivery(destination, {
+        runId: run.runId,
+        ...(run.activeCycleId === undefined ? {} : { cycleId: run.activeCycleId }),
+        status: plan.status,
+        summary: plan.summary
+      });
       runtime.enqueueHostDeliveryInTransaction({
-        originId: `steward-run:${run.runId}:terminal`,
+        originId: `steward-run:${run.runId}:${run.activeCycleId ?? "run"}:terminal`,
         destinationId: destination.destinationId,
         kind: delivery.kind,
         address: delivery.address,
-        payload: {
-          schemaVersion: "VikunjaTaskComment@1",
-          runId: run.runId,
-          body: `Rollerskate Run ${run.runId}: ${plan.status}\n\n${plan.summary}`
-        },
+        payload: delivery.payload,
         at
       });
     }
@@ -128,6 +197,9 @@ export function applyRunDecisionInTransaction(input: {
       stepId,
       parentStepId: sourceStepId,
       depth: 0,
+      ...(mandate.kind !== "workflow" || mandate.invocationBudget === undefined
+        ? {}
+        : { invocationBudget: mandate.invocationBudget }),
       ...(run.workspaceGrant === undefined ? {} : { workspaceGrant: run.workspaceGrant })
     },
     parent: {
@@ -159,7 +231,21 @@ export function applyRunDecisionInTransaction(input: {
         stepCount: plan.nextStepCount,
         updatedAt: at
       });
-  const receipt: AgentRunDecisionReceipt = {
+  const receipt: AgentRunDecisionReceipt = decision.schemaVersion === "RunDecision@3" ? {
+    schemaVersion: "AgentRunDecisionReceipt@2",
+    runId: run.runId,
+    requestId,
+    expectedRunVersion: decision.expectedRunVersion,
+    resultingRunVersion: advanced.version,
+    sourceStepId,
+    action: "next_step",
+    targetAgentId: plan.targetAgentId,
+    nextStepId: stepId,
+    nextEventId: admission.event.eventId,
+    nextExecutionId: admission.execution.executionId,
+    resultingRunStatus: "active",
+    acceptedAt: at
+  } : {
     schemaVersion: "AgentRunDecisionReceipt@1",
     runId: run.runId,
     requestId,

@@ -9,6 +9,12 @@ import { ScheduledTaskStore } from "./store.js";
 import { latestCronOccurrence } from "./time.js";
 import type { ExternalRefTriggerGuard } from
   "../../modules/external-resource/trigger-binding.js";
+import {
+  BoundScheduleRuntime,
+  type ScheduleRunBindingAdapter
+} from "./bound-runtime.js";
+
+export type { ScheduleRunBindingAdapter } from "./bound-runtime.js";
 
 export interface ScheduledTaskCycleResult {
   readonly projected: readonly string[];
@@ -23,17 +29,26 @@ export class ScheduledTaskRuntime {
   readonly #store: ScheduledTaskStore;
   readonly #validateTarget: (revision: ScheduleRevision) => string | undefined;
   readonly #externalRefGuard: ExternalRefTriggerGuard | undefined;
+  readonly #bound: BoundScheduleRuntime;
 
   public constructor(options: {
     readonly store: ScheduledTaskStore;
     readonly runtime: RuntimeStore;
     readonly validateTarget: (revision: ScheduleRevision) => string | undefined;
     readonly externalRefGuard?: ExternalRefTriggerGuard;
+    readonly runBinding?: ScheduleRunBindingAdapter;
   }) {
     this.#store = options.store;
     this.#runtime = options.runtime;
     this.#validateTarget = options.validateTarget;
     this.#externalRefGuard = options.externalRefGuard;
+    this.#bound = new BoundScheduleRuntime({
+      store: options.store,
+      ...(options.externalRefGuard === undefined
+        ? {}
+        : { externalRefGuard: options.externalRefGuard }),
+      ...(options.runBinding === undefined ? {} : { runBinding: options.runBinding })
+    });
   }
 
   public async runCycle(at = new Date().toISOString()): Promise<ScheduledTaskCycleResult> {
@@ -52,6 +67,14 @@ export class ScheduledTaskRuntime {
     }
 
     for (const schedule of this.#store.due(now)) {
+      if (schedule.revision.schemaVersion === "ScheduleRevision@2") {
+        const result = await this.#bound.decideDue(schedule, now);
+        if (result.kind === "admit") admitted.push(result.run.runId);
+        if (result.kind === "failed") failed.push(result.run.runId);
+        if (result.kind === "skip") skipped.push(result.run.runId);
+        if (result.kind === "queue") queued.push(result.run.runId);
+        continue;
+      }
       const decision = this.#decideDue(schedule, now);
       if (decision.kind === "admit") {
         const result = await this.#admitPending(decision.run, now);
@@ -73,6 +96,12 @@ export class ScheduledTaskRuntime {
     for (const schedule of this.#store.list()) {
       for (const run of this.#store.unterminatedRuns(schedule.definition.scheduleId)) {
         if (run.status === "unknown") continue;
+        if (run.agentRunId !== undefined) {
+          if (this.#bound.projectOccurrence(run, schedule, at)) {
+            projected.push(run.runId);
+          }
+          continue;
+        }
         if (run.status === "running") {
           const callbacks = this.#store.callbackOccurrences(run);
           if (callbacks.length === 0 && run.eventId === undefined) {
@@ -161,6 +190,9 @@ export class ScheduledTaskRuntime {
     const occurrenceKey = schedule.definition.nextOccurrenceKey;
     if (firstAt === undefined || occurrenceKey === undefined) {
       throw new Error(`Active Schedule has no next occurrence: ${schedule.definition.scheduleId}`);
+    }
+    if (schedule.revision.schemaVersion !== "ScheduleRevision@1") {
+      throw new Error("ScheduleRevision@2 must use Run occurrence admission");
     }
     const latest = schedule.revision.kind === "cron"
       ? latestCronOccurrence(
@@ -280,14 +312,17 @@ export class ScheduledTaskRuntime {
       }, at);
       return "skipped";
     }
-    if (schedule.definition.status === "paused" &&
-      !current.occurrenceKey.startsWith("manual:")) {
-      return "deferred";
-    }
     const revision = this.#store.requireRevision(
       current.scheduleId,
       current.scheduleRevision
     );
+    if (revision.schemaVersion === "ScheduleRevision@2") {
+      return this.#bound.admitPending(current, revision, at);
+    }
+    if (schedule.definition.status === "paused" &&
+      !current.occurrenceKey.startsWith("manual:")) {
+      return "deferred";
+    }
     if (this.#store.hasOtherActiveRun(current) ||
       (revision.fixedSessionId !== undefined &&
         this.#store.hasOtherActiveFixedSessionRun(current, revision.fixedSessionId))) {

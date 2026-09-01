@@ -11,7 +11,15 @@ import type {
   AgentRunner,
   RunnerEvent,
   RunnerTurnReceipt,
-  RunnerTurnRequest
+  RunnerTurnRequest,
+  RunnerTerminationReason
+} from "./protocol.js";
+import {
+  RunnerInvocationError,
+  RunnerProgressTracker,
+  runnerInvocationFailure,
+  runnerMeaningfulTimeoutMilliseconds,
+  runnerTimeoutMilliseconds
 } from "./protocol.js";
 
 export interface AcpRunnerOptions {
@@ -31,8 +39,26 @@ export class AcpRunner implements AgentRunner {
     this.#options = options;
   }
 
+  public get defaultTimeoutMilliseconds(): number {
+    return this.#options.timeoutMilliseconds;
+  }
+
+  public get defaultMeaningfulOutputTimeoutMilliseconds(): number {
+    return this.#options.meaningfulOutputTimeoutMilliseconds;
+  }
+
   public async invoke(request: RunnerTurnRequest): Promise<RunnerTurnReceipt> {
     const startedAt = new Date().toISOString();
+    const totalTimeoutMilliseconds = runnerTimeoutMilliseconds(
+      request.totalTimeoutMilliseconds ?? this.#options.timeoutMilliseconds,
+      "totalTimeoutMilliseconds"
+    );
+    const meaningfulOutputTimeoutMilliseconds = runnerMeaningfulTimeoutMilliseconds(
+      request.meaningfulOutputTimeoutMilliseconds ??
+        this.#options.meaningfulOutputTimeoutMilliseconds
+    );
+    const progress = new RunnerProgressTracker(startedAt, request.onProgress);
+    progress.phase("starting");
     const child = spawnRunnerProcess({
       executable: this.#options.executable,
       args: ["acp"],
@@ -40,55 +66,85 @@ export class AcpRunner implements AgentRunner {
       environment: this.#options.environment
     });
     const stderr = collectBoundedStderr(child);
-    const processFailure = new Promise<never>((_resolve, reject) => {
-      child.once("error", reject);
-    });
-
+    let turnSettled = false;
     let meaningfulTimeout: NodeJS.Timeout | undefined;
-    let rejectMeaningfulTimeout: ((error: Error) => void) | undefined;
-    const meaningfulFailure = new Promise<never>((_resolve, reject) => {
-      rejectMeaningfulTimeout = reject;
+    let rejectLifecycle: ((error: RunnerInvocationError) => void) | undefined;
+    let terminationStarted = false;
+    let activeContext: acp.ClientContext | undefined;
+    let activeSessionId: string | undefined;
+    let pendingCancelNotification: Promise<void> | undefined;
+    const lifecycleFailure = new Promise<never>((_resolve, reject) => {
+      rejectLifecycle = reject;
+    });
+    const terminate = (reason: RunnerTerminationReason, message: string) => {
+      if (terminationStarted) return;
+      terminationStarted = true;
+      progress.phase(reason === "protocol_exit" ? "terminated" : "cancelling");
+      const protocolStop = reason === "protocol_exit" ||
+        activeContext === undefined || activeSessionId === undefined
+        ? "unavailable" as const
+        : "requested" as const;
+      if (protocolStop === "requested") {
+        pendingCancelNotification = Promise.resolve(activeContext!.notify(
+          acp.methods.agent.session.cancel,
+          {
+            sessionId: activeSessionId!
+          }
+        )).catch(() => undefined);
+      }
+      rejectLifecycle?.(runnerInvocationFailure({
+        message,
+        progress,
+        reason,
+        totalTimeoutMilliseconds,
+        meaningfulOutputTimeoutMilliseconds,
+        protocolStop
+      }));
+    };
+    child.once("error", (error) => {
+      terminate("protocol_exit", errorMessage(error));
+    });
+    child.once("exit", (code, signal) => {
+      if (turnSettled) return;
+      terminate(
+        "protocol_exit",
+        `Kimi ACP process exited before turn settlement ` +
+        `(code=${String(code)} signal=${String(signal)})`
+      );
     });
     const resetMeaningfulTimeout = () => {
+      if (terminationStarted) return;
       if (meaningfulTimeout !== undefined) clearTimeout(meaningfulTimeout);
       meaningfulTimeout = setTimeout(() => {
-        child.kill("SIGKILL");
-        rejectMeaningfulTimeout?.(new Error(
+        terminate(
+          "stall",
           `agent invocation stalled without meaningful output: ${this.#options.adapterId}`
-        ));
-      }, this.#options.meaningfulOutputTimeoutMilliseconds);
+        );
+      }, meaningfulOutputTimeoutMilliseconds);
     };
     resetMeaningfulTimeout();
 
     let totalTimeout: NodeJS.Timeout | undefined;
-    const totalFailure = new Promise<never>((_resolve, reject) => {
-      totalTimeout = setTimeout(() => {
-        child.kill("SIGKILL");
-        reject(new Error(`agent invocation timed out: ${this.#options.adapterId}`));
-      }, this.#options.timeoutMilliseconds);
-    });
+    totalTimeout = setTimeout(() => {
+      terminate("deadline", `agent invocation timed out: ${this.#options.adapterId}`);
+    }, totalTimeoutMilliseconds);
     const updates: acp.SessionUpdate[] = [];
     let assistantOutputBytes = 0;
-    let rejectResponse: ((error: Error) => void) | undefined;
-    const responseFailure = new Promise<never>((_resolve, reject) => {
-      rejectResponse = reject;
-    });
-    let activeSessionId: string | undefined;
     const application = acp
       .client({ name: "rollerskate-local" })
       .onRequest(acp.methods.client.session.requestPermission, ({ params }) =>
         kimiPermissionDecision(request.workspaceAccess, params))
       .onNotification(acp.methods.client.session.update, ({ params }) => {
-        if (params.sessionId !== activeSessionId) return;
+        if (terminationStarted || params.sessionId !== activeSessionId) return;
         const update = params.update;
         if (update.sessionUpdate === "agent_message_chunk" &&
           update.content.type === "text") {
           assistantOutputBytes += Buffer.byteLength(update.content.text, "utf8");
           if (assistantOutputBytes > this.#options.maxOutputBytes) {
-            child.kill("SIGKILL");
-            rejectResponse?.(new Error(
+            terminate(
+              "protocol_error",
               `Kimi Code assistant output exceeds ${this.#options.maxOutputBytes} bytes`
-            ));
+            );
             return;
           }
           updates.push(update);
@@ -102,6 +158,8 @@ export class AcpRunner implements AgentRunner {
               : { name: update.name })
           });
         }
+        const kind = progressKind(update);
+        if (kind !== undefined) progress.observe(kind, isMeaningfulUpdate(update));
         if (isMeaningfulUpdate(update)) resetMeaningfulTimeout();
       });
     const stream = acp.ndJsonStream(
@@ -112,10 +170,11 @@ export class AcpRunner implements AgentRunner {
     try {
       const response = await Promise.race([
         application.connectWith(stream, async (context) => {
+          activeContext = context;
           const initialized = await context.request(acp.methods.agent.initialize, {
             protocolVersion: acp.PROTOCOL_VERSION,
             clientCapabilities: {},
-            clientInfo: { name: "Rollerskate Local", version: "0.5.4" }
+            clientInfo: { name: "Rollerskate Local", version: "0.5.6" }
           });
           if (initialized.protocolVersion !== acp.PROTOCOL_VERSION) {
             throw new Error(
@@ -138,6 +197,7 @@ export class AcpRunner implements AgentRunner {
             sessionState = await newKimiSession(context, this.#options.workingDirectory);
           }
           activeSessionId = sessionState.sessionId;
+          progress.session(activeSessionId);
           const modeId = kimiMode(request.workspaceAccess);
           if (request.sessionId === undefined &&
             sessionState.modes?.currentModeId !== modeId) {
@@ -154,6 +214,7 @@ export class AcpRunner implements AgentRunner {
               value: request.model
             });
           }
+          progress.phase("prompting");
           const promptResponse = await context.request(acp.methods.agent.session.prompt, {
             sessionId: activeSessionId,
             prompt: [{ type: "text", text: request.prompt }]
@@ -167,14 +228,31 @@ export class AcpRunner implements AgentRunner {
               : { usage: promptResponse.usage })
           };
         }),
-        meaningfulFailure,
-        processFailure,
-        responseFailure,
-        totalFailure
+        lifecycleFailure
       ]);
-      if (response.stopReason !== "end_turn") {
-        throw new Error(`Kimi ACP turn stopped with ${response.stopReason}`);
+      turnSettled = true;
+      if (response.stopReason === "cancelled") {
+        progress.phase("terminated");
+        throw runnerInvocationFailure({
+          message: `Kimi ACP turn stopped with ${response.stopReason}`,
+          progress,
+          reason: "cancelled",
+          totalTimeoutMilliseconds,
+          meaningfulOutputTimeoutMilliseconds,
+          protocolStop: "acknowledged"
+        });
       }
+      if (response.stopReason !== "end_turn") {
+        throw runnerInvocationFailure({
+          message: `Kimi ACP turn stopped with ${response.stopReason}`,
+          progress,
+          reason: "protocol_error",
+          totalTimeoutMilliseconds,
+          meaningfulOutputTimeoutMilliseconds,
+          protocolStop: "unavailable"
+        });
+      }
+      progress.phase("terminated");
       return {
         startedAt,
         completedAt: new Date().toISOString(),
@@ -184,12 +262,31 @@ export class AcpRunner implements AgentRunner {
       };
     } catch (error) {
       const detail = stderr();
-      throw new Error(
-        `${errorMessage(error)}${detail === "" ? "" : `\nstderr: ${detail}`}`
-      );
+      if (error instanceof RunnerInvocationError) {
+        throw new RunnerInvocationError(
+          `${error.message}${detail === "" ? "" : `\nstderr: ${detail}`}`,
+          error.trace
+        );
+      }
+      const connectionClosed = isAcpConnectionClosed(error);
+      if (connectionClosed) progress.phase("terminated");
+      throw runnerInvocationFailure({
+        message: `${errorMessage(error)}${detail === "" ? "" : `\nstderr: ${detail}`}`,
+        progress,
+        reason: connectionClosed ? "protocol_exit" : "protocol_error",
+        totalTimeoutMilliseconds,
+        meaningfulOutputTimeoutMilliseconds,
+        protocolStop: "unavailable"
+      });
     } finally {
       if (meaningfulTimeout !== undefined) clearTimeout(meaningfulTimeout);
       if (totalTimeout !== undefined) clearTimeout(totalTimeout);
+      if (pendingCancelNotification !== undefined) {
+        await Promise.race([
+          pendingCancelNotification,
+          new Promise<void>((resolve) => setTimeout(resolve, 100))
+        ]);
+      }
       await stopRunnerProcess(child, { closeStdin: true, graceMilliseconds: 5_000 });
     }
   }
@@ -250,6 +347,17 @@ function isMeaningfulUpdate(update: acp.SessionUpdate): boolean {
   ].includes(update.sessionUpdate);
 }
 
+function progressKind(update: acp.SessionUpdate):
+  "assistant" | "thought" | "tool" | "plan" | "protocol" | undefined {
+  if (update.sessionUpdate === "agent_message_chunk") return "assistant";
+  if (update.sessionUpdate === "agent_thought_chunk") return "thought";
+  if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
+    return "tool";
+  }
+  if (update.sessionUpdate === "plan" || update.sessionUpdate === "plan_update") return "plan";
+  return "protocol";
+}
+
 function acpRunnerEvents(
   updates: readonly acp.SessionUpdate[],
   usage: acp.Usage | undefined
@@ -297,4 +405,8 @@ function acpRunnerEvents(
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isAcpConnectionClosed(error: unknown): boolean {
+  return error instanceof Error && error.message === "ACP connection closed";
 }

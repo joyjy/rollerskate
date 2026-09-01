@@ -3,6 +3,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import {
   activateLocalChat,
   dispatchLocalChatMessage,
+  handoffLocalChatMessageToRun,
   localChatPresenceView,
   localChatView,
   postLocalChatMessage,
@@ -99,6 +100,15 @@ export async function serveChatApi(
         requireString(body, "body"),
         options,
         replyToEventId === undefined ? {} : { replyToEventId }
+      ));
+      return;
+    }
+    const workHandoff = url.pathname.match(/^\/api\/chat\/messages\/([^/]+)\/run$/);
+    if (workHandoff !== null && method === "POST") {
+      json(response, 201, handoffLocalChatMessageToRun(
+        repoRoot,
+        decodeURIComponent(workHandoff[1]!),
+        options
       ));
       return;
     }

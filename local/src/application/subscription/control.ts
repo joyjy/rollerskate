@@ -26,11 +26,15 @@ import {
   type SubscriptionConsoleView,
   type SubscriptionInspection
 } from "./query.js";
-import { controlContinuousSubscriptionView } from "./continuous.js";
+import {
+  controlContinuousSubscriptionView,
+  setContinuousSubscriptionArchivedView
+} from "./continuous.js";
 export {
   inspectSubscription,
   inspectSubscriptionView,
   listSubscriptionViews,
+  pageSubscriptionViews,
   type FreeSubscriptionView,
   type SubscriptionConsoleView,
   type SubscriptionInspection
@@ -113,7 +117,35 @@ export function controlSubscriptionView(
   if (continuous !== undefined) return continuous;
   const store = new SubscriptionStore(runtimePaths(repoRoot, runtimeDirectory).database);
   try {
+    const current = store.require(subscriptionId);
+    if (action === "resume" && current.definitionSchema !== "SubscriptionDefinition@4") {
+      throw new Error("legacy_trigger_execution_closed: migrate this Subscription to a bound Run");
+    }
     store.setStatus(subscriptionId, action);
+  } finally {
+    store.close();
+  }
+  return inspectSubscriptionView(repoRoot, subscriptionId, runtimeDirectory);
+}
+
+export function setSubscriptionArchivedView(
+  repoRoot: string,
+  subscriptionId: string,
+  archived: boolean,
+  runtimeDirectory?: string,
+  at = new Date().toISOString()
+): SubscriptionConsoleView {
+  const continuous = setContinuousSubscriptionArchivedView(
+    repoRoot,
+    subscriptionId,
+    archived,
+    runtimeDirectory,
+    at
+  );
+  if (continuous !== undefined) return continuous;
+  const store = new SubscriptionStore(runtimePaths(repoRoot, runtimeDirectory).database);
+  try {
+    store.setArchived(subscriptionId, archived, at);
   } finally {
     store.close();
   }

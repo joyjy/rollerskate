@@ -1,9 +1,7 @@
 import assert from "node:assert/strict";
 import {
-  chmodSync,
   mkdtempSync,
-  rmSync,
-  writeFileSync
+  rmSync
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,7 +14,6 @@ import type { CreateScheduleInput } from "../src/capabilities/scheduled-task/mod
 import { ScheduledTaskRuntime } from "../src/capabilities/scheduled-task/runtime.js";
 import { ScheduledTaskStore } from "../src/capabilities/scheduled-task/store.js";
 import { RuntimeStore } from "../src/core/runtime/store.js";
-import { startRuntime } from "../src/bootstrap/runtime.js";
 import { runLocalApp } from "../src/entrypoints/cli/main.js";
 
 test("due one-shot admits exactly one canonical Event and projects its terminal result", async () => {
@@ -383,100 +380,21 @@ test("Execution retry stays on the same ScheduledRun and Event", async () => {
   }
 });
 
-test("real foreground loop executes a CLI-created one-shot and traces its Session", async () => {
+test("public CLI cannot create a legacy one-shot outside Steward source binding", async () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-schedule-loop-repo-"));
   const runtimeDirectory = mkdtempSync(join(tmpdir(), "rollerskate-schedule-loop-runtime-"));
   try {
     addLocalAgent(repo, "alice", "codex", { runtimeDirectory });
-    const executable = join(runtimeDirectory, "codex-fixture");
-    writeFileSync(executable, `#!${process.execPath}
-const readline = require("node:readline");
-const rl = readline.createInterface({ input: process.stdin });
-const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
-rl.on("line", (line) => {
-  const message = JSON.parse(line);
-  if (message.id === 0) send({ id: 0, result: {} });
-  if (message.id === 1) send({ id: 1, result: { thread: {
-    id: message.params.threadId || "scheduled-provider-session"
-  } } });
-  if (message.id === 2) {
-    send({ id: 2, result: { turn: { id: "turn-fixture", items: [], status: "inProgress" } } });
-    send({ method: "item/completed", params: {
-      threadId: message.params.threadId, turnId: "turn-fixture", completedAtMs: Date.now(),
-      item: { id: "message-fixture", type: "agentMessage", text: "scheduled result" }
-    } });
-    send({ method: "turn/completed", params: {
-      threadId: message.params.threadId,
-      turn: { id: "turn-fixture", items: [], status: "completed" }
-    } });
-  }
-});
-`);
-    chmodSync(executable, 0o700);
     const scheduleFile = join(runtimeDirectory, "schedule.json");
-    writeFileSync(scheduleFile, JSON.stringify({
-      schemaVersion: 1,
-      agent: "alice",
-      kind: "once",
-      expression: new Date(Date.now() + 100).toISOString(),
-      misfirePolicy: "run_once",
-      overlapPolicy: "queue",
-      misfireGraceMilliseconds: 60_000,
-      session: { policy: "new_each_run" },
-      prompt: "Run the scheduled smoke."
-    }));
-    let createOutput = "";
-    assert.equal(await runLocalApp(repo, [
-      "--runtime", runtimeDirectory, "schedule", "create", scheduleFile
-    ], {}, { write(text) { createOutput += text; } }), 0);
-    const scheduleId = (JSON.parse(createOutput) as {
-      summary: { scheduleId: string };
-    }).summary.scheduleId;
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 5_000);
-    let admitted = false;
-    let projected = false;
-    try {
-      await startRuntime({
-        repoRoot: repo,
-        runtimeDirectory,
-        codexExecutable: executable,
-        environment: { HOME: repo },
-        pollMilliseconds: 50,
-        output: { write(text) {
-          if (text.includes('"type":"scheduled_task.cycle"') &&
-            text.includes('"admitted":["run_')) {
-            admitted = true;
-          }
-          if (admitted && text.includes('"type":"scheduled_task.cycle"') &&
-            text.includes('"projected":["run_')) {
-            const projection = new ScheduledTaskStore(
-              runtimePaths(repo, runtimeDirectory).database
-            );
-            try {
-              if (projection.runs(scheduleId)[0]?.status === "succeeded") {
-                projected = true;
-                controller.abort();
-              }
-            } finally {
-              projection.close();
-            }
-          }
-        } }
-      }, controller.signal);
-    } finally {
-      clearTimeout(timer);
-    }
-    assert.equal(admitted, true);
-    assert.equal(projected, true);
+    await assert.rejects(
+      runLocalApp(repo, [
+        "--runtime", runtimeDirectory, "schedule", "create", scheduleFile
+      ]),
+      /legacy_trigger_write_closed/
+    );
     const schedules = new ScheduledTaskStore(runtimePaths(repo, runtimeDirectory).database);
     try {
-      const run = schedules.runs(scheduleId)[0]!;
-      assert.equal(run.status, "succeeded");
-      assert.match(run.eventId ?? "", /^evt_/);
-      assert.match(run.executionId ?? "", /^exe_/);
-      assert.match(run.sessionId ?? "", /^ses_/);
+      assert.deepEqual(schedules.list(), []);
     } finally {
       schedules.close();
     }

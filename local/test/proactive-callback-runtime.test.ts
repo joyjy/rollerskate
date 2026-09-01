@@ -343,7 +343,7 @@ test("host command callback executes the exact granted executable", async () => 
   }
 });
 
-test("schema v63 upgrades v46 in place and preserves Schedule and SubscriptionDefinition@3", () => {
+test("schema v69 upgrades v46 in place and preserves Schedule and SubscriptionDefinition@3", () => {
   const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v48-from-v46-"));
   const database = join(directory, "runtime.db");
   try {
@@ -402,8 +402,8 @@ test("schema v63 upgrades v46 in place and preserves Schedule and SubscriptionDe
     v46.close();
 
     const diagnostics = initializeRuntimeSchema(database);
-    assert.equal(diagnostics.schemaVersion, 63);
-    assert.equal(diagnostics.tables.length, 28);
+    assert.equal(diagnostics.schemaVersion, 69);
+    assert.equal(diagnostics.tables.length, 29);
     const migratedSchedules = new ScheduledTaskStore(database);
     const migratedSubscriptions = new SubscriptionStore(database);
     try {
@@ -424,7 +424,7 @@ test("schema v63 upgrades v46 in place and preserves Schedule and SubscriptionDe
   }
 });
 
-test("schema v63 drops v51 one-shot callback rows and settles their parent as unknown", () => {
+test("schema v69 drops v51 one-shot callback rows and settles their parent as unknown", () => {
   const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v52-from-v51-callback-"));
   const databasePath = join(directory, "runtime.db");
   try {
@@ -485,7 +485,7 @@ test("schema v63 drops v51 one-shot callback rows and settles their parent as un
     legacy.prepare("UPDATE schema_meta SET value = '51' WHERE key = 'schema_version'").run();
     legacy.close();
 
-    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 63);
+    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 69);
     const migrated = new SubscriptionStore(databasePath);
     try {
       assert.equal(
@@ -796,7 +796,7 @@ test("Continuous callback finalization is bounded and visible callbacks load in 
   }
 });
 
-test("schema v63 rejects an incomplete database declared as v46", () => {
+test("schema v69 rejects an incomplete database declared as v46", () => {
   const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v48-incomplete-v46-"));
   const databasePath = join(directory, "runtime.db");
   try {
@@ -812,7 +812,7 @@ test("schema v63 rejects an incomplete database declared as v46", () => {
   }
 });
 
-test("schema v63 migrates v47 and repairs self-declared v48 Delivery state", () => {
+test("schema v69 migrates v47 and repairs self-declared v48 Delivery state", () => {
   const eventId = "evt_019fa649-637b-7bf2-ad2b-a9b7be044fcd";
   const deliveryId = "del_019fa649-637b-7bf2-ad2b-a9b7be044fcd";
   for (const declaredVersion of [47, 48]) {
@@ -878,7 +878,7 @@ test("schema v63 migrates v47 and repairs self-declared v48 Delivery state", () 
       `);
       database.close();
 
-      assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 63);
+      assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 69);
       const runtime = new RuntimeStore(databasePath);
       try {
         const delivery = runtime.delivery(deliveryId)!;

@@ -53,10 +53,13 @@ test("owner decisions are fixed, idempotent and create a Run only after acceptan
     assert.equal(accepted.request.status, "accepted");
     assert.deepEqual(accepted.request.decisionReceipt?.admittedBudget, {
       maxSteps: 20,
-      maxDepth: 4
+      maxDepth: 0
     });
     assert.deepEqual(accepted.request.decisionReceipt?.admittedGrantRefs, []);
     assert.ok(accepted.run !== undefined);
+    assert.equal(accepted.run.run.orchestratorBinding?.schemaVersion, "OrchestratorBinding@3");
+    assert.equal(accepted.run.run.mandate.kind, "workflow");
+    assert.equal(accepted.run.run.maxDepth, 0);
     const duplicate = await decideWorkRequestForTarget(fixture.repo, {
       agentHandle: "worker",
       workRequestId: "decision",
@@ -272,6 +275,7 @@ function setup() {
   initializeRuntimeSchema(paths.database);
   bootstrapLocalFoundation(paths, AT);
   const foundation = new LocalFoundationStore(paths.database);
+  foundation.addAgent("codex", "codex", AT);
   const agent = foundation.addAgent("worker", "codex", AT);
   foundation.close();
   const dependencies = { runtimeDirectory, now: () => new Date(AT) };

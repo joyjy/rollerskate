@@ -49,7 +49,8 @@ export function productTables(database: DatabaseSync): string[] {
 
 export function preV61ProductTables(database: DatabaseSync): string[] {
   return productTables(database).filter((table) =>
-    !(["agent_run_decisions", "agent_run_cycles"].includes(table) &&
+    !(["agent_run_decisions", "agent_run_cycles",
+      "legacy_trigger_migration_receipts"].includes(table) &&
       rowCount(database, table) === 0));
 }
 

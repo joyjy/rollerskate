@@ -46,9 +46,36 @@ import {
   migrateV61Schema
 } from "./v61-migration.js";
 import { assertV62SchemaShape, migrateV62Schema } from "./v62-migration.js";
+import { assertV63SchemaShape, migrateV63Schema } from "./v63-migration.js";
+import { assertV64SchemaShape, migrateV64Schema } from "./v64-migration.js";
+import { assertV65SchemaShape, migrateV65Schema } from "./v65-migration.js";
+import { assertV66SchemaShape, migrateV66Schema } from "./v66-migration.js";
+import { assertV67SchemaShape, migrateV67Schema } from "./v67-migration.js";
+import { assertV68SchemaShape, migrateV68Schema } from "./v68-migration.js";
 import { assertNoLiveRuntimeSchemaUpgrade } from "./upgrade-guard.js";
 
-export const LOCAL_SCHEMA_VERSION = 63;
+export const LOCAL_SCHEMA_VERSION = 69;
+
+export function assertCurrentLocalSchema(database: DatabaseSync): void {
+  const declaredVersion = schemaVersion(database);
+  if (declaredVersion === LOCAL_SCHEMA_VERSION) return;
+  if (declaredVersion === undefined) {
+    throw new Error(
+      "Local Runtime database has no schema version; run scripts/rs doctor --local"
+    );
+  }
+  if (declaredVersion > LOCAL_SCHEMA_VERSION) {
+    throw new Error(
+      `Local Runtime database schema ${declaredVersion} is newer than supported ` +
+      `${LOCAL_SCHEMA_VERSION}; use a matching Rollerskate version`
+    );
+  }
+  throw new Error(
+    `Local Runtime database schema ${declaredVersion} is not current ` +
+    `${LOCAL_SCHEMA_VERSION}; read-only queries do not migrate schema, so stop ` +
+    "the Runtime if it is running and run scripts/rs start before retrying"
+  );
+}
 
 export function migrateLocalDatabase(database: DatabaseSync): void {
   const declaredVersion = schemaVersion(database);
@@ -67,9 +94,75 @@ export function migrateLocalDatabase(database: DatabaseSync): void {
     migrateCurrentRuntimeData(database);
     return;
   }
+  if (declaredVersion === 68) {
+    assertV68SchemaShape(database);
+    migrateV68Schema(database, LOCAL_SCHEMA_VERSION);
+    backfillScheduleCallbacks(database);
+    migrateCurrentRuntimeData(database);
+    return;
+  }
+  if (declaredVersion === 67) {
+    upgradeFromV67(database);
+    backfillScheduleCallbacks(database);
+    migrateCurrentRuntimeData(database);
+    return;
+  }
+  if (declaredVersion === 66) {
+    assertV66SchemaShape(database);
+    migrateV66Schema(database, 67);
+    upgradeFromV67(database);
+    backfillScheduleCallbacks(database);
+    migrateCurrentRuntimeData(database);
+    return;
+  }
+  if (declaredVersion === 65) {
+    assertV65SchemaShape(database);
+    migrateV65Schema(database, 66);
+    assertV66SchemaShape(database);
+    migrateV66Schema(database, 67);
+    upgradeFromV67(database);
+    backfillScheduleCallbacks(database);
+    migrateCurrentRuntimeData(database);
+    return;
+  }
+  if (declaredVersion === 64) {
+    assertV64SchemaShape(database);
+    migrateV64Schema(database, 65);
+    assertV65SchemaShape(database);
+    migrateV65Schema(database, 66);
+    assertV66SchemaShape(database);
+    migrateV66Schema(database, 67);
+    upgradeFromV67(database);
+    backfillScheduleCallbacks(database);
+    migrateCurrentRuntimeData(database);
+    return;
+  }
+  if (declaredVersion === 63) {
+    assertV63SchemaShape(database);
+    migrateV63Schema(database, 64);
+    assertV64SchemaShape(database);
+    migrateV64Schema(database, 65);
+    assertV65SchemaShape(database);
+    migrateV65Schema(database, 66);
+    assertV66SchemaShape(database);
+    migrateV66Schema(database, 67);
+    upgradeFromV67(database);
+    backfillScheduleCallbacks(database);
+    migrateCurrentRuntimeData(database);
+    return;
+  }
   if (declaredVersion === 62) {
     assertV62SchemaShape(database);
-    migrateV62Schema(database, LOCAL_SCHEMA_VERSION);
+    migrateV62Schema(database, 63);
+    assertV63SchemaShape(database);
+    migrateV63Schema(database, 64);
+    assertV64SchemaShape(database);
+    migrateV64Schema(database, 65);
+    assertV65SchemaShape(database);
+    migrateV65Schema(database, 66);
+    assertV66SchemaShape(database);
+    migrateV66Schema(database, 67);
+    upgradeFromV67(database);
     backfillScheduleCallbacks(database);
     migrateCurrentRuntimeData(database);
     return;
@@ -78,7 +171,16 @@ export function migrateLocalDatabase(database: DatabaseSync): void {
     assertV61SchemaShape(database);
     migrateV61Schema(database, 62);
     assertV62SchemaShape(database);
-    migrateV62Schema(database, LOCAL_SCHEMA_VERSION);
+    migrateV62Schema(database, 63);
+    assertV63SchemaShape(database);
+    migrateV63Schema(database, 64);
+    assertV64SchemaShape(database);
+    migrateV64Schema(database, 65);
+    assertV65SchemaShape(database);
+    migrateV65Schema(database, 66);
+    assertV66SchemaShape(database);
+    migrateV66Schema(database, 67);
+    upgradeFromV67(database);
     backfillScheduleCallbacks(database);
     migrateCurrentRuntimeData(database);
     return;
@@ -172,6 +274,10 @@ export function migrateLocalDatabase(database: DatabaseSync): void {
 
 function migrateCurrentRuntimeData(database: DatabaseSync): void {
   database.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS subscriptions_bound_run
+      ON subscriptions(agent_run_id) WHERE agent_run_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS continuous_subscriptions_bound_run
+      ON continuous_subscriptions(agent_run_id) WHERE agent_run_id IS NOT NULL;
     UPDATE agents
     SET current_session_id = NULL
     WHERE current_session_id IN (
@@ -232,7 +338,8 @@ function backfillScheduleCallbacks(database: DatabaseSync): void {
       ),
       revision_created_at
     FROM schedules AS schedule
-    WHERE NOT EXISTS (
+    WHERE schedule.definition_schema = 'ScheduleRevision@1'
+      AND NOT EXISTS (
       SELECT 1 FROM proactive_callback_definitions AS callback
       WHERE callback.owner_kind = 'schedule'
         AND callback.owner_id = schedule.schedule_id
@@ -287,7 +394,24 @@ function isCurrentSchema(database: DatabaseSync): boolean {
       (column) => tableColumns(database, "agent_runs").includes(column)
     ) && ["series_key", "active_cycle_id"].every(
       (column) => tableColumns(database, "agent_runs").includes(column)
-    ) && tableColumns(database, "agent_sessions").includes("cycle_id") &&
+    ) && tableColumns(database, "agent_runs").includes("archived_at") &&
+    tableColumns(database, "agent_runs").includes("source_binding_json") &&
+    tableColumns(database, "agent_run_cycles").includes("source_envelope_json") &&
+    ["definition_schema", "source_binding_json"].every(
+      (column) => tableColumns(database, "schedules").includes(column)
+    ) && ["agent_run_id", "cycle_id", "admission_receipt_json"].every(
+      (column) => tableColumns(database, "scheduled_runs").includes(column)
+    ) && ["source_binding_json", "agent_run_id", "cycle_id",
+      "admission_receipt_json"].every(
+      (column) => tableColumns(database, "subscriptions").includes(column)
+    ) && ["definition_schema", "source_binding_json", "agent_run_id",
+      "pending_cycle_id", "pending_admission_receipt_json"].every(
+      (column) => tableColumns(database, "continuous_subscriptions").includes(column)
+    ) &&
+    ["schedules", "subscriptions", "continuous_subscriptions"].every(
+      (table) => tableColumns(database, table).includes("archived_at")
+    ) &&
+    tableColumns(database, "agent_sessions").includes("cycle_id") &&
     hasVikunjaTaskDeliveryKind(database) && hasInitialStewardRunShape(database);
 }
 
@@ -297,5 +421,21 @@ function upgradeFromV60(database: DatabaseSync): void {
   assertV61SchemaShape(database);
   migrateV61Schema(database, 62);
   assertV62SchemaShape(database);
-  migrateV62Schema(database, LOCAL_SCHEMA_VERSION);
+  migrateV62Schema(database, 63);
+  assertV63SchemaShape(database);
+  migrateV63Schema(database, 64);
+  assertV64SchemaShape(database);
+  migrateV64Schema(database, 65);
+  assertV65SchemaShape(database);
+  migrateV65Schema(database, 66);
+  assertV66SchemaShape(database);
+  migrateV66Schema(database, 67);
+  upgradeFromV67(database);
+}
+
+function upgradeFromV67(database: DatabaseSync): void {
+  assertV67SchemaShape(database);
+  migrateV67Schema(database, 68);
+  assertV68SchemaShape(database);
+  migrateV68Schema(database, LOCAL_SCHEMA_VERSION);
 }

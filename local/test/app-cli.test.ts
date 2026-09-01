@@ -80,6 +80,18 @@ test("help has one explicit form", async () => {
   }
 });
 
+test("agent request is closed in favor of RunIntent admission", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "rollerskate-agent-request-cutover-"));
+  try {
+    await assert.rejects(() => runLocalApp(repo, [
+      "--runtime", join(repo, "runtime"),
+      "agent", "request", "alice", "do", "work"
+    ]), /direct_agent_work_closed.*RunIntent@1/);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
 test("workspace set command persists one canonical Agent workspace root", async () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-agent-configure-"));
   const runtime = join(repo, "runtime");
@@ -586,6 +598,7 @@ test("start discovers the Pi executable for an active Pi Agent", async () => {
     "--runtime",
     runtime,
     "start",
+    "--foreground",
     "--no-open",
     "--ui-port",
     String(port)
@@ -632,6 +645,7 @@ test("start logs graceful shutdown signals before exiting", async () => {
       "--runtime",
       runtime,
       "start",
+      "--foreground",
       "--no-open",
       "--ui-port",
       String(port)
@@ -664,6 +678,94 @@ test("start logs graceful shutdown signals before exiting", async () => {
       }
       rmSync(repo, { recursive: true, force: true });
     }
+  }
+});
+
+test("start owns a detached idempotent daemon lifecycle", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "rollerskate-daemon-start-"));
+  const runtime = join(repo, "runtime");
+  const port = await unusedLoopbackPort();
+  const script = join(process.cwd(), "..", "scripts", "rs");
+  const command = (...arguments_: readonly string[]) => spawnSync(script, [
+    "--runtime",
+    runtime,
+    ...arguments_
+  ], {
+    cwd: repo,
+    encoding: "utf8"
+  });
+
+  try {
+    const started = command("start", "--no-open", "--ui-port", String(port));
+    assert.equal(started.status, 0, started.stderr);
+    assert.match(started.stdout, /Rollerskate started in the background\./);
+    const pid = Number(started.stdout.match(/PID: (\d+)/u)?.[1]);
+    assert.equal(Number.isInteger(pid), true);
+
+    const status = command("status");
+    assert.equal(status.status, 0, status.stderr);
+    assert.match(status.stdout, /Local Runtime: running/);
+    assert.match(status.stdout, new RegExp(`PID: ${pid}`));
+
+    const repeated = command("start", "--no-open", "--ui-port", String(port));
+    assert.equal(repeated.status, 0, repeated.stderr);
+    assert.match(repeated.stdout, new RegExp(`already running with pid ${pid}`));
+
+    const restarted = command("restart", "--no-open", "--ui-port", String(port));
+    assert.equal(restarted.status, 0, restarted.stderr);
+    assert.match(restarted.stdout, new RegExp(`stopped \\(pid ${pid}\\)`));
+    assert.match(restarted.stdout, /Rollerskate started in the background\./);
+    const restartedPid = Number(restarted.stdout.match(/PID: (\d+)/u)?.[1]);
+    assert.equal(Number.isInteger(restartedPid), true);
+    assert.notEqual(restartedPid, pid);
+    assert.match(command("status").stdout, new RegExp(`PID: ${restartedPid}`));
+
+    const stopped = command("stop");
+    assert.equal(stopped.status, 0, stopped.stderr);
+    assert.match(stopped.stdout, new RegExp(`stopped \\(pid ${restartedPid}\\)`));
+    assert.match(command("status").stdout, /Local Runtime: stopped/);
+  } finally {
+    command("stop");
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("daemon start fails promptly when the Console cannot bind", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "rollerskate-daemon-failure-"));
+  const runtime = join(repo, "runtime");
+  const blocker = createServer();
+  blocker.listen(0, "127.0.0.1");
+  await once(blocker, "listening");
+  const address = blocker.address();
+  assert.notEqual(address, null);
+  assert.equal(typeof address, "object");
+  const port = typeof address === "object" && address !== null ? address.port : 0;
+  const script = join(process.cwd(), "..", "scripts", "rs");
+
+  try {
+    const startedAt = Date.now();
+    const result = spawnSync(script, [
+      "--runtime",
+      runtime,
+      "start",
+      "--no-open",
+      "--ui-port",
+      String(port)
+    ], {
+      cwd: repo,
+      encoding: "utf8"
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /daemon exited before readiness/);
+    assert.equal(Date.now() - startedAt < 5_000, true);
+    assert.match(
+      readFileSync(join(runtime, "logs", "daemon.log"), "utf8"),
+      /Local UI failed to start/
+    );
+  } finally {
+    blocker.close();
+    await once(blocker, "close");
+    rmSync(repo, { recursive: true, force: true });
   }
 });
 

@@ -169,7 +169,11 @@ export function stewardOrchestratorPrompt(input: {
   readonly participants: readonly StewardDelegateTarget[];
   readonly taskUrl?: string;
   readonly workspaceEffect?: WorkspaceEffect;
+  readonly contractVersion?: 2 | 3;
+  readonly triggerKinds?: readonly string[];
+  readonly sourceEnvelope?: unknown;
 }): string {
+  const decisionVersion = input.contractVersion ?? 2;
   const state = input.priorState ?? {
     schemaVersion: "OrchestratorState@1",
     goal: input.objective,
@@ -179,20 +183,37 @@ export function stewardOrchestratorPrompt(input: {
   };
   return [
     "You are the Steward Orchestrator for this Run. You own decomposition, Agent selection, handoff, and stopping; Workers do not.",
-    input.checkpoint === undefined
-      ? "First decompose the goal into a bounded task state, then select the first Worker. Keep stable taskIds; do not copy raw transcripts."
-      : "Update the bounded task state from the newest Worker checkpoint. Keep stable taskIds and preserve accepted conclusions; do not copy raw transcripts.",
-    "Choose next_step only when another bounded step can materially change completion. Use an exact admitted agentId. Finish only when the goal is actually satisfied; otherwise use needs_human when authority or information is missing.",
-    "The next Worker receives only nextStep.mandate, not the checkpoint, prior task state, or decision history. Put every bounded fact and reference needed for the handoff into that mandate.",
-    "The Runtime will validate this decision against the current Run version, roster, deadline, and budget. Never expand them.",
-    ...(input.workspaceEffect === "must_change"
-      ? ["Runtime will reject finish.outcome=succeeded until it independently observes a workspace revision change."]
-      : []),
     "",
     `Goal: ${input.objective}`,
     `Current Run version: ${input.runVersion}`,
     `Worker step budget: ${input.completedWorkerSteps}/${input.maxSteps}`,
     ...(input.taskUrl === undefined ? [] : [`Result destination: ${input.taskUrl}`]),
+    ...(input.triggerKinds === undefined
+      ? []
+      : [`Admitted trigger intents: ${input.triggerKinds.join(", ")}`]),
+    "",
+    input.checkpoint === undefined
+      ? "First decompose the goal into a bounded task state, then select the first Worker. Keep stable taskIds; do not copy raw transcripts."
+      : "Update the bounded task state from the newest Worker checkpoint. Keep stable taskIds and preserve accepted conclusions; do not copy raw transcripts.",
+    "Choose next_step only when another bounded step can materially change completion. Use an exact admitted agentId. Finish only when the goal is actually satisfied; otherwise use needs_human when authority or information is missing.",
+    ...(decisionVersion === 3
+      ? [
+          input.sourceEnvelope === undefined
+            ? "Use await_source only to bind this standalone Run to one admitted trigger."
+            : "This cycle came from the already-bound source in Current TriggerOccurrenceEnvelope@1. await_source is invalid now; use next_step, finish, or needs_human.",
+          ...(input.triggerKinds?.some((kind) => kind === "once" || kind === "cron") === true
+            ? [
+                "Schedule templates are exact: schedule.once@1 uses {expression,misfirePolicy,overlapPolicy,misfireGraceMilliseconds,cancellationPolicy}; schedule.cron@1 adds timezone. Subscription templates are exact: subscription.until@1 uses {title,pluginRef,pluginConfig,intervalMilliseconds,maxWaitMilliseconds,maxAttempts,cancellationPolicy}; subscription.continuous@1 omits maxWaitMilliseconds/maxAttempts. pluginRef must come from admitted authority. cancellationPolicy is pause_source or cancel_source."
+              ]
+            : []),
+          "finish must declare scope=cycle or scope=run. A source occurrence may finish its cycle and await the next occurrence, or close the whole Run."
+        ]
+      : []),
+    "The next Worker receives only nextStep.mandate, not the checkpoint, prior task state, or decision history. Put every bounded fact and reference needed for the handoff into that mandate.",
+    "The Runtime will validate this decision against the current Run version, roster, deadline, and budget. Never expand them.",
+    ...(input.workspaceEffect === "must_change"
+      ? ["Runtime will reject finish.outcome=succeeded until it independently observes a workspace revision change."]
+      : []),
     "",
     "Admitted participants:",
     JSON.stringify(input.participants, null, 2),
@@ -214,11 +235,14 @@ export function stewardOrchestratorPrompt(input: {
     ...(input.checkpoint === undefined
       ? []
       : [JSON.stringify(input.checkpoint, null, 2)]),
+    ...(input.sourceEnvelope === undefined
+      ? []
+      : ["Current TriggerOccurrenceEnvelope@1:", JSON.stringify(input.sourceEnvelope, null, 2)]),
     "",
-    "Return exactly one RunDecision@2 JSON object with no code fence or extra text.",
+    `Return exactly one RunDecision@${decisionVersion} JSON object with no code fence or extra text.`,
     "For next_step use:",
     JSON.stringify({
-      schemaVersion: "RunDecision@2",
+      schemaVersion: `RunDecision@${decisionVersion}`,
       action: "next_step",
       expectedRunVersion: input.runVersion,
       rationale: "why another bounded step is needed",
@@ -229,6 +253,44 @@ export function stewardOrchestratorPrompt(input: {
         mandate: { kind: "objective", objective: "bounded next objective" }
       }
     }, null, 2),
-    "For terminal output replace action/nextStep with either finish={outcome,summary}, or action=needs_human with no finish/nextStep. Always include the updated state."
+    ...(decisionVersion === 3
+      ? [
+          ...(input.sourceEnvelope === undefined
+            ? [
+                "For await_source use:",
+                JSON.stringify({
+                  schemaVersion: "RunDecision@3",
+                  action: "await_source",
+                  expectedRunVersion: input.runVersion,
+                  rationale: "why the Run should wait for one admitted source",
+                  checkedAcceptance: [],
+                  state,
+                  awaitSource: {
+                    sourceKind: "schedule | subscription | continuous_subscription",
+                    templateId: "exact admitted template id",
+                    parameters: {}
+                  }
+                }, null, 2)
+              ]
+            : []),
+          "For finish use:",
+          JSON.stringify({
+            schemaVersion: "RunDecision@3",
+            action: "finish",
+            expectedRunVersion: input.runVersion,
+            rationale: "why this scope is complete",
+            checkedAcceptance: [],
+            state,
+            finish: {
+              scope: "cycle | run",
+              outcome: "succeeded | failed",
+              summary: "bounded terminal summary"
+            }
+          }, null, 2),
+          "For needs_human omit nextStep/awaitSource/finish. Always include the updated state."
+        ]
+      : [
+          "For terminal output replace action/nextStep with either finish={outcome,summary}, or action=needs_human with no finish/nextStep. Always include the updated state."
+        ])
   ].join("\n");
 }

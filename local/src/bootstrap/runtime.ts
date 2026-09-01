@@ -16,11 +16,24 @@ import { LocalDeviceStore } from "../infrastructure/files/device-binding-store.j
 import { PollProbeExecutor } from "../capabilities/subscription/plugin-runner.js";
 import { SubscriptionRuntime } from "../capabilities/subscription/runtime.js";
 import { ContinuousSubscriptionRuntime } from "../capabilities/subscription/continuous-runtime.js";
+import { SubscriptionStore } from "../capabilities/subscription/store.js";
+import { ContinuousSubscriptionStore } from
+  "../capabilities/subscription/continuous-store.js";
 import { ProactiveCallbackRuntime } from "../application/callback/proactive-runtime.js";
 import { proactiveCallbackOwnerAdapters } from "../application/callback/proactive.js";
 import { HostCallbackKernel } from "../infrastructure/callback/host-kernel.js";
 import { ScheduledTaskRuntime } from "../capabilities/scheduled-task/runtime.js";
 import { ScheduledTaskStore } from "../capabilities/scheduled-task/store.js";
+import {
+  scheduleRunBindingAdapter,
+  scheduleSourceBindingRegistrar
+} from "../application/schedule/source-binding.js";
+import {
+  subscriptionRunBindingAdapter,
+  subscriptionSourceBindingRegistrar
+} from "../application/subscription/source-binding.js";
+import { resolveRegisteredSubscriptionPlugin } from
+  "../application/subscription/plugin-registry.js";
 import { StewardModule } from "../application/steward/module.js";
 import { AgentRunStore } from "../infrastructure/sqlite/agent-run-store.js";
 import { openRuntimeDatabase } from "../infrastructure/sqlite/database.js";
@@ -65,6 +78,7 @@ import {
   RoomServerPublisherRouter
 } from "../integrations/server/room-client.js";
 import { runtimePaths } from "../infrastructure/runtime/config.js";
+import { runtimeArtifactRevision } from "../infrastructure/runtime/revision.js";
 import { initializeRuntimeSchema } from "../infrastructure/sqlite/schema.js";
 import {
   bootstrapLocalFoundation,
@@ -155,6 +169,7 @@ export async function startRuntime(
     return await runLoop({
       statePath: resources.paths.loopState,
       runtimeDirectory: resources.paths.runtimeDirectory,
+      runtimeRevision: runtimeArtifactRevision(options.repoRoot),
       agentNames: resources.agentNames,
       routeIds: resources.routeIds,
       phases: resources.phases,
@@ -190,6 +205,8 @@ export async function startRuntime(
                 resources.agentRunStore.close();
               } finally {
                 try {
+                  resources.subscriptionStore.close();
+                  resources.continuousSubscriptionStore.close();
                   resources.runtimeDatabase.close();
                 } finally {
                   try {
@@ -243,7 +260,7 @@ async function assembleRuntime(options: RuntimeStartOptions) {
   });
   const runtimeDatabase = openRuntimeDatabase(paths.database);
   const runtimeStore = new RuntimeStore(runtimeDatabase);
-  const scheduledTaskStore = new ScheduledTaskStore(paths.database);
+  const scheduledTaskStore = new ScheduledTaskStore(runtimeDatabase);
   const agentRunStore = new AgentRunStore(runtimeDatabase);
   const foundation = foundationStore.foundation();
   if (foundation === undefined) throw new Error("Local foundation is not initialized");
@@ -420,8 +437,19 @@ async function assembleRuntime(options: RuntimeStartOptions) {
         ...(options.fetch === undefined ? {} : { fetch: options.fetch })
       }));
     }
+    const subscriptionRunBinding = subscriptionRunBindingAdapter({
+      runtime: runtimeStore,
+      runs: agentRunStore
+    });
+    const subscriptionStore = new SubscriptionStore(runtimeDatabase, {
+      runBinding: subscriptionRunBinding
+    });
+    const continuousSubscriptionStore = new ContinuousSubscriptionStore(runtimeDatabase, {
+      runBinding: subscriptionRunBinding
+    });
     const subscriptions = new SubscriptionRuntime({
       databasePath: paths.database,
+      store: subscriptionStore,
       ...(externalRefGuard === undefined ? {} : { externalRefGuard }),
       probeExecutor: new PollProbeExecutor({
         ...(options.fetch === undefined ? {} : { fetch: options.fetch })
@@ -429,6 +457,7 @@ async function assembleRuntime(options: RuntimeStartOptions) {
     });
     const continuousSubscriptions = new ContinuousSubscriptionRuntime({
       databasePath: paths.database,
+      store: continuousSubscriptionStore,
       ...(externalRefGuard === undefined ? {} : { externalRefGuard }),
       probeExecutor: new PollProbeExecutor({
         ...(options.fetch === undefined ? {} : { fetch: options.fetch })
@@ -439,6 +468,7 @@ async function assembleRuntime(options: RuntimeStartOptions) {
       store: scheduledTaskStore,
       runtime: runtimeStore,
       validateTarget(revision) {
+        if (revision.schemaVersion !== "ScheduleRevision@1") return undefined;
         const agent = foundationStore.agent(revision.agentId);
         if (agent === undefined) return "agent-not-found";
         if (agent.status !== "active") return "agent-suspended";
@@ -455,6 +485,10 @@ async function assembleRuntime(options: RuntimeStartOptions) {
         }
         return undefined;
       },
+      runBinding: scheduleRunBindingAdapter({
+        runtime: runtimeStore,
+        runs: agentRunStore
+      }),
       ...(externalRefGuard === undefined ? {} : { externalRefGuard })
     });
     const proactiveCallbacks = new ProactiveCallbackRuntime(paths.database, {
@@ -480,9 +514,22 @@ async function assembleRuntime(options: RuntimeStartOptions) {
       }
       return runtimeAgents.get(agentId);
     };
+    const bindScheduleSource = scheduleSourceBindingRegistrar(scheduledTaskStore);
+    const bindSubscriptionSource = subscriptionSourceBindingRegistrar({
+      oneShot: subscriptionStore,
+      continuous: continuousSubscriptionStore,
+      resolvePlugin: (ref) => resolveRegisteredSubscriptionPlugin(
+        options.repoRoot,
+        ref,
+        options.runtimeDirectory
+      )
+    });
     const steward = new StewardModule({
       runs: agentRunStore,
-      runtime: runtimeStore
+      runtime: runtimeStore,
+      bindSource: (input) => input.decision.awaitSource.sourceKind === "schedule"
+        ? bindScheduleSource(input)
+        : bindSubscriptionSource(input)
     });
     const modules = [steward.manifest()];
     const serverTopics = new ServerTopicRuntimeBridge({
@@ -611,6 +658,8 @@ async function assembleRuntime(options: RuntimeStartOptions) {
       matrixIngress,
       matrixDelivery,
       subscriptions,
+      subscriptionStore,
+      continuousSubscriptionStore,
       proactiveCallbacks,
       runtimeCycle,
       scheduledTaskStore,

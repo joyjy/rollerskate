@@ -3,6 +3,7 @@ import { computed } from "vue";
 
 import type {
   AgentInvocationDiagnosticsOutput,
+  AgentRunDecisionOutput,
   AgentStepResultOutput,
   AgentTurnResultOutput
 } from "@/api/schema";
@@ -15,7 +16,7 @@ const props = defineProps<{
   completedAt?: string | null;
   prompt?: string;
   effectivePrompt?: string | null;
-  result?: AgentTurnResultOutput | AgentStepResultOutput | null;
+  result?: AgentTurnResultOutput | AgentStepResultOutput | AgentRunDecisionOutput | null;
   rawOutput?: string | null;
   error?: string | null;
   invocation?: AgentInvocationDiagnosticsOutput | null;
@@ -159,6 +160,36 @@ const toolCallsSummary = computed(() => {
           <div v-if="result.artifactRefs.length > 0" class="artifact-list">
             <span class="label">Artifacts</span>
             <span v-for="ref in result.artifactRefs" :key="ref" class="artifact-pill mono">{{ ref }}</span>
+          </div>
+        </div>
+        <div
+          v-else-if="result.schemaVersion === 'RunDecision@2' || result.schemaVersion === 'RunDecision@3'"
+          class="result-card"
+          :class="result.action === 'finish' ? result.finish.outcome : 'delegate'"
+        >
+          <div class="result-action">
+            <span class="action-badge">orchestrator · {{ result.action }}</span>
+            <span v-if="result.action === 'finish'" class="outcome-badge" :class="result.finish.outcome">
+              {{ result.finish.outcome }}
+            </span>
+          </div>
+          <div v-if="result.action === 'next_step'" class="result-target">
+            <span class="label">Target</span>
+            <span class="mono">
+              {{ result.nextStep.target.kind === 'self' ? 'self' : result.nextStep.target.agentId }}
+            </span>
+          </div>
+          <div v-if="result.action === 'await_source'" class="result-target">
+            <span class="label">Source</span>
+            <span class="mono">{{ result.awaitSource.sourceKind }} · {{ result.awaitSource.templateId }}</span>
+          </div>
+          <div class="result-summary">
+            {{ result.action === 'finish' ? result.finish.summary : result.rationale }}
+          </div>
+          <div class="artifact-list">
+            <span class="label">State</span>
+            <span class="artifact-pill">{{ result.state.tasks.length }} tasks</span>
+            <span class="artifact-pill">{{ result.state.acceptedEvidence.length }} evidence</span>
           </div>
         </div>
         <div v-else class="result-card" :class="result.action === 'complete' ? result.outcome : 'delegate'">

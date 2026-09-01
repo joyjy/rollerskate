@@ -11,10 +11,12 @@ const props = defineProps<{
   activeAgents: readonly LocalAgent[];
   currentHumanId?: string;
   allowReply?: boolean;
+  allowWorkHandoff?: boolean;
 }>();
 
 const emit = defineEmits<{
   reply: [message: ChatTimelineMessage];
+  handoff: [message: ChatTimelineMessage];
 }>();
 
 type TimelineItem =
@@ -114,6 +116,12 @@ defineExpose({ scrollToBottom, scrollToMessage });
                 class="reply-action"
                 @click="emit('reply', item.message)"
               >Reply</button>
+              <button
+                v-if="allowWorkHandoff && item.message.sender.kind === 'owner'"
+                type="button"
+                class="handoff-action"
+                @click="emit('handoff', item.message)"
+              >Hand off to Run</button>
               <ChatReadProgress
                 v-if="item.message.sender.kind === 'owner' && item.message.readProgress"
                 :progress="item.message.readProgress"
@@ -169,10 +177,11 @@ defineExpose({ scrollToBottom, scrollToMessage });
   border-bottom: 1px solid var(--border);
 }
 .message:focus { outline: 2px solid var(--primary-soft); outline-offset: -2px; }
-.reply-action {
+.reply-action, .handoff-action {
   border: 0; background: transparent; color: var(--primary); cursor: pointer; opacity: 0; padding: 0;
 }
-.message:hover .reply-action, .message:focus-within .reply-action { opacity: 1; }
+.message:hover .reply-action, .message:focus-within .reply-action,
+.message:hover .handoff-action, .message:focus-within .handoff-action { opacity: 1; }
 .reply-reference {
   display: grid; gap: 2px; width: 100%; margin: 6px 0; padding: 7px 9px;
   border: 0; border-left: 3px solid var(--primary); border-radius: 4px;

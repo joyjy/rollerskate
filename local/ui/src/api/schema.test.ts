@@ -2,11 +2,81 @@ import { describe, expect, it } from "vitest";
 import * as v from "valibot";
 
 import {
+  agentRunDecisionSchema,
+  agentRunDecisionReceiptSchema,
   agentSummariesSchema,
   networkSafetyViewSchema,
   runtimeAuditSchema,
   subscriptionsSchema
 } from "@/api/schema";
+
+describe("agentRunDecisionSchema", () => {
+  const common = {
+    expectedRunVersion: 1,
+    rationale: "one bounded step remains",
+    checkedAcceptance: [],
+    state: {
+      schemaVersion: "OrchestratorState@1",
+      goal: "complete the run",
+      tasks: [],
+      acceptedEvidence: [],
+      unresolvedQuestions: []
+    }
+  };
+
+  it("reads current v3 and persisted v2 step results, but not unrelated v1 input", () => {
+    expect(v.safeParse(agentRunDecisionSchema, {
+      ...common,
+      schemaVersion: "RunDecision@3",
+      action: "finish",
+      finish: { scope: "run", outcome: "succeeded", summary: "done" }
+    }).success).toBe(true);
+    expect(v.safeParse(agentRunDecisionSchema, {
+      ...common,
+      schemaVersion: "RunDecision@2",
+      action: "next_step",
+      nextStep: {
+        target: { kind: "agent", agentId: "prn_worker" },
+        mandate: { kind: "objective", objective: "finish the task" }
+      }
+    }).success).toBe(true);
+    expect(v.safeParse(agentRunDecisionSchema, {
+      ...common,
+      schemaVersion: "RunDecision@1",
+      action: "needs_human"
+    }).success).toBe(false);
+  });
+});
+
+describe("agentRunDecisionReceiptSchema", () => {
+  it("accepts active v2 and historical v1 decision receipts", () => {
+    const common = {
+      runId: "run_1",
+      requestId: "decision_1",
+      expectedRunVersion: 1,
+      resultingRunVersion: 2,
+      sourceStepId: "step_1",
+      acceptedAt: "2026-08-28T04:00:00.000Z"
+    };
+
+    expect(v.safeParse(agentRunDecisionReceiptSchema, {
+      ...common,
+      schemaVersion: "AgentRunDecisionReceipt@2",
+      action: "next_step",
+      targetAgentId: "prn_worker",
+      nextStepId: "step_2",
+      nextEventId: "evt_2",
+      nextExecutionId: "exe_2",
+      resultingRunStatus: "active"
+    }).success).toBe(true);
+    expect(v.safeParse(agentRunDecisionReceiptSchema, {
+      ...common,
+      schemaVersion: "AgentRunDecisionReceipt@1",
+      action: "finish",
+      terminalStatus: "succeeded"
+    }).success).toBe(true);
+  });
+});
 
 describe("agentSummariesSchema", () => {
   it("accepts unknown Local Agent clients for forward-compatible display", () => {
@@ -144,7 +214,7 @@ describe("v0.4 Console schemas", () => {
   });
 
   it("accepts a Free Subscription with exact callback grant and unknown receipt state", () => {
-    const result = v.safeParse(subscriptionsSchema, [{
+    const result = v.safeParse(subscriptionsSchema, { items: [{
       kind: "free",
       id: "sub_1",
       title: "Observe build",
@@ -197,14 +267,16 @@ describe("v0.4 Console schemas", () => {
       createdAt: "2026-07-27T00:00:00.000Z",
       updatedAt: "2026-07-27T00:00:03.000Z",
       latestError: null,
-      terminalObservation: { state: "passed" }
-    }]);
+      terminalObservation: { state: "passed" },
+      archivedAt: null,
+      availableActions: { archive: true, unarchive: false }
+    }], total: 1, page: 1, pageSize: 20 });
 
     expect(result.success).toBe(true);
   });
 
   it("accepts a Continuous Subscription checkpoint and pending callback view", () => {
-    const result = v.safeParse(subscriptionsSchema, [{
+    const result = v.safeParse(subscriptionsSchema, { items: [{
       kind: "continuous",
       id: "sub_continuous",
       title: "Refresh live data",
@@ -246,9 +318,11 @@ describe("v0.4 Console schemas", () => {
       pendingOccurrenceKey: null,
       pendingObservation: null,
       latestError: null,
+      archivedAt: null,
+      availableActions: { archive: false, unarchive: false },
       createdAt: "2026-07-28T00:00:00.000Z",
       updatedAt: "2026-07-28T00:00:03.000Z"
-    }]);
+    }], total: 1, page: 1, pageSize: 20 });
     expect(result.success).toBe(true);
   });
 });

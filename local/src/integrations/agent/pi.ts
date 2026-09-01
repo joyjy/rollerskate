@@ -7,11 +7,15 @@ import type { AgentInputEvent, ChatDispatchEvent } from "../../core/event/model.
 import type { RuntimeAgentAdapter } from "../../core/runtime/handlers.js";
 import { runtimeAgentEventPrompt } from "./event-prompt.js";
 import {
+  agentInvocationFailure,
+  agentInvocationProgress,
   BoundedToolUsage,
   finiteNonNegative,
+  invocationTimeoutMilliseconds,
   invocationDiagnostics,
   type ProviderInvocationDiagnostics
 } from "./invocation-diagnostics.js";
+import { AgentInvocationError } from "../../core/runtime/agent-invocation.js";
 import { providerPolicyObservationFromArgv } from "./provider-policy.js";
 import { PiRpcRunner } from "./runner/pi-rpc.js";
 import {
@@ -19,6 +23,8 @@ import {
   runnerToolNames,
   runnerTurnCount,
   runnerUsage,
+  DEFAULT_MEANINGFUL_OUTPUT_TIMEOUT_MILLISECONDS,
+  RunnerInvocationError,
   type RunnerTurnReceipt,
   type RunnerUsage
 } from "./runner/protocol.js";
@@ -40,6 +46,7 @@ export interface PiRuntimeAgentOptions {
   readonly projectRoot: string;
   readonly environment: Readonly<Record<string, string>>;
   readonly timeoutMilliseconds: number;
+  readonly meaningfulOutputTimeoutMilliseconds?: number;
   readonly maxOutputBytes?: number;
   readonly launchArgs?: readonly string[];
   readonly resolveChatHistoryContext?: (
@@ -94,6 +101,13 @@ export class PiRuntimeAgent implements RuntimeAgentAdapter {
         : { chatHistoryContext })
     } satisfies PiRequest;
     const access = piWorkspaceAccess(request.event);
+    const totalTimeoutMilliseconds = invocationTimeoutMilliseconds(
+      input.event,
+      this.#processOptions.timeoutMilliseconds
+    );
+    const meaningfulOutputTimeoutMilliseconds =
+      this.#processOptions.meaningfulOutputTimeoutMilliseconds ??
+      DEFAULT_MEANINGFUL_OUTPUT_TIMEOUT_MILLISECONDS;
     providerPolicyObservationFromArgv(
       "pi",
       piArgs(request, this.#launchArgs),
@@ -113,13 +127,41 @@ export class PiRuntimeAgent implements RuntimeAgentAdapter {
       },
       workingDirectory: this.workspace,
       timeoutMilliseconds: this.#processOptions.timeoutMilliseconds,
+      meaningfulOutputTimeoutMilliseconds:
+        this.#processOptions.meaningfulOutputTimeoutMilliseconds ??
+        DEFAULT_MEANINGFUL_OUTPUT_TIMEOUT_MILLISECONDS,
       maxOutputBytes: this.#processOptions.maxOutputBytes ?? 1_048_576
     });
-    const result = await process.invoke({
-      prompt: runtimeAgentEventPrompt(request.event),
-      sessionId: request.providerSessionId,
-      workspaceAccess: access
-    });
+    let result: RunnerTurnReceipt;
+    try {
+      result = await process.invoke({
+        prompt: runtimeAgentEventPrompt(request.event),
+        sessionId: request.providerSessionId,
+        workspaceAccess: access,
+        totalTimeoutMilliseconds,
+        meaningfulOutputTimeoutMilliseconds,
+        ...(input.reportProgress === undefined
+          ? {}
+          : {
+              onProgress: (progress) => input.reportProgress!(agentInvocationProgress({
+                adapterId: this.adapterId,
+                workspace: this.workspace,
+                workspaceAccess: access,
+                progress,
+                providerSessionId: request.providerSessionId
+              }))
+            })
+      });
+    } catch (error) {
+      if (!(error instanceof RunnerInvocationError)) throw error;
+      throw new AgentInvocationError(error.message, agentInvocationFailure({
+        adapterId: this.adapterId,
+        workspace: this.workspace,
+        workspaceAccess: access,
+        trace: error.trace,
+        providerSessionId: request.providerSessionId
+      }));
+    }
     const response = piResponse(result);
     return {
       providerSessionId: response.providerSessionId,

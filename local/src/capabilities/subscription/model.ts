@@ -1,3 +1,8 @@
+import type { ProactiveCallbackDefinition } from "../../modules/callback/proactive-model.js";
+import type { ExternalRefTriggerBinding } from
+  "../../modules/external-resource/trigger-binding.js";
+import type { RunSourceBinding } from "../../modules/steward/source-contract.js";
+
 export type SubscriptionStatus =
   | "active"
   | "paused"
@@ -44,15 +49,34 @@ export interface FreeSubscriptionDefinition {
   readonly externalRefBinding?: ExternalRefTriggerBinding;
 }
 
+export interface BoundSubscriptionDefinition {
+  readonly schemaVersion: "SubscriptionDefinition@4";
+  readonly revision: string;
+  readonly title: string;
+  readonly probe: SubscriptionProbeDefinition & {
+    readonly artifactRevision: string;
+    readonly artifactDigest: string;
+  };
+  readonly intervalMilliseconds: number;
+  readonly maxWaitMilliseconds: number;
+  readonly maxAttempts: number;
+  readonly sourceBinding: RunSourceBinding;
+  readonly externalRefBinding?: ExternalRefTriggerBinding;
+}
+
 export type FreeSubscriptionCallback = ProactiveCallbackDefinition;
 
 export interface FreeSubscription {
   readonly subscriptionId: string;
-  readonly definitionSchema: "SubscriptionDefinition@3";
+  readonly definitionSchema: "SubscriptionDefinition@3" | "SubscriptionDefinition@4";
   readonly definitionRevision: string;
   readonly definitionDigest: string;
   readonly title: string;
-  readonly ownerAgentId: string;
+  readonly ownerAgentId?: string;
+  readonly sourceBinding?: RunSourceBinding;
+  readonly agentRunId?: string;
+  readonly cycleId?: string;
+  readonly admissionReceipt?: SubscriptionOccurrenceAdmissionReceipt;
   readonly probe: FreeSubscriptionDefinition["probe"];
   readonly externalRefBinding?: ExternalRefTriggerBinding;
   readonly intervalMilliseconds: number;
@@ -60,6 +84,7 @@ export interface FreeSubscription {
   readonly maxAttempts: number;
   readonly attemptCount: number;
   readonly status: SubscriptionStatus;
+  readonly archivedAt?: string;
   readonly callbackPhaseStatus:
     | "pending"
     | "running"
@@ -76,6 +101,14 @@ export interface FreeSubscription {
   readonly terminalKey?: string;
   readonly terminalObservation?: unknown;
 }
-import type { ProactiveCallbackDefinition } from "../../modules/callback/proactive-model.js";
-import type { ExternalRefTriggerBinding } from
-  "../../modules/external-resource/trigger-binding.js";
+
+export interface SubscriptionOccurrenceAdmissionReceipt {
+  readonly schemaVersion: "SubscriptionOccurrenceAdmissionReceipt@1";
+  readonly subscriptionId: string;
+  readonly occurrenceKey: string;
+  readonly agentRunId: string;
+  readonly cycleId: string;
+  readonly orchestratorEventId: string;
+  readonly orchestratorExecutionId: string;
+  readonly admittedAt: string;
+}

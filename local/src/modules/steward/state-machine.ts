@@ -5,6 +5,15 @@ import type {
   CallerOrchestratorBinding
 } from "./caller-contract.js";
 import type { AgentTurnResult } from "./result-contract.js";
+import type {
+  RunSourceBinding,
+  TriggerOccurrenceEnvelope
+} from "./source-contract.js";
+
+export interface AgentRunInvocationBudget {
+  readonly schemaVersion: "AgentInvocationBudget@1";
+  readonly totalTimeoutMilliseconds: number;
+}
 
 export type AgentRunWorkspaceEffect =
   "must_change" | "may_remain_unchanged";
@@ -24,6 +33,7 @@ export interface AgentRunTurnContext {
   readonly cycleId?: string;
   readonly stepId: string;
   readonly depth: number;
+  readonly invocationBudget?: AgentRunInvocationBudget;
   readonly completionBinding?: {
     readonly schemaVersion: "AgentCompletionBinding@1";
     readonly callerAgentId: string;
@@ -59,6 +69,7 @@ export interface WorkflowRunMandateSnapshot {
   readonly workflowVersion: number;
   readonly inputs: Readonly<Record<string, unknown>>;
   readonly renderedInstruction: string;
+  readonly invocationBudget?: AgentRunInvocationBudget;
   readonly participantAgentIds?: readonly string[];
 }
 
@@ -78,6 +89,7 @@ export interface AgentRunProjection {
   readonly workspaceGrant?: AgentRunWorkspaceGrant;
   readonly orchestrationMode: "autonomous" | "caller";
   readonly orchestratorBinding?: CallerOrchestratorBinding;
+  readonly sourceBinding?: RunSourceBinding;
   readonly status: AgentRunStatus;
   readonly activeStepId?: string;
   readonly activeExecutionId?: string;
@@ -88,6 +100,7 @@ export interface AgentRunProjection {
   readonly checkpoint?: AgentRunCheckpoint;
   readonly terminalSummary?: string;
   readonly cancelledAt?: string;
+  readonly archivedAt?: string;
   readonly version: number;
   readonly createdAt: string;
   readonly updatedAt: string;
@@ -108,6 +121,7 @@ export interface AgentRunCycleProjection {
   readonly sourceRevision: string;
   readonly mandate: RunMandateSnapshot;
   readonly workspaceGrant?: AgentRunWorkspaceGrant;
+  readonly sourceEnvelope?: TriggerOccurrenceEnvelope;
   readonly status: AgentRunCycleStatus;
   readonly stepCount: number;
   readonly terminalSummary?: string;
@@ -211,6 +225,13 @@ export type CallerRunDecisionPlan =
       readonly kind: "terminal";
       readonly status: "succeeded" | "failed" | "needs_human";
       readonly summary: string;
+      readonly scope: "cycle" | "run";
+    }
+  | {
+      readonly kind: "await_source";
+      readonly sourceKind: "schedule" | "subscription" | "continuous_subscription";
+      readonly templateId: string;
+      readonly parameters: Readonly<Record<string, unknown>>;
     };
 
 export function planCallerRunDecision(input: {
@@ -223,7 +244,8 @@ export function planCallerRunDecision(input: {
     throw new Error("Run is not caller-orchestrated");
   }
   const initialStewardDecision =
-    run.orchestratorBinding.schemaVersion === "OrchestratorBinding@2" &&
+    (run.orchestratorBinding.schemaVersion === "OrchestratorBinding@2" ||
+      run.orchestratorBinding.schemaVersion === "OrchestratorBinding@3") &&
     run.stepCount === 0 &&
     run.checkpoint === undefined &&
     (run.status === "active" || run.status === "awaiting_orchestrator");
@@ -237,17 +259,50 @@ export function planCallerRunDecision(input: {
     );
   }
   if (decision.action === "finish") {
+    const scope = decision.schemaVersion === "RunDecision@3"
+      ? decision.finish.scope
+      : run.activeCycleId === undefined ? "run" : "cycle";
+    if (scope === "cycle" &&
+      (run.sourceBinding === undefined || run.activeCycleId === undefined)) {
+      throw new Error("finish(scope=cycle) requires an active source-bound cycle");
+    }
     return {
       kind: "terminal",
       status: decision.finish.outcome,
-      summary: decision.finish.summary
+      summary: decision.finish.summary,
+      scope
     };
   }
   if (decision.action === "needs_human") {
     return {
       kind: "terminal",
       status: "needs_human",
-      summary: decision.rationale
+      summary: decision.rationale,
+      scope: "run"
+    };
+  }
+  if (decision.action === "await_source") {
+    if (run.orchestratorBinding.schemaVersion !== "OrchestratorBinding@3") {
+      throw new Error("await_source requires OrchestratorBinding@3");
+    }
+    if (run.sourceBinding !== undefined || run.seriesKey !== undefined ||
+      run.activeCycleId !== undefined) {
+      throw new Error("Agent Run already has a source binding or series identity");
+    }
+    const allowedKinds = run.orchestratorBinding.authority.trigger?.allowedKinds ?? [];
+    const admitted = decision.awaitSource.sourceKind === "schedule"
+      ? allowedKinds.includes("once") || allowedKinds.includes("cron")
+      : decision.awaitSource.sourceKind === "subscription"
+        ? allowedKinds.includes("until")
+        : allowedKinds.includes("continuous");
+    if (!admitted) {
+      throw new Error("RunDecision source kind exceeds admitted trigger authority");
+    }
+    return {
+      kind: "await_source",
+      sourceKind: decision.awaitSource.sourceKind,
+      templateId: decision.awaitSource.templateId,
+      parameters: decision.awaitSource.parameters
     };
   }
   if (run.deadlineAt !== undefined &&
@@ -259,7 +314,8 @@ export function planCallerRunDecision(input: {
   }
   const targetAgentId = decision.nextStep.target.kind === "self"
     ? run.checkpoint?.agentId ?? (
-        run.orchestratorBinding.schemaVersion === "OrchestratorBinding@2"
+        run.orchestratorBinding.schemaVersion === "OrchestratorBinding@2" ||
+          run.orchestratorBinding.schemaVersion === "OrchestratorBinding@3"
           ? run.orchestratorBinding.orchestratorRef.agentId
           : undefined
       )

@@ -59,6 +59,11 @@ const scheduledRunViewSchema = v.object({
   eventId: nullableString,
   executionId: nullableString,
   sessionId: nullableString,
+  agentRunId: v.optional(nullableString, null),
+  cycleId: v.optional(nullableString, null),
+  agentRunStatus: v.optional(nullableString, null),
+  cycleStatus: v.optional(nullableString, null),
+  admissionReceipt: v.optional(v.nullable(v.unknown()), null),
   decisionReason: nullableString,
   callbacks: v.array(scheduledCallbackViewSchema),
   availableActions: v.object({
@@ -90,13 +95,14 @@ export const scheduleSummaryViewSchema = v.object({
   kind: v.union([v.literal("once"), v.literal("cron")]),
   expression: v.string(),
   timezone: nullableString,
-  sessionPolicy: v.union([
+  sessionPolicy: v.nullable(v.union([
     v.literal("new_each_run"),
     v.literal("fixed")
-  ]),
+  ])),
   fixedSessionId: nullableString,
   owner: operationAgentReferenceSchema,
-  agent: operationAgentReferenceSchema,
+  agent: v.nullable(operationAgentReferenceSchema),
+  sourceBinding: v.optional(v.nullable(v.unknown()), null),
   runCounts: v.object({
     queued: v.number(),
     running: v.number(),
@@ -109,8 +115,11 @@ export const scheduleSummaryViewSchema = v.object({
     pause: v.boolean(),
     resume: v.boolean(),
     cancel: v.boolean(),
-    runNow: v.boolean()
+    runNow: v.boolean(),
+    archive: v.boolean(),
+    unarchive: v.boolean()
   }),
+  archivedAt: nullableString,
   updatedAt: v.string()
 });
 
@@ -121,8 +130,8 @@ export const scheduleDetailViewSchema = v.object({
     misfirePolicy: v.union([v.literal("skip"), v.literal("run_once")]),
     overlapPolicy: v.union([v.literal("skip"), v.literal("queue")]),
     misfireGraceMilliseconds: v.number(),
-    prompt: v.string(),
-    workspace: v.string(),
+    prompt: nullableString,
+    workspace: nullableString,
     externalRefBinding: v.optional(v.nullable(v.unknown())),
     callbacks: v.array(v.looseObject({
       callbackId: v.string(),
@@ -137,7 +146,20 @@ export const scheduleDetailViewSchema = v.object({
   runs: v.array(scheduledRunViewSchema)
 });
 
-export const scheduleSummaryViewsSchema = v.array(scheduleSummaryViewSchema);
+export const scheduleSummaryViewsSchema = v.object({
+  items: v.array(scheduleSummaryViewSchema),
+  total: v.number(),
+  page: v.number(),
+  pageSize: v.number()
+});
+export const scheduleArchiveResponseSchema = v.object({
+  schedule: scheduleDetailViewSchema,
+  status: v.union([
+    v.literal("archive"),
+    v.literal("unarchive"),
+    v.literal("unchanged")
+  ])
+});
 export const scheduleRunNowResponseSchema = v.object({
   receipt: v.looseObject({
     status: v.union([v.literal("accepted"), v.literal("duplicate")]),

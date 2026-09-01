@@ -152,6 +152,29 @@ export class RuntimeDeliveryStore {
     return this.#requireDelivery(deliveryId);
   }
 
+  public retryFailed(
+    deliveryId: string,
+    at = new Date().toISOString()
+  ): RuntimeDelivery {
+    const timestamp = iso(at);
+    return withImmediateTransaction(this.#database, () => {
+      const delivery = this.#requireDelivery(deliveryId);
+      if (delivery.status !== "failed") return delivery;
+      if (delivery.attemptCount >= 30) {
+        throw new Error(`delivery retry limit reached: ${deliveryId}`);
+      }
+      const changed = this.#database.prepare(`
+        UPDATE deliveries SET status = 'retry_wait', max_attempts = attempt_count + 1,
+          next_attempt_at = ?, last_error = NULL, updated_at = ?
+        WHERE delivery_id = ? AND status = 'failed'
+      `).run(timestamp, timestamp, deliveryId);
+      if (changed.changes !== 1) {
+        throw new Error(`delivery is not failed: ${deliveryId}`);
+      }
+      return this.#requireDelivery(deliveryId);
+    });
+  }
+
   public failed(
     deliveryId: string,
     error: string,

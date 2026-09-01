@@ -1,4 +1,8 @@
 import { runtimePaths } from "../../infrastructure/runtime/config.js";
+import { openRuntimeDatabaseReadOnly } from
+  "../../infrastructure/sqlite/database.js";
+import { assertCurrentLocalSchema } from
+  "../../infrastructure/sqlite/schema/index.js";
 import { RuntimeStore, type RuntimeAudit } from "../../core/runtime/store.js";
 
 export function eventTrace(
@@ -6,17 +10,25 @@ export function eventTrace(
   eventId: string,
   runtimeDirectory?: string
 ): EventTraceView {
-  const store = new RuntimeStore(runtimePaths(repoRoot, runtimeDirectory).database);
+  const database = openRuntimeDatabaseReadOnly(
+    runtimePaths(repoRoot, runtimeDirectory).database
+  );
   try {
-    const audit = store.audit(eventId);
-    if (audit === undefined) throw new Error(`Event not found: ${eventId}`);
-    return eventTraceView(
-      audit,
-      store.auditsForRoot(audit.event.causality.rootEventId),
-      true
-    );
+    assertCurrentLocalSchema(database);
+    const store = new RuntimeStore(database, { migrate: false });
+    try {
+      const audit = store.audit(eventId);
+      if (audit === undefined) throw new Error(`Event not found: ${eventId}`);
+      return eventTraceView(
+        audit,
+        store.auditsForRoot(audit.event.causality.rootEventId),
+        true
+      );
+    } finally {
+      store.close();
+    }
   } finally {
-    store.close();
+    database.close();
   }
 }
 
@@ -24,12 +36,20 @@ export function listEventTraces(
   repoRoot: string,
   runtimeDirectory?: string
 ): readonly EventTraceView[] {
-  const store = new RuntimeStore(runtimePaths(repoRoot, runtimeDirectory).database);
+  const database = openRuntimeDatabaseReadOnly(
+    runtimePaths(repoRoot, runtimeDirectory).database
+  );
   try {
-    const audits = store.audits(1_000);
-    return eventTraceViews(audits, false);
+    assertCurrentLocalSchema(database);
+    const store = new RuntimeStore(database, { migrate: false });
+    try {
+      const audits = store.audits(1_000);
+      return eventTraceViews(audits, false);
+    } finally {
+      store.close();
+    }
   } finally {
-    store.close();
+    database.close();
   }
 }
 
@@ -121,6 +141,12 @@ function eventTraceView(
     ...(includeDetails && audit.chat !== undefined ? { chat: audit.chat } : {}),
     ...(includeDetails && audit.invocation !== undefined
       ? { invocation: audit.invocation }
+      : {}),
+    ...(includeDetails && audit.invocationProgress !== undefined
+      ? { invocationProgress: audit.invocationProgress }
+      : {}),
+    ...(includeDetails && audit.invocationFailure !== undefined
+      ? { invocationFailure: audit.invocationFailure }
       : {}),
     lifecycleChangedAt: timestamps.at(-1) ?? audit.event.createdAt,
     reasonForIntervention: failure === undefined ? null : bounded(failure, 512),

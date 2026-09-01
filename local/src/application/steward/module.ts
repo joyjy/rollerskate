@@ -30,11 +30,15 @@ import {
   type AgentStepResult,
   type StewardRunDecision
 } from "../../modules/steward/caller-contract.js";
+import type { StewardRunDecisionV3 } from
+  "../../modules/steward/run-contract-v3.js";
 import {
   parseAgentTurnResult,
   type AgentTurnMandate,
   type AgentTurnResult
 } from "../../modules/steward/result-contract.js";
+import { assertSpecCompatibility } from
+  "../../modules/spec/registry.js";
 import { workspaceEffectFailure } from
   "../../modules/steward/workspace-effect.js";
 import {
@@ -50,7 +54,8 @@ import {
 } from "./prompt.js";
 import {
   applyRunDecisionInTransaction,
-  assertWorkspaceEffectSatisfied
+  assertWorkspaceEffectSatisfied,
+  type StewardSourceBindingRegistrar
 } from "./decision.js";
 import { stepMandateSnapshot } from "./control-support.js";
 import {
@@ -74,10 +79,12 @@ export class StewardModule implements
   readonly #recoveryContinuations: readonly RuntimeAgentResultContinuation[];
   readonly #callerContinuation: CallerAgentStepContinuation;
   readonly #orchestratorContinuation: StewardDecisionContinuation;
+  readonly #orchestratorContinuationV3: StewardDecisionContinuation;
 
   public constructor(options: {
     readonly runs: AgentRunStore;
     readonly runtime: RuntimeStore;
+    readonly bindSource?: StewardSourceBindingRegistrar;
   }) {
     this.#runs = options.runs;
     this.#runtime = options.runtime;
@@ -87,7 +94,14 @@ export class StewardModule implements
         this.handleAgentResult(execution, result, request, at)
     });
     this.#callerContinuation = new CallerAgentStepContinuation(options);
-    this.#orchestratorContinuation = new StewardDecisionContinuation(options);
+    this.#orchestratorContinuation = new StewardDecisionContinuation(
+      options,
+      "run-decision@2"
+    );
+    this.#orchestratorContinuationV3 = new StewardDecisionContinuation(
+      options,
+      "run-decision@3"
+    );
   }
 
   public manifest(): RuntimeApplicationModule {
@@ -97,7 +111,8 @@ export class StewardModule implements
         this,
         ...this.#recoveryContinuations,
         this.#callerContinuation,
-        this.#orchestratorContinuation
+        this.#orchestratorContinuation,
+        this.#orchestratorContinuationV3
       ],
       executionGuards: [this]
     };
@@ -248,6 +263,10 @@ export class StewardModule implements
             stepId: childStepId,
             parentStepId: context.stepId,
             depth: context.depth + 1,
+            ...(childMandate.kind !== "workflow" ||
+              childMandate.invocationBudget === undefined
+              ? {}
+              : { invocationBudget: childMandate.invocationBudget }),
             ...(run.workspaceGrant === undefined
               ? {}
               : { workspaceGrant: run.workspaceGrant }),
@@ -342,6 +361,10 @@ export class StewardModule implements
           stepId: callbackStepId,
           parentStepId: context.stepId,
           depth: callerRequest.runContext.depth,
+          ...(run.mandate.kind !== "workflow" ||
+            run.mandate.invocationBudget === undefined
+            ? {}
+            : { invocationBudget: run.mandate.invocationBudget }),
           ...(run.workspaceGrant === undefined
             ? {}
             : { workspaceGrant: run.workspaceGrant }),
@@ -513,6 +536,17 @@ class CallerAgentStepContinuation implements RuntimeAgentResultContinuation {
             checkpoint,
             ...(priorState === undefined ? {} : { priorState }),
             participants: this.#runs.activeParticipantTargets(participantIds),
+            contractVersion: binding.schemaVersion === "OrchestratorBinding@3" ? 3 : 2,
+            ...(binding.schemaVersion !== "OrchestratorBinding@3" ||
+              binding.authority.trigger === undefined
+              ? {}
+              : { triggerKinds: binding.authority.trigger.allowedKinds }),
+            ...(checkpointed.activeCycleId === undefined
+              ? {}
+              : {
+                  sourceEnvelope: this.#runs.cycle(checkpointed.activeCycleId)
+                    ?.sourceEnvelope
+                }),
             ...(checkpointed.workspaceGrant?.effect === undefined
               ? {}
               : { workspaceEffect: checkpointed.workspaceGrant.effect }),
@@ -522,7 +556,7 @@ class CallerAgentStepContinuation implements RuntimeAgentResultContinuation {
           }),
           runContext: {
             schemaVersion: "AgentRunContext@1",
-            resultContractId: "run-decision@2",
+            resultContractId: binding.decisionContractId,
             runId: checkpointed.runId,
             ...(checkpointed.activeCycleId === undefined
               ? {}
@@ -530,6 +564,10 @@ class CallerAgentStepContinuation implements RuntimeAgentResultContinuation {
             stepId: orchestrationStepId,
             parentStepId: checkpoint.stepId,
             depth: 0,
+            ...(checkpointed.mandate.kind !== "workflow" ||
+              checkpointed.mandate.invocationBudget === undefined
+              ? {}
+              : { invocationBudget: checkpointed.mandate.invocationBudget }),
             ...(checkpointed.workspaceGrant === undefined
               ? {}
               : { workspaceGrant: checkpointed.workspaceGrant })
@@ -571,16 +609,20 @@ class CallerAgentStepContinuation implements RuntimeAgentResultContinuation {
 }
 
 class StewardDecisionContinuation implements RuntimeAgentResultContinuation {
-  public readonly resultContractId = "run-decision@2";
+  public readonly resultContractId: "run-decision@2" | "run-decision@3";
   readonly #runs: AgentRunStore;
   readonly #runtime: RuntimeStore;
+  readonly #bindSource: StewardSourceBindingRegistrar | undefined;
 
   public constructor(options: {
     readonly runs: AgentRunStore;
     readonly runtime: RuntimeStore;
-  }) {
+    readonly bindSource?: StewardSourceBindingRegistrar;
+  }, resultContractId: "run-decision@2" | "run-decision@3") {
     this.#runs = options.runs;
     this.#runtime = options.runtime;
+    this.#bindSource = options.bindSource;
+    this.resultContractId = resultContractId;
   }
 
   public handleAgentResult(
@@ -595,12 +637,18 @@ class StewardDecisionContinuation implements RuntimeAgentResultContinuation {
       const run = this.#runs.requireProjection(context.runId);
       const binding = run.orchestratorBinding;
       if (!isStewardOrchestrated(binding) ||
+        binding.decisionContractId !== this.resultContractId ||
         request.agentId !== binding.orchestratorRef.agentId) {
-        throw new Error("RunDecision@2 producer is not the admitted Steward Orchestrator");
+        throw new Error("RunDecision producer is not the admitted Steward Orchestrator");
       }
-      const initialDecision = run.status === "active" && run.stepCount === 0 &&
+      const rootInitialDecision = run.status === "active" && run.stepCount === 0 &&
         run.checkpoint === undefined &&
         run.activeStepId === context.stepId && request.eventId === run.rootEventId;
+      const sourceInitialDecision = run.status === "awaiting_orchestrator" &&
+        run.stepCount === 0 && run.checkpoint === undefined &&
+        run.activeCycleId !== undefined && context.cycleId === run.activeCycleId &&
+        run.activeStepId === context.stepId;
+      const initialDecision = rootInitialDecision || sourceInitialDecision;
       const checkpointDecision = run.status === "awaiting_orchestrator" &&
         run.checkpoint !== undefined && context.parentStepId === run.checkpoint.stepId;
       if (!initialDecision && !checkpointDecision) {
@@ -620,15 +668,21 @@ class StewardDecisionContinuation implements RuntimeAgentResultContinuation {
           context.stepId,
           `Steward Orchestrator failed: ${result.error ?? "provider failure"}`,
           at,
-          initialDecision ? run : undefined
+          rootInitialDecision ? run : undefined
         );
         return;
       }
-      let decision: StewardRunDecision;
+      let decision: StewardRunDecision | StewardRunDecisionV3;
       try {
-        const parsed = parseRunDecision(JSON.parse(result.output ?? "") as unknown);
-        if (parsed.schemaVersion !== "RunDecision@2") {
-          throw new Error("Steward Orchestrator must return RunDecision@2");
+        const parsed = parseRunDecision(JSON.parse(result.output ?? "") as unknown, {
+          allowHistorical: this.resultContractId === "run-decision@2"
+        });
+        assertSpecCompatibility(this.resultContractId, parsed.schemaVersion, {
+          kind: "result-contract",
+          allowHistorical: this.resultContractId === "run-decision@2"
+        });
+        if (parsed.schemaVersion === "RunDecision@1") {
+          throw new Error("Manual RunDecision@1 is not an internal Steward result");
         }
         decision = parsed;
       } catch (error) {
@@ -636,9 +690,9 @@ class StewardDecisionContinuation implements RuntimeAgentResultContinuation {
           execution,
           run.runId,
           context.stepId,
-          `Invalid RunDecision@2: ${errorMessage(error)}`,
+          `Invalid ${this.resultContractId}: ${errorMessage(error)}`,
           at,
-          initialDecision ? run : undefined
+          rootInitialDecision ? run : undefined
         );
         return;
       }
@@ -659,9 +713,9 @@ class StewardDecisionContinuation implements RuntimeAgentResultContinuation {
           execution,
           run.runId,
           context.stepId,
-          `RunDecision@2 rejected: ${errorMessage(error)}`,
+          `${this.resultContractId} rejected: ${errorMessage(error)}`,
           at,
-          initialDecision ? run : undefined
+          rootInitialDecision ? run : undefined
         );
         return;
       }
@@ -673,6 +727,7 @@ class StewardDecisionContinuation implements RuntimeAgentResultContinuation {
         requestId,
         sourceKind: "handler",
         parentResult: result,
+        ...(this.#bindSource === undefined ? {} : { bindSource: this.#bindSource }),
         at
       });
       this.#runtime.recordExecutionReceiptInTransaction(execution.executionId, {

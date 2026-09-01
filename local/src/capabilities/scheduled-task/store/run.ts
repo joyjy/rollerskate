@@ -4,11 +4,16 @@ import { withImmediateTransaction } from "../../../infrastructure/sqlite/transac
 import { requireRuntimeId } from "../../../core/runtime/model.js";
 import { RuntimeStore } from "../../../core/runtime/store.js";
 import {
+  requireAgentRunCycleId,
+  requireAgentRunId
+} from "../../../modules/steward/state-machine.js";
+import {
   newScheduledRunId,
   requireScheduleId,
   requireScheduleRevision,
   requireScheduledRunId,
   type ScheduledRun,
+  type ScheduleOccurrenceAdmissionReceipt,
   type ScheduledRunStatus,
   type ScheduleRevision,
   type ScheduleStatus
@@ -19,6 +24,7 @@ import {
   iso,
   mapRun,
   optionalText,
+  parseScheduleOccurrenceAdmissionReceipt,
   scheduleDefinitionSnapshot,
   terminalRunStatus,
   text,
@@ -35,6 +41,7 @@ export interface InsertScheduledRunInput {
   readonly coalescedThrough?: string;
   readonly admittedAt?: string;
   readonly decisionReason?: string;
+  readonly agentRunId?: string;
   readonly createdAt?: string;
 }
 
@@ -50,6 +57,8 @@ export interface ScheduledRunPatch {
   readonly eventId?: string;
   readonly executionId?: string;
   readonly sessionId?: string;
+  readonly cycleId?: string;
+  readonly admissionReceipt?: ScheduleOccurrenceAdmissionReceipt;
   readonly decisionReason?: string;
   readonly completedAt?: string;
 }
@@ -70,25 +79,31 @@ export class ScheduledRunStore {
   }
 
   public insertDueRun(input: InsertScheduledRunInput): InsertScheduledRunReceipt {
-    return withImmediateTransaction(this.#database, () => {
-      const definition = this.#database.prepare(`
-        SELECT status, current_revision, next_occurrence_key
-        FROM schedules
-        WHERE schedule_id = ?
-      `).get(input.scheduleId) as {
-        status: ScheduleStatus;
-        current_revision: number;
-        next_occurrence_key: string | null;
-      } | undefined;
-      if (definition === undefined) throw new Error(`Schedule not found: ${input.scheduleId}`);
-      if (definition.status !== "active" ||
-        definition.current_revision !== input.scheduleRevision ||
-        definition.next_occurrence_key !== input.occurrenceKey) {
-        throw new Error(`Schedule occurrence changed before admission: ${input.scheduleId}`);
-      }
-      const receipt = this.insertRun(input);
-      return receipt;
-    });
+    return withImmediateTransaction(
+      this.#database,
+      () => this.insertDueRunInTransaction(input)
+    );
+  }
+
+  public insertDueRunInTransaction(
+    input: InsertScheduledRunInput
+  ): InsertScheduledRunReceipt {
+    const definition = this.#database.prepare(`
+      SELECT status, current_revision, next_occurrence_key
+      FROM schedules
+      WHERE schedule_id = ?
+    `).get(input.scheduleId) as {
+      status: ScheduleStatus;
+      current_revision: number;
+      next_occurrence_key: string | null;
+    } | undefined;
+    if (definition === undefined) throw new Error(`Schedule not found: ${input.scheduleId}`);
+    if (definition.status !== "active" ||
+      definition.current_revision !== input.scheduleRevision ||
+      definition.next_occurrence_key !== input.occurrenceKey) {
+      throw new Error(`Schedule occurrence changed before admission: ${input.scheduleId}`);
+    }
+    return this.insertRun(input);
   }
 
   public insertRun(input: InsertScheduledRunInput): InsertScheduledRunReceipt {
@@ -108,16 +123,21 @@ export class ScheduledRunStore {
     const existing = this.#runForOccurrence(input.scheduleId, input.occurrenceKey);
     if (existing !== undefined) return { run: existing, status: "duplicate" };
     const runId = newScheduledRunId();
-    const definitionSnapshot = scheduleDefinitionSnapshot(
-      this.#requireRevision(input.scheduleId, input.scheduleRevision)
-    );
+    const revision = this.#requireRevision(input.scheduleId, input.scheduleRevision);
+    const expectedAgentRunId = revision.schemaVersion === "ScheduleRevision@2"
+      ? revision.sourceBinding.runId
+      : undefined;
+    if (input.agentRunId !== expectedAgentRunId) {
+      throw new Error("Schedule occurrence Agent Run does not match its revision");
+    }
+    const definitionSnapshot = scheduleDefinitionSnapshot(revision);
     try {
       this.#database.prepare(`
         INSERT INTO scheduled_runs (
           run_id, schedule_id, occurrence_key, scheduled_for, schedule_revision,
           definition_snapshot_json, coalesced_through, admitted_at, status, decision_reason,
-          created_at, updated_at, completed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          agent_run_id, created_at, updated_at, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         runId,
         input.scheduleId,
@@ -129,6 +149,7 @@ export class ScheduledRunStore {
         admittedAt ?? null,
         input.status,
         input.decisionReason ?? null,
+        expectedAgentRunId ?? null,
         createdAt,
         createdAt,
         terminalRunStatus(input.status) ? createdAt : null
@@ -162,6 +183,24 @@ export class ScheduledRunStore {
       requireRuntimeId(patch.executionId, "exe", "executionId");
     }
     if (patch.sessionId !== undefined) requireRuntimeId(patch.sessionId, "ses", "sessionId");
+    const admissionReceipt = patch.admissionReceipt === undefined
+      ? current.admissionReceipt
+      : parseScheduleOccurrenceAdmissionReceipt(patch.admissionReceipt);
+    const cycleId = patch.cycleId ?? current.cycleId;
+    if ((cycleId === undefined) !== (admissionReceipt === undefined)) {
+      throw new Error("Schedule occurrence cycle and admission receipt must be written together");
+    }
+    if (cycleId !== undefined) {
+      requireAgentRunCycleId(cycleId);
+      if (current.agentRunId === undefined || admissionReceipt === undefined ||
+        admissionReceipt.scheduleId !== current.scheduleId ||
+        admissionReceipt.occurrenceId !== current.runId ||
+        admissionReceipt.agentRunId !== current.agentRunId ||
+        admissionReceipt.cycleId !== cycleId) {
+        throw new Error("Schedule occurrence admission receipt does not match its owner");
+      }
+      requireAgentRunId(current.agentRunId);
+    }
     optionalText(patch.decisionReason, "decisionReason", 1_024);
     const completedAt = patch.completedAt === undefined
       ? terminalRunStatus(status)
@@ -172,7 +211,7 @@ export class ScheduledRunStore {
       UPDATE scheduled_runs
       SET status = ?, coalesced_through = ?, admitted_at = ?,
         event_id = ?, execution_id = ?, session_id = ?, decision_reason = ?,
-        completed_at = ?, updated_at = ?
+        cycle_id = ?, admission_receipt_json = ?, completed_at = ?, updated_at = ?
       WHERE run_id = ?
     `).run(
       status,
@@ -182,6 +221,8 @@ export class ScheduledRunStore {
       patch.executionId ?? current.executionId ?? null,
       patch.sessionId ?? current.sessionId ?? null,
       patch.decisionReason ?? current.decisionReason ?? null,
+      cycleId ?? null,
+      admissionReceipt === undefined ? null : JSON.stringify(admissionReceipt),
       completedAt ?? null,
       timestamp,
       runId

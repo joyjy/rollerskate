@@ -24,6 +24,168 @@ const agentRunStatusSchema = v.union([
   v.literal("cancelled")
 ]);
 
+const runDecisionTargetSchema = v.variant("kind", [
+  v.object({ kind: v.literal("self") }),
+  v.object({ kind: v.literal("agent"), agentId: v.string() })
+]);
+
+const runDecisionMandateSchema = v.variant("kind", [
+  v.object({ kind: v.literal("objective"), objective: v.string() }),
+  v.object({
+    kind: v.literal("workflow"),
+    workflowRef: v.string(),
+    inputs: v.record(v.string(), v.unknown())
+  })
+]);
+
+const orchestratorStateSchema = v.object({
+  schemaVersion: v.literal("OrchestratorState@1"),
+  goal: v.string(),
+  tasks: v.array(v.object({
+    taskId: v.string(),
+    objective: v.string(),
+    status: v.union([
+      v.literal("pending"),
+      v.literal("active"),
+      v.literal("completed"),
+      v.literal("blocked")
+    ]),
+    assignedAgentId: optionalString,
+    summary: optionalString
+  })),
+  acceptedEvidence: v.array(v.string()),
+  unresolvedQuestions: v.array(v.string())
+});
+
+const runDecisionCommonSchema = {
+  expectedRunVersion: v.number(),
+  rationale: v.string(),
+  checkedAcceptance: v.array(v.string()),
+  state: orchestratorStateSchema
+};
+
+const runDecisionV2Schema = v.variant("action", [
+  v.object({
+    schemaVersion: v.literal("RunDecision@2"),
+    ...runDecisionCommonSchema,
+    action: v.literal("next_step"),
+    nextStep: v.object({
+      target: runDecisionTargetSchema,
+      mandate: runDecisionMandateSchema
+    })
+  }),
+  v.object({
+    schemaVersion: v.literal("RunDecision@2"),
+    ...runDecisionCommonSchema,
+    action: v.literal("finish"),
+    finish: v.object({
+      outcome: v.union([v.literal("succeeded"), v.literal("failed")]),
+      summary: v.string()
+    })
+  }),
+  v.object({
+    schemaVersion: v.literal("RunDecision@2"),
+    ...runDecisionCommonSchema,
+    action: v.literal("needs_human")
+  })
+]);
+
+const runDecisionV3Schema = v.variant("action", [
+  v.object({
+    schemaVersion: v.literal("RunDecision@3"),
+    ...runDecisionCommonSchema,
+    action: v.literal("next_step"),
+    nextStep: v.object({
+      target: runDecisionTargetSchema,
+      mandate: runDecisionMandateSchema
+    })
+  }),
+  v.object({
+    schemaVersion: v.literal("RunDecision@3"),
+    ...runDecisionCommonSchema,
+    action: v.literal("await_source"),
+    awaitSource: v.object({
+      sourceKind: v.union([
+        v.literal("schedule"),
+        v.literal("subscription"),
+        v.literal("continuous_subscription")
+      ]),
+      templateId: v.string(),
+      parameters: v.record(v.string(), v.unknown())
+    })
+  }),
+  v.object({
+    schemaVersion: v.literal("RunDecision@3"),
+    ...runDecisionCommonSchema,
+    action: v.literal("finish"),
+    finish: v.object({
+      scope: v.union([v.literal("cycle"), v.literal("run")]),
+      outcome: v.union([v.literal("succeeded"), v.literal("failed")]),
+      summary: v.string()
+    })
+  }),
+  v.object({
+    schemaVersion: v.literal("RunDecision@3"),
+    ...runDecisionCommonSchema,
+    action: v.literal("needs_human")
+  })
+]);
+
+export const agentRunDecisionSchema = v.union([
+  runDecisionV3Schema,
+  runDecisionV2Schema
+]);
+
+const agentRunDecisionReceiptCommonSchema = {
+  runId: v.string(),
+  requestId: v.string(),
+  expectedRunVersion: v.number(),
+  resultingRunVersion: v.number(),
+  sourceStepId: v.string(),
+  targetAgentId: optionalString,
+  nextStepId: optionalString,
+  nextEventId: optionalString,
+  nextExecutionId: optionalString,
+  terminalStatus: v.optional(v.union([
+    v.literal("succeeded"),
+    v.literal("failed"),
+    v.literal("needs_human")
+  ])),
+  acceptedAt: v.string()
+};
+
+export const agentRunDecisionReceiptSchema = v.variant("schemaVersion", [
+  v.looseObject({
+    schemaVersion: v.literal("AgentRunDecisionReceipt@1"),
+    ...agentRunDecisionReceiptCommonSchema,
+    action: v.union([
+      v.literal("next_step"),
+      v.literal("finish"),
+      v.literal("needs_human")
+    ])
+  }),
+  v.looseObject({
+    schemaVersion: v.literal("AgentRunDecisionReceipt@2"),
+    ...agentRunDecisionReceiptCommonSchema,
+    action: v.union([
+      v.literal("next_step"),
+      v.literal("await_source"),
+      v.literal("finish"),
+      v.literal("needs_human")
+    ]),
+    resultingRunStatus: v.union([
+      v.literal("active"),
+      v.literal("awaiting_source"),
+      v.literal("succeeded"),
+      v.literal("failed"),
+      v.literal("needs_human")
+    ]),
+    finishScope: v.optional(v.union([v.literal("cycle"), v.literal("run")])),
+    sourceBinding: v.optional(v.unknown()),
+    cycleId: optionalString
+  })
+]);
+
 export const agentRunSummarySchema = v.object({
   runId: v.string(),
   rootEventId: v.string(),
@@ -31,6 +193,15 @@ export const agentRunSummarySchema = v.object({
     key: v.string(),
     activeCycleId: nullableString
   })),
+  source: v.optional(v.nullable(v.object({
+    kind: v.union([
+      v.literal("schedule"),
+      v.literal("subscription"),
+      v.literal("continuous_subscription")
+    ]),
+    id: v.string(),
+    definitionRevision: v.string()
+  }))),
   orchestrationMode: v.union([v.literal("autonomous"), v.literal("caller")]),
   mandate: v.object({
     kind: v.union([v.literal("objective"), v.literal("workflow")]),
@@ -54,7 +225,18 @@ export const agentRunSummarySchema = v.object({
   }),
   status: agentRunStatusSchema,
   terminalSummary: nullableString,
+  archivedAt: nullableString,
   updatedAt: v.string()
+});
+
+export const chatRunHandoffReceiptSchema = v.looseObject({
+  status: v.union([v.literal("accepted"), v.literal("duplicate")]),
+  run: v.looseObject({
+    runId: v.string(),
+    orchestratorBinding: v.optional(v.looseObject({
+      schemaVersion: v.literal("OrchestratorBinding@3")
+    }))
+  })
 });
 
 const agentRunDetailViewInnerSchema = v.object({
@@ -86,6 +268,28 @@ const agentRunDetailViewInnerSchema = v.object({
     completedAt: optionalString,
     updatedAt: v.string()
   })),
+  triggerSource: v.optional(v.nullable(v.object({
+    kind: v.union([
+      v.literal("schedule"),
+      v.literal("subscription"),
+      v.literal("continuous_subscription")
+    ]),
+    id: v.string(),
+    definitionRevision: v.string(),
+    status: v.string(),
+    diagnosticsRoute: v.string(),
+    nextActionAt: nullableString,
+    pendingOccurrenceKey: nullableString,
+    checkpointOccurrenceKey: nullableString,
+    reconcileStatus: v.string(),
+    latestError: nullableString,
+    lastOccurrence: v.nullable(v.object({
+      occurrenceKey: v.string(),
+      cycleId: nullableString,
+      status: v.string(),
+      observedAt: v.string()
+    }))
+  }))),
   checkpoint: v.nullable(v.object({
     schemaVersion: v.literal("AgentRunCheckpoint@1"),
     stepId: v.string(),
@@ -97,19 +301,7 @@ const agentRunDetailViewInnerSchema = v.object({
     observedWorkspaceRevision: v.optional(v.string()),
     recordedAt: v.string()
   })),
-  decisions: v.array(v.looseObject({
-    schemaVersion: v.literal("AgentRunDecisionReceipt@1"),
-    requestId: v.string(),
-    expectedRunVersion: v.number(),
-    resultingRunVersion: v.number(),
-    sourceStepId: v.string(),
-    action: v.union([
-      v.literal("next_step"),
-      v.literal("finish"),
-      v.literal("needs_human")
-    ]),
-    acceptedAt: v.string()
-  })),
+  decisions: v.array(agentRunDecisionReceiptSchema),
   participants: v.array(agentRunAgentReferenceSchema),
   sessions: v.array(v.looseObject({
     sessionId: v.string(),
@@ -152,7 +344,11 @@ const agentRunDetailViewInnerSchema = v.object({
     ]),
     prompt: v.string(),
     effectivePrompt: v.nullable(v.string()),
-    result: v.nullable(v.union([agentTurnResultSchema, agentStepResultSchema])),
+    result: v.nullable(v.union([
+      agentTurnResultSchema,
+      agentStepResultSchema,
+      agentRunDecisionSchema
+    ])),
     rawOutput: v.nullable(v.string()),
     error: v.nullable(v.string()),
     invocation: v.nullable(agentInvocationDiagnosticsSchema),
@@ -188,7 +384,12 @@ const agentRunDetailViewInnerSchema = v.object({
 });
 
 export const agentRunDetailViewSchema = agentRunDetailViewInnerSchema;
-export const agentRunSummariesSchema = v.array(agentRunSummarySchema);
+export const agentRunSummariesSchema = v.object({
+  items: v.array(agentRunSummarySchema),
+  total: v.number(),
+  page: v.number(),
+  pageSize: v.number()
+});
 
 export const cancelAgentRunReceiptSchema = v.looseObject({
   status: v.union([v.literal("cancelled"), v.literal("already_terminal")]),
@@ -199,6 +400,19 @@ export const cancelAgentRunReceiptSchema = v.looseObject({
   })
 });
 
+export const setAgentRunArchivedReceiptSchema = v.looseObject({
+  status: v.union([
+    v.literal("archived"),
+    v.literal("unarchived"),
+    v.literal("unchanged")
+  ]),
+  run: v.looseObject({
+    runId: v.string(),
+    archivedAt: optionalString
+  })
+});
+
 export type AgentRunStepOutput = v.InferOutput<typeof agentRunDetailViewSchema>["steps"][number];
+export type AgentRunDecisionOutput = v.InferOutput<typeof agentRunDecisionSchema>;
 export type AgentRunSummaryViewOutput = v.InferOutput<typeof agentRunSummarySchema>;
 export type AgentRunDetailViewOutput = v.InferOutput<typeof agentRunDetailViewSchema>;

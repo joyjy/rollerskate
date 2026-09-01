@@ -2,7 +2,7 @@
 
 ![Rollerskate logo](assets/logo.png)
 
-Rollerskate v0.5.4 是 Local-first Agent proactive system。首次启动无需 Server、OIDC 或 Device enrollment：Runtime 自动建立全局 `~/.rollerskate/`、共享 LocalWorkspace、Owner Principal、唯一 `Local` Chat 与前台 loop。产品能力包括 Subscription、Scheduled Task、Steward Run、Agent Run、Topic governance、可显式指定 intent 的长期 Free Chat、Topic activation schedule、same-client history、Interactive Channel send/follow/callback、Notice Center、公开 Agent/Topic profile 与原生 Server Topic 被动同步。基础产品入口仍是 `scripts/rs start`。
+Rollerskate v0.5.6 是 Local-first Agent proactive system。首次启动无需 Server、OIDC 或 Device enrollment：Runtime 自动建立全局 `~/.rollerskate/`、共享 LocalWorkspace、Owner Principal、唯一 `Local` Chat 与后台 Core Loop。产品能力包括 Subscription、Scheduled Task、Steward Run、Agent Run、Topic governance、可显式指定 intent 的长期 Free Chat、Topic activation schedule、same-client history、Interactive Channel send/follow/callback、Notice Center、公开 Agent/Topic profile 与原生 Server Topic 被动同步；Kimi、pi 与 Codex provider invocation 统一使用流式进度、独立 total/idle timeout、协议取消和有界失败恢复。基础产品入口仍是 `scripts/rs start`。
 
 ## Local product
 
@@ -12,7 +12,7 @@ Rollerskate v0.5.4 是 Local-first Agent proactive system。首次启动无需 S
 scripts/rs start
 ```
 
-`start` 将 Console API 与内置 Vite 挂在同一个 loopback 地址；`local/ui/src/` 是产品运行源，Agent 保存 Vue、TypeScript 或 CSS 后，已打开页面通过 HMR 更新。Console production build 仍属于验证门禁，但静态 `local/ui/dist/` 不是默认产品入口。
+`start` 自行启动 detached daemon，等待 Core Loop 和 Console ready 后返回；调用方不需要保持终端或另行托管进程。`stop` 优雅停止，`restart` 用当前源码重启。Console API 与内置 Vite 挂在同一个 loopback 地址；`local/ui/src/` 是产品运行源，Agent 保存 Vue、TypeScript 或 CSS 后，已打开页面通过 HMR 更新。Console production build 仍属于验证门禁，但静态 `local/ui/dist/` 不是默认产品入口。
 
 也可以通过 CLI 管理 Local Agent：
 
@@ -37,22 +37,26 @@ Server 功能仍通过 Local Console 的 `/console/network` 暴露，而不是�
 
 公开 profile 只包含公共身份、角色、disclosure 与表达规则。私有人格 prompt、workspace、memory、provider transcript、credential 和工具权限不上传 Server。Owner 可以按 Agent 显式授权或撤销 same-client history；provider policy、bounded scan/read、redaction 和 audit 只约束本地读取，不把 Server Topic 变成远端执行入口。Topic governance、带随机 idle/participant 策略的 Free Chat mode、scheduled activation 与原生 interactive Channel send/follow 进入 v0.5.2。当前通用 Run 支持 `forum@1`、manual caller 和默认 Codex Orchestrator；Vikunja 作为 read-only Connector 与普通 terminal writeback destination 使用，不建立 Project/effect 硬集成。从 RS UI 发起、观察和介入 Agent Run，并处理 External Requests 的 Interactive Run Workspace 进入 v0.6。
 
-Scheduled Task 通过同一个前台 loop 主动创建 Agent work，不依赖 Server、系统 cron 或新 UI：
+Scheduled Task 通过同一个 Core Loop 激活已绑定 Steward Run，不依赖 Server 或系统 cron。公开新建只接受 `RunIntent@1`，不再接受携带 Agent/prompt/callback 的 Schedule definition：
 
 ```bash
-scripts/rs schedule create /absolute/path/to/schedule.json
+scripts/rs run preflight /absolute/path/to/run-intent.json
+scripts/rs run start /absolute/path/to/run-intent.json
 scripts/rs schedule list
-scripts/rs schedule runs <schedule-id>
+scripts/rs schedule occurrences <schedule-id>
 ```
 
 完整 JSON、cron/timezone、misfire/overlap 与恢复方法见 [Scheduled Task runbook](docs/runbook/scheduled-tasks.md)。
 
-Agent Run 使用同一个 loop 完成 bounded 多 Agent 协作。Owner 指定一个 active Agent 作为本 Run 的 Steward，并提交内联 objective 或 `workflowRef + inputs`；每个 Agent turn 可以完成当前 step，或顺序委派一个 child Agent。`review@1` 是随源码发布的首个 versioned workflow，不是独立 Runtime engine：
+Agent Run 使用同一个 loop 完成 bounded 多 Agent 协作。Owner 提交 objective、acceptance 与 stable refs，compiler 固定 active `codex` Steward、participant roster、workspace revision 和 authority ceiling；每个 Agent turn 可以完成当前 step，或顺序委派一个 child Agent。`review@1` 是随源码发布的首个 versioned workflow，不是独立 Runtime engine：
 
 ```bash
-scripts/rs run start /absolute/path/to/run.json --request-id acceptance-1
+scripts/rs run preflight /absolute/path/to/run-intent.json
+scripts/rs run start /absolute/path/to/run-intent.json
 scripts/rs run trace <run-id>
 scripts/rs run cancel <run-id>
+scripts/rs run legacy-migration-plan
+scripts/rs run legacy-migrate /absolute/path/to/approved-migration.json
 ```
 
 完整配置、external workspace grant、callback 与取消语义见 [Agent Run and Review runbook](docs/runbook/reviews.md)。
