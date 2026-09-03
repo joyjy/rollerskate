@@ -27,7 +27,6 @@ export interface PiRpcRunnerOptions {
   readonly args: readonly string[];
   readonly environment: Readonly<Record<string, string>>;
   readonly workingDirectory: string;
-  readonly timeoutMilliseconds: number;
   readonly meaningfulOutputTimeoutMilliseconds: number;
   readonly maxOutputBytes: number;
 }
@@ -44,10 +43,12 @@ export class PiRpcRunner implements AgentRunner {
       return Promise.reject(new Error("pi RPC requires a Session id"));
     }
     const startedAt = new Date().toISOString();
-    const totalTimeoutMilliseconds = runnerTimeoutMilliseconds(
-      request.totalTimeoutMilliseconds ?? this.#options.timeoutMilliseconds,
-      "totalTimeoutMilliseconds"
-    );
+    const totalTimeoutMilliseconds = request.totalTimeoutMilliseconds === undefined
+      ? undefined
+      : runnerTimeoutMilliseconds(
+          request.totalTimeoutMilliseconds,
+          "totalTimeoutMilliseconds"
+        );
     const meaningfulOutputTimeoutMilliseconds = runnerMeaningfulTimeoutMilliseconds(
       request.meaningfulOutputTimeoutMilliseconds ??
         this.#options.meaningfulOutputTimeoutMilliseconds
@@ -65,7 +66,9 @@ export class PiRpcRunner implements AgentRunner {
       const events: RunnerEvent[] = [];
       let settled = false;
       let stateSessionId: string | undefined;
+      let promptSent = false;
       let promptAccepted = false;
+      let pendingRequest: "state" | "prompt" | undefined = "state";
       let assistantBytes = 0;
       let assistantMessageSeen = false;
       let toolEventsComplete = true;
@@ -136,33 +139,71 @@ export class PiRpcRunner implements AgentRunner {
         }));
       };
 
+      const sendPrompt = () => {
+        if (promptSent || settled || child.stdin.destroyed) return;
+        promptSent = true;
+        pendingRequest = "prompt";
+        child.stdin.write(`${JSON.stringify({
+          id: "prompt",
+          type: "prompt",
+          message: request.prompt
+        })}\n`);
+        progress.phase("prompting");
+      };
+
       const decoder = new JsonLineResponseDecoder({
         maxLineBytes: this.#options.maxOutputBytes,
         onDiscardedLine: () => {
           toolEventsComplete = false;
         },
         onMessage: (value): boolean => {
+          if (settled) return false;
           if (!isRecord(value)) return false;
           const progressEvent = piProgress(value);
           if (progressEvent !== undefined) {
             progress.observe(progressEvent.kind, progressEvent.meaningful);
             if (progressEvent.meaningful) resetMeaningfulTimeout();
           }
-          if (value.type === "response" && value.command === "get_state") {
-            if (value.success !== true) {
-              terminate("protocol_error", `pi RPC get_state failed: ${responseError(value)}`);
+          if (value.type === "response") {
+            if (value.command === "get_state" && value.id === "state") {
+              if (pendingRequest !== "state") {
+                terminate("protocol_error",
+                  "pi RPC get_state response arrived out of phase (duplicate or early)");
+                return true;
+              }
+              if (value.success !== true) {
+                terminate("protocol_error", `pi RPC get_state failed: ${responseError(value)}`);
+                return true;
+              }
+              if (isRecord(value.data) && typeof value.data.sessionId === "string") {
+                stateSessionId = value.data.sessionId;
+              }
+              if (stateSessionId === undefined) {
+                terminate("protocol_error", "pi RPC get_state response is missing the Session id");
+                return true;
+              }
+              if (stateSessionId !== request.sessionId) {
+                terminate("protocol_error", "pi RPC get_state Session id does not match the request");
+                return true;
+              }
+              sendPrompt();
+            } else if (value.command === "prompt" && value.id === "prompt") {
+              if (pendingRequest !== "prompt") {
+                terminate("protocol_error",
+                  "pi RPC prompt response arrived out of phase (duplicate or early)");
+                return true;
+              }
+              if (value.success !== true) {
+                terminate("protocol_error", `pi RPC prompt failed: ${responseError(value)}`);
+                return true;
+              }
+              pendingRequest = undefined;
+              promptAccepted = true;
+            } else {
+              terminate("protocol_error",
+                `pi RPC unexpected response id ${String(value.id)} for command ${String(value.command)}`);
               return true;
             }
-            if (isRecord(value.data) && typeof value.data.sessionId === "string") {
-              stateSessionId = value.data.sessionId;
-            }
-          }
-          if (value.type === "response" && value.command === "prompt") {
-            if (value.success !== true) {
-              terminate("protocol_error", `pi RPC prompt failed: ${responseError(value)}`);
-              return true;
-            }
-            promptAccepted = true;
           }
           const includeAgentEnd = value.type !== "agent_end" || !assistantMessageSeen;
           for (const event of piRunnerEvents(value, includeAgentEnd)) {
@@ -190,9 +231,11 @@ export class PiRpcRunner implements AgentRunner {
           `agent invocation stalled without meaningful output: ${this.#options.adapterId}`
         );
       }, meaningfulOutputTimeoutMilliseconds);
-      totalTimeout = setTimeout(() => {
-        terminate("deadline", `agent invocation timed out: ${this.#options.adapterId}`);
-      }, totalTimeoutMilliseconds);
+      if (totalTimeoutMilliseconds !== undefined) {
+        totalTimeout = setTimeout(() => {
+          terminate("deadline", `agent invocation timed out: ${this.#options.adapterId}`);
+        }, totalTimeoutMilliseconds);
+      }
 
       child.stdout.on("data", (chunk: Buffer) => {
         if (settled) return;
@@ -217,12 +260,6 @@ export class PiRpcRunner implements AgentRunner {
         );
       });
       child.stdin.write(`${JSON.stringify({ id: "state", type: "get_state" })}\n`);
-      child.stdin.write(`${JSON.stringify({
-        id: "prompt",
-        type: "prompt",
-        message: request.prompt
-      })}\n`);
-      progress.phase("prompting");
     });
   }
 }

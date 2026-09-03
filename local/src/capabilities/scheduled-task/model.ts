@@ -3,6 +3,10 @@ import type { ProactiveCallbackDefinition } from "../../modules/callback/proacti
 import type { ExternalRefTriggerBinding } from
   "../../modules/external-resource/trigger-binding.js";
 import type { RunSourceBinding } from "../../modules/steward/source-contract.js";
+import type {
+  DeterministicApplicationActionReceipt,
+  ProactiveTarget
+} from "../../modules/proactive/target.js";
 
 export type ScheduleStatus = "active" | "paused" | "completed" | "cancelled";
 export type ScheduleKind = "once" | "cron";
@@ -69,7 +73,22 @@ export interface BoundScheduleRevision extends ScheduleRevisionBase {
   };
 }
 
-export type ScheduleRevision = LegacyScheduleRevision | BoundScheduleRevision;
+export interface TargetedScheduleRevision extends ScheduleRevisionBase {
+  readonly schemaVersion: "ScheduleRevision@3";
+  readonly agentId?: undefined;
+  readonly sessionPolicy?: undefined;
+  readonly fixedSessionId?: undefined;
+  readonly prompt?: undefined;
+  readonly workspace?: undefined;
+  readonly callbacks?: undefined;
+  readonly sourceBinding?: undefined;
+  readonly target: ProactiveTarget;
+}
+
+export type ScheduleRevision =
+  | LegacyScheduleRevision
+  | BoundScheduleRevision
+  | TargetedScheduleRevision;
 
 export interface Schedule {
   readonly definition: ScheduleDefinition;
@@ -102,6 +121,7 @@ export interface ScheduleOccurrence {
   readonly agentRunId?: string;
   readonly cycleId?: string;
   readonly admissionReceipt?: ScheduleOccurrenceAdmissionReceipt;
+  readonly actionReceipt?: DeterministicApplicationActionReceipt;
   readonly decisionReason?: string;
   readonly createdAt: string;
   readonly updatedAt: string;
@@ -146,6 +166,13 @@ export interface CreateBoundScheduleInput {
   readonly misfireGraceMilliseconds: number;
   readonly sourceBinding: BoundScheduleRevision["sourceBinding"];
   readonly externalRefBinding?: ExternalRefTriggerBinding;
+}
+
+export interface CreateTargetedScheduleInput extends Omit<
+  CreateBoundScheduleInput,
+  "sourceBinding"
+> {
+  readonly target: ProactiveTarget;
 }
 
 export function newScheduleId(): string {

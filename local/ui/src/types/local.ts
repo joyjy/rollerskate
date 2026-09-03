@@ -29,6 +29,11 @@ export type LocalChatView = LocalChatViewOutput;
 export type LocalChatSession = LocalChatView["sessions"][number];
 export type LocalChatMessagePage = LocalChatView["messages"];
 export type LocalChatMessage = LocalChatMessagePage["items"][number];
+export type ChatRunProposal = NonNullable<LocalChatMessage["runProposals"]>[number];
+export type ChatRunWorkspaceSelection =
+  | { readonly kind: "project" }
+  | { readonly kind: "local" }
+  | { readonly kind: "path"; readonly path: string };
 export type ChatReadProgress = NonNullable<LocalChatMessage["readProgress"]>;
 export type ChatPresence = ChatPresenceOutput;
 export type LocalChatPresenceView = LocalChatPresenceViewOutput;

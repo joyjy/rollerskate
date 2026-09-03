@@ -39,7 +39,7 @@ const PLUGIN: RegisteredSubscriptionPlugin = {
   allowedExecutables: []
 };
 
-test("SubscriptionDefinition@4 activates one Run cycle for one terminal observation", () => {
+test("SubscriptionDefinition@5 activates one Run cycle for one terminal observation", () => {
   const fixture = setup();
   const started = startRun(fixture, "one-shot-run", "until");
   let context = openContext(fixture.paths.database);
@@ -47,7 +47,7 @@ test("SubscriptionDefinition@4 activates one Run cycle for one terminal observat
     const bound = bind(context, started.run.runId, oneShotDecision(1));
     assert.equal(bound.status, "awaiting_source");
     const subscription = context.oneShot.boundForRun(bound.runId)!;
-    assert.equal(subscription.definitionSchema, "SubscriptionDefinition@4");
+    assert.equal(subscription.definitionSchema, "SubscriptionDefinition@5");
     assert.equal(subscription.ownerAgentId, undefined);
     assert.equal(callbackCount(context, "subscription", subscription.subscriptionId), 0);
 
@@ -105,7 +105,7 @@ test("SubscriptionDefinition@4 activates one Run cycle for one terminal observat
   }
 });
 
-test("ContinuousSubscriptionDefinition@2 checkpoints only a succeeded Run cycle", () => {
+test("ContinuousSubscriptionDefinition@3 checkpoints only a succeeded Run cycle", () => {
   const fixture = setup();
   const started = startRun(fixture, "continuous-run", "continuous");
   let context = openContext(fixture.paths.database);
@@ -114,7 +114,7 @@ test("ContinuousSubscriptionDefinition@2 checkpoints only a succeeded Run cycle"
     const subscription = context.continuous.boundForRun(bound.runId)!;
     assert.equal(
       subscription.definition.schemaVersion,
-      "ContinuousSubscriptionDefinition@2"
+      "ContinuousSubscriptionDefinition@3"
     );
     assert.equal(callbackCount(
       context,
@@ -173,7 +173,7 @@ test("ContinuousSubscriptionDefinition@2 checkpoints only a succeeded Run cycle"
 });
 
 for (const outcome of ["needs_human"] as const) {
-  test(`ContinuousSubscriptionDefinition@2 keeps checkpoint on ${outcome} cycle`, () => {
+  test(`ContinuousSubscriptionDefinition@3 keeps checkpoint on ${outcome} cycle`, () => {
     const fixture = setup();
     const started = startRun(fixture, `continuous-${outcome}`, "continuous");
     const context = openContext(fixture.paths.database);
@@ -199,7 +199,7 @@ for (const outcome of ["needs_human"] as const) {
   });
 }
 
-test("ContinuousSubscriptionDefinition@2 blocks an unknown missing cycle receipt", () => {
+test("ContinuousSubscriptionDefinition@3 blocks an unknown missing cycle receipt", () => {
   const fixture = setup();
   const started = startRun(fixture, "continuous-missing-cycle", "continuous");
   let context = openContext(fixture.paths.database);

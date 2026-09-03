@@ -7,7 +7,7 @@ import test from "node:test";
 
 import { initializeRuntimeSchema } from "../src/infrastructure/sqlite/schema.js";
 
-test("schema v69 adds Run-bound Schedule definitions and occurrence receipts", () => {
+test("schema v72 adds Run-bound Schedule definitions and occurrence receipts", () => {
   const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v66-"));
   const databasePath = join(directory, "runtime.db");
   try {
@@ -70,7 +70,7 @@ test("schema v69 adds Run-bound Schedule definitions and occurrence receipts", (
       legacy.close();
     }
 
-    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 69);
+    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 72);
     const database = new DatabaseSync(databasePath, { readOnly: true });
     try {
       const scheduleColumns = database.prepare("PRAGMA table_info(schedules)").all() as
@@ -79,6 +79,7 @@ test("schema v69 adds Run-bound Schedule definitions and occurrence receipts", (
         unknown as Array<{ name: string }>;
       assert.equal(scheduleColumns.some(({ name }) => name === "definition_schema"), true);
       assert.equal(scheduleColumns.some(({ name }) => name === "source_binding_json"), true);
+      assert.equal(scheduleColumns.some(({ name }) => name === "target_json"), true);
       assert.equal(occurrenceColumns.some(({ name }) => name === "agent_run_id"), true);
       assert.equal(occurrenceColumns.some(({ name }) => name === "cycle_id"), true);
       assert.equal(
@@ -92,6 +93,7 @@ test("schema v69 adds Run-bound Schedule definitions and occurrence receipts", (
         SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'scheduled_runs'
       `).get() as { sql: string };
       assert.match(scheduleSql.sql, /ScheduleRevision@2/u);
+      assert.match(scheduleSql.sql, /ScheduleRevision@3/u);
       assert.match(scheduleSql.sql, /RunSourceBinding@1/u);
       assert.match(occurrenceSql.sql, /ScheduleOccurrenceAdmissionReceipt@1/u);
       assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);

@@ -92,7 +92,11 @@ const chatAttentionReceiptSchema = v.object({
 
 const chatDecisionReceiptSchema = v.object({
   dispatchEventId: v.string(),
-  speechAction: v.union([v.literal("reply"), v.literal("silent")]),
+  speechAction: v.union([
+    v.literal("reply"),
+    v.literal("silent"),
+    v.literal("propose_run")
+  ]),
   presenceTransition: v.optional(chatPresenceSchema),
   replyEventId: optionalString,
   createdAt: v.string()

@@ -1,11 +1,14 @@
 import { moduleId, requireModuleId } from "../shared/id.js";
-import type { FreeChatMode } from "./free-chat.js";
 
 export type TopicActivationScheduleStatus = "active" | "paused" | "cancelled" | "completed";
 export type TopicActivationCandidatePolicy =
   | "deterministic_one"
   | "sampled_sequential"
   | "all_available";
+export type TopicActivationIntentPolicy =
+  | { readonly kind: "continue_recent" }
+  | { readonly kind: "choose_from_themes" }
+  | { readonly kind: "fixed_directed"; readonly brief: string };
 
 export interface TopicActivationSchedule {
   readonly scheduleId: string;
@@ -17,7 +20,7 @@ export interface TopicActivationSchedule {
   readonly misfirePolicy: "skip" | "run_once";
   readonly misfireGraceMilliseconds: number;
   readonly candidatePolicy: TopicActivationCandidatePolicy;
-  readonly intentPolicy: FreeChatMode["intentPolicy"];
+  readonly intentPolicy: TopicActivationIntentPolicy;
   readonly turnBudget: number;
   readonly nextRunAt?: string;
   readonly nextOccurrenceKey?: string;
@@ -58,7 +61,7 @@ export interface CreateTopicActivationSchedule {
   readonly misfirePolicy?: "skip" | "run_once";
   readonly misfireGraceMilliseconds?: number;
   readonly candidatePolicy?: TopicActivationCandidatePolicy;
-  readonly intentPolicy?: FreeChatMode["intentPolicy"];
+  readonly intentPolicy?: TopicActivationIntentPolicy;
   readonly turnBudget?: number;
 }
 
@@ -256,7 +259,7 @@ function normalizeDefinition(input: CreateTopicActivationSchedule) {
   };
 }
 
-function intentPolicy(value: unknown): FreeChatMode["intentPolicy"] {
+function intentPolicy(value: unknown): TopicActivationIntentPolicy {
   const record = object(value, "intentPolicy");
   const kind = oneOf(
     record.kind, ["continue_recent", "choose_from_themes", "fixed_directed"] as const, "intentPolicy.kind"

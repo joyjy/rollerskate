@@ -63,7 +63,7 @@ export interface AgentInvocationFailure extends AgentInvocationProgressBase {
   readonly schemaVersion: "AgentInvocationFailure@1";
   readonly failedAt: string;
   readonly reason: "stall" | "deadline" | "protocol_exit" | "cancelled" | "protocol_error";
-  readonly totalTimeoutMilliseconds: number;
+  readonly totalTimeoutMilliseconds?: number;
   readonly meaningfulOutputTimeoutMilliseconds: number;
   readonly protocolStop: "requested" | "acknowledged" | "unavailable";
   readonly recovery: "explicit_read_only_resume" | "unknown_outcome_no_replay" | "none";

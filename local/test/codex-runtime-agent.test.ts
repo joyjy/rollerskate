@@ -74,7 +74,8 @@ rl.on("close", () => {
       ? [{
           name: "rollerskate_client_history",
           command: process.execPath,
-          args: ["/tool/client-history.js", "--agent-id", event.agentId]
+          args: ["/tool/client-history.js", "--agent-id", event.agentId],
+          tools: ["list_client_threads", "read_client_thread"]
         }]
       : [],
     serializeMcpPolicy: (observation) =>
@@ -174,7 +175,6 @@ rl.on("line", (line) => {
     executable,
     environment: {},
     workingDirectory: workspace,
-    timeoutMilliseconds: 3_000,
     meaningfulOutputTimeoutMilliseconds: 1_000,
     maxOutputBytes: 1_024,
     threadParameters: {
@@ -196,20 +196,20 @@ test("Codex progress renews idle only and cannot extend the Run deadline", async
     projectRoot: fixture.workspace,
     environment: {},
     timeoutMilliseconds: 3_000,
-    meaningfulOutputTimeoutMilliseconds: 1_000
+    meaningfulOutputTimeoutMilliseconds: 3_000
   });
   const progress: unknown[] = [];
 
   await assert.rejects(
     agent.invoke({
-      event: boundedRunEvent(650),
+      event: boundedRunEvent(1_500),
       reportProgress: (update) => progress.push(update)
     }),
     (error: unknown) => {
       assert.equal(error instanceof AgentInvocationError, true);
       const failure = (error as AgentInvocationError).failure;
       assert.equal(failure.reason, "deadline");
-      assert.equal(failure.totalTimeoutMilliseconds, 650);
+      assert.equal(failure.totalTimeoutMilliseconds, 1_500);
       assert.equal(failure.recovery, "explicit_read_only_resume");
       assert.equal(failure.providerSessionId, "provider-session");
       assert.deepEqual(failure.lastProgress, { kind: "assistant" });
@@ -227,14 +227,31 @@ test("Codex progress renews idle only and cannot extend the Run deadline", async
   );
 });
 
+test("Codex progress can outlive the adapter default without an explicit Run deadline", async () => {
+  const fixture = codexFixture({ meaningfulThenCompleteMilliseconds: 2_500 });
+  const agent = new CodexRuntimeAgent({
+    executable: fixture.executable,
+    projectRoot: fixture.workspace,
+    environment: {},
+    timeoutMilliseconds: 1_500
+  });
+
+  const result = await agent.invoke({ event: boundedRunEvent() });
+
+  assert.match(result.outcome.kind === "message" ? result.outcome.body : "", /^streamed fixture/);
+  assert.equal(codexInvocation(fixture.invocation).messages.some(
+    (candidate) => candidate.method === "turn/interrupt"
+  ), false);
+});
+
 test("Codex stalls on protocol-only updates and interrupts the active Turn", async () => {
   const fixture = codexFixture({ stall: true });
   const agent = new CodexRuntimeAgent({
     executable: fixture.executable,
     projectRoot: fixture.workspace,
     environment: {},
-    timeoutMilliseconds: 2_000,
-    meaningfulOutputTimeoutMilliseconds: 500
+    timeoutMilliseconds: 3_000,
+    meaningfulOutputTimeoutMilliseconds: 1_500
   });
 
   await assert.rejects(agent.invoke({ event: boundedRunEvent() }), (error: unknown) => {
@@ -422,6 +439,7 @@ function subscriptionEvent(eventId: string, workspace: string): AgentInputEvent 
 
 function codexFixture(options: {
   readonly meaningfulForever?: boolean;
+  readonly meaningfulThenCompleteMilliseconds?: number;
   readonly stall?: boolean;
   readonly cancelled?: boolean;
   readonly exitBeforeSettlement?: boolean;
@@ -468,7 +486,18 @@ rl.on("line", (line) => {
         params: { threadId: "unrelated-session", turnId: "unrelated-turn",
           itemId: "unrelated-message", delta: "unrelated fixture" }
       });
-    }, 5);` : options.meaningfulForever === true ? `updates = setInterval(() => send({
+    }, 5);` : options.meaningfulThenCompleteMilliseconds !== undefined ? `updates = setInterval(() => send({
+      method: "item/agentMessage/delta",
+      params: { threadId: "provider-session", turnId: "turn-fixture",
+        itemId: "message-fixture", delta: "streamed fixture" }
+    }), 50);
+    setTimeout(() => {
+      clearInterval(updates);
+      send({ method: "turn/completed", params: {
+        threadId: "provider-session",
+        turn: { id: "turn-fixture", items: [], status: "completed" }
+      } });
+    }, ${options.meaningfulThenCompleteMilliseconds});` : options.meaningfulForever === true ? `updates = setInterval(() => send({
       method: "item/agentMessage/delta",
       params: { threadId: "provider-session", turnId: "turn-fixture",
         itemId: "message-fixture", delta: "streamed fixture" }

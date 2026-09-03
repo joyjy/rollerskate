@@ -1,4 +1,8 @@
-import type { ChatPresence, ChatTurnDecision } from "../../../core/chat/model.js";
+import type {
+  ChatPresence,
+  ChatRunProposalDraft,
+  ChatTurnDecision
+} from "../../../core/chat/model.js";
 import type {
   ChatAttentionPlan,
   ChatAttentionReason
@@ -52,6 +56,7 @@ export interface ChatDecisionReceipt {
   readonly dispatchEventId: string;
   readonly speechAction: ChatTurnDecision["speech"]["action"];
   readonly silenceReason?: string;
+  readonly proposal?: ChatRunProposalDraft;
   readonly presenceTransition?: ChatPresence;
   readonly replyEventId?: string;
   readonly createdAt: string;

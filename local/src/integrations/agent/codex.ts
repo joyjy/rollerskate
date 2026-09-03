@@ -20,7 +20,6 @@ import { type StdioMcpServer, validateStdioMcpServer } from "./mcp-server.js";
 import { codexAppServerPolicyObservation } from "./provider-policy.js";
 import { CodexAppServerRunner } from "./runner/codex-app-server.js";
 import {
-  DEFAULT_MEANINGFUL_OUTPUT_TIMEOUT_MILLISECONDS,
   RunnerInvocationError,
   runnerAssistantMessages,
   runnerToolNames,
@@ -85,13 +84,10 @@ export class CodexRuntimeAgent implements RuntimeAgentAdapter {
     } satisfies CodexMcpServerResolutionInput;
     const mcpServers = this.#options.resolveMcpServers?.(resolutionInput) ?? [];
     const access = codexWorkspaceAccess(input.event);
-    const totalTimeoutMilliseconds = invocationTimeoutMilliseconds(
-      input.event,
-      this.#options.timeoutMilliseconds
-    );
+    const totalTimeoutMilliseconds = invocationTimeoutMilliseconds(input.event);
     const meaningfulOutputTimeoutMilliseconds =
       this.#options.meaningfulOutputTimeoutMilliseconds ??
-      DEFAULT_MEANINGFUL_OUTPUT_TIMEOUT_MILLISECONDS;
+      this.#options.timeoutMilliseconds;
     const networkAccess = codexNetworkAccess(input.event);
     const threadParameters = codexThreadParameters(
       access,
@@ -116,7 +112,6 @@ export class CodexRuntimeAgent implements RuntimeAgentAdapter {
       executable: this.#options.executable,
       environment,
       workingDirectory: this.workspace,
-      timeoutMilliseconds: this.#options.timeoutMilliseconds,
       meaningfulOutputTimeoutMilliseconds,
       maxOutputBytes: this.#options.maxOutputBytes ?? 1_048_576,
       threadParameters

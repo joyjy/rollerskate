@@ -11,6 +11,7 @@ import {
   type RunAuthorityEnvelope
 } from "../../modules/steward/admission-contract.js";
 import type { RunSourceBinding } from "../../modules/steward/source-contract.js";
+import { stewardRunProactiveTarget } from "../../modules/proactive/target.js";
 import { resolveSpecToken } from "../../modules/spec/registry.js";
 import type { StewardSourceBindingRegistrar } from "../steward/decision.js";
 import type { ExternalRefTriggerBinding } from
@@ -97,24 +98,25 @@ export function scheduleSourceBindingRegistrar(
       source: {
         kind: "schedule",
         id: scheduleId,
-        definitionRevision: "ScheduleRevision@2:1"
+        definitionRevision: "ScheduleRevision@3:1"
       },
       authorityDigest: runAuthorityDigest(run.orchestratorBinding.authority),
       occurrencePolicy: input.kind === "once" ? "one_shot" : "recurring",
       cancellationPolicy: input.cancellationPolicy,
       reconcilePolicy: "source_owned"
     };
-    const schedule = schedules.createBoundInTransaction({
+    const schedule = schedules.createTargetedInTransaction({
       scheduleId,
       ownerPrincipalId: run.stewardAgentId,
       ...input,
-      sourceBinding
+      target: stewardRunProactiveTarget(sourceBinding)
     }, at);
-    if (schedule.revision.schemaVersion !== "ScheduleRevision@2") {
+    if (schedule.revision.schemaVersion !== "ScheduleRevision@3" ||
+      schedule.revision.target.kind !== "steward_run") {
       throw new Error("Schedule source registration returned a legacy definition");
     }
     resolveSpecToken(schedule.revision.schemaVersion, { kind: "contract" });
-    return schedule.revision.sourceBinding;
+    return schedule.revision.target.sourceBinding;
   };
 }
 

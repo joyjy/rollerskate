@@ -107,19 +107,44 @@ export interface ChatPresence {
   readonly wakeKeywords: readonly string[];
 }
 
+export interface ChatRunProposalDraft {
+  readonly schema: "ChatRunProposalDraft@1";
+  readonly goal?: string;
+  readonly scope: {
+    readonly include: readonly string[];
+    readonly exclude: readonly string[];
+  };
+  readonly acceptance: readonly string[];
+  readonly desiredEffect?: "none" | "read" | "change";
+  readonly workspaceRef?: "local:workspace";
+  readonly blockingQuestion?: string;
+}
+
+type ChatSpeechDecision =
+  | { readonly action: "reply"; readonly body: string }
+  | { readonly action: "silent"; readonly reason: string };
+
+type ChatSpeechDecisionV2 = ChatSpeechDecision | {
+  readonly action: "propose_run";
+  readonly proposal: ChatRunProposalDraft;
+};
+
 export type ChatDecision = {
   readonly schema: "ChatDecision@1";
-  readonly speech:
-    | { readonly action: "reply"; readonly body: string }
-    | { readonly action: "silent"; readonly reason: string };
+  readonly speech: ChatSpeechDecision;
+  readonly presence: ChatPresence;
+} | {
+  readonly schema: "ChatDecision@2";
+  readonly speech: ChatSpeechDecisionV2;
   readonly presence: ChatPresence;
 };
 
 export type ChatMentionDecision = {
   readonly schema: "ChatMentionDecision@1";
-  readonly speech:
-    | { readonly action: "reply"; readonly body: string }
-    | { readonly action: "silent"; readonly reason: string };
+  readonly speech: ChatSpeechDecision;
+} | {
+  readonly schema: "ChatMentionDecision@2";
+  readonly speech: ChatSpeechDecisionV2;
 };
 
 export type ChatTurnDecision = ChatDecision | ChatMentionDecision;
@@ -262,27 +287,24 @@ export function parseChatDecision(
   try {
     parsed = JSON.parse(value);
   } catch {
-    throw new Error("Chat Agent output must be valid ChatDecision@1 JSON");
+    throw new Error("Chat Agent output must be valid ChatDecision JSON");
   }
-  if (!isRecord(parsed) || parsed.schema !== "ChatDecision@1") {
-    throw new Error("Chat Agent output must use schema ChatDecision@1");
+  if (!isRecord(parsed) ||
+    (parsed.schema !== "ChatDecision@1" && parsed.schema !== "ChatDecision@2")) {
+    throw new Error("Chat Agent output must use schema ChatDecision@1 or ChatDecision@2");
   }
-  const speech = parsed.speech;
-  if (!isRecord(speech) || (speech.action !== "reply" && speech.action !== "silent")) {
-    throw new Error("ChatDecision.speech.action must be reply or silent");
-  }
-  const normalizedSpeech = speech.action === "reply"
-    ? { action: "reply" as const, body: requireText(speech.body, "ChatDecision.speech.body") }
-    : {
-        action: "silent" as const,
-        reason: boundedText(speech.reason, "ChatDecision.speech.reason", 200)
-      };
   const presence = parseChatPresence(parsed.presence, now);
-  return {
-    schema: "ChatDecision@1",
-    speech: normalizedSpeech,
-    presence
-  };
+  return parsed.schema === "ChatDecision@1"
+    ? {
+        schema: "ChatDecision@1",
+        speech: parseChatSpeech(parsed.speech, "ChatDecision", false),
+        presence
+      }
+    : {
+        schema: "ChatDecision@2",
+        speech: parseChatSpeech(parsed.speech, "ChatDecision", true),
+        presence
+      };
 }
 
 export function parseChatMentionDecision(value: string): ChatMentionDecision {
@@ -290,30 +312,26 @@ export function parseChatMentionDecision(value: string): ChatMentionDecision {
   try {
     parsed = JSON.parse(value);
   } catch {
-    throw new Error("Chat Agent output must be valid ChatMentionDecision@1 JSON");
+    throw new Error("Chat Agent output must be valid ChatMentionDecision JSON");
   }
-  if (!isRecord(parsed) || parsed.schema !== "ChatMentionDecision@1") {
-    throw new Error("Chat Agent output must use schema ChatMentionDecision@1");
+  if (!isRecord(parsed) || (parsed.schema !== "ChatMentionDecision@1" &&
+    parsed.schema !== "ChatMentionDecision@2")) {
+    throw new Error(
+      "Chat Agent output must use schema ChatMentionDecision@1 or ChatMentionDecision@2"
+    );
   }
   if ("presence" in parsed) {
     throw new Error("ChatMentionDecision@1 must not include presence");
   }
-  const speech = parsed.speech;
-  if (!isRecord(speech) || (speech.action !== "reply" && speech.action !== "silent")) {
-    throw new Error("ChatMentionDecision.speech.action must be reply or silent");
-  }
-  return {
-    schema: "ChatMentionDecision@1",
-    speech: speech.action === "reply"
-      ? {
-          action: "reply",
-          body: requireText(speech.body, "ChatMentionDecision.speech.body")
-        }
-      : {
-          action: "silent",
-          reason: boundedText(speech.reason, "ChatMentionDecision.speech.reason", 200)
-        }
-  };
+  return parsed.schema === "ChatMentionDecision@1"
+    ? {
+        schema: "ChatMentionDecision@1",
+        speech: parseChatSpeech(parsed.speech, "ChatMentionDecision", false)
+      }
+    : {
+        schema: "ChatMentionDecision@2",
+        speech: parseChatSpeech(parsed.speech, "ChatMentionDecision", true)
+      };
 }
 
 export function availableChatDecision(scope: ChatPresenceScope = "topic"): ChatDecision {
@@ -329,6 +347,133 @@ export function silentChatMentionDecision(): ChatMentionDecision {
     schema: "ChatMentionDecision@1",
     speech: { action: "silent", reason: "No useful reply to this mention." }
   };
+}
+
+function parseChatSpeech(
+  value: unknown,
+  field: "ChatDecision" | "ChatMentionDecision",
+  allowProposal: false
+): ChatSpeechDecision;
+function parseChatSpeech(
+  value: unknown,
+  field: "ChatDecision" | "ChatMentionDecision",
+  allowProposal: true
+): ChatSpeechDecisionV2;
+function parseChatSpeech(
+  value: unknown,
+  field: "ChatDecision" | "ChatMentionDecision",
+  allowProposal: boolean
+): ChatSpeechDecision | ChatSpeechDecisionV2 {
+  if (!isRecord(value)) throw new Error(`${field}.speech must be an object`);
+  if (value.action === "reply") {
+    return { action: "reply", body: requireText(value.body, `${field}.speech.body`) };
+  }
+  if (value.action === "silent") {
+    return {
+      action: "silent",
+      reason: boundedText(value.reason, `${field}.speech.reason`, 200)
+    };
+  }
+  if (value.action === "propose_run" && allowProposal) {
+    return { action: "propose_run", proposal: parseChatRunProposalDraft(value.proposal) };
+  }
+  throw new Error(
+    `${field}.speech.action must be reply or silent${allowProposal ? " or propose_run" : ""}`
+  );
+}
+
+export function parseChatRunProposalDraft(value: unknown): ChatRunProposalDraft {
+  if (!isRecord(value) || value.schema !== "ChatRunProposalDraft@1") {
+    throw new Error("ChatRunProposalDraft@1 is required");
+  }
+  exactKeys(value, [
+    "schema", "goal", "scope", "acceptance", "desiredEffect", "workspaceRef",
+    "blockingQuestion"
+  ], "ChatRunProposalDraft@1");
+  const goal = optionalBoundedText(value.goal, "ChatRunProposalDraft.goal", 4_096);
+  const scope = value.scope === undefined
+    ? { include: [] as readonly string[], exclude: [] as readonly string[] }
+    : parseProposalScope(value.scope);
+  const acceptance = value.acceptance === undefined
+    ? []
+    : boundedTextList(value.acceptance, "ChatRunProposalDraft.acceptance", 32, 1_000);
+  const desiredEffect = value.desiredEffect;
+  if (desiredEffect !== undefined && desiredEffect !== "none" &&
+    desiredEffect !== "read" && desiredEffect !== "change") {
+    throw new Error("ChatRunProposalDraft.desiredEffect is unsupported");
+  }
+  const workspaceRef = value.workspaceRef;
+  if (workspaceRef !== undefined && workspaceRef !== "local:workspace") {
+    throw new Error("ChatRunProposalDraft.workspaceRef is unsupported");
+  }
+  if (desiredEffect === "none" && workspaceRef !== undefined) {
+    throw new Error("desiredEffect=none cannot include workspaceRef");
+  }
+  const suppliedBlocker = optionalBoundedText(
+    value.blockingQuestion,
+    "ChatRunProposalDraft.blockingQuestion",
+    1_000
+  );
+  const missing = [
+    ...(goal === undefined ? ["goal"] : []),
+    ...(scope.include.length === 0 ? ["scope.include"] : []),
+    ...(acceptance.length === 0 ? ["acceptance"] : []),
+    ...(desiredEffect === undefined ? ["desiredEffect"] : [])
+  ];
+  const blockingQuestion = suppliedBlocker ?? (missing.length === 0
+    ? undefined
+    : `Please clarify ${missing.join(", ")} before starting this Run.`);
+  return {
+    schema: "ChatRunProposalDraft@1",
+    ...(goal === undefined ? {} : { goal }),
+    scope,
+    acceptance,
+    ...(desiredEffect === undefined ? {} : { desiredEffect }),
+    ...(workspaceRef === undefined ? {} : { workspaceRef }),
+    ...(blockingQuestion === undefined ? {} : { blockingQuestion })
+  };
+}
+
+function parseProposalScope(value: unknown): ChatRunProposalDraft["scope"] {
+  if (!isRecord(value)) throw new Error("ChatRunProposalDraft.scope must be an object");
+  exactKeys(value, ["include", "exclude"], "ChatRunProposalDraft.scope");
+  return {
+    include: value.include === undefined
+      ? []
+      : boundedTextList(value.include, "ChatRunProposalDraft.scope.include", 32, 1_000),
+    exclude: value.exclude === undefined
+      ? []
+      : boundedTextList(value.exclude, "ChatRunProposalDraft.scope.exclude", 32, 1_000)
+  };
+}
+
+function boundedTextList(
+  value: unknown,
+  field: string,
+  maximumItems: number,
+  maximumLength: number
+): readonly string[] {
+  if (!Array.isArray(value) || value.length > maximumItems) {
+    throw new Error(`${field} must contain at most ${maximumItems} items`);
+  }
+  return [...new Set(value.map((item) => boundedText(item, `${field}[]`, maximumLength)))];
+}
+
+function optionalBoundedText(
+  value: unknown,
+  field: string,
+  maximum: number
+): string | undefined {
+  return value === undefined ? undefined : boundedText(value, field, maximum);
+}
+
+function exactKeys(
+  value: Readonly<Record<string, unknown>>,
+  allowed: readonly string[],
+  field: string
+): void {
+  const unexpected = Object.keys(value).find((key) => !allowed.includes(key));
+  if (unexpected !== undefined) throw new Error(`${field}.${unexpected} is unsupported`);
 }
 
 export function parseChatPresence(value: unknown, now = new Date().toISOString()): ChatPresence {

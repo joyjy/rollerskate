@@ -36,6 +36,10 @@ import { resolveRegisteredSubscriptionPlugin } from
   "../application/subscription/plugin-registry.js";
 import { StewardModule } from "../application/steward/module.js";
 import { AgentRunStore } from "../infrastructure/sqlite/agent-run-store.js";
+import {
+  DeterministicApplicationActionRegistry,
+  type DeterministicApplicationActionRegistration
+} from "../application/proactive/action-registry.js";
 import { openRuntimeDatabase } from "../infrastructure/sqlite/database.js";
 import {
   AgentHandler,
@@ -94,6 +98,12 @@ import {
   withChatHistoryContinuation
 } from "../application/chat/agent-continuation.js";
 import {
+  chatReadToolDefinitions,
+  chatReadToolGrant,
+  createChatReadToolContext
+} from
+  "../application/chat/read-tool-policy.js";
+import {
   boundedChatPromptHistory,
   chatTimelineFromStore
 } from "../application/chat/query.js";
@@ -109,7 +119,6 @@ import { TopicGovernanceAdmissionPolicy } from
   "../application/topic/admission.js";
 import { TopicGovernanceStore } from
   "../infrastructure/sqlite/topic-governance-store.js";
-import { FreeChatRuntime } from "../application/topic/free-chat-runtime.js";
 import { TopicActivationScheduleRuntime } from
   "../application/topic/schedule-runtime.js";
 import { InteractiveChannelRuntime } from
@@ -120,6 +129,12 @@ import { listWorkRequestTargets } from
   "../application/work-request/control.js";
 import { AgentWorkRequestRuntime } from
   "../application/work-request/runtime.js";
+import { loadOwnerExternalWorkflowRegistry } from
+  "../application/proactive/external-workflow-registry.js";
+import { ExternalWorkflowStore } from
+  "../infrastructure/proactive/external-workflow-store.js";
+import { ExternalWorkflowRuntime } from
+  "../application/proactive/external-workflow-runtime.js";
 
 export interface RuntimeStartOptions {
   readonly repoRoot: string;
@@ -137,6 +152,8 @@ export interface RuntimeStartOptions {
   readonly fetch?: typeof fetch;
   readonly macOsNotificationRunner?: MacOsNotificationRunner;
   readonly connectorRead?: (request: ConnectorReadRequest) => Promise<ConnectorReadResult>;
+  readonly deterministicApplicationActions?:
+    readonly DeterministicApplicationActionRegistration[];
 }
 
 const CLIENT_HISTORY_MCP_ENTRYPOINT = fileURLToPath(
@@ -144,6 +161,9 @@ const CLIENT_HISTORY_MCP_ENTRYPOINT = fileURLToPath(
 );
 const CHAT_HISTORY_MCP_ENTRYPOINT = fileURLToPath(
   new URL("../entrypoints/mcp/chat-history.js", import.meta.url)
+);
+const CHAT_READ_TOOLS_MCP_ENTRYPOINT = fileURLToPath(
+  new URL("../entrypoints/mcp/chat-read-tools.js", import.meta.url)
 );
 
 export async function startRuntime(
@@ -166,6 +186,7 @@ export async function startRuntime(
     resources.runtimeStore.reconcileInterrupted(reconciledAt);
     resources.subscriptions.reconcileInterrupted();
     resources.proactiveCallbacks.recover(reconciledAt);
+    resources.externalWorkflowStore.recoverInterrupted(reconciledAt);
     return await runLoop({
       statePath: resources.paths.loopState,
       runtimeDirectory: resources.paths.runtimeDirectory,
@@ -181,6 +202,16 @@ export async function startRuntime(
     }, signal);
   } finally {
     try {
+      const externalSettled = await resources.externalWorkflows.settle();
+      if (options.output !== undefined && (
+        externalSettled.succeeded.length > 0 || externalSettled.failed.length > 0 ||
+        externalSettled.unknown.length > 0 || externalSettled.errors.length > 0
+      )) {
+        options.output.write(`${JSON.stringify({
+          type: "proactive.external_workflow_cycle",
+          ...externalSettled
+        })}\n`);
+      }
       const settled = await resources.runtimeCycle.settle();
       if (options.output !== undefined && (
         settled.executions.length > 0 || settled.deliveries.length > 0 ||
@@ -216,16 +247,12 @@ export async function startRuntime(
                       resources.topicGovernanceStore.close();
                     } finally {
                       try {
-                        resources.freeChat.close();
+                        resources.topicActivationSchedules.close();
                       } finally {
                         try {
-                          resources.topicActivationSchedules.close();
+                          resources.interactiveChannels.close();
                         } finally {
-                          try {
-                            resources.interactiveChannels.close();
-                          } finally {
-                            resources.foundationStore.close();
-                          }
+                          resources.foundationStore.close();
                         }
                       }
                     }
@@ -247,9 +274,6 @@ async function assembleRuntime(options: RuntimeStartOptions) {
   const foundationStore = new LocalFoundationStore(paths.database);
   const localChat = new LocalChatStore(paths.database);
   const topicGovernanceStore = new TopicGovernanceStore(paths.database);
-  const freeChat = new FreeChatRuntime(options.repoRoot, {
-    runtimeDirectory: paths.runtimeDirectory
-  });
   const topicActivationSchedules = new TopicActivationScheduleRuntime(
     options.repoRoot,
     { runtimeDirectory: paths.runtimeDirectory }
@@ -259,6 +283,15 @@ async function assembleRuntime(options: RuntimeStartOptions) {
     ...(options.fetch === undefined ? {} : { fetch: options.fetch })
   });
   const runtimeDatabase = openRuntimeDatabase(paths.database);
+  const applicationActions = new DeterministicApplicationActionRegistry(
+    runtimeDatabase,
+    options.deterministicApplicationActions ?? []
+  );
+  const externalWorkflowRegistry = loadOwnerExternalWorkflowRegistry(
+    options.repoRoot,
+    options.runtimeDirectory
+  );
+  const externalWorkflowStore = new ExternalWorkflowStore(runtimeDatabase);
   const runtimeStore = new RuntimeStore(runtimeDatabase);
   const scheduledTaskStore = new ScheduledTaskStore(runtimeDatabase);
   const agentRunStore = new AgentRunStore(runtimeDatabase);
@@ -314,7 +347,11 @@ async function assembleRuntime(options: RuntimeStartOptions) {
               ? {}
               : { excludedProviderSessionId: currentProviderSessionId })
           }
-        )
+        ),
+        chatReadTools: () => createChatReadToolContext({
+          repoRoot: options.repoRoot,
+          runtimeDirectory: paths.runtimeDirectory
+        })
       });
     const agentNames: string[] = [];
     for (const localAgent of foundationStore.listAgents().filter(
@@ -442,10 +479,12 @@ async function assembleRuntime(options: RuntimeStartOptions) {
       runs: agentRunStore
     });
     const subscriptionStore = new SubscriptionStore(runtimeDatabase, {
-      runBinding: subscriptionRunBinding
+      runBinding: subscriptionRunBinding,
+      applicationActions
     });
     const continuousSubscriptionStore = new ContinuousSubscriptionStore(runtimeDatabase, {
-      runBinding: subscriptionRunBinding
+      runBinding: subscriptionRunBinding,
+      applicationActions
     });
     const subscriptions = new SubscriptionRuntime({
       databasePath: paths.database,
@@ -464,6 +503,11 @@ async function assembleRuntime(options: RuntimeStartOptions) {
       })
     });
     const callbackKernel = new HostCallbackKernel();
+    const externalWorkflows = new ExternalWorkflowRuntime({
+      store: externalWorkflowStore,
+      registry: externalWorkflowRegistry,
+      executor: callbackKernel
+    });
     const scheduledTasks = new ScheduledTaskRuntime({
       store: scheduledTaskStore,
       runtime: runtimeStore,
@@ -489,6 +533,8 @@ async function assembleRuntime(options: RuntimeStartOptions) {
         runtime: runtimeStore,
         runs: agentRunStore
       }),
+      applicationActions,
+      externalWorkflows: externalWorkflowStore,
       ...(externalRefGuard === undefined ? {} : { externalRefGuard })
     });
     const proactiveCallbacks = new ProactiveCallbackRuntime(paths.database, {
@@ -645,8 +691,8 @@ async function assembleRuntime(options: RuntimeStartOptions) {
       ...topicSyncPhases(topicSync),
       ...matrixPhases(matrixIngress),
       scheduledTaskPhase(scheduledTasks),
+      externalWorkflowPhase(externalWorkflows),
       topicActivationSchedulePhase(topicActivationSchedules),
-      freeChatPhase(freeChat),
       interactiveChannelPhase(interactiveChannels),
       proactiveCallbackPhase(proactiveCallbacks),
       runtimeProgressPhase(runProgress),
@@ -661,6 +707,8 @@ async function assembleRuntime(options: RuntimeStartOptions) {
       subscriptionStore,
       continuousSubscriptionStore,
       proactiveCallbacks,
+      externalWorkflows,
+      externalWorkflowStore,
       runtimeCycle,
       scheduledTaskStore,
       agentRunStore,
@@ -668,7 +716,6 @@ async function assembleRuntime(options: RuntimeStartOptions) {
       runtimeStore,
       localChat,
       topicGovernanceStore,
-      freeChat,
       topicActivationSchedules,
       interactiveChannels,
       foundationStore,
@@ -691,7 +738,6 @@ async function assembleRuntime(options: RuntimeStartOptions) {
     if (!handedOff) {
       localChat.close();
       topicGovernanceStore.close();
-      freeChat.close();
       topicActivationSchedules.close();
       interactiveChannels.close();
       foundationStore.close();
@@ -754,18 +800,6 @@ function continuousSubscriptionPhase(runtime: ContinuousSubscriptionRuntime): Lo
   };
 }
 
-function freeChatPhase(runtime: FreeChatRuntime): LoopPhase {
-  return {
-    scope: "topic.free-chat",
-    run: async () => {
-      const result = runtime.runCycle();
-      return Object.values(result).every((ids) => ids.length === 0)
-        ? undefined
-        : { type: "topic.free_chat_cycle", ...result };
-    }
-  };
-}
-
 function topicActivationSchedulePhase(
   runtime: TopicActivationScheduleRuntime
 ): LoopPhase {
@@ -801,6 +835,20 @@ function proactiveCallbackPhase(runtime: ProactiveCallbackRuntime): LoopPhase {
         result.succeeded.length === 0 && result.failed.length === 0
         ? undefined
         : { type: "proactive.callback_cycle", ...result };
+    }
+  };
+}
+
+function externalWorkflowPhase(runtime: ExternalWorkflowRuntime): LoopPhase {
+  return {
+    scope: "proactive.external-workflow",
+    run: async (signal) => {
+      const result = runtime.poll(signal);
+      return result.claimed.length === 0 && result.succeeded.length === 0 &&
+        result.failed.length === 0 && result.unknown.length === 0 &&
+        result.errors.length === 0
+        ? undefined
+        : { type: "proactive.external_workflow_cycle", ...result };
     }
   };
 }
@@ -852,6 +900,7 @@ function runtimeAgentForClient(
                 return [...servers, {
                   name: "rollerskate_client_history",
                   command: process.execPath,
+                  tools: ["list_client_threads", "read_client_thread"],
                   args: [
                     CLIENT_HISTORY_MCP_ENTRYPOINT,
                     "--repo-root", options.repoRoot,
@@ -879,22 +928,24 @@ function runtimeAgentForClient(
     case "kimi-code":
       return new KimiCodeRuntimeAgent({
         executable: requireExecutable(options.kimiCodeExecutable, "Kimi Code"),
-        ...common,
-        timeoutMilliseconds: Math.max(common.timeoutMilliseconds, 900_000)
+        ...common
       });
     case "pi":
       return new PiRuntimeAgent({
         executable: requireExecutable(options.piExecutable, "pi"),
         ...common,
-        resolveChatHistoryContext: ({ event }) => event.type === "chat.dispatch" &&
-          event.sourceMessageEventId !== undefined
+        chatReadToolGrant: chatReadToolGrant(),
+        resolveChatToolContext: ({ event }) => event.type === "chat.dispatch"
           ? {
+              repoRoot: options.repoRoot,
               runtimeDirectory: runtimePaths(
                 options.repoRoot,
                 options.runtimeDirectory
               ).runtimeDirectory,
               topicId: event.topicId,
-              sourceMessageEventId: event.sourceMessageEventId
+              ...(event.sourceMessageEventId === undefined
+                ? {}
+                : { sourceMessageEventId: event.sourceMessageEventId })
             }
           : undefined
       });
@@ -905,18 +956,32 @@ function chatHistoryMcpServers(
   event: AgentInputEvent | ChatDispatchEvent,
   options: RuntimeStartOptions
 ) {
-  if (event.type !== "chat.dispatch" || event.sourceMessageEventId === undefined) return [];
+  if (event.type !== "chat.dispatch") return [];
+  const paths = runtimePaths(options.repoRoot, options.runtimeDirectory);
+  const readTools = {
+    name: "rollerskate_read",
+    command: process.execPath,
+    tools: chatReadToolDefinitions.map(({ name }) => name),
+    args: [
+      CHAT_READ_TOOLS_MCP_ENTRYPOINT,
+      "--repo-root", options.repoRoot,
+      "--runtime-directory",
+      paths.runtimeDirectory
+    ]
+  };
+  if (event.sourceMessageEventId === undefined) return [readTools];
   return [{
     name: "rollerskate_chat",
     command: process.execPath,
+    tools: ["read_chat_history"],
     args: [
       CHAT_HISTORY_MCP_ENTRYPOINT,
       "--runtime-directory",
-      runtimePaths(options.repoRoot, options.runtimeDirectory).runtimeDirectory,
+      paths.runtimeDirectory,
       "--topic-id", event.topicId,
       "--source-message-event-id", event.sourceMessageEventId
     ]
-  }];
+  }, readTools];
 }
 
 function localRuntimeAgentKey(agent: LocalAgent, workspace: string): string {

@@ -52,7 +52,7 @@ scripts/rs resume
 - `workload status` 输出 Core Loop 当前负责推进的 ready、running、retrying 与 total canonical work unit；已经关联 V1 Execution 或 V2 Run cycle 的 ScheduleOccurrence 不重复计数。
 - `failure list/inspect` 输出影响 Runtime readiness、workload 或需要 Owner 介入的 bounded projection，并给出稳定 object/Event reference 与下钻提示。
 - `failure retry` 只接受 exact failed Delivery failure ref，在 Owner 修复 transport 后追加一次 attempt budget，并沿原 origin/destination/payload 重试；重复调用 active 或 delivered Delivery 不复制投递。
-- `recover` 仅在 Runtime 已停止且确实存在 interrupted durable work 时可用。安全可重试的 Execution 与 Delivery 恢复既有状态；已经进入 provider invocation 的 V1 ScheduleOccurrence 改为 `unknown` 并停止对应 Execution，避免盲目重放可能已有 side effect 的请求。V2 occurrence 与 Agent Run 复用 durable cycle、Execution recovery 与 generic ResultHandler continuation，没有专用 `steward recover`。
+- `recover` 仅在 Runtime 已停止且确实存在 interrupted durable work 时可用。安全可重试的 Execution 与 Delivery 恢复既有状态；已经进入 provider invocation 的 V1 ScheduleOccurrence 改为 `unknown` 并停止对应 Execution；external workflow 在 effect boundary 前恢复 retry，boundary 后改为 `unknown`，都避免盲目重放可能已有 side effect 的请求。Run-bound occurrence 与 Agent Run 复用 durable cycle、Execution recovery 与 generic ResultHandler continuation，没有专用 `steward recover`。
 - `pause` 与 `resume` 使用与 Console 相同的 structured availability guard，控制后续 Runtime cycle claim，不删除 durable state，也不取消已开始的 provider invocation。
 
 全部 canonical Event 与 Runtime log event 见 [Event Reference](../architecture/event-reference.md)。
@@ -73,9 +73,9 @@ scripts/rs agent profile <handle> update <json-file>
 
 `handle` 是用户填写的短名称；Principal ID 由系统生成。创建时必须选择 `codex`、`claude-code`、`kimi-code` 或 `pi` adapter。`--launch-arg` 可重复，每次保存一个原始 argv 元素，不经过 shell 解析；例如 `--launch-arg --model --launch-arg claude-sonnet-4-6`。`agent configure` 原子替换该 Agent 的整组启动参数，不带 `--launch-arg` 时清空；下一次调用自动使用新 adapter 配置。
 
-Codex 通过 app-server `thread/start|resume` params 设置 `read-only | workspace-write` sandbox、`approvalPolicy=never`、可选 network grant 与 invocation-scoped MCP config；不再调用 `codex exec --json`，launch args 只允许 `--model <model>`。assistant/reasoning/plan/tool 通知实时形成 bounded progress；默认 meaningful idle budget 为 120 秒，Run workflow 可显式覆盖独立 total budget。stall、deadline 或 active protocol failure 会发送 `turn/interrupt` 并有界终止进程；partial delta 不会成为成功结果或写任务重放依据。
+Codex 通过 app-server `thread/start|resume` params 设置 `read-only | workspace-write` sandbox、`approvalPolicy=never`、可选 network grant 与 invocation-scoped MCP config；不再调用 `codex exec --json`，launch args 只允许 `--model <model>`。assistant/reasoning/plan/tool 通知实时形成 bounded progress；默认 meaningful idle budget 为 300 秒，每次 meaningful update 都会续期。只有 Run workflow 显式声明 invocation budget 时才启用不可续期的 total deadline。stall、deadline 或 active protocol failure 会发送 `turn/interrupt` 并有界终止进程；partial delta 不会成为成功结果或写任务重放依据。
 
-Session、output transport、workspace 与 permission/sandbox 参数由 adapter 控制，不能通过启动参数覆盖。Agent Run 的 external workspace grant 对所有 client 使用同一 `read | write` contract：Codex 与 Claude Code adapter 会把它转换为各自的进程权限参数。Kimi Code 通过 ACP v1 的 `session/new|resume|prompt` 运行：`read` grant 在新 Session 使用 `plan` mode，只批准 read/search/think/fetch tool kind；`write` grant 使用 `default` mode 并按次批准工具请求；恢复时 read/write access 已由 Session reference 锁定，不重复设置 mode。bundled profile 作为 prompt policy 注入；旧 Session reference 或 access 不匹配会新建 Session。Kimi launch args 只允许 `--model <model>`；Chat 合并 assistant message，Run/Subscription 只取末条，结果预算只计算 assistant text，不保存大块 tool trace。连续 120 秒没有 assistant/thought/tool/plan update 时 stall watchdog 终止调用，总 timeout 独立生效。macOS 进程固定使用 Kimi legacy engine 规避 v2 watcher 的 `EMFILE` 回归，但仍走 ACP v1。Kimi 的权限映射不等同于 Codex OS sandbox，授权根仍以 Runtime 传入的 workspace 和 prompt contract 为边界。pi 对所有调用使用 `--mode rpc`；Runtime 预生成 exact provider ID，以 `--session-id` 创建或恢复，验证 `get_state` 后发送 prompt，并等待 `agent_settled`。单条超限 RPC record 会被丢弃并让 tool usage 保持未知，后续短 terminal result 仍可完成。pi 用 `--tools` 白名单映射 grant：`read` 只开放 read/grep/find/ls，`write` 额外开放 write/edit/bash；工具白名单即权限边界，无 OS sandbox。公共 `agent request` 已关闭；需要执行工作时用 `run start` 的 stable participant ref 选择 Agent。
+Session、output transport、workspace 与 permission/sandbox 参数由 adapter 控制，不能通过启动参数覆盖。Agent Run 的 external workspace grant 对所有 client 使用同一 `read | write` contract：Codex 与 Claude Code adapter 会把它转换为各自的进程权限参数。Kimi Code 通过 ACP v1 的 `session/new|resume|prompt` 运行：`read` grant 在新 Session 使用 `plan` mode，只批准 read/search/think/fetch tool kind；`write` grant 使用 `default` mode 并按次批准工具请求；恢复时 read/write access 已由 Session reference 锁定，不重复设置 mode。bundled profile 作为 prompt policy 注入；旧 Session reference 或 access 不匹配会新建 Session。Kimi launch args 只允许 `--model <model>`；Chat 合并 assistant message，Run/Subscription 只取末条，结果预算只计算 assistant text，不保存大块 tool trace。默认连续 300 秒没有 assistant/thought/tool/plan update 才触发 stall；持续 thought 会续期 idle，只有 workflow 显式 budget 才形成独立 total deadline。macOS 进程固定使用 Kimi legacy engine 规避 v2 watcher 的 `EMFILE` 回归，但仍走 ACP v1。Kimi 的权限映射不等同于 Codex OS sandbox，授权根仍以 Runtime 传入的 workspace 和 prompt contract 为边界。pi 对所有调用使用 `--mode rpc`；Runtime 预生成 exact provider ID，以 `--session-id` 创建或恢复，验证 `get_state` 后发送 prompt，并等待 `agent_settled`。单条超限 RPC record 会被丢弃并让 tool usage 保持未知，后续短 terminal result 仍可完成。pi 用 `--tools` 白名单映射 grant：`read` 只开放 read/grep/find/ls 和 bundled `read_git_diff`，`write` 额外开放 write/edit/bash 且不加载 Git 扩展；扩展内容进入 adapter identity 与 Runtime revision。工具白名单即权限边界，无 OS sandbox。Pi 与其他 streaming adapter 使用相同的 meaningful-idle / explicit-deadline 语义。公共 `agent request` 已关闭；需要执行工作时用 `run start` 的 stable participant ref 选择 Agent。
 
 公共 Run 不接受 raw `workspace`、network 或 budget。`run start` 只接收 `RunIntent@1`；Owner compiler 从稳定 `workspaceRef` 与 `desiredEffect` 生成 canonical grant，当前默认 network off、`maxSteps=20`、`maxDepth=0`。
 
@@ -127,12 +127,7 @@ scripts/rs chat status
 scripts/rs chat governance
 scripts/rs chat pause --revision <revision>
 scripts/rs chat resume --revision <revision>
-scripts/rs chat resume-and-wake --revision <revision> --idempotency-key <key>
 scripts/rs chat participant add|remove <handle> --revision <revision>
-scripts/rs chat free status
-scripts/rs chat free start --idempotency-key <key> [--intent continue_recent|choose_from_themes|directed] [--brief <text>]
-scripts/rs chat free continue-now --revision <revision>
-scripts/rs chat free exit --revision <revision>
 scripts/rs chat schedule status [schedule-id]
 scripts/rs chat schedule create (--once <iso> | --cron <five-field-cron> --timezone <iana>) [--misfire skip|run_once] [--misfire-grace-ms <0-604800000>] [--candidates deterministic_one|sampled_sequential|all_available] [--intent continue_recent|choose_from_themes|directed] [--brief <text>] [--turn-budget <1-64>]
 scripts/rs chat schedule pause|resume|cancel <schedule-id> --revision <revision>
@@ -144,9 +139,8 @@ scripts/rs chat session new <handle>
 - `history` 输出 Local Topic 的稳定 message timeline cursor page；内部 `chat.dispatch` 只在 Event trace 中查看。
 - `status` 输出每个 Agent 的 lifecycle status 以及已有的 Global/Topic presence。未出现 presence 表示尚未做过显式 decision，运行时按 available 处理。
 - `governance` 输出当前 `TopicGovernance`、active participant roster、最近 control receipts 和动作可用性；其中 `expectedRevision` 可直接用于后续 control。`pause`、`resume` 与 participant add/remove 都必须显式携带该 revision；同状态重试返回 `unchanged`，过期且仍需 mutation 的 revision 返回 `conflict` 和 current governance，不产生写入。
-- `resume` 只恢复 Topic，不创建 Chat activation。`resume-and-wake` 还必须携带调用方生成并在重试时复用的 idempotency key；它只会收敛为一个 `reason=resumed` 的 canonical activation。
+- `resume` 只恢复 Topic，不创建 Chat activation。Local Chat 没有 Wake/Free Chat 命令；没有 Owner/Agent message 或显式 Topic schedule source 时不会调用 Agent。
 - participant add/remove 只修改 Local conversation roster；空 roster 合法。它不删除或 suspend Agent，不旋转 Session，不撤销 history grant，不删除消息，也不修改 Server membership。
-- `chat free status` 输出 latest mode、recent receipts、expected revision 与 start/continue-now/exit availability。`start` 必须携带调用方在重试时复用的 idempotency key；默认使用 governance conversation policy，`directed` 必须同时提供 `--brief`。`continue-now` 只把当前 sample deadline 提前到现在，不绕过 single-root admission；`exit` 持久化 terminal mode 与 receipt。两个 mutation 都使用 status 返回的 revision 做 CAS。
 - `chat schedule` 管理 Topic-owned scheduled activation，不是顶层 `schedule` arbitrary Scheduled Task 的别名。create 只接受 conversation time、misfire、candidate、intent 和 turn budget；`directed` intent 必须同时提供 `--brief`。status 返回 current schedule 与 recent occurrence receipts，pause/resume/cancel 必须使用其中的 revision 做 CAS。唯一 loop 的 `topic.schedule` phase 把每个 occurrence 至多 admission 为一个 canonical `chat.activation`；暂停窗口、misfire、paused Topic、scheduled policy disabled、空 eligible roster 或 active-root overlap 都写 bounded skip receipt 并推进，不 backfill。
 - `presence set` 由 Owner 覆盖一个 Agent 的当前 scoped presence。`available` 不接受 `--until` 或 wake keyword；`snoozed` 必须提供未来的 `--until`，`--wake-keyword` 可重复。它修改的是 `Agent × (Global | 当前 Topic)` 状态，不是 Topic 配置，也不改变 Agent lifecycle。
 - `session new` 清空该 Agent 的 current Session pointer并增加 generation，不删除历史。
@@ -196,10 +190,13 @@ Notice Center 从 SQLite `notices` 读取由 `macos-notification` Delivery snaps
 ```text
 scripts/rs subscription list
 scripts/rs subscription inspect <id>
+scripts/rs subscription history <id> --json
 scripts/rs subscription pause <id>
 scripts/rs subscription resume <id>
 scripts/rs subscription cancel <id>
 ```
+
+`subscription history` 是固定 schema 的只读 JSON 查询，返回 `SubscriptionHistory@1`，并保持 `fires[] → deliveries[] → executions[]` 三层结构。每层分别保留来源标识、状态、错误和时间；Delivery 与 Execution 的 `attempt`、`maxAttempts`、`lastError` 是当前持久化的累计值和当前或最终错误，不表示数据库保存了逐 retry ledger。合法但尚未触发的 Subscription 返回 `queryStatus=ok`、`linkStatus=resolved` 和空 `fires`；旧记录无法可靠回溯时返回 `linkStatus=unresolved` 及稳定 `reasonCode`，查询错误则以非零命令结果退出，不伪装为空历史。
 
 Console 的 `/console/subscriptions` 把 one-shot 与 Continuous 合并成 trigger diagnostics 列表。`GET /api/subscriptions?page=&pageSize=&q=&archive=current|archived|all` 返回稳定 envelope；V4/V2 显示 linked Run/cycle、pending/checkpoint/reconcile，legacy callback trace 标记为 `legacy / non-public`。
 
@@ -207,7 +204,7 @@ Console 的 `/console/subscriptions` 把 one-shot 与 Continuous 合并成 trigg
 
 ## Local Scheduled Task
 
-新的 Schedule 只能由带 `triggerIntent: "once" | "cron"` 的 `RunIntent@1` 建立。Steward 在 admitted authority 内选择 `schedule.once@1 | schedule.cron@1` template；application 原子写 `ScheduleRevision@2` 与 exact `RunSourceBinding@1`，definition 不含 Agent、prompt、workspace、Session、callback、command 或 destination。
+新的 Agent-backed Schedule 只能由带 `triggerIntent: "once" | "cron"` 的 `RunIntent@1` 建立。Steward 在 admitted authority 内选择 `schedule.once@1 | schedule.cron@1` template；application 原子写 `ScheduleRevision@3` 与 exact Run target。Owner 也可把 paused legacy V1 显式迁移到 mode-0600 registry 中的 versioned external workflow target。definition 不含 raw Agent、prompt、workspace、Session、callback、executable、argv、command 或 destination。
 
 ```text
 scripts/rs schedule list
@@ -216,17 +213,18 @@ scripts/rs schedule pause <schedule-id>
 scripts/rs schedule resume <schedule-id>
 scripts/rs schedule cancel <schedule-id>
 scripts/rs schedule run-now <schedule-id> --request-id <idempotency-key>
+scripts/rs schedule migrate-workflow <schedule-id> --workflow-ref <workflow:name@version> --expected-revision <n> --request-id <idempotency-key>
 scripts/rs schedule occurrences <schedule-id> [--limit <count>]
 scripts/rs schedule runs <schedule-id> [--limit <count>] # legacy alias
 scripts/rs schedule trace <run-id>
 scripts/rs schedule resolve <run-id> <succeeded|failed>
 ```
 
-`schedule create/update` 固定返回 `legacy_trigger_write_closed`。历史 V1 可 inspect、pause、cancel、archive 和 resolve unknown，但不能 resume 或 run-now；V2 control 继续按 Run/source contract 工作。`occurrences` 是主查询名，`runs` 是兼容 alias；V2 trace 返回 exact Run/cycle/admission receipt，V1 只保留 legacy diagnostics。
+`schedule create/update` 固定返回 `legacy_trigger_write_closed`。历史 V1 可 inspect、pause、cancel、archive 和 resolve unknown，但不能直接 resume 或 run-now；`migrate-workflow` 要求 paused V1、exact expected revision、registered ref 和稳定 request ID，成功后保留同一 Schedule ID 并写 immutable migration receipt。V2/V3 Run target 继续按 Run/source contract 工作；V3 external target 按独立 execution/lease/effect boundary/receipt 工作。`occurrences` 是主查询名，`runs` 是兼容 alias；trace 按 target 返回 Run/cycle、deterministic action 或 external workflow diagnostics。
 
 完整示例、cron/DST、misfire、overlap 与恢复说明见 [Scheduled Task runbook](./scheduled-tasks.md)。
 
-Console 的 `/console/schedules` 是 trigger diagnostics。`GET /api/schedules?page=&pageSize=&q=&archive=current|archived|all` 返回稳定分页 envelope；V2 occurrence 的 primary action 打开 linked Run，legacy trace 标记为 `legacy / non-public`。
+Console 的 `/console/schedules` 是 trigger diagnostics。`GET /api/schedules?page=&pageSize=&q=&archive=current|archived|all` 返回稳定分页 envelope；Run target occurrence 的 primary action 打开 linked Run，external workflow occurrence 展示 attempt、effect boundary 和 receipt，legacy trace 标记为 `legacy / non-public`。
 
 ## Agent Run 与 `review@1`
 
@@ -256,6 +254,7 @@ scripts/rs run legacy-migrate <approval-json-file>
 scripts/rs run inspect <run-id>
 scripts/rs run trace <run-id>
 scripts/rs run decide <run-id> <json-file> --request-id <idempotency-key>
+scripts/rs run retry-orchestrator <run-id> --request-id <idempotency-key>
 scripts/rs run cancel <run-id>
 scripts/rs run close <run-id>
 scripts/rs run archive <run-id>
@@ -266,7 +265,7 @@ scripts/rs run unarchive <run-id>
 
 `run start` 只接受同一 `RunIntent@1`，其 `requestId` 同时是 idempotency key。原始 `schemaVersion: 1` / `StartStewardRunInput` 仅保留为内部 legacy seam，不是公共 CLI contract。compiler 当前固定 `maxSteps=20`、`maxDepth=0` 与 network off；Steward prompt 只看到 objective、acceptance、terminal evidence 和人可读 authority summary，不能改写 raw grant。
 
-Console `POST /api/runs` 同样只接收 `RunIntent@1`。accepted External Work Request 先由本机 Owner receipt 缩小 workflow/budget/participant，再经过同一 compiler 建立 `OrchestratorBinding@3` Run。Local Chat 的普通消息仍是对话；只有用户在 exact Owner message 上显式选择 `Hand off to Run`，才以 `chat-work:<eventId>` 幂等 intent 创建 Run 并跳转到 Run Workspace。
+Console `POST /api/runs` 同样只接收 `RunIntent@1`。accepted External Work Request 先由本机 Owner receipt 缩小 workflow/budget/participant，再经过同一 compiler 建立 `OrchestratorBinding@3` Run。Local Chat 的普通消息仍是对话：没有 proposal 时，用户在 exact Owner message 上选择 `Hand off to Run`，以 `chat-work:<eventId>` 幂等创建 Run；有 proposal 时，每个 Agent dispatch 独立成卡，Owner 先做 workspace preflight，再以 `chat-work:<eventId>:<dispatchEventId>` 确认 exact revision。两者都不能由 Agent 自动触发。
 
 默认 `run list` 只返回未归档 Run；`--archived` 只返回 archived Run。`run archive` 仅接受 terminal Run，`run unarchive` 可逆恢复默认可见性；两者都不删除或改写 Run、Event、Execution、Session、cycle、decision、output 与 trace 证据。
 
@@ -277,5 +276,7 @@ Console `POST /api/runs` 同样只接收 `RunIntent@1`。accepted External Work 
 proposal digest 同时绑定 exact registry mapping 与 rendered workflow artifact digest；mapping 或 artifact 漂移会使旧 approval 失效。
 
 `run decide` 的 JSON 必须是严格 `RunDecision@1`，包含当前 `expectedRunVersion`、bounded rationale 与 checked acceptance；action 只能是 `next_step`、`finish` 或 `needs_human`。`next_step.target` 只能是 `self` 或 admission roster 中的 exact Agent，不能增加 workspace/network/delegate authority。同一 request ID + 相同 decision 返回既有 receipt；payload 冲突或 stale version 失败。
+
+`run retry-orchestrator` 是 Owner 对 `OrchestratorBinding@3` 初始只读决策的精确恢复入口，既适用于独立 Run，也适用于 source-bound Run 的 active cycle；只接受处于 `awaiting_orchestrator`、尚未产生 Worker checkpoint、且 workspace 非 write 的 Run。命令从当前 Run version、状态和 fixed roster 重新渲染 prompt，并复用最新已 settled Steward request 的 Run context 与只读 Session recovery evidence，追加一次新的 Steward request；它不会创建新 Run/cycle、改变 source binding 或重放未知 write outcome。`--request-id` 形成稳定 external ID：同一 key 重复调用返回同一 Event/Execution 的 `duplicate` receipt，即使 Run/cycle 后续已终结；不同 key 表示 Owner 明确授权另一次恢复尝试。独立 Run 或新 source cycle 的首次 Steward provider/contract failure 由 Runtime 自动重试一次，第二次失败仍保留 manual fallback。
 
 Autonomous Run 的每个 Agent turn 返回 `AgentTurnResult@1`；Caller mode 返回 `AgentStepResult@1`，由 Caller decision 安排下一步。Run/Subscription typed result 可以是完整 JSON、单一 JSON fence 或带 bounded wrapper 的唯一顶层 object，字段 schema 始终严格。Run provider execution 只尝试一次；失败、contract-invalid 或未满足 `must_change` completion gate 时由一次 bounded Steward adjudication 决定 accept、带安全证据的单次 retry 或 `needs_human`，Runtime 无法排除 side effect 时拒绝 retry；adjudicator 不能用 normalized result 覆盖 Runtime revision 证据。Steward Console 使用同一 application query 展示 Run index、orchestration mode、typed checkpoint、decision receipts、mandate、workspace grant、turn budget、Agent exchanges、prompt/result/tool diagnostics 与 terminal summary，并允许取消活动 Run、归档 terminal Run及切换 archived 列表。`GET /api/runs?page=&pageSize=&q=&archive=current|archived|all` 与另外两类 owner 使用同一分页 envelope。完整状态机与恢复说明见 [Agent Run runbook](./reviews.md)。

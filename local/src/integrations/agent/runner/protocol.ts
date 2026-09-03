@@ -5,7 +5,7 @@ export interface RunnerTurnRequest {
   readonly sessionId?: string;
   readonly workspaceAccess: "read" | "write";
   readonly model?: string;
-  readonly totalTimeoutMilliseconds?: number;
+  readonly totalTimeoutMilliseconds?: number | undefined;
   readonly meaningfulOutputTimeoutMilliseconds?: number;
   readonly onProgress?: (progress: RunnerProgress) => void;
 }
@@ -48,7 +48,7 @@ export type RunnerTerminationReason =
 export interface RunnerFailureTrace extends RunnerProgress {
   readonly failedAt: string;
   readonly reason: RunnerTerminationReason;
-  readonly totalTimeoutMilliseconds: number;
+  readonly totalTimeoutMilliseconds?: number | undefined;
   readonly meaningfulOutputTimeoutMilliseconds: number;
   readonly protocolStop: "requested" | "acknowledged" | "unavailable";
 }
@@ -67,7 +67,7 @@ export function runnerInvocationFailure(input: {
   readonly message: string;
   readonly progress: RunnerProgressTracker;
   readonly reason: RunnerTerminationReason;
-  readonly totalTimeoutMilliseconds: number;
+  readonly totalTimeoutMilliseconds?: number | undefined;
   readonly meaningfulOutputTimeoutMilliseconds: number;
   readonly protocolStop: RunnerFailureTrace["protocolStop"];
 }): RunnerInvocationError {
@@ -76,14 +76,15 @@ export function runnerInvocationFailure(input: {
     ...input.progress.snapshot(failedAt),
     failedAt,
     reason: input.reason,
-    totalTimeoutMilliseconds: input.totalTimeoutMilliseconds,
+    ...(input.totalTimeoutMilliseconds === undefined
+      ? {}
+      : { totalTimeoutMilliseconds: input.totalTimeoutMilliseconds }),
     meaningfulOutputTimeoutMilliseconds: input.meaningfulOutputTimeoutMilliseconds,
     protocolStop: input.protocolStop
   });
 }
 
 export const MAX_RUNNER_TIMEOUT_MILLISECONDS = 900_000;
-export const DEFAULT_MEANINGFUL_OUTPUT_TIMEOUT_MILLISECONDS = 120_000;
 const PROGRESS_EMIT_INTERVAL_MILLISECONDS = 1_000;
 
 export function runnerTimeoutMilliseconds(value: number, field: string): number {

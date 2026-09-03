@@ -27,6 +27,7 @@ import {
   chatTimelineFromStore,
   incrementalChatPromptHistory
 } from "./query.js";
+import { chatReadToolCapability } from "./read-tool-policy.js";
 
 export class ChatHandler implements RuntimeEventHandler {
   public readonly kind = "chat" as const;
@@ -191,6 +192,7 @@ export class ChatHandler implements RuntimeEventHandler {
                 : {}),
               conversationIntent,
               history: promptHistory,
+              readTools: chatReadToolCapability(client === "kimi-code" ? "request" : "tools"),
               ...(event.type === "chat.message"
                 ? {
                     chatHistory: chatHistoryCapability(client)

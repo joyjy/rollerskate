@@ -15,11 +15,17 @@ import {
   parseExternalRefTriggerBinding
 } from "../../modules/external-resource/trigger-binding.js";
 import { parseRunSourceBinding } from "../../modules/steward/source-contract.js";
+import {
+  type DeterministicApplicationActionRuntime,
+  parseProactiveTarget,
+  proactiveTargetRunBinding,
+} from "../../modules/proactive/target.js";
 import type {
   BoundSubscriptionDefinition,
   FreeSubscription,
   FreeSubscriptionDefinition,
-  SubscriptionStatus
+  SubscriptionStatus,
+  TargetedSubscriptionDefinition
 } from "./model.js";
 import type { PollObservation } from "./plugin-contract.js";
 import {
@@ -55,6 +61,7 @@ interface SubscriptionRow {
   latest_error: string | null;
   external_ref_binding_json: string | null;
   source_binding_json: string | null;
+  target_json: string | null;
   agent_run_id: string | null;
   cycle_id: string | null;
   admission_receipt_json: string | null;
@@ -68,12 +75,14 @@ export class SubscriptionStore {
   readonly #callbacks: CallbackStore;
   readonly #ownsDatabase: boolean;
   readonly #runBinding: SubscriptionRunBindingAdapter | undefined;
+  readonly #actions: DeterministicApplicationActionRuntime | undefined;
 
   public constructor(
     databasePath: string | DatabaseSync,
     options: {
       readonly migrate?: boolean;
       readonly runBinding?: SubscriptionRunBindingAdapter;
+      readonly applicationActions?: DeterministicApplicationActionRuntime;
     } = {}
   ) {
     this.#database = typeof databasePath === "string"
@@ -84,6 +93,7 @@ export class SubscriptionStore {
       ? {}
       : { migrate: options.migrate });
     this.#runBinding = options.runBinding;
+    this.#actions = options.applicationActions;
   }
 
   public create(
@@ -202,12 +212,74 @@ export class SubscriptionStore {
     return this.require(input.subscriptionId);
   }
 
+  public createTargetedInTransaction(
+    input: TargetedSubscriptionDefinition & { readonly subscriptionId: string },
+    createdAt = new Date().toISOString()
+  ): FreeSubscription {
+    validateTargetedDefinition(input);
+    requireLocalId(input.subscriptionId, "sub", "subscriptionId");
+    const definitionDigest = sha256(stableJson({
+      schemaVersion: input.schemaVersion,
+      revision: input.revision,
+      title: input.title.trim(),
+      probe: input.probe,
+      intervalMilliseconds: input.intervalMilliseconds,
+      maxWaitMilliseconds: input.maxWaitMilliseconds,
+      maxAttempts: input.maxAttempts,
+      target: input.target,
+      externalRefBinding: input.externalRefBinding ?? null
+    }));
+    const existingById = this.get(input.subscriptionId);
+    if (existingById !== undefined) {
+      if (existingById.definitionSchema === "SubscriptionDefinition@5" &&
+        existingById.definitionDigest === definitionDigest) return existingById;
+      throw new Error("Subscription ID is already bound to another definition");
+    }
+    const binding = proactiveTargetRunBinding(input.target);
+    if (binding !== undefined) {
+      const existing = this.boundForRun(binding.runId);
+      if (existing !== undefined) {
+        throw new Error("Agent Run is already bound to another Subscription definition");
+      }
+    }
+    const timestamp = iso(createdAt);
+    const deadline = new Date(Date.parse(timestamp) + input.maxWaitMilliseconds).toISOString();
+    const nextPoll = new Date(Date.parse(timestamp) + input.intervalMilliseconds).toISOString();
+    this.#database.prepare(`
+      INSERT INTO subscriptions (
+        subscription_id, title, owner_agent_id, plugin_path, plugin_id,
+        plugin_schema_version, plugin_config_json, policy_json, interval_ms,
+        max_wait_ms, max_attempts, attempt_count, definition_schema,
+        definition_revision, definition_digest, callback_phase_status, status,
+        started_at, deadline_at, next_poll_at, external_ref_binding_json,
+        target_json, agent_run_id, created_at, updated_at
+      ) VALUES (?, ?, NULL, ?, ?, 1, ?, ?, ?, ?, ?, 0,
+        'SubscriptionDefinition@5', ?, ?, 'pending', 'active', ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      input.subscriptionId, input.title.trim(), input.probe.plugin.path,
+      input.probe.plugin.id,
+      JSON.stringify({
+        artifactRevision: input.probe.artifactRevision,
+        artifactDigest: input.probe.artifactDigest,
+        config: input.probe.plugin.config
+      }),
+      JSON.stringify(input.probe.policy), input.intervalMilliseconds,
+      input.maxWaitMilliseconds, input.maxAttempts, input.revision,
+      definitionDigest, timestamp, deadline, nextPoll,
+      encodeExternalRefTriggerBinding(input.externalRefBinding),
+      JSON.stringify(input.target), binding?.runId ?? null,
+      timestamp, timestamp
+    );
+    return this.require(input.subscriptionId);
+  }
+
   public boundForRun(runId: string): FreeSubscription | undefined {
     const row = this.#database.prepare(`
       SELECT * FROM subscriptions
-      WHERE definition_schema = 'SubscriptionDefinition@4' AND agent_run_id = ?
+      WHERE definition_schema IN ('SubscriptionDefinition@4', 'SubscriptionDefinition@5')
+        AND agent_run_id = ?
     `).get(runId) as SubscriptionRow | undefined;
-    return row === undefined ? undefined : mapSubscription(row);
+    return row === undefined ? undefined : this.#map(row);
   }
 
   public get(subscriptionId: string): FreeSubscription | undefined {
@@ -215,7 +287,7 @@ export class SubscriptionStore {
       SELECT * FROM subscriptions
       WHERE subscription_id = ?
     `).get(subscriptionId) as SubscriptionRow | undefined;
-    return row === undefined ? undefined : mapSubscription(row);
+    return row === undefined ? undefined : this.#map(row);
   }
 
   public require(subscriptionId: string): FreeSubscription {
@@ -230,7 +302,7 @@ export class SubscriptionStore {
     return (this.#database.prepare(`
       SELECT * FROM subscriptions
       ORDER BY created_at DESC, subscription_id ASC
-    `).all() as unknown as SubscriptionRow[]).map(mapSubscription);
+    `).all() as unknown as SubscriptionRow[]).map((row) => this.#map(row));
   }
 
   public setArchived(
@@ -267,7 +339,7 @@ export class SubscriptionStore {
         AND julianday(deadline_at) > julianday(?) AND attempt_count < max_attempts
       ORDER BY next_poll_at ASC, subscription_id ASC LIMIT ?
     `).all(timestamp, timestamp, limit) as unknown as SubscriptionRow[])
-      .map(mapSubscription);
+      .map((row) => this.#map(row));
   }
 
   public beginAttempt(
@@ -313,13 +385,19 @@ export class SubscriptionStore {
       } else {
         const terminalKey = terminalOccurrenceKey(subscriptionId);
         const observationJson = terminalObservationJson(observation, terminalKey);
-        if (subscription.definitionSchema === "SubscriptionDefinition@4") {
-          if (this.#runBinding === undefined || subscription.sourceBinding === undefined) {
-            throw new Error("SubscriptionDefinition@4 Run binding adapter is unavailable");
+        if (subscription.definitionSchema === "SubscriptionDefinition@4" ||
+          (subscription.definitionSchema === "SubscriptionDefinition@5" &&
+            subscription.target?.kind === "steward_run")) {
+          const binding = subscription.sourceBinding ??
+            (subscription.target?.kind === "steward_run"
+              ? subscription.target.sourceBinding
+              : undefined);
+          if (this.#runBinding === undefined || binding === undefined) {
+            throw new Error("Subscription Steward Run target adapter is unavailable");
           }
           const receipt = activateSubscriptionOccurrenceInTransaction({
             adapter: this.#runBinding,
-            binding: subscription.sourceBinding,
+            binding,
             subscriptionId,
             occurrenceKey: terminalKey,
             observation: JSON.parse(observationJson) as unknown,
@@ -336,6 +414,36 @@ export class SubscriptionStore {
           `).run(
             terminalKey, observationJson, receipt.cycleId, JSON.stringify(receipt),
             timestamp, subscriptionId
+          );
+        } else if (subscription.definitionSchema === "SubscriptionDefinition@5" &&
+          subscription.target?.kind === "application_action") {
+          if (this.#actions === undefined) {
+            throw new Error("Subscription application action target adapter is unavailable");
+          }
+          const receipt = this.#actions.executeInTransaction({
+            target: subscription.target,
+            source: {
+              kind: "subscription",
+              id: subscriptionId,
+              definitionRevision: `SubscriptionDefinition@5:${subscription.definitionRevision}`
+            },
+            occurrenceKey: terminalKey,
+            observation: JSON.parse(observationJson) as unknown,
+            at: timestamp
+          });
+          this.#database.prepare(`
+            UPDATE subscriptions SET status = ?, terminal_key = ?,
+              terminal_observation_json = ?, callback_phase_status = ?,
+              latest_error = ?, updated_at = ?
+            WHERE subscription_id = ? AND status = 'active' AND terminal_key IS NULL
+          `).run(
+            receipt.status === "failed" ? "blocked" : "completed",
+            terminalKey,
+            observationJson,
+            receipt.status === "failed" ? "completed_with_errors" : "completed",
+            receipt.error ?? null,
+            timestamp,
+            subscriptionId
           );
         } else {
           const owner = { kind: "subscription" as const, id: subscriptionId, revision: 1 };
@@ -423,7 +531,9 @@ export class SubscriptionStore {
       SELECT subscription.*
       FROM subscriptions AS subscription
       LEFT JOIN agent_runs AS run ON run.run_id = subscription.agent_run_id
-      WHERE subscription.definition_schema = 'SubscriptionDefinition@4'
+      WHERE subscription.definition_schema IN (
+        'SubscriptionDefinition@4', 'SubscriptionDefinition@5'
+      ) AND subscription.agent_run_id IS NOT NULL
         AND (
           (subscription.cycle_id IS NOT NULL
             AND subscription.callback_phase_status IN ('pending', 'running'))
@@ -433,13 +543,18 @@ export class SubscriptionStore {
         )
       ORDER BY subscription.updated_at, subscription.subscription_id
       LIMIT 100
-    `).all() as unknown as SubscriptionRow[]).map(mapSubscription);
+    `).all() as unknown as SubscriptionRow[]).map((row) => this.#map(row));
     for (const subscription of candidates) {
       const runId = subscription.agentRunId!;
       const run = this.#runBinding.runState(runId);
       if (run !== undefined && terminalRunStatus(run.status) &&
         (subscription.status === "active" || subscription.status === "paused")) {
-        const action = subscription.sourceBinding!.cancellationPolicy === "cancel_source"
+        const binding = subscription.sourceBinding ??
+          (subscription.target?.kind === "steward_run"
+            ? subscription.target.sourceBinding
+            : undefined);
+        if (binding === undefined) continue;
+        const action = binding.cancellationPolicy === "cancel_source"
           ? "cancel"
           : subscription.status === "active"
             ? "pause"
@@ -464,7 +579,9 @@ export class SubscriptionStore {
       const update = this.#database.prepare(`
         UPDATE subscriptions
         SET callback_phase_status = ?, latest_error = ?, updated_at = ?
-        WHERE subscription_id = ? AND definition_schema = 'SubscriptionDefinition@4'
+        WHERE subscription_id = ? AND definition_schema IN (
+          'SubscriptionDefinition@4', 'SubscriptionDefinition@5'
+        )
           AND cycle_id = ? AND callback_phase_status != ?
       `).run(
         phase, error, timestamp, subscription.subscriptionId,
@@ -534,6 +651,21 @@ export class SubscriptionStore {
       )
     `).run(at, at);
   }
+
+  #map(row: SubscriptionRow): FreeSubscription {
+    const subscription = mapSubscription(row);
+    if (subscription.definitionSchema !== "SubscriptionDefinition@5" ||
+      subscription.target?.kind !== "application_action" ||
+      subscription.terminalKey === undefined || this.#actions === undefined) {
+      return subscription;
+    }
+    const receipt = this.#actions.receipt({
+      kind: "subscription",
+      id: subscription.subscriptionId,
+      definitionRevision: `SubscriptionDefinition@5:${subscription.definitionRevision}`
+    }, subscription.terminalKey);
+    return receipt === undefined ? subscription : { ...subscription, actionReceipt: receipt };
+  }
 }
 
 function mapSubscription(row: SubscriptionRow): FreeSubscription {
@@ -546,6 +678,13 @@ function mapSubscription(row: SubscriptionRow): FreeSubscription {
   const sourceBinding = row.source_binding_json === null
     ? undefined
     : parseRunSourceBinding(JSON.parse(row.source_binding_json) as unknown);
+  const target = row.target_json === null
+    ? undefined
+    : parseProactiveTarget(JSON.parse(row.target_json) as unknown, {
+        kind: "subscription",
+        id: row.subscription_id,
+        definitionRevision: `SubscriptionDefinition@5:${row.definition_revision}`
+      });
   const admissionReceipt = row.admission_receipt_json === null
     ? undefined
     : parseSubscriptionOccurrenceAdmissionReceipt(
@@ -561,6 +700,7 @@ function mapSubscription(row: SubscriptionRow): FreeSubscription {
       ownerAgentId: requireNonEmpty(row.owner_agent_id, "ownerAgentId")
     }),
     ...(sourceBinding === undefined ? {} : { sourceBinding }),
+    ...(target === undefined ? {} : { target }),
     ...(row.agent_run_id === null ? {} : { agentRunId: row.agent_run_id }),
     ...(row.cycle_id === null ? {} : { cycleId: row.cycle_id }),
     ...(admissionReceipt === undefined ? {} : { admissionReceipt }),
@@ -610,6 +750,24 @@ function validateBoundDefinition(
   }
 }
 
+function validateTargetedDefinition(
+  input: TargetedSubscriptionDefinition & { readonly subscriptionId: string }
+): void {
+  if (input.schemaVersion !== "SubscriptionDefinition@5") {
+    throw new Error("SubscriptionDefinition@5 schemaVersion is required");
+  }
+  validateDefinitionBase(input);
+  const target = parseProactiveTarget(input.target, {
+    kind: "subscription",
+    id: input.subscriptionId,
+    definitionRevision: `SubscriptionDefinition@5:${input.revision}`
+  });
+  const binding = proactiveTargetRunBinding(target);
+  if (binding !== undefined && binding.occurrencePolicy !== "one_shot") {
+    throw new Error("SubscriptionDefinition@5 target must be one_shot");
+  }
+}
+
 function validateDefinition(input: FreeSubscriptionDefinition): void {
   if (input.schemaVersion !== 3) throw new Error("schemaVersion must be 3");
   validateDefinitionBase(input);
@@ -624,7 +782,11 @@ function validateDefinition(input: FreeSubscriptionDefinition): void {
   }
 }
 
-function validateDefinitionBase(input: FreeSubscriptionDefinition | BoundSubscriptionDefinition): void {
+function validateDefinitionBase(input:
+  | FreeSubscriptionDefinition
+  | BoundSubscriptionDefinition
+  | TargetedSubscriptionDefinition
+): void {
   requireNonEmpty(input.revision, "revision");
   const title = requireNonEmpty(input.title, "title");
   if (title.length > 120) throw new Error("title must be at most 120 characters");

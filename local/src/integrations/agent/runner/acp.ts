@@ -27,7 +27,6 @@ export interface AcpRunnerOptions {
   readonly executable: string;
   readonly environment: Readonly<Record<string, string>>;
   readonly workingDirectory: string;
-  readonly timeoutMilliseconds: number;
   readonly meaningfulOutputTimeoutMilliseconds: number;
   readonly maxOutputBytes: number;
 }
@@ -39,20 +38,18 @@ export class AcpRunner implements AgentRunner {
     this.#options = options;
   }
 
-  public get defaultTimeoutMilliseconds(): number {
-    return this.#options.timeoutMilliseconds;
-  }
-
   public get defaultMeaningfulOutputTimeoutMilliseconds(): number {
     return this.#options.meaningfulOutputTimeoutMilliseconds;
   }
 
   public async invoke(request: RunnerTurnRequest): Promise<RunnerTurnReceipt> {
     const startedAt = new Date().toISOString();
-    const totalTimeoutMilliseconds = runnerTimeoutMilliseconds(
-      request.totalTimeoutMilliseconds ?? this.#options.timeoutMilliseconds,
-      "totalTimeoutMilliseconds"
-    );
+    const totalTimeoutMilliseconds = request.totalTimeoutMilliseconds === undefined
+      ? undefined
+      : runnerTimeoutMilliseconds(
+          request.totalTimeoutMilliseconds,
+          "totalTimeoutMilliseconds"
+        );
     const meaningfulOutputTimeoutMilliseconds = runnerMeaningfulTimeoutMilliseconds(
       request.meaningfulOutputTimeoutMilliseconds ??
         this.#options.meaningfulOutputTimeoutMilliseconds
@@ -125,9 +122,11 @@ export class AcpRunner implements AgentRunner {
     resetMeaningfulTimeout();
 
     let totalTimeout: NodeJS.Timeout | undefined;
-    totalTimeout = setTimeout(() => {
-      terminate("deadline", `agent invocation timed out: ${this.#options.adapterId}`);
-    }, totalTimeoutMilliseconds);
+    if (totalTimeoutMilliseconds !== undefined) {
+      totalTimeout = setTimeout(() => {
+        terminate("deadline", `agent invocation timed out: ${this.#options.adapterId}`);
+      }, totalTimeoutMilliseconds);
+    }
     const updates: acp.SessionUpdate[] = [];
     let assistantOutputBytes = 0;
     const application = acp
@@ -174,7 +173,7 @@ export class AcpRunner implements AgentRunner {
           const initialized = await context.request(acp.methods.agent.initialize, {
             protocolVersion: acp.PROTOCOL_VERSION,
             clientCapabilities: {},
-            clientInfo: { name: "Rollerskate Local", version: "0.5.6" }
+            clientInfo: { name: "Rollerskate Local", version: "0.5.7" }
           });
           if (initialized.protocolVersion !== acp.PROTOCOL_VERSION) {
             throw new Error(

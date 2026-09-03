@@ -46,7 +46,10 @@ export const TARGET_TABLES = [
   ...V60_TARGET_TABLES,
   "agent_run_cycles",
   "agent_run_decisions",
-  "legacy_trigger_migration_receipts"
+  "deterministic_action_receipts",
+  "external_workflow_executions",
+  "legacy_trigger_migration_receipts",
+  "proactive_source_migration_receipts"
 ] as const;
 
 const MIGRATION_SOURCE_TABLES = [...TARGET_TABLES, "subscription_callbacks"] as const;
@@ -84,7 +87,10 @@ export function assertSupportedSchemaShape(
   ];
   const callerRunTables = [
     "agent_run_decisions",
-    "legacy_trigger_migration_receipts"
+    "deterministic_action_receipts",
+    "external_workflow_executions",
+    "legacy_trigger_migration_receipts",
+    "proactive_source_migration_receipts"
   ];
   const excluded = version === 44
     ? new Set([

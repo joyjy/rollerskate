@@ -248,7 +248,7 @@ describe("Schedule view", () => {
     const wrapper = mount(SchedulesView, { global: { plugins: [router] } });
     await flushPromises();
 
-    expect(wrapper.text()).toContain("Schedule only owns timing");
+    expect(wrapper.text()).toContain("Schedule owns timing and occurrence identity");
     expect(wrapper.text()).toContain("Occurrences · 1");
     const link = wrapper.get('a[href*="runId=arun_bound"]');
     expect(link.attributes("href")).toContain("cycleId=cyc_bound");

@@ -14,8 +14,8 @@ import {
   advanceTopicActivationSchedule,
   type TopicActivationSchedule
 } from "../../modules/topic/schedule.js";
-import { sampleFreeChatCycle } from "../../modules/topic/free-chat.js";
 import { nextCronOccurrence } from "../../capabilities/scheduled-task/time.js";
+import { selectTopicActivation } from "./schedule-selection.js";
 
 export interface TopicActivationScheduleCycle {
   readonly admittedActivationEventIds: readonly string[];
@@ -82,10 +82,8 @@ export class TopicActivationScheduleRuntime {
             current, occurrenceKey, scheduledFor, "no-eligible-participant", at, at
           );
         }
-        const sample = sampleFreeChatCycle({
-          modeId: `${current.scheduleId}:${occurrenceKey}`,
-          cycleIndex: 1,
-          sampledAt: scheduledFor,
+        const selection = selectTopicActivation({
+          selectionId: `${current.scheduleId}:${occurrenceKey}:v1`,
           governanceRevision: governance.revision,
           intentPolicy: current.intentPolicy,
           candidates,
@@ -96,14 +94,14 @@ export class TopicActivationScheduleRuntime {
         const candidateAgentIds = current.candidatePolicy === "all_available"
           ? candidates.map(({ agentId }) => agentId).sort()
           : current.candidatePolicy === "deterministic_one"
-            ? sample.candidateAgentIds.slice(0, 1)
-            : sample.candidateAgentIds;
+            ? selection.candidateAgentIds.slice(0, 1)
+            : selection.candidateAgentIds;
         const key = `topic-schedule:${current.scheduleId}:${occurrenceKey}`;
         const activation = this.#runtime.createChatActivationInTransaction({
           topicId: current.topicId,
           reason: "scheduled",
           strategyId: "scheduled",
-          conversationIntent: parseConversationIntentSnapshot(sample.conversationIntent),
+          conversationIntent: parseConversationIntentSnapshot(selection.conversationIntent),
           candidateAgentIds,
           sequentialDispatch: current.candidatePolicy === "sampled_sequential",
           idempotencyKey: key,

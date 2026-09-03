@@ -7,7 +7,7 @@ import test from "node:test";
 
 import { initializeRuntimeSchema } from "../src/infrastructure/sqlite/schema.js";
 
-test("schema v69 adds durable legacy trigger migration receipts", () => {
+test("schema v72 adds durable legacy trigger migration receipts", () => {
   const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v68-"));
   const databasePath = join(directory, "runtime.db");
   try {
@@ -22,7 +22,7 @@ test("schema v69 adds durable legacy trigger migration receipts", () => {
       legacy.close();
     }
     const diagnostics = initializeRuntimeSchema(databasePath);
-    assert.equal(diagnostics.schemaVersion, 69);
+    assert.equal(diagnostics.schemaVersion, 72);
     const current = new DatabaseSync(databasePath);
     try {
       const table = current.prepare(`

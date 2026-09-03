@@ -8,6 +8,8 @@ import {
 } from "../../infrastructure/runtime/config.js";
 import { SubscriptionStore } from "../../capabilities/subscription/store.js";
 import { CallbackStore } from "../../infrastructure/callback/store.js";
+import { ExternalWorkflowStore } from
+  "../../infrastructure/proactive/external-workflow-store.js";
 import { ScheduledTaskStore } from "../../capabilities/scheduled-task/store.js";
 import { readLoopStatus, type LoopStatus } from "../../core/loop.js";
 import { RuntimeStore } from "../../core/runtime/store.js";
@@ -18,6 +20,7 @@ import {
   runtimeOperationsView,
   type RuntimeControlResultView
 } from "./query.js";
+import { openRuntimeDatabase } from "../../infrastructure/sqlite/database.js";
 
 export interface RuntimeActivity {
   readonly events: number;
@@ -86,18 +89,35 @@ export function reconcileRuntime(
   repoRoot: string,
   runtimeDirectory?: string
 ): number {
+  const result = reconcileRuntimeResult(repoRoot, runtimeDirectory);
+  return result.recovered + result.failed + result.leftUnknown;
+}
+
+function reconcileRuntimeResult(
+  repoRoot: string,
+  runtimeDirectory?: string
+): { readonly recovered: number; readonly failed: number; readonly leftUnknown: number } {
   const paths = runtimePaths(repoRoot, runtimeDirectory);
   const callbacks = new CallbackStore(paths.database);
   const subscriptions = new SubscriptionStore(paths.database);
   const schedules = new ScheduledTaskStore(paths.database);
   const runtime = new RuntimeStore(paths.database);
+  const workflowDatabase = openRuntimeDatabase(paths.database);
+  const workflows = new ExternalWorkflowStore(workflowDatabase);
   try {
-    const recovered = schedules.reconcileInterrupted() +
+    const workflowRecovery = workflows.recoverInterrupted();
+    const recovered = workflowRecovery.retried.length +
+      schedules.reconcileInterrupted() +
       runtime.reconcileInterrupted() +
       callbacks.reconcileInterrupted();
     subscriptions.reconcileCallbacks();
-    return recovered;
+    return {
+      recovered,
+      failed: workflowRecovery.failed.length,
+      leftUnknown: workflowRecovery.unknown.length
+    };
   } finally {
+    workflowDatabase.close();
     subscriptions.close();
     runtime.close();
     schedules.close();
@@ -126,14 +146,13 @@ export function controlRuntime(
     throw new Error(`Runtime cannot ${action} while status is ${current.status}`);
   }
   if (action === "recover") {
-    const recovered = reconcileRuntime(repoRoot, runtimeDirectory);
+    const result = reconcileRuntimeResult(repoRoot, runtimeDirectory);
+    const total = result.recovered + result.failed + result.leftUnknown;
     return {
       kind: "recover",
       status: "succeeded",
-      message: `Reconciled ${recovered} interrupted item(s).`,
-      recovered,
-      leftUnknown: 0,
-      failed: 0
+      message: `Reconciled ${total} interrupted item(s).`,
+      ...result
     };
   }
   setLoopPaused(repoRoot, action === "pause", runtimeDirectory);

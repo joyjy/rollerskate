@@ -1,16 +1,22 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 import {
-  activateLocalChat,
   dispatchLocalChatMessage,
   handoffLocalChatMessageToRun,
   localChatPresenceView,
   localChatView,
   postLocalChatMessage,
-  resumeAndWakeLocalChat,
   rotateLocalAgentSession,
   setLocalChatPresence
 } from "../../application/chat/control.js";
+import {
+  confirmLocalChatRunProposal,
+  declineLocalChatRunProposal,
+  preflightLocalChatRunProposal
+} from
+  "../../application/chat/run-proposal-control.js";
+import type { ChatRunWorkspaceSelection } from
+  "../../application/chat/run-proposal.js";
 import {
   addLocalTopicParticipant,
   pauseLocalTopic,
@@ -20,13 +26,6 @@ import {
 } from "../../application/topic/governance-control.js";
 import { inspectLocalTopicGovernance } from
   "../../application/topic/governance-query.js";
-import {
-  continueLocalFreeChatNow,
-  exitLocalFreeChat,
-  startLocalFreeChat
-} from "../../application/topic/free-chat-control.js";
-import { inspectLocalFreeChat } from
-  "../../application/topic/free-chat-query.js";
 import {
   cancelLocalTopicActivationSchedule,
   createLocalTopicActivationSchedule,
@@ -78,10 +77,6 @@ export async function serveChatApi(
       json(response, 200, inspectLocalTopicGovernance(repoRoot, runtimeDirectory));
       return;
     }
-    if (url.pathname === "/api/chat/free-chat" && method === "GET") {
-      json(response, 200, inspectLocalFreeChat(repoRoot, runtimeDirectory));
-      return;
-    }
     if (url.pathname === "/api/chat/schedules" && method === "GET") {
       json(response, 200, localTopicActivationSchedules(repoRoot, runtimeDirectory));
       return;
@@ -112,33 +107,50 @@ export async function serveChatApi(
       ));
       return;
     }
-    if (url.pathname === "/api/chat/activate" && method === "POST") {
+    const proposalConfirmation = url.pathname.match(
+      /^\/api\/chat\/proposals\/([^/]+)\/([^/]+)\/confirm$/
+    );
+    if (proposalConfirmation !== null && method === "POST") {
       const body = await readJsonBody(request);
-      const strategy = requireString(body, "strategy");
-      if (strategy !== "starter" && strategy !== "manual") {
-        throw new Error("strategy must be starter or manual");
-      }
-      const intent = body.intent;
-      const brief = body.brief;
-      if (intent !== undefined && intent !== "continue_recent" &&
-        intent !== "choose_from_themes" && intent !== "directed") {
-        throw new Error("intent is unsupported");
-      }
-      if (intent === "directed" && (typeof brief !== "string" || brief.trim() === "")) {
-        throw new Error("directed intent requires brief");
-      }
-      if (intent !== "directed" && brief !== undefined) {
-        throw new Error("brief requires directed intent");
-      }
-      json(response, 201, activateLocalChat(repoRoot, {
-        strategy,
-        idempotencyKey: requireString(body, "idempotencyKey"),
-        ...(intent === undefined ? {} : {
-          intentPolicy: intent === "directed"
-            ? { kind: "fixed_directed", brief: brief as string }
-            : { kind: intent }
-        })
-      }, options));
+      const result = confirmLocalChatRunProposal(
+        repoRoot,
+        decodeURIComponent(proposalConfirmation[1]!),
+        decodeURIComponent(proposalConfirmation[2]!),
+        requireString(body, "revision"),
+        options,
+        parseWorkspaceSelection(body, false)
+      );
+      json(response, result.status === "duplicate" ? 200 : 201, result);
+      return;
+    }
+    const proposalDecline = url.pathname.match(
+      /^\/api\/chat\/proposals\/([^/]+)\/([^/]+)\/decline$/
+    );
+    if (proposalDecline !== null && method === "POST") {
+      const body = await readJsonBody(request);
+      const result = declineLocalChatRunProposal(
+        repoRoot,
+        decodeURIComponent(proposalDecline[1]!),
+        decodeURIComponent(proposalDecline[2]!),
+        requireString(body, "revision"),
+        options
+      );
+      json(response, result.status === "duplicate" ? 200 : 201, result);
+      return;
+    }
+    const proposalPreflight = url.pathname.match(
+      /^\/api\/chat\/proposals\/([^/]+)\/([^/]+)\/preflight$/
+    );
+    if (proposalPreflight !== null && method === "POST") {
+      const body = await readJsonBody(request);
+      json(response, 200, preflightLocalChatRunProposal(
+        repoRoot,
+        decodeURIComponent(proposalPreflight[1]!),
+        decodeURIComponent(proposalPreflight[2]!),
+        requireString(body, "revision"),
+        parseWorkspaceSelection(body, true)!,
+        options
+      ));
       return;
     }
     if (url.pathname === "/api/chat/governance/pause" && method === "POST") {
@@ -151,53 +163,6 @@ export async function serveChatApi(
       respondGovernanceControl(response, resumeLocalTopic(
         repoRoot, expectedRevision(await readJsonBody(request)), options
       ));
-      return;
-    }
-    if (url.pathname === "/api/chat/governance/resume-and-wake" && method === "POST") {
-      const body = await readJsonBody(request);
-      const result = resumeAndWakeLocalChat(
-        repoRoot,
-        expectedRevision(body),
-        requireString(body, "idempotencyKey"),
-        options
-      );
-      json(response, result.governance.outcome === "conflict" ? 409 : 200, result);
-      return;
-    }
-    if (url.pathname === "/api/chat/free-chat/start" && method === "POST") {
-      const body = await readJsonBody(request);
-      const intent = body.intent;
-      const brief = body.brief;
-      if (intent !== undefined && intent !== "continue_recent" &&
-        intent !== "choose_from_themes" && intent !== "directed") {
-        throw new Error("intent is unsupported");
-      }
-      if (intent === "directed" && (typeof brief !== "string" || brief.trim() === "")) {
-        throw new Error("directed intent requires brief");
-      }
-      const result = startLocalFreeChat(repoRoot, {
-        idempotencyKey: requireString(body, "idempotencyKey"),
-        ...(intent === undefined ? {} : {
-          intentPolicy: intent === "directed"
-            ? { kind: "fixed_directed", brief: brief as string }
-            : { kind: intent }
-        })
-      }, options);
-      json(response, result.outcome === "conflict" ? 409 : 201, result);
-      return;
-    }
-    if (url.pathname === "/api/chat/free-chat/continue-now" && method === "POST") {
-      const result = continueLocalFreeChatNow(
-        repoRoot, expectedRevision(await readJsonBody(request)), options
-      );
-      json(response, result.outcome === "conflict" ? 409 : 200, result);
-      return;
-    }
-    if (url.pathname === "/api/chat/free-chat/exit" && method === "POST") {
-      const result = exitLocalFreeChat(
-        repoRoot, expectedRevision(await readJsonBody(request)), options
-      );
-      json(response, result.outcome === "conflict" ? 409 : 200, result);
       return;
     }
     if (url.pathname === "/api/chat/schedules" && method === "POST") {
@@ -322,6 +287,29 @@ export async function serveChatApi(
   } catch (error) {
     json(response, 400, { error: error instanceof Error ? error.message : String(error) });
   }
+}
+
+function parseWorkspaceSelection(
+  body: Readonly<Record<string, unknown>>,
+  required: boolean
+): ChatRunWorkspaceSelection | undefined {
+  const kind = body.workspaceKind;
+  if (kind === undefined && !required) {
+    if (body.workspacePath !== undefined) {
+      throw new Error("workspacePath requires workspaceKind=path");
+    }
+    return undefined;
+  }
+  if (kind !== "project" && kind !== "local" && kind !== "path") {
+    throw new Error("workspaceKind must be project, local, or path");
+  }
+  if (kind !== "path") {
+    if (body.workspacePath !== undefined) {
+      throw new Error("workspacePath requires workspaceKind=path");
+    }
+    return { kind };
+  }
+  return { kind, path: requireString(body, "workspacePath") };
 }
 
 function boundedInteger(value: unknown, field: string, minimum: number, maximum: number): number {

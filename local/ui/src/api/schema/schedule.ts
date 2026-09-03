@@ -64,6 +64,8 @@ const scheduledRunViewSchema = v.object({
   agentRunStatus: v.optional(nullableString, null),
   cycleStatus: v.optional(nullableString, null),
   admissionReceipt: v.optional(v.nullable(v.unknown()), null),
+  actionReceipt: v.optional(v.nullable(v.unknown()), null),
+  externalWorkflowExecution: v.optional(v.nullable(v.unknown()), null),
   decisionReason: nullableString,
   callbacks: v.array(scheduledCallbackViewSchema),
   availableActions: v.object({
@@ -103,6 +105,7 @@ export const scheduleSummaryViewSchema = v.object({
   owner: operationAgentReferenceSchema,
   agent: v.nullable(operationAgentReferenceSchema),
   sourceBinding: v.optional(v.nullable(v.unknown()), null),
+  target: v.optional(v.nullable(v.unknown()), null),
   runCounts: v.object({
     queued: v.number(),
     running: v.number(),

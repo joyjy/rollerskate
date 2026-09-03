@@ -7,6 +7,7 @@ import {
   requireAgentRunCycleId,
   requireAgentRunId
 } from "../../../modules/steward/state-machine.js";
+import { proactiveTargetRunBinding } from "../../../modules/proactive/target.js";
 import {
   newScheduledRunId,
   requireScheduleId,
@@ -126,7 +127,9 @@ export class ScheduledRunStore {
     const revision = this.#requireRevision(input.scheduleId, input.scheduleRevision);
     const expectedAgentRunId = revision.schemaVersion === "ScheduleRevision@2"
       ? revision.sourceBinding.runId
-      : undefined;
+      : revision.schemaVersion === "ScheduleRevision@3"
+        ? proactiveTargetRunBinding(revision.target)?.runId
+        : undefined;
     if (input.agentRunId !== expectedAgentRunId) {
       throw new Error("Schedule occurrence Agent Run does not match its revision");
     }
@@ -289,7 +292,8 @@ export class ScheduledRunStore {
       SELECT 1 FROM scheduled_runs
       WHERE schedule_id = ? AND run_id != ?
         AND status IN ('queued', 'running', 'unknown')
-        AND event_id IS NOT NULL
+        AND (event_id IS NOT NULL OR
+          json_extract(definition_snapshot_json, '$.target.kind') = 'external_workflow')
       LIMIT 1
     `).get(run.scheduleId, run.runId) as { 1: number } | undefined;
     return row !== undefined;

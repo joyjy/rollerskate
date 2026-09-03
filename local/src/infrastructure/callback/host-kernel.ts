@@ -7,6 +7,7 @@ import type {
   HostCommandRequest,
   HostCommandResult
 } from "../../integrations/host-command.js";
+import { HostCommandExecutionError } from "../../integrations/host-command.js";
 
 export class HostCallbackKernel implements HostCommandExecutor {
   public async executeHostCommand(
@@ -18,8 +19,12 @@ export class HostCallbackKernel implements HostCommandExecutor {
     return runCommand({
       executable: request.executable,
       argv: request.arguments,
+      ...(request.cwd === undefined ? {} : { cwd: request.cwd }),
+      ...(request.environment === undefined ? {} : { environment: request.environment }),
       timeout: positiveInteger(request.timeoutMilliseconds, "host command timeoutMilliseconds"),
-      maxOutput: positiveInteger(request.maxOutputBytes, "host command maxOutputBytes")
+      maxOutput: positiveInteger(request.maxOutputBytes, "host command maxOutputBytes"),
+      ...(request.signal === undefined ? {} : { signal: request.signal }),
+      ...(request.stdin === undefined ? {} : { stdin: request.stdin })
     });
   }
 
@@ -83,7 +88,7 @@ function runCommand(input: {
   readonly maxOutput: number;
   readonly signal?: AbortSignal;
   readonly stdin?: string;
-}): Promise<{ readonly exitCode: number; readonly stdout: string; readonly stderr: string }> {
+}): Promise<{ readonly exitCode: 0; readonly stdout: string; readonly stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = execFile(input.executable, input.argv, {
       ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
@@ -93,11 +98,30 @@ function runCommand(input: {
       ...(input.signal === undefined ? {} : { signal: input.signal }),
       encoding: "utf8"
     }, (error, stdout, stderr) => {
-      if (error !== null) reject(error);
-      else resolve({ exitCode: 0, stdout, stderr });
+      if (error === null) {
+        resolve({ exitCode: 0, stdout, stderr });
+        return;
+      }
+      const exitCode = numericExitCode(error);
+      const unknown = input.signal?.aborted === true || exitCode === undefined ||
+        "killed" in error && error.killed === true;
+      reject(new HostCommandExecutionError({
+        message: error.message,
+        outcome: unknown ? "unknown" : "failed",
+        ...(exitCode === undefined ? {} : { exitCode }),
+        stdout,
+        stderr
+      }));
     });
     child.stdin?.end(input.stdin ?? "");
   });
+}
+
+function numericExitCode(error: Error): number | undefined {
+  if (!("code" in error) || typeof error.code !== "number") return undefined;
+  return Number.isInteger(error.code) && error.code >= 0 && error.code <= 255
+    ? error.code
+    : undefined;
 }
 
 function canonicalPath(value: string): string {

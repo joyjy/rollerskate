@@ -106,6 +106,19 @@ export interface ChatMessageEvent extends EventBase {
       readonly handle: string;
     }[];
   };
+  readonly runProposalDecision?: ChatRunProposalDecision;
+}
+
+export interface ChatRunProposalDecision {
+  readonly schema: "ChatRunProposalDecision@1";
+  readonly sourceMessageEventId: string;
+  readonly dispatchEventId: string;
+  readonly action: "declined";
+  readonly actor: {
+    readonly kind: "owner";
+    readonly principalId: string;
+  };
+  readonly decidedAt: string;
 }
 
 export interface ChatMessageTarget {
@@ -140,6 +153,29 @@ export function parseChatMessageTargets(
     throw new Error(`Chat message targets contain duplicates: ${eventId}`);
   }
   return targets;
+}
+
+export function parseChatRunProposalDecision(
+  value: unknown,
+  eventId: string
+): ChatRunProposalDecision | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value) || value.schema !== "ChatRunProposalDecision@1" ||
+    typeof value.sourceMessageEventId !== "string" ||
+    typeof value.dispatchEventId !== "string" || value.action !== "declined" ||
+    !isRecord(value.actor) || value.actor.kind !== "owner" ||
+    typeof value.actor.principalId !== "string" ||
+    typeof value.decidedAt !== "string") {
+    throw new Error(`Chat Run proposal decision is malformed: ${eventId}`);
+  }
+  return {
+    schema: "ChatRunProposalDecision@1",
+    sourceMessageEventId: value.sourceMessageEventId,
+    dispatchEventId: value.dispatchEventId,
+    action: "declined",
+    actor: { kind: "owner", principalId: value.actor.principalId },
+    decidedAt: value.decidedAt
+  };
 }
 
 export type ChatActivationReason =

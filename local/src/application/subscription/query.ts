@@ -31,6 +31,19 @@ import {
 } from "../list-page.js";
 import { openRuntimeDatabaseReadOnly } from "../../infrastructure/sqlite/database.js";
 
+export {
+  subscriptionHistory,
+  subscriptionHistoryByReference,
+  type SubscriptionHistory,
+  type SubscriptionHistoryDelivery,
+  type SubscriptionHistoryExecution,
+  type SubscriptionHistoryFire,
+  type SubscriptionHistoryQuery,
+  type SubscriptionHistoryQueryReasonCode,
+  type SubscriptionHistoryReasonCode,
+  type SubscriptionHistoryResultEvent
+} from "./history.js";
+
 export interface SubscriptionInspection {
   readonly subscription: FreeSubscription;
   readonly callbackDefinitions: readonly ProactiveCallbackDefinition[];
@@ -84,6 +97,7 @@ export interface FreeSubscriptionView {
     readonly externalRefBinding: FreeSubscription["externalRefBinding"] | null;
     readonly callbacks: readonly ProactiveCallbackDefinition[];
     readonly sourceBinding: FreeSubscription["sourceBinding"] | null;
+    readonly target: FreeSubscription["target"] | null;
   };
   readonly callbacks: readonly SubscriptionCallbackView[];
   readonly probe: SubscriptionProbeView;
@@ -95,6 +109,7 @@ export interface FreeSubscriptionView {
   readonly agentRunId: string | null;
   readonly cycleId: string | null;
   readonly admissionReceipt: FreeSubscription["admissionReceipt"] | null;
+  readonly actionReceipt: FreeSubscription["actionReceipt"] | null;
   readonly archivedAt: string | null;
   readonly availableActions: {
     readonly archive: boolean;
@@ -361,7 +376,8 @@ function subscriptionView(
       artifactDigest: subscription.probe.artifactDigest,
       externalRefBinding: subscription.externalRefBinding ?? null,
       callbacks: callbackDefinitions,
-      sourceBinding: subscription.sourceBinding ?? null
+      sourceBinding: subscription.sourceBinding ?? null,
+      target: subscription.target ?? null
     },
     callbacks: callbacks.map((callback) => subscriptionCallbackView(callback, runtime)),
     probe: {
@@ -393,6 +409,7 @@ function subscriptionView(
     agentRunId: subscription.agentRunId ?? null,
     cycleId: subscription.cycleId ?? null,
     admissionReceipt: subscription.admissionReceipt ?? null,
+    actionReceipt: subscription.actionReceipt ?? null,
     archivedAt: subscription.archivedAt ?? null,
     availableActions: {
       archive: subscription.archivedAt === undefined &&

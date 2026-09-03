@@ -7,7 +7,7 @@ import test from "node:test";
 
 import { initializeRuntimeSchema } from "../src/infrastructure/sqlite/schema.js";
 
-test("schema v69 adds archive visibility to Schedule and Subscription owners", () => {
+test("schema v72 adds archive visibility to Schedule and Subscription owners", () => {
   const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v64-"));
   const databasePath = join(directory, "runtime.db");
   try {
@@ -27,7 +27,7 @@ test("schema v69 adds archive visibility to Schedule and Subscription owners", (
       legacy.close();
     }
 
-    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 69);
+    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 72);
     const database = new DatabaseSync(databasePath, { readOnly: true });
     try {
       for (const table of ["schedules", "subscriptions", "continuous_subscriptions"]) {

@@ -38,7 +38,11 @@ describe("ChatContextPanel", () => {
           {
             principalId: futureAgent.principalId,
             handle: futureAgent.handle,
-            status: futureAgent.status
+            status: futureAgent.status,
+            lastTurn: {
+              state: "proposed",
+              at: "2026-07-31T00:00:00.000Z"
+            }
           }
         ],
         sessions: [],
@@ -55,6 +59,7 @@ describe("ChatContextPanel", () => {
     expect(rows[0]?.text()).toContain("Source unavailable");
     expect(rows[1]?.text()).toContain("@future");
     expect(rows[1]?.text()).toContain("future-client");
+    expect(rows[1]?.text()).toContain("proposed a Run");
     expect(rows[2]?.classes()).toContain("suspended");
     expect(rows[2]?.text()).toContain("Suspended");
 

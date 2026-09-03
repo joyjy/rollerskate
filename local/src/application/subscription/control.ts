@@ -118,7 +118,7 @@ export function controlSubscriptionView(
   const store = new SubscriptionStore(runtimePaths(repoRoot, runtimeDirectory).database);
   try {
     const current = store.require(subscriptionId);
-    if (action === "resume" && current.definitionSchema !== "SubscriptionDefinition@4") {
+    if (action === "resume" && current.definitionSchema === "SubscriptionDefinition@3") {
       throw new Error("legacy_trigger_execution_closed: migrate this Subscription to a bound Run");
     }
     store.setStatus(subscriptionId, action);

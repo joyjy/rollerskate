@@ -14,7 +14,7 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
-  (e: "governanceAction", action: "pause" | "resume" | "resume-and-wake"): void;
+  (e: "governanceAction", action: "pause" | "resume"): void;
   (e: "participantAction", action: "add" | "remove", agent: LocalAgent): void;
   (e: "scheduleAction", action: "pause" | "resume" | "cancel", scheduleId: string): void;
   (e: "scheduleCreate", input: {
@@ -169,12 +169,6 @@ function toLocalDateTimeInput(value: string): string {
             :disabled="pending !== null"
             @click="emit('governanceAction', 'resume')"
           >{{ pending === "governance:resume" ? "Resuming…" : "Resume" }}</button>
-          <button
-            type="button"
-            class="primary-button"
-            :disabled="pending !== null || !governance.actionAvailability.resumeAndWake"
-            @click="emit('governanceAction', 'resume-and-wake')"
-          >{{ pending === "governance:resume-and-wake" ? "Waking…" : "Resume & wake" }}</button>
         </template>
       </div>
       <small v-if="governance?.recentReceipts.at(-1)" class="receipt-line">

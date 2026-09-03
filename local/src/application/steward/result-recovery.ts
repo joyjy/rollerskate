@@ -486,7 +486,12 @@ function terminalEvidence(
             ...(invocationFailure.lastProgress === undefined
               ? {}
               : { lastProgress: invocationFailure.lastProgress }),
-            totalTimeoutMilliseconds: invocationFailure.totalTimeoutMilliseconds,
+            ...(invocationFailure.totalTimeoutMilliseconds === undefined
+              ? {}
+              : {
+                  totalTimeoutMilliseconds:
+                    invocationFailure.totalTimeoutMilliseconds
+                }),
             meaningfulOutputTimeoutMilliseconds:
               invocationFailure.meaningfulOutputTimeoutMilliseconds,
             protocolStop: invocationFailure.protocolStop,

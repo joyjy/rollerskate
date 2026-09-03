@@ -30,6 +30,9 @@ import {
 } from "../list-page.js";
 import { runtimePaths } from "../../infrastructure/runtime/config.js";
 import { openRuntimeDatabaseReadOnly } from "../../infrastructure/sqlite/database.js";
+import type { ProactiveTarget } from "../../modules/proactive/target.js";
+import { proactiveTargetRunBinding } from "../../modules/proactive/target.js";
+import type { RunSourceBinding } from "../../modules/steward/source-contract.js";
 
 export interface ScheduleSummaryView {
   readonly scheduleId: string;
@@ -45,7 +48,8 @@ export interface ScheduleSummaryView {
   readonly fixedSessionId: string | null;
   readonly owner: AgentReferenceView;
   readonly agent: AgentReferenceView | null;
-  readonly sourceBinding: ScheduleInspection["schedule"]["revision"]["sourceBinding"] | null;
+  readonly sourceBinding: RunSourceBinding | null;
+  readonly target: ProactiveTarget | null;
   readonly runCounts: Readonly<Record<ScheduledRunStatus, number>>;
   readonly availableActions: {
     readonly pause: boolean;
@@ -91,6 +95,8 @@ export interface ScheduleOccurrenceView {
   readonly agentRunStatus: string | null;
   readonly cycleStatus: string | null;
   readonly admissionReceipt: ScheduleOccurrenceInspection["run"]["admissionReceipt"] | null;
+  readonly actionReceipt: ScheduleOccurrenceInspection["run"]["actionReceipt"] | null;
+  readonly externalWorkflowExecution: ScheduleOccurrenceInspection["externalWorkflowExecution"] | null;
   readonly decisionReason: string | null;
   readonly callbacks: readonly ScheduledCallbackView[];
   readonly availableActions: {
@@ -306,7 +312,10 @@ export function scheduleSummaryView(inspection: ScheduleInspection): ScheduleSum
     agent: inspection.agent === undefined ? null : agentReference(inspection.agent),
     sourceBinding: revision.schemaVersion === "ScheduleRevision@2"
       ? revision.sourceBinding
-      : null,
+      : revision.schemaVersion === "ScheduleRevision@3"
+        ? proactiveTargetRunBinding(revision.target) ?? null
+        : null,
+    target: revision.schemaVersion === "ScheduleRevision@3" ? revision.target : null,
     runCounts,
     availableActions: {
       pause: definition.status === "active",
@@ -365,6 +374,8 @@ export function scheduleOccurrenceView(
     agentRunStatus: inspection.agentRun?.status ?? null,
     cycleStatus: inspection.cycle?.status ?? null,
     admissionReceipt: run.admissionReceipt ?? null,
+    actionReceipt: run.actionReceipt ?? null,
+    externalWorkflowExecution: inspection.externalWorkflowExecution ?? null,
     decisionReason: run.decisionReason ?? null,
     callbacks: inspection.callbacks.map(({ occurrence, delivery }) => ({
       occurrenceId: occurrence.occurrenceId,

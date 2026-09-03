@@ -63,6 +63,7 @@ export interface RuntimePaths {
   readonly clientHistoryAccess: string;
   readonly topicInbox: string;
   readonly subscriptionPlugins: string;
+  readonly externalWorkflows: string;
   readonly legacyTriggerWorkflows: string;
 }
 
@@ -111,6 +112,7 @@ export function runtimePaths(repoRoot: string, configuredRuntimeDirectory?: stri
     clientHistoryAccess: join(runtimeDirectory, "client-history-access.json"),
     topicInbox: join(runtimeDirectory, "topic-inbox.json"),
     subscriptionPlugins: join(runtimeDirectory, "subscription-plugins.json"),
+    externalWorkflows: join(runtimeDirectory, "external-workflows.json"),
     legacyTriggerWorkflows: join(runtimeDirectory, "legacy-trigger-workflows.json")
   };
 }

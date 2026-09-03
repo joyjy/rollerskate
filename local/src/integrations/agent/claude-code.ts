@@ -12,6 +12,7 @@ import {
 } from "./invocation-diagnostics.js";
 import { providerPolicyObservationFromArgv } from "./provider-policy.js";
 import {
+  stdioMcpAllowedTools,
   stdioMcpConfig,
   type StdioMcpServer
 } from "./mcp-server.js";
@@ -118,7 +119,7 @@ function claudeCodeArgs(
     : [
         "--mcp-config", stdioMcpConfig(request.mcpServers),
         "--strict-mcp-config",
-        "--allowedTools", "mcp__rollerskate_chat__read_chat_history"
+        "--allowedTools", ...stdioMcpAllowedTools(request.mcpServers)
       ];
   return request.providerSessionId === undefined
     ? [...options, ...mcpOptions]

@@ -15,7 +15,6 @@ export interface TopicParticipant {
 }
 
 export interface TopicStrategyPolicy {
-  readonly starterEnabled: boolean;
   readonly participantMessageEnabled: boolean;
   readonly scheduledEnabled: boolean;
 }
@@ -166,7 +165,6 @@ export function defaultTopicGovernance(
       governanceRevision: 1
     })),
     strategyPolicy: {
-      starterEnabled: true,
       participantMessageEnabled: true,
       scheduledEnabled: true
     },
@@ -209,7 +207,6 @@ export function parseTopicGovernance(value: unknown): TopicGovernance {
     status,
     participants,
     strategyPolicy: {
-      starterEnabled: boolean(strategy.starterEnabled, "strategyPolicy.starterEnabled"),
       participantMessageEnabled: boolean(
         strategy.participantMessageEnabled,
         "strategyPolicy.participantMessageEnabled"

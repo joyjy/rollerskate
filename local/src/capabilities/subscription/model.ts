@@ -2,6 +2,10 @@ import type { ProactiveCallbackDefinition } from "../../modules/callback/proacti
 import type { ExternalRefTriggerBinding } from
   "../../modules/external-resource/trigger-binding.js";
 import type { RunSourceBinding } from "../../modules/steward/source-contract.js";
+import type {
+  DeterministicApplicationActionReceipt,
+  ProactiveTarget
+} from "../../modules/proactive/target.js";
 
 export type SubscriptionStatus =
   | "active"
@@ -64,19 +68,32 @@ export interface BoundSubscriptionDefinition {
   readonly externalRefBinding?: ExternalRefTriggerBinding;
 }
 
+export interface TargetedSubscriptionDefinition extends Omit<
+  BoundSubscriptionDefinition,
+  "schemaVersion" | "sourceBinding"
+> {
+  readonly schemaVersion: "SubscriptionDefinition@5";
+  readonly target: ProactiveTarget;
+}
+
 export type FreeSubscriptionCallback = ProactiveCallbackDefinition;
 
 export interface FreeSubscription {
   readonly subscriptionId: string;
-  readonly definitionSchema: "SubscriptionDefinition@3" | "SubscriptionDefinition@4";
+  readonly definitionSchema:
+    | "SubscriptionDefinition@3"
+    | "SubscriptionDefinition@4"
+    | "SubscriptionDefinition@5";
   readonly definitionRevision: string;
   readonly definitionDigest: string;
   readonly title: string;
   readonly ownerAgentId?: string;
   readonly sourceBinding?: RunSourceBinding;
+  readonly target?: ProactiveTarget;
   readonly agentRunId?: string;
   readonly cycleId?: string;
   readonly admissionReceipt?: SubscriptionOccurrenceAdmissionReceipt;
+  readonly actionReceipt?: DeterministicApplicationActionReceipt;
   readonly probe: FreeSubscriptionDefinition["probe"];
   readonly externalRefBinding?: ExternalRefTriggerBinding;
   readonly intervalMilliseconds: number;

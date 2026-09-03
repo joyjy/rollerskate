@@ -91,7 +91,7 @@ test("loopback UI API reads durable Subscriptions and applies explicit control a
       failures: Array<{ owner: string }>;
     };
     assert.equal(runtimeView.status, "stopped");
-    assert.equal(runtimeView.version, "0.5.6");
+    assert.equal(runtimeView.version, "0.5.7");
     assert.deepEqual(runtimeView.controls, { pause: false, resume: false, recover: false });
     assert.ok(runtimeView.workload.ready >= 0);
     assert.ok(runtimeView.failures.every((failure) => failure.owner !== "runtime"));

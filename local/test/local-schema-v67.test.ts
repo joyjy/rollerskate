@@ -7,7 +7,7 @@ import test from "node:test";
 
 import { initializeRuntimeSchema } from "../src/infrastructure/sqlite/schema.js";
 
-test("schema v69 adds Run-bound one-shot and continuous Subscription receipts", () => {
+test("schema v72 adds Run-bound one-shot and continuous Subscription receipts", () => {
   const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v67-"));
   const databasePath = join(directory, "runtime.db");
   try {
@@ -52,7 +52,7 @@ test("schema v69 adds Run-bound one-shot and continuous Subscription receipts", 
       legacy.close();
     }
 
-    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 69);
+    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 72);
     const database = new DatabaseSync(databasePath, { readOnly: true });
     try {
       const oneShot = database.prepare(`
@@ -63,8 +63,10 @@ test("schema v69 adds Run-bound one-shot and continuous Subscription receipts", 
         WHERE type = 'table' AND name = 'continuous_subscriptions'
       `).get() as { sql: string };
       assert.match(oneShot.sql, /SubscriptionDefinition@4/u);
+      assert.match(oneShot.sql, /SubscriptionDefinition@5/u);
       assert.match(oneShot.sql, /SubscriptionOccurrenceAdmissionReceipt@1/u);
       assert.match(continuous.sql, /ContinuousSubscriptionDefinition@2/u);
+      assert.match(continuous.sql, /ContinuousSubscriptionDefinition@3/u);
       assert.match(continuous.sql, /pending_admission_receipt_json/u);
       assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
     } finally {

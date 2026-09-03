@@ -6,6 +6,9 @@ import type { ProviderPolicyObservationSnapshot } from
 type ProviderPolicyClient = "codex" | "claude-code" | "kimi-code" | "pi";
 type ProviderWorkspaceAccess = "read" | "write";
 
+const KIMI_RAW_RESULT_DIRECTIVE =
+  "The first non-whitespace character of your entire response must be the opening brace `{`";
+
 export function codexAppServerPolicyObservation(
   parameters: Readonly<Record<string, unknown>>,
   helperSource: string,
@@ -108,26 +111,58 @@ function verifiedControls(
     return { permissionMode: "plan", tools: "Read,Glob,Grep" };
   }
   if (client === "pi") {
+    for (const flag of [
+      "--no-extensions",
+      "--no-skills",
+      "--no-prompt-templates",
+      "--no-themes",
+      "--no-context-files"
+    ]) requireFlag(argv, flag, client, workspaceAccess);
     const mode = lastValue(argv, "--mode");
     if (mode !== "rpc") {
       throw new Error("pi output mode provider policy is not enforced by argv");
     }
     const expected = workspaceAccess === "write"
       ? "read,write,edit,bash,grep,find,ls"
-      : "read,grep,find,ls";
+      : "read,grep,find,ls,read_git_diff";
     const actualTools = lastValue(argv, "--tools");
-    const expectedWithChatHistory = `${expected},read_chat_history`;
-    if (actualTools !== expected && actualTools !== expectedWithChatHistory) {
+    const configuredReadTools = (resources.piChatReadToolNames ?? "")
+      .split(",").filter((name) => name !== "");
+    const expectedChatToolSets = [
+      ["read_chat_history"],
+      configuredReadTools,
+      ["read_chat_history", ...configuredReadTools]
+    ].filter((names) => names.length > 0)
+      .map((names) => `${expected},${names.join(",")}`);
+    if (actualTools !== expected && !expectedChatToolSets.includes(actualTools ?? "")) {
       throw new Error(`pi ${workspaceAccess} provider policy is not enforced by argv`);
+    }
+    const chatToolsEnabled = actualTools !== expected;
+    const readGitExtension = resources.piReadonlyGitExtensionPath;
+    const chatHistoryExtension = resources.piChatHistoryExtensionPath;
+    const readGitExtensionSource = resources.piReadonlyGitExtensionSource;
+    const chatHistoryExtensionSource = resources.piChatHistoryExtensionSource;
+    if (readGitExtension === undefined || chatHistoryExtension === undefined ||
+      readGitExtensionSource === undefined || readGitExtensionSource.trim() === "" ||
+      chatHistoryExtensionSource === undefined || chatHistoryExtensionSource.trim() === "" ||
+      argv.some((argument) => argument.startsWith("--extension="))) {
+      throw new Error(`pi ${workspaceAccess} extension policy is not enforced by argv`);
+    }
+    const expectedExtensions = [
+      ...(workspaceAccess === "read" ? [readGitExtension] : []),
+      ...(chatToolsEnabled ? [chatHistoryExtension] : [])
+    ];
+    if (!sameValues(valuesAfter(argv, "--extension"), expectedExtensions)) {
+      throw new Error(`pi ${workspaceAccess} extension policy is not enforced by argv`);
     }
     reject(argv, [
       "--no-tools", "--no-builtin-tools", "--exclude-tools", "--api-key"
     ], client, workspaceAccess);
     return {
       mode: "rpc",
-      tools: actualTools,
+      tools: actualTools!,
       workspaceAccess,
-      chatHistory: actualTools === expectedWithChatHistory
+      chatHistory: actualTools?.split(",").includes("read_chat_history") ?? false
     };
   }
   if (argv.length !== 1 || argv[0] !== "acp") {
@@ -147,6 +182,7 @@ function verifiedControls(
       : ["Read", "Grep", "Glob"],
     workspaceAccess
   );
+  requireKimiRawResultDirective(agentFileContent, workspaceAccess);
   return {
     transport: "acp-v1",
     workspaceAccess,
@@ -177,6 +213,28 @@ function requireKimiTools(
   }
 }
 
+function requireKimiRawResultDirective(
+  agentFileContent: string,
+  workspaceAccess: ProviderWorkspaceAccess
+): void {
+  if (!agentFileContent.includes(KIMI_RAW_RESULT_DIRECTIVE)) {
+    throw new Error(
+      `kimi-code ${workspaceAccess} provider policy is missing the raw-result first-character directive`
+    );
+  }
+}
+
+function requireFlag(
+  argv: readonly string[],
+  flag: string,
+  client: string,
+  workspaceAccess: ProviderWorkspaceAccess = "read"
+): void {
+  if (!argv.includes(flag)) {
+    throw new Error(`${client} ${workspaceAccess} provider policy is not enforced by argv`);
+  }
+}
+
 function requireLastValue(
   argv: readonly string[],
   flag: string,
@@ -193,6 +251,19 @@ function requireLastValue(
 function lastValue(argv: readonly string[], flag: string): string | undefined {
   const index = argv.lastIndexOf(flag);
   return index < 0 ? undefined : argv[index + 1];
+}
+
+function valuesAfter(argv: readonly string[], flag: string): readonly string[] {
+  const values: string[] = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    if (argv[index] === flag && index + 1 < argv.length) values.push(argv[index + 1]!);
+  }
+  return values;
+}
+
+function sameValues(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length &&
+    left.every((value, index) => value === right[index]);
 }
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {

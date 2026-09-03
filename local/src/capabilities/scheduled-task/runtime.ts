@@ -13,6 +13,10 @@ import {
   BoundScheduleRuntime,
   type ScheduleRunBindingAdapter
 } from "./bound-runtime.js";
+import type { DeterministicApplicationActionRuntime } from
+  "../../modules/proactive/target.js";
+import type { ExternalWorkflowExecutionRuntime } from
+  "../../modules/proactive/target.js";
 
 export type { ScheduleRunBindingAdapter } from "./bound-runtime.js";
 
@@ -30,6 +34,8 @@ export class ScheduledTaskRuntime {
   readonly #validateTarget: (revision: ScheduleRevision) => string | undefined;
   readonly #externalRefGuard: ExternalRefTriggerGuard | undefined;
   readonly #bound: BoundScheduleRuntime;
+  readonly #actions: DeterministicApplicationActionRuntime | undefined;
+  readonly #workflows: ExternalWorkflowExecutionRuntime | undefined;
 
   public constructor(options: {
     readonly store: ScheduledTaskStore;
@@ -37,11 +43,15 @@ export class ScheduledTaskRuntime {
     readonly validateTarget: (revision: ScheduleRevision) => string | undefined;
     readonly externalRefGuard?: ExternalRefTriggerGuard;
     readonly runBinding?: ScheduleRunBindingAdapter;
+    readonly applicationActions?: DeterministicApplicationActionRuntime;
+    readonly externalWorkflows?: ExternalWorkflowExecutionRuntime;
   }) {
     this.#store = options.store;
     this.#runtime = options.runtime;
     this.#validateTarget = options.validateTarget;
     this.#externalRefGuard = options.externalRefGuard;
+    this.#actions = options.applicationActions;
+    this.#workflows = options.externalWorkflows;
     this.#bound = new BoundScheduleRuntime({
       store: options.store,
       ...(options.externalRefGuard === undefined
@@ -67,7 +77,9 @@ export class ScheduledTaskRuntime {
     }
 
     for (const schedule of this.#store.due(now)) {
-      if (schedule.revision.schemaVersion === "ScheduleRevision@2") {
+      if (schedule.revision.schemaVersion === "ScheduleRevision@2" ||
+        (schedule.revision.schemaVersion === "ScheduleRevision@3" &&
+          schedule.revision.target.kind === "steward_run")) {
         const result = await this.#bound.decideDue(schedule, now);
         if (result.kind === "admit") admitted.push(result.run.runId);
         if (result.kind === "failed") failed.push(result.run.runId);
@@ -96,6 +108,37 @@ export class ScheduledTaskRuntime {
     for (const schedule of this.#store.list()) {
       for (const run of this.#store.unterminatedRuns(schedule.definition.scheduleId)) {
         if (run.status === "unknown") continue;
+        if (schedule.revision.schemaVersion === "ScheduleRevision@3" &&
+          schedule.revision.target.kind === "external_workflow") {
+          const execution = this.#workflows?.execution({
+            kind: "schedule",
+            id: schedule.definition.scheduleId,
+            definitionRevision: `ScheduleRevision@3:${run.scheduleRevision}`
+          }, run.occurrenceKey);
+          if (execution === undefined) {
+            if (run.status === "running") {
+              this.#store.patchRun(run.runId, {
+                status: "unknown",
+                decisionReason: "external-workflow-execution-missing"
+              }, at);
+              projected.push(run.runId);
+            }
+            continue;
+          }
+          const status = externalWorkflowRunStatus(execution.status);
+          if (status !== undefined && (status !== run.status ||
+            execution.completedAt !== run.completedAt)) {
+            this.#store.patchRun(run.runId, {
+              status,
+              decisionReason: `external-workflow-${execution.status}`,
+              ...(execution.completedAt === undefined
+                ? {}
+                : { completedAt: execution.completedAt })
+            }, at);
+            projected.push(run.runId);
+          }
+          continue;
+        }
         if (run.agentRunId !== undefined) {
           if (this.#bound.projectOccurrence(run, schedule, at)) {
             projected.push(run.runId);
@@ -191,8 +234,10 @@ export class ScheduledTaskRuntime {
     if (firstAt === undefined || occurrenceKey === undefined) {
       throw new Error(`Active Schedule has no next occurrence: ${schedule.definition.scheduleId}`);
     }
-    if (schedule.revision.schemaVersion !== "ScheduleRevision@1") {
-      throw new Error("ScheduleRevision@2 must use Run occurrence admission");
+    if (schedule.revision.schemaVersion === "ScheduleRevision@2" ||
+      (schedule.revision.schemaVersion === "ScheduleRevision@3" &&
+        schedule.revision.target.kind === "steward_run")) {
+      throw new Error("Schedule Steward Run target must use Run occurrence admission");
     }
     const latest = schedule.revision.kind === "cron"
       ? latestCronOccurrence(
@@ -234,10 +279,15 @@ export class ScheduledTaskRuntime {
       };
     } else {
       const ownActive = this.#store.unterminatedRuns(schedule.definition.scheduleId)
-        .some((run) => run.eventId !== undefined);
-      const fixedActive = schedule.revision.fixedSessionId === undefined
+        .some((run) => run.eventId !== undefined ||
+          (schedule.revision.schemaVersion === "ScheduleRevision@3" &&
+            schedule.revision.target.kind === "external_workflow"));
+      const fixedSessionId = schedule.revision.schemaVersion === "ScheduleRevision@1"
+        ? schedule.revision.fixedSessionId
+        : undefined;
+      const fixedActive = fixedSessionId === undefined
         ? false
-        : this.#store.hasActiveFixedSessionRun(schedule.revision.fixedSessionId);
+        : this.#store.hasActiveFixedSessionRun(fixedSessionId);
       if (ownActive || fixedActive) {
         if (schedule.revision.overlapPolicy === "skip") {
           decision = {
@@ -316,16 +366,21 @@ export class ScheduledTaskRuntime {
       current.scheduleId,
       current.scheduleRevision
     );
-    if (revision.schemaVersion === "ScheduleRevision@2") {
+    if (revision.schemaVersion === "ScheduleRevision@2" ||
+      (revision.schemaVersion === "ScheduleRevision@3" &&
+        revision.target.kind === "steward_run")) {
       return this.#bound.admitPending(current, revision, at);
     }
     if (schedule.definition.status === "paused" &&
       !current.occurrenceKey.startsWith("manual:")) {
       return "deferred";
     }
+    const fixedSessionId = revision.schemaVersion === "ScheduleRevision@1"
+      ? revision.fixedSessionId
+      : undefined;
     if (this.#store.hasOtherActiveRun(current) ||
-      (revision.fixedSessionId !== undefined &&
-        this.#store.hasOtherActiveFixedSessionRun(current, revision.fixedSessionId))) {
+      (fixedSessionId !== undefined &&
+        this.#store.hasOtherActiveFixedSessionRun(current, fixedSessionId))) {
       return "deferred";
     }
     const invalid = this.#validateTarget(revision);
@@ -365,6 +420,93 @@ export class ScheduledTaskRuntime {
         return "failed";
       }
     }
+    if (revision.schemaVersion === "ScheduleRevision@3" &&
+      revision.target.kind === "application_action") {
+      const target = revision.target;
+      if (this.#actions === undefined) {
+        this.#store.patchRun(current.runId, {
+          status: "failed",
+          decisionReason: "application-action-registry-unavailable",
+          completedAt: at
+        }, at);
+        return "failed";
+      }
+      return this.#store.withImmediateTransaction(() => {
+        const latest = this.#store.requireRun(current.runId);
+        if (latest.status !== "queued") return "deferred" as const;
+        const receipt = this.#actions!.executeInTransaction({
+          target,
+          source: {
+            kind: "schedule",
+            id: revision.scheduleId,
+            definitionRevision: `ScheduleRevision@3:${revision.revision}`
+          },
+          occurrenceKey: latest.occurrenceKey,
+          observation: {
+            scheduledFor: latest.scheduledFor,
+            ...(latest.coalescedThrough === undefined
+              ? {}
+              : { coalescedThrough: latest.coalescedThrough })
+          },
+          at
+        });
+        const status = receipt.status === "failed"
+          ? "failed"
+          : receipt.status === "skipped"
+            ? "skipped"
+            : "succeeded";
+        this.#store.patchRun(latest.runId, {
+          status,
+          admittedAt: at,
+          decisionReason: `application-action-${receipt.status}`,
+          completedAt: receipt.completedAt
+        }, at);
+        return receipt.status === "failed"
+          ? "failed" as const
+          : receipt.status === "skipped"
+            ? "skipped" as const
+            : "admitted" as const;
+      });
+    }
+    if (revision.schemaVersion === "ScheduleRevision@3" &&
+      revision.target.kind === "external_workflow") {
+      const target = revision.target;
+      if (this.#workflows === undefined) {
+        this.#store.patchRun(current.runId, {
+          status: "failed",
+          decisionReason: "external-workflow-runtime-unavailable",
+          completedAt: at
+        }, at);
+        return "failed";
+      }
+      return this.#store.withImmediateTransaction(() => {
+        const latest = this.#store.requireRun(current.runId);
+        if (latest.status !== "queued") return "deferred" as const;
+        this.#workflows!.enqueueInTransaction({
+          target,
+          source: {
+            kind: "schedule",
+            id: revision.scheduleId,
+            definitionRevision: `ScheduleRevision@3:${revision.revision}`
+          },
+          occurrenceKey: latest.occurrenceKey,
+          observation: {
+            schemaVersion: "ScheduleWorkflowObservation@1",
+            scheduledFor: latest.scheduledFor,
+            ...(latest.coalescedThrough === undefined
+              ? {}
+              : { coalescedThrough: latest.coalescedThrough })
+          },
+          at
+        });
+        this.#store.patchRun(latest.runId, {
+          status: "running",
+          admittedAt: at,
+          decisionReason: "external-workflow-queued"
+        }, at);
+        return "admitted" as const;
+      });
+    }
     const admitted = this.#store.admitCallbackRun(current.runId, at);
     const callback = this.#store.admitSingleAgentCallback(admitted, at);
     if (callback?.eventId !== undefined) {
@@ -380,6 +522,16 @@ export class ScheduledTaskRuntime {
     }
     return "admitted";
   }
+}
+
+function externalWorkflowRunStatus(
+  status: "queued" | "claimed" | "running" | "retry_wait" |
+    "succeeded" | "failed" | "unknown"
+): "running" | "succeeded" | "failed" | "unknown" | undefined {
+  if (status === "succeeded" || status === "failed" || status === "unknown") return status;
+  if (status === "queued" || status === "claimed" || status === "running" ||
+    status === "retry_wait") return "running";
+  return undefined;
 }
 
 function message(error: unknown): string {

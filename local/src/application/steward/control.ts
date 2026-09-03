@@ -2,6 +2,10 @@ import { realpathSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 
+import type {
+  AgentRequestEvent,
+  AgentResultEvent
+} from "../../core/event/model.js";
 import { workspaceRevision } from "../../infrastructure/workspace/revision.js";
 import {
   runtimeId,
@@ -48,6 +52,11 @@ import {
   type StewardDelegateTarget
 } from "./prompt.js";
 import { applyRunDecisionInTransaction } from "./decision.js";
+import {
+  queueStewardOrchestratorRetryInTransaction,
+  stewardOrchestratorRetryPrompt,
+  type StewardOrchestratorRetryReceipt
+} from "./orchestrator-retry.js";
 
 export interface StartStewardRunInput {
   readonly requestId: string;
@@ -109,6 +118,11 @@ export interface CloseStewardRunSeriesReceipt {
 export interface SetStewardRunArchivedReceipt {
   readonly run: AgentRunProjection;
   readonly status: "archived" | "unarchived" | "unchanged";
+}
+
+export interface RetryStewardOrchestratorReceipt extends
+  StewardOrchestratorRetryReceipt {
+  readonly run: AgentRunProjection;
 }
 
 export interface SubmitCallerRunDecisionInput {
@@ -604,6 +618,98 @@ export function cancelStewardRun(
           at
         )
       };
+    });
+  } finally {
+    runs.close();
+    runtime.close();
+    database.close();
+  }
+}
+
+export function retryStewardOrchestrator(
+  repoRoot: string,
+  runId: string,
+  requestIdInput: string,
+  runtimeDirectory?: string,
+  at = new Date().toISOString()
+): RetryStewardOrchestratorReceipt {
+  const requestId = text(requestIdInput, "requestId", 256);
+  const timestamp = iso(at);
+  const database = openRuntimeDatabase(runtimePaths(repoRoot, runtimeDirectory).database);
+  const runtime = new RuntimeStore(database);
+  const runs = new AgentRunStore(database);
+  try {
+    return runtime.withImmediateTransaction(() => {
+      const run = runs.requireProjection(runId);
+      const binding = run.orchestratorBinding;
+      if (binding?.schemaVersion !== "OrchestratorBinding@3") {
+        throw new Error("Run is not OrchestratorBinding@3 Steward orchestration");
+      }
+      const events = runtime.eventsForRoot(run.rootEventId);
+      const externalId = `agent-run:${run.runId}:manual-orchestrator-retry:${requestId}`;
+      const replayEvent = events.find((event): event is AgentRequestEvent =>
+        event.type === "agent.request" && event.source.externalId === externalId
+      );
+      if (replayEvent !== undefined) {
+        const replayExecution = runtime.executionForEvent(replayEvent.eventId);
+        if (replayExecution === undefined) {
+          throw new Error("Manual Steward retry Execution is missing");
+        }
+        return {
+          status: "duplicate",
+          eventId: replayEvent.eventId,
+          executionId: replayExecution.executionId,
+          resumedSession: replayEvent.sessionId !== undefined,
+          run
+        };
+      }
+      if (run.status !== "awaiting_orchestrator" || run.activeStepId === undefined ||
+        run.stepCount !== 0 ||
+        run.checkpoint !== undefined || run.workspaceGrant?.access === "write") {
+        throw new Error(
+          "Run is not awaiting its initial read-only Steward decision"
+        );
+      }
+      if (run.deadlineAt !== undefined &&
+        Date.parse(timestamp) >= Date.parse(run.deadlineAt)) {
+        throw new Error("Agent Run deadline exhausted");
+      }
+      const requests = events.filter((event): event is AgentRequestEvent =>
+        event.type === "agent.request" &&
+        event.agentId === binding.orchestratorRef.agentId &&
+        event.runContext?.runId === run.runId &&
+        event.runContext?.cycleId === run.activeCycleId &&
+        event.runContext?.stepId === run.activeStepId
+      );
+      const request = requests.at(-1);
+      if (request === undefined) {
+        throw new Error("Active initial Steward request is missing");
+      }
+      const result = events.findLast((event): event is AgentResultEvent =>
+        event.type === "agent.result" &&
+        event.causality.parentEventId === request.eventId
+      );
+      if (result === undefined) {
+        throw new Error("Latest initial Steward request is not terminal");
+      }
+      const agentExecution = runtime.executionForEvent(request.eventId);
+      const resultExecution = runtime.executionForEvent(result.eventId);
+      if (agentExecution === undefined || resultExecution?.status !== "succeeded") {
+        throw new Error("Latest initial Steward result has not settled");
+      }
+      const retry = queueStewardOrchestratorRetryInTransaction({
+        runtime,
+        request,
+        result,
+        agentExecution,
+        source: {
+          kind: "cli",
+          externalId
+        },
+        prompt: stewardOrchestratorRetryPrompt(runs, run),
+        at: timestamp
+      });
+      return { ...retry, run };
     });
   } finally {
     runs.close();

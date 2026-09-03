@@ -100,6 +100,7 @@ function lastTurnLabel(agent: LocalAgent): string {
   if (turn === undefined) return "No turn yet";
   if (turn.state === "thinking") return "Thinking now";
   if (turn.state === "replied") return "Last turn · contributed";
+  if (turn.state === "proposed") return "Last turn · proposed a Run";
   if (turn.state === "silent") {
     return `Last turn · stayed silent${turn.reason === undefined ? "" : ` · ${turn.reason}`}`;
   }

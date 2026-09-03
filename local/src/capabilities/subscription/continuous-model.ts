@@ -6,6 +6,10 @@ import type {
   SubscriptionOccurrenceAdmissionReceipt
 } from "./model.js";
 import type { RunSourceBinding } from "../../modules/steward/source-contract.js";
+import type {
+  DeterministicApplicationActionReceipt,
+  ProactiveTarget
+} from "../../modules/proactive/target.js";
 import type { PollObservation } from "./plugin-contract.js";
 
 export interface LegacyContinuousSubscriptionDefinition {
@@ -36,9 +40,18 @@ export interface BoundContinuousSubscriptionDefinition {
   readonly externalRefBinding?: ExternalRefTriggerBinding;
 }
 
+export interface TargetedContinuousSubscriptionDefinition extends Omit<
+  BoundContinuousSubscriptionDefinition,
+  "schemaVersion" | "sourceBinding"
+> {
+  readonly schemaVersion: "ContinuousSubscriptionDefinition@3";
+  readonly target: ProactiveTarget;
+}
+
 export type ContinuousSubscriptionDefinition =
   | LegacyContinuousSubscriptionDefinition
-  | BoundContinuousSubscriptionDefinition;
+  | BoundContinuousSubscriptionDefinition
+  | TargetedContinuousSubscriptionDefinition;
 
 export interface ContinuousSubscription {
   readonly subscriptionId: string;
@@ -54,6 +67,7 @@ export interface ContinuousSubscription {
   readonly agentRunId?: string;
   readonly pendingCycleId?: string;
   readonly pendingAdmissionReceipt?: SubscriptionOccurrenceAdmissionReceipt;
+  readonly latestActionReceipt?: DeterministicApplicationActionReceipt;
   readonly latestError?: string;
   readonly createdAt: string;
   readonly updatedAt: string;

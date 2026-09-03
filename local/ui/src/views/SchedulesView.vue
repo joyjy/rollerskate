@@ -245,6 +245,18 @@ function runConversationCompletedAt(run: ScheduledRunViewOutput): string | null 
 function runConversationError(run: ScheduledRunViewOutput): string | null {
   return run.audit?.resultEvent?.error ?? run.audit?.execution?.lastError ?? null;
 }
+
+function proactiveTargetKind(value: unknown): string | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const kind = (value as Record<string, unknown>).kind;
+  return typeof kind === "string" ? kind : null;
+}
+
+function externalExecution(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
 </script>
 
 <template>
@@ -328,9 +340,10 @@ function runConversationError(run: ScheduledRunViewOutput): string | null {
           <div><span class="detail-label">Expression</span><strong class="mono compact-ref">{{ detail.summary.expression }}</strong></div>
           <div><span class="detail-label">Timezone</span><strong>{{ detail.summary.timezone ?? "explicit offset" }}</strong></div>
           <div v-if="detail.summary.agent"><span class="detail-label">Legacy target</span><strong>@{{ detail.summary.agent.handle }}</strong><span class="dim">{{ detail.summary.agent.client }}</span></div>
-          <div v-else><span class="detail-label">Execution owner</span><strong>Bound Steward Run</strong><span class="dim">Schedule only owns timing</span></div>
+          <div v-else><span class="detail-label">Execution owner</span><strong>{{ proactiveTargetKind(detail.summary.target) === "external_workflow" ? "Owner external workflow" : proactiveTargetKind(detail.summary.target) === "application_action" ? "Owner application action" : "Bound Steward Run" }}</strong><span class="dim">Schedule owns timing and occurrence identity</span></div>
           <div v-if="detail.summary.sessionPolicy"><span class="detail-label">Legacy session</span><strong>{{ detail.summary.sessionPolicy }}</strong><span class="mono compact-ref">{{ detail.summary.fixedSessionId ?? "new per run" }}</span></div>
-          <div v-else><span class="detail-label">Source binding</span><strong>RunSourceBinding@1</strong></div>
+          <div v-else-if="detail.summary.sourceBinding"><span class="detail-label">Source binding</span><strong>RunSourceBinding@1</strong></div>
+          <div v-else><span class="detail-label">Target contract</span><strong>ProactiveTarget@1</strong></div>
           <div><span class="detail-label">Misfire</span><strong>{{ detail.revision.misfirePolicy }}</strong><span class="dim">{{ detail.revision.misfireGraceMilliseconds }}ms grace</span></div>
           <div><span class="detail-label">Overlap</span><strong>{{ detail.revision.overlapPolicy }}</strong></div>
         </section>
@@ -338,7 +351,10 @@ function runConversationError(run: ScheduledRunViewOutput): string | null {
         <details class="diagnostics-disclosure">
           <summary>Definition</summary>
           <div class="definition-body">
-            <template v-if="detail.summary.sourceBinding">
+            <template v-if="detail.summary.target">
+              <pre class="mono callback-receipt">{{ JSON.stringify(detail.summary.target, null, 2) }}</pre>
+            </template>
+            <template v-else-if="detail.summary.sourceBinding">
               <pre class="mono callback-receipt">{{ JSON.stringify(detail.summary.sourceBinding, null, 2) }}</pre>
             </template>
             <template v-else>
@@ -378,6 +394,10 @@ function runConversationError(run: ScheduledRunViewOutput): string | null {
                 <button type="button" class="text-button" :disabled="busy" @click="resolveRun(run, 'succeeded')">Resolve succeeded</button>
                 <button type="button" class="text-button danger" :disabled="busy" @click="resolveRun(run, 'failed')">Resolve failed</button>
               </div>
+              <details v-if="externalExecution(run.externalWorkflowExecution)" class="diagnostics-disclosure">
+                <summary>External workflow · {{ externalExecution(run.externalWorkflowExecution)?.status }}</summary>
+                <pre class="mono callback-receipt">{{ JSON.stringify(run.externalWorkflowExecution, null, 2) }}</pre>
+              </details>
               <details v-if="run.callbacks.length > 0" class="diagnostics-disclosure">
                 <summary>Callbacks · {{ run.callbacks.length }}</summary>
                 <div class="callback-list">

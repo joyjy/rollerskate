@@ -62,6 +62,10 @@ import {
   agentTurnRecoveryContinuations,
   requestAgentTurnAdjudicationInTransaction
 } from "./result-recovery.js";
+import {
+  queueStewardOrchestratorRetryInTransaction,
+  stewardOrchestratorRetryPrompt
+} from "./orchestrator-retry.js";
 
 export interface RuntimeApplicationModule {
   readonly moduleId: string;
@@ -644,11 +648,19 @@ class StewardDecisionContinuation implements RuntimeAgentResultContinuation {
       const rootInitialDecision = run.status === "active" && run.stepCount === 0 &&
         run.checkpoint === undefined &&
         run.activeStepId === context.stepId && request.eventId === run.rootEventId;
+      const standaloneRetryDecision = run.status === "awaiting_orchestrator" &&
+        run.stepCount === 0 && run.checkpoint === undefined &&
+        binding.schemaVersion === "OrchestratorBinding@3" &&
+        run.activeCycleId === undefined && context.cycleId === undefined &&
+        run.activeStepId === context.stepId;
       const sourceInitialDecision = run.status === "awaiting_orchestrator" &&
         run.stepCount === 0 && run.checkpoint === undefined &&
         run.activeCycleId !== undefined && context.cycleId === run.activeCycleId &&
         run.activeStepId === context.stepId;
-      const initialDecision = rootInitialDecision || sourceInitialDecision;
+      const initialDecision = rootInitialDecision || standaloneRetryDecision ||
+        sourceInitialDecision;
+      const firstInitialDecision = sourceInitialDecision ||
+        (rootInitialDecision && binding.schemaVersion === "OrchestratorBinding@3");
       const checkpointDecision = run.status === "awaiting_orchestrator" &&
         run.checkpoint !== undefined && context.parentStepId === run.checkpoint.stepId;
       if (!initialDecision && !checkpointDecision) {
@@ -662,6 +674,14 @@ class StewardDecisionContinuation implements RuntimeAgentResultContinuation {
         return;
       }
       if (result.outcome !== "succeeded") {
+        if (firstInitialDecision && this.#queueInitialRetry(
+          execution,
+          result,
+          request,
+          run,
+          `Steward Orchestrator failed: ${result.error ?? "provider failure"}`,
+          at
+        )) return;
         this.#recordRejected(
           execution,
           run.runId,
@@ -686,11 +706,20 @@ class StewardDecisionContinuation implements RuntimeAgentResultContinuation {
         }
         decision = parsed;
       } catch (error) {
+        const contractError = `Invalid ${this.resultContractId}: ${errorMessage(error)}`;
+        if (firstInitialDecision && this.#queueInitialRetry(
+          execution,
+          result,
+          request,
+          run,
+          contractError,
+          at
+        )) return;
         this.#recordRejected(
           execution,
           run.runId,
           context.stepId,
-          `Invalid ${this.resultContractId}: ${errorMessage(error)}`,
+          contractError,
           at,
           rootInitialDecision ? run : undefined
         );
@@ -709,11 +738,20 @@ class StewardDecisionContinuation implements RuntimeAgentResultContinuation {
           stepMandateSnapshot(decision.nextStep.mandate);
         }
       } catch (error) {
+        const rejection = `${this.resultContractId} rejected: ${errorMessage(error)}`;
+        if (firstInitialDecision && this.#queueInitialRetry(
+          execution,
+          result,
+          request,
+          run,
+          rejection,
+          at
+        )) return;
         this.#recordRejected(
           execution,
           run.runId,
           context.stepId,
-          `${this.resultContractId} rejected: ${errorMessage(error)}`,
+          rejection,
           at,
           rootInitialDecision ? run : undefined
         );
@@ -739,6 +777,62 @@ class StewardDecisionContinuation implements RuntimeAgentResultContinuation {
       });
       this.#runtime.completeResultExecutionInTransaction(execution.executionId, at);
     });
+    return true;
+  }
+
+  #queueInitialRetry(
+    execution: RuntimeExecution,
+    result: AgentResultEvent,
+    request: AgentRequestEvent,
+    run: AgentRunProjection,
+    error: string,
+    at: string
+  ): boolean {
+    const sourceInitial = run.activeCycleId !== undefined;
+    const occurrencePrefix = `agent-run:${run.runId}:occurrence:`;
+    if ((sourceInitial && !request.source.externalId?.startsWith(occurrencePrefix)) ||
+      run.workspaceGrant?.access === "write" ||
+      (run.deadlineAt !== undefined && Date.parse(at) >= Date.parse(run.deadlineAt))) {
+      return false;
+    }
+    const agentExecution = this.#runtime.executionForEvent(request.eventId);
+    if (agentExecution === undefined) {
+      throw new Error("Steward Orchestrator Agent Execution is missing");
+    }
+    const retryRun = sourceInitial
+      ? run
+      : this.#runs.awaitInitialStewardDecisionInTransaction({
+          runId: run.runId,
+          expectedVersion: run.version,
+          expectedStepId: request.runContext!.stepId,
+          expectedExecutionId: agentExecution.executionId,
+          updatedAt: at
+        });
+    const retry = queueStewardOrchestratorRetryInTransaction({
+      runtime: this.#runtime,
+      request,
+      result,
+      agentExecution,
+      source: {
+        kind: "handler",
+        externalId: sourceInitial
+          ? `agent-run:${run.runId}:occurrence-retry:${request.runContext!.stepId}:1`
+          : `agent-run:${run.runId}:root-retry:${request.runContext!.stepId}:1`
+      },
+      prompt: stewardOrchestratorRetryPrompt(this.#runs, retryRun),
+      at
+    });
+    this.#runtime.recordExecutionReceiptInTransaction(execution.executionId, {
+      schema: "StewardOrchestratorDecisionReceipt@1",
+      runId: run.runId,
+      stepId: request.runContext!.stepId,
+      outcome: "retry_queued",
+      error: error.slice(0, 4_096),
+      retryEventId: retry.eventId,
+      retryExecutionId: retry.executionId,
+      resumedSession: retry.resumedSession
+    });
+    this.#runtime.completeResultExecutionInTransaction(execution.executionId, at);
     return true;
   }
 

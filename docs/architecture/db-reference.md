@@ -1,7 +1,7 @@
 ---
 type: Reference
 title: Rollerskate Local Database Reference
-description: Local SQLite 的 Event / index / object 建模规范，以及 schema v69 的 29 张物理表、ownership、authority 与迁移规则。
+description: Local SQLite 的 Event / index / object 建模规范，以及 schema v72 的 32 张物理表、ownership、authority 与迁移规则。
 tags: [rollerskate, local, sqlite, database, schema]
 timestamp: 2026-07-26
 ---
@@ -10,7 +10,7 @@ timestamp: 2026-07-26
 
 [返回 architecture index](./index.md)
 
-`local/src/infrastructure/sqlite/schema/` 是 Local SQLite DDL、组合版本与兼容迁移的唯一事实边界；目录内 `index.ts` 是唯一公开入口，`definition.ts`、各版本 migration 与 `introspection.ts` 分别拥有当前定义、兼容升级和 SQLite metadata helpers。外层 `schema.ts` 只负责打开数据库并调用该入口，各 Store 不再各自创建业务表。schema v69 只有下文登记的 29 张产品表，不包含 SQLite 内部表。
+`local/src/infrastructure/sqlite/schema/` 是 Local SQLite DDL、组合版本与兼容迁移的唯一事实边界；目录内 `index.ts` 是唯一公开入口，`definition.ts`、各版本 migration 与 `introspection.ts` 分别拥有当前定义、兼容升级和 SQLite metadata helpers。外层 `schema.ts` 只负责打开数据库并调用该入口，各 Store 不再各自创建业务表。schema v72 只有下文登记的 32 张产品表，不包含 SQLite 内部表。
 
 ## 物理建模总则：默认聚合，按生命周期拆分
 
@@ -82,7 +82,7 @@ Notice Center 需要独立物理表，因为 Notice 除了 Delivery/Event 派生
 
 因此 `chat_messages` 可以整表删除重建，而 `notices` 不能丢弃 read/ack 后整表重建。两者都提供独立视图，但只有 Notice 同时拥有不可重建的用户状态。
 
-## schema v69：29 张物理表
+## schema v72：32 张物理表
 
 | Table | Classification / owner | 主键与职责 |
 |---|---|---|
@@ -91,8 +91,8 @@ Notice Center 需要独立物理表，因为 Notice 除了 Delivery/Event 派生
 | `agents` | durable object / Foundation | `principal_id`；保存 Agent identity、client/config 和 current Session pointer。 |
 | `topic_governance` | durable current object / Topic governance | `topic_id`；保存 Topic status、participant roster、strategy/conversation policy 和 CAS revision。 |
 | `topic_governance_control_receipts` | immutable audit child / Topic governance | `receipt_id`；按 `(topic_id, resulting_revision)` 保存 bounded、versioned control receipt。 |
-| `free_chat_modes` | durable current object / Free Chat | `mode_id`；保存单 Topic active mode、确定性 cycle sample、intent snapshot、恢复 cursor、limits 与 CAS revision。 |
-| `free_chat_mode_receipts` | immutable audit child / Free Chat | `receipt_id`；按 `(mode_id, sequence)` 保存 start/control/advance/stop receipt。 |
+| `free_chat_modes` | inert historical object / retired Free Chat | `mode_id`；保留旧 mode snapshot；schema v70 将 active row 恰好一次转为 `stopped`，之后无 runtime writer。 |
+| `free_chat_mode_receipts` | immutable historical audit / retired Free Chat | `receipt_id`；保留旧 receipt，并为每个升级时 active mode 追加一条 `feature_retired` stop receipt。 |
 | `topic_activation_schedules` | durable current object / Topic scheduled activation | `schedule_id`；保存 once/cron intent schedule、next occurrence、candidate policy 与 CAS revision。 |
 | `topic_activation_schedule_receipts` | immutable audit child / Topic scheduled activation | `receipt_id`；按 `(schedule_id, sequence)` 与唯一 occurrence key 保存 control/admission/skip/failure receipt。 |
 | `interactive_channel_bindings` | durable authority object / Interactive Channel | `binding_id`；保存 exact Agent、channel allowlist、expiry、可选 callback Session 与 CAS revision。 |
@@ -108,12 +108,15 @@ Notice Center 需要独立物理表，因为 Notice 除了 Delivery/Event 派生
 | `chat_messages` | rebuildable projection / `application/chat` | `event_id`；保存 Timeline snapshot、attention denominator 与 Agent Execution-driven read progress，不拥有消息或用户 read state。 |
 | `deliveries` | durable work / `core/runtime` | `delivery_id`；保存 Event 或 host origin 发起的一次投递、bounded payload、Destination snapshot、retry 与外部 receipt。 |
 | `chat_presence` | durable policy / `core/chat` | `(agent_id, scope_kind, scope_id)`；保存 scoped available/snoozed 状态。 |
-| `subscriptions` | durable object / Subscription | `subscription_id`；保存严格 V3 legacy callback 或 V4 Run binding、probe policy、terminal observation、Run/cycle/admission receipt、reconcile summary 与可逆 archive visibility。 |
-| `continuous_subscriptions` | durable object / Continuous Subscription | `subscription_id`；保存严格 V1 legacy callback 或 V2 Run binding、probe policy、长期 poll lifecycle、pending observation、Run cycle receipt、source-owned checkpoint 与可逆 archive visibility。 |
+| `subscriptions` | durable object / Subscription | `subscription_id`；保存严格 V3 legacy callback、V4 Run binding 或 V5 unified target、probe policy、terminal observation、对应 receipt、reconcile summary 与可逆 archive visibility。 |
+| `continuous_subscriptions` | durable object / Continuous Subscription | `subscription_id`；保存严格 V1 legacy callback、V2 Run binding 或 V3 unified target、probe policy、长期 poll lifecycle、pending observation、target receipt、source-owned checkpoint 与可逆 archive visibility。 |
 | `proactive_callback_definitions` | immutable durable child / legacy Schedule、one-shot/Continuous Subscription | `definition_id`；按 owner revision 与 ordinal 保存共享 callback definition 和 exact grant snapshot。 |
 | `proactive_callback_occurrences` | durable work occurrence / legacy Schedule、one-shot/Continuous Subscription | `occurrence_id`；按 trigger occurrence 与 ordinal 保存 started/terminal transition、Agent Event、bounded receipt 与 crash-unknown。 |
-| `schedules` | durable current object / Scheduled Task | `schedule_id`；保存 V1 legacy callback 或 V2 Run-bound current definition、current revision、可选 fixed ExternalRef trigger binding、next occurrence 与可逆 archive visibility。 |
-| `scheduled_runs` | durable ScheduleOccurrence / Scheduled Task | `run_id`；保存 occurrence lifecycle、bounded immutable definition snapshot，以及 V2 的 Run/cycle/admission receipt link。 |
+| `deterministic_action_receipts` | immutable terminal receipt / proactive source owner | `receipt_id`；按 `(source_kind, source_id, occurrence_key)` 唯一保存 target digest、versioned action ref、succeeded/skipped/failed 与 bounded receipt。 |
+| `external_workflow_executions` | durable external work / proactive runtime | `execution_id`；按 `(source_kind, source_id, occurrence_key)` 唯一保存 fixed workflow target/observation、attempt、lease、effect boundary、terminal/unknown runtime receipt 与 manual resolution receipt。 |
+| `proactive_source_migration_receipts` | immutable migration receipt / proactive application | `receipt_id`；按稳定 `request_id` 唯一固定 legacy Schedule old revision/digest 与新 external workflow target/source revision。 |
+| `schedules` | durable current object / Scheduled Task | `schedule_id`；保存 V1 legacy callback、V2 Run binding 或 V3 unified target、current revision、可选 fixed ExternalRef trigger binding、next occurrence 与可逆 archive visibility。 |
+| `scheduled_runs` | durable ScheduleOccurrence / Scheduled Task | `run_id`；保存 occurrence lifecycle、bounded immutable definition snapshot，以及 Run target 的 cycle/admission link；action 或 external workflow receipt 由对应独立表持有。 |
 | `notices` | projection + authoritative state / `application/notice` | `notice_id`；保存 derived Notice snapshot 与 read/ack。 |
 
 ### Foundation 与 Agent continuity
@@ -130,7 +133,7 @@ Chat admission snapshot 作为 `chat.dispatch` canonical Event payload 的 bound
 
 每次治理 mutation 使用 expected revision，在一个 `BEGIN IMMEDIATE` transaction 内 CAS 更新 `topic_governance` 并追加一条 `TopicGovernanceControlReceipt@1`。receipt 独立成表，因为审计记录持续增长且写入后不可变；它只保存 action、actor、前后 revision、changed fields 与时间，不复制 current snapshot，也不成为第二个控制入口。`topic_governance_receipts_topic_revision` 支持按 Topic 读取最近 receipt。当前没有 Topic deletion/receipt retention 或 Event rebuild 入口；Runtime restart 直接恢复 current object，receipt 只用于审计。
 
-`free_chat_modes` 由 Topic application vertical 拥有，不进入 Core。每个 mode 持久化当前 cycle 的 delay、sampled Agent 顺序、conversation intent、pending activation root、meaningful activity cursor、silence/turn/cycle limits 与 revision；restart 从该 current object 恢复，只处理当前 due cycle，不回填错过的多个周期。每次 start、continue-now、activation admission、contribution/silence advance、exit 或 safety stop 都以 CAS 更新 current row，并在同一 transaction 追加 `FreeChatModeReceipt@1`。`free_chat_mode_receipts_mode_sequence` 提供稳定审计顺序；同一 Topic 由 partial unique index 限制最多一个 active mode。
+`free_chat_modes` 与 `free_chat_mode_receipts` 自 schema v70 起只是历史审计表。升级在一个 transaction 内把每个 active row CAS 为 `stopped`、保留原 state fields、增加 `stopReason=feature_retired`，并按原 sequence 追加唯一 `FreeChatModeReceipt@1`；同一 helper 重入不会再改 revision 或追加 receipt。迁移同时将 `manual`、`starter` 或旧 Free Chat root 下的 queued/retry/running Execution 终止为 `cancelled`，不删除 Event、mode 或 receipt。当前源码没有 Store、control/query、API/CLI/UI 或 loop phase 可继续写这两张表。
 
 ### Topic activation schedule 与 occurrence receipt
 
@@ -161,9 +164,11 @@ definition/grant 使用严格的 `ProactiveCallbackDefinition@1` / `ProactiveCal
 `events` 是 immutable facts，`executions` 是 mutable retry/recovery state，二者不能合并。schema v53 曾在既有 17 张表上增加 `chat.activation` Event constraint；activation 的策略、candidate snapshot、expiry 与 turn budget 都属于 immutable Event payload，不新增物理表。Chat attention receipt 列表和 Chat decision receipt 迁入对应 `executions.receipt_json`：
 
 - `ChatAttentionReceiptList@1` 属于 `chat.message` 或 `chat.activation` 的 Chat Execution；
-- `ChatDecisionReceipt@1` 属于 `chat.dispatch` 的 Agent Execution。
+- `ChatDecisionReceipt@1 | @2` 属于 `chat.dispatch` 的 Agent Execution；`@2` 只在 `speechAction=propose_run` 时携带严格 `ChatRunProposalDraft@1`。
 
 receipt 写入必须经过对应 versioned runtime parser，当前列上限为 64 KiB。新增 Handler receipt 需要定义独立 schema，不能复用任意 JSON。
+
+Chat-to-Run proposal 不增加物理表或 schema migration。每个 proposal 的 immutable fact 保存在对应 `chat.dispatch` Agent Execution 的 `ChatDecisionReceipt@2`；Owner 拒绝则追加一个携带 `ChatRunProposalDecision@1` 的 immutable system `chat.message`，以 `chat-run-proposal-decision:<sourceMessageEventId>:<dispatchEventId>` 保证逐 proposal 幂等，且不创建 Chat Execution。`application/chat` 只对 exact Owner source message + dispatch 做可重建投影。Owner 确认后，既有 `agent_runs.owner_request_id='chat-work:' || sourceMessageEventId || ':' || dispatchEventId` 是唯一 association authority；started、needs-human 与 terminal summary 都从该 row 读取，不能复制回 Chat receipt、`chat_messages` 或新的 reconcile state。
 
 Agent provider 调用的可观测信息使用 `AgentInvocationReceipt@1`，保存 exact effective prompt、调用时间与 provider 实际报告的 token/turn/tool usage；provider 没有报告的字段必须保持 absent，不能伪装成 `0`。Chat 的 Agent Execution 因为同一列已经承载 decision receipt，把同一 `AgentInvocationDiagnostics@1` 嵌入 `ChatDecisionReceipt@1.invocation`。运行中的流式调用以 `AgentInvocationProgressReceipt@1` 覆盖同一 Execution receipt，最多按固定频率保存 Session reference、阶段、最后 meaningful 时间、计数和最后进度种类；失败时由 `AgentInvocationFailureReceipt@1` 取代，追加 termination reason、total/idle budget、协议终止状态与 recovery disposition。两者都禁止保存 raw assistant/thought/tool payload。它们是 bounded execution diagnosis，不是新的 Event fact，也不建立 invocation 表；restart 不从 progress receipt 恢复正在运行的 provider work，仍按 interrupted unknown 语义终止。
 
@@ -187,7 +192,7 @@ Schedule、one-shot Subscription 与 Continuous Subscription 复用同一 visibi
 
 `agent_runs.source_binding_json` 是 Run current aggregate 内的 bounded `RunSourceBinding@1`，只能把 standalone `OrchestratorBinding@3` Run 单向提升为 single-source series；它引用 source owner 的 exact definition revision，但不复制 Schedule/Subscription 状态机。`agent_run_cycles.source_envelope_json` 是 cycle admission 时写入后不可独立修改的 bounded `TriggerOccurrenceEnvelope@1`。source occurrence Event、cycle row 和 Run `awaiting_orchestrator` CAS 必须在同一个 application transaction 内创建；`(run_id, occurrenceKey)` expression index与 `(run_id, source_revision)` constraint共同阻止重复唤醒。restart 直接恢复 Run/cycle/Event/Execution，不从时间或 transcript 重建 envelope。
 
-`mandate_snapshot_json` 是 bounded、versioned `RunMandateSnapshot@1`：保存内联 objective，或 workflow ID/version、validated inputs、rendered instruction snapshot 与 workflow 可选声明的 bounded `AgentInvocationBudget@1`。该 per-turn total timeout 随每个 workflow turn 进入 immutable `AgentRunContext@1`；adapter 只校验并执行 `1..900000ms` 上下界，workflow 未声明时继续使用 provider adapter 默认值。可选 `workspace_grant_json` 保存 Owner admission 的 canonical external root、`read | write` 与初始 revision；它不是 Agent 自行修改的配置。Run deadline、max steps、max depth 和 step count 仍是 Run current state，不与单次 provider total timeout 混用。
+`mandate_snapshot_json` 是 bounded、versioned `RunMandateSnapshot@1`：保存内联 objective，或 workflow ID/version、validated inputs、rendered instruction snapshot 与 workflow 可选声明的 bounded `AgentInvocationBudget@1`。该 per-turn total timeout 随每个 workflow turn 进入 immutable `AgentRunContext@1`；adapter 只校验并执行 `1..900000ms` 上下界。workflow 未声明时不存在绝对 invocation deadline，provider adapter 的默认 `timeoutMilliseconds` 只作为 meaningful-idle budget，持续 thought/tool/assistant/plan update 会续期。可选 `workspace_grant_json` 保存 Owner admission 的 canonical external root、`read | write` 与初始 revision；它不是 Agent 自行修改的配置。Run deadline、max steps、max depth 和 step count 仍是 Run current state，不与单次 provider total timeout 混用。
 
 autonomous `agent.request.prompt` 保存该 turn 的 active delegate roster 和 exact `AgentTurnResult@1` shape；caller admission 则把 participant roster 固定在 mandate，Worker prompt 使用 `AgentStepResult@1` 且不提供 delegate authority。Event prompt snapshot 不建立 Agent membership 表。Store 读取 mandate/workspace JSON 时必须重新校验 schemaVersion、exact fields、类型与大小，不能只依赖 `json_valid` 或 TypeScript cast。
 
@@ -207,19 +212,25 @@ Event admission 把每个 Destination 的 `destinationId/kind/address/createdAt/
 
 ### Schedule 与 ScheduleOccurrence
 
-`schedules` 只保存 current definition。`definition_schema` 区分 `ScheduleRevision@1` legacy callback 与 `ScheduleRevision@2` Run-bound definition。V1 必须保存 Agent/Session/prompt/workspace 且不得有 source binding；V2 必须清空这些 execution authority 字段，并保存 exact `RunSourceBinding@1`，其中 source ID/revision 必须与 owning Schedule/current revision 一致。`schedules_bound_run` 保证一个 Run 最多绑定一个 Schedule。
+`schedules` 只保存 current definition。V1 legacy callback 与 V2 Run binding 保持历史兼容；current `ScheduleRevision@3` 清空旧 execution authority/source-binding columns，并在 `target_json` 保存严格 `ProactiveTarget@1`。Run target 内的 source ID/revision 必须与 owning Schedule/current revision 一致；`schedules_target_run` 保证一个 Run 最多绑定一个 current Schedule。
 
-`scheduled_runs` 是兼容表名，application 主模型为 `ScheduleOccurrence`。`definition_snapshot_json` 保存实际 occurrence 使用的 `ScheduleDefinitionSnapshot@1 | @2`，当前上限 128 KiB。V2 row 保存 `agent_run_id`、唯一 `cycle_id` 与严格 `ScheduleOccurrenceAdmissionReceipt@1`；receipt 内 schedule/occurrence/run/cycle identity 必须逐项与列一致，且 V2 禁止自己的 Event/Execution/Session link。V1 row 不得保存 Run binding。Schedule occurrence、Run cycle、orchestrator Event/Execution 与 receipt 由 source application 在同一 SQLite transaction 内建立。
+`scheduled_runs` 是兼容表名，application 主模型为 `ScheduleOccurrence`。`definition_snapshot_json` 保存实际 occurrence 使用的 `ScheduleDefinitionSnapshot@1 | @2 | @3`，当前上限 128 KiB。V3 Run target row 保存 `agent_run_id`、唯一 `cycle_id` 与严格 admission receipt；V3 action target 不保存 Agent/Event/Execution/Session/cycle link，而由 `(schedule, occurrenceKey)` 关联共享 deterministic receipt；V3 external workflow target 同样不保存 Agent link，source transaction 只 enqueue 对应 `external_workflow_executions` row，terminal state 由后续 loop phase 投影回来。
 
 这避免为了未发生的配置版本维护独立 revision 表，同时保证已经 admission 的 occurrence 在 Schedule 修改后仍能准确恢复。需要完整 Schedule 配置审计历史时，应先证明产品查询与 retention 需求，再重新引入 revision log。
 
 ### Subscription 与 bound occurrence
 
-`subscriptions.definition_schema` 严格区分 `SubscriptionDefinition@3` legacy callback 与 `SubscriptionDefinition@4` Run-bound definition。V3 必须保存 owner 且不得有 source/Run/cycle receipt；V4 必须清空 owner，保存 exact `RunSourceBinding@1` 与 bound `agent_run_id`，terminal observation 后同时保存唯一 `cycle_id` 和严格 `SubscriptionOccurrenceAdmissionReceipt@1`。`subscriptions_bound_run` 保证一个 Run 最多绑定一个 one-shot Subscription。
+`subscriptions.definition_schema` 严格区分 V3 legacy callback、V4 Run binding 与 current `SubscriptionDefinition@5` unified target。V5 Run target 保存 bound `agent_run_id`，terminal observation 后保存唯一 cycle/admission receipt；V5 action target 禁止这些 Run columns，并从共享 receipt 表读取 terminal action fact。
 
-`continuous_subscriptions.definition_schema` 同样区分 `ContinuousSubscriptionDefinition@1 | @2`。V2 必须清空 owner 并保存 source binding/Run；每个 pending delta 关联 exact cycle/admission receipt，只有该 cycle succeeded 才把 pending observation 前移为 checkpoint。failed、needs-human、cancelled 或 receipt 缺失都不移动 checkpoint。`continuous_subscriptions_bound_run` 保证一个 Run 最多绑定一个 Continuous Subscription。
+`continuous_subscriptions.definition_schema` 同样区分 V1 legacy callback、V2 Run binding 与 current V3 unified target。V3 Run target 延续 pending cycle 语义；V3 action target 在 observation transaction 内同步写 terminal receipt，succeeded/skipped 前移 checkpoint，failed 保留 pending 并 block。`continuous_subscriptions_bound_run` 保证一个 Run 最多绑定一个 Continuous Subscription。
 
-两类 V4/V2 occurrence 均在 source owner transaction 内写 `TriggerOccurrenceEnvelope@1`、Run cycle、orchestrator Event/Execution 与本地 admission receipt；重复 occurrence 返回已有 cycle。V3/V1 callback rows 保留 readback/reconcile，但 discriminator 禁止 V4/V2 materialize proactive callback。
+`deterministic_action_receipts` 是 append-only terminal fact，不是 retry queue。receipt ID 由 exact source definition 与 occurrence key 决定，row 同时固定 target digest、action ref 与完整 bounded receipt。handler 只能在 owning `DatabaseSync` transaction 内同步运行；SAVEPOINT 让 handler 异常回滚其业务 mutation，而外层 source transaction仍能保存 failed receipt。任何网络、进程、文件或 Agent side effect 都不在该 exactly-once 边界内，因此 registry contract 明确禁止这类 handler。
+
+`external_workflow_executions` 是独立 retry/lease state machine，因为外部进程、Git 与网络无法放入 source SQLite transaction。execution ID 由 exact source identity 与 occurrence key 决定；target digest、workflow ref、registration digest 与 observation 在 enqueue 时冻结。`claimed/running` 必须同时持有 owner/token/expiry，spawn 前写 `effect_started_at`；pre-effect interruption 可以回到 `retry_wait`，post-effect interruption只能写带 error 的 unknown runtime receipt。manual resolution 追加独立 receipt 并保留原 unknown receipt，不能把未知历史覆盖成仿佛 Runtime 直接成功。
+
+`proactive_source_migration_receipts` 只记录 Owner 显式迁移，不是通用 revision log。它与 paused legacy Schedule 的 V1→V3 current-row rebuild 同事务写入；重复 request ID 只有在 schedule/ref/from-revision 全部一致时返回原 receipt。
+
+历史 V4/V2 与 current V5/V3 的 Run-target occurrence 均在 source owner transaction 内写 `TriggerOccurrenceEnvelope@1`、Run cycle、orchestrator Event/Execution 与本地 admission receipt；重复 occurrence 返回已有 cycle。V3/V1 callback rows 保留 readback/reconcile，但 discriminator 禁止 Run-target generation materialize proactive callback。
 
 ### Notice authority
 
@@ -252,7 +263,9 @@ Delivery insert/update trigger 定向 upsert derived columns。显式 rebuild �
 | `schedules_due` | `schedules` | 查询到期 Schedule。 |
 | `schedules_archive_updated` | `schedules` | 按 archive visibility 与原始更新时间稳定分页 Schedule。 |
 | `schedules_bound_run` | `schedules` | 保证一个 Run 最多绑定一个 V2 Schedule。 |
+| `schedules_target_run` | `schedules` | 保证一个 Run 最多绑定一个 current V3 Run target。 |
 | `scheduled_runs_schedule`、`scheduled_runs_status` | `scheduled_runs` | 查询 run history 与 active/unknown state。 |
+| `external_workflow_executions_due` | `external_workflow_executions` | 按 status 与 next attempt claim bounded external workflow work。 |
 | `notices_timeline` | `notices` | 稳定读取 Notice Center timeline。 |
 | `topic_governance_receipts_topic_revision` | `topic_governance_control_receipts` | 按 Topic 与 resulting revision 读取最近 control receipt。 |
 | `topic_activation_schedules_due`、`topic_activation_schedules_topic` | `topic_activation_schedules` | 查询到期 Topic schedule，以及按 Topic/更新时间读取 current schedules。 |
@@ -261,11 +274,11 @@ Delivery insert/update trigger 定向 upsert derived columns。显式 rebuild �
 
 ## Legacy compatibility tables
 
-旧 schema 58/59 可能包含 `release_candidate_runtime`、`release_candidates`、`release_candidate_messages`，以及旧 v59 的 `release_candidate_effects`。这些表不属于当前 v68 产品 schema，全新数据库和从 v57 升级的数据库不会创建它们；迁移只接受完整的历史三表或四表组合并原样保留，Local 没有 reader/writer，外部业务 dispatcher 自己持有高水位和业务账本。
+旧 schema 58/59 可能包含 `release_candidate_runtime`、`release_candidates`、`release_candidate_messages`，以及旧 v59 的 `release_candidate_effects`。这些表不属于当前 v72 产品 schema，全新数据库和从 v57 升级的数据库不会创建它们；迁移只接受完整的历史三表或四表组合并原样保留，Local 没有 reader/writer，外部业务 dispatcher 自己持有高水位和业务账本。
 
-## v44–v67 → v68 migration
+## v44–v71 → v72 migration
 
-v0.3.11 首次正式推广时使用 schema v44，因此 v44 是唯一历史基线；v44 之前和缺失 version 的产品数据库不再直接迁移。v44–v62 先走既有兼容链；v62→v63 在一个 `BEGIN IMMEDIATE` transaction 内重建 `agent_runs`，加入 series/active cycle，创建 `agent_run_cycles`，并为 `agent_sessions` 增加 cycle binding；v63→v64 原位为 Run 增加 nullable `archived_at`；v64→v65 原位为 `schedules`、`subscriptions` 与 `continuous_subscriptions` 增加 nullable `archived_at` 及查询 index；v65→v66 为 Run/cycle 增加 nullable source binding/occurrence envelope；v66→v67 重建 Schedule/occurrence 表，加入严格 V1/V2 Run binding；v67→v68 在一个 `BEGIN IMMEDIATE` transaction 内重建 one-shot/Continuous Subscription 表，加入严格 V3/V4、V1/V2 discriminator、Run source binding、cycle link 和 admission receipt。旧 definition 全部保留为 V3/V1，不生成虚假的 Run/cycle authority。所有升级先通过 live Runtime guard；检测到旧 Runtime 仍持有 loop 时拒绝原地迁移。
+v0.3.11 首次正式推广时使用 schema v44，因此 v44 是唯一历史基线；v44 之前和缺失 version 的产品数据库不再直接迁移。v44–v62 先走既有兼容链；v62→v63 在一个 `BEGIN IMMEDIATE` transaction 内重建 `agent_runs`，加入 series/active cycle，创建 `agent_run_cycles`，并为 `agent_sessions` 增加 cycle binding；v63→v64 原位为 Run 增加 nullable `archived_at`；v64→v65 原位为 `schedules`、`subscriptions` 与 `continuous_subscriptions` 增加 nullable `archived_at` 及查询 index；v65→v66 为 Run/cycle 增加 nullable source binding/occurrence envelope；v66→v67 重建 Schedule/occurrence 表，加入严格 V1/V2 Run binding；v67→v68 重建 one-shot/Continuous Subscription；v68→v69 增加 legacy trigger migration receipt；v69→v70 退役 synthetic Chat activation；v70→v71 重建 unified `ProactiveTarget@1` source constraints并增加 deterministic action receipt；v71→v72 重建 Schedule/occurrence constraints以接纳 external workflow target，并新增 durable execution 与 source migration receipt。旧 definition 原样保留，不生成虚假的 Run/cycle/workflow authority。所有升级先通过 live Runtime guard；检测到旧 Runtime 仍持有 loop 时拒绝原地迁移。
 
 - 保留 canonical non-Review Event、对应 Execution/Delivery retry state、Session continuity、Agent Run、V3/V1 Subscription、Schedule、Notice read/ack，以及已有 callback receipt；旧 definition 不隐式转换为 Run-bound版本。
 - `review.requested`、`review.decision`、`review` Execution 与 `reviews` aggregate 明确丢弃；新审查只作为 `review@1` workflow 运行在通用 Steward Run 上。

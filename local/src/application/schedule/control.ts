@@ -3,7 +3,10 @@ import { statSync } from "node:fs";
 import { LocalFoundationStore } from "../../infrastructure/sqlite/foundation-store.js";
 import type { LocalAgent } from "../../modules/foundation/model.js";
 import { runtimePaths } from "../../infrastructure/runtime/config.js";
-import { openRuntimeDatabase } from "../../infrastructure/sqlite/database.js";
+import {
+  openRuntimeDatabase,
+  openRuntimeDatabaseReadOnly
+} from "../../infrastructure/sqlite/database.js";
 import { AgentRunStore } from "../../infrastructure/sqlite/agent-run-store.js";
 import type {
   CreateScheduleInput,
@@ -27,6 +30,10 @@ import type {
   AgentRunCycleProjection,
   AgentRunProjection
 } from "../../modules/steward/state-machine.js";
+import { proactiveTargetRunBinding } from "../../modules/proactive/target.js";
+import type { ExternalWorkflowExecution } from "../../modules/proactive/target.js";
+import { ExternalWorkflowStore } from
+  "../../infrastructure/proactive/external-workflow-store.js";
 
 export interface ScheduleControlInput extends Omit<ScheduleRevisionInput, "agentId" | "workspace"> {
   readonly agent: string;
@@ -45,6 +52,7 @@ export interface ScheduleInspection {
 
 export interface ScheduleOccurrenceInspection {
   readonly run: ScheduleOccurrence;
+  readonly externalWorkflowExecution?: ExternalWorkflowExecution;
   readonly audit?: RuntimeAudit;
   readonly agentRun?: AgentRunProjection;
   readonly cycle?: AgentRunCycleProjection;
@@ -100,7 +108,7 @@ export function listSchedules(
   repoRoot: string,
   runtimeDirectory?: string
 ): ScheduleInspection[] {
-  return withStores(repoRoot, runtimeDirectory, (stores) =>
+  return withReadStores(repoRoot, runtimeDirectory, (stores) =>
     stores.schedules.list().map((schedule) => inspection(schedule, stores))
   );
 }
@@ -110,7 +118,7 @@ export function inspectSchedule(
   scheduleId: string,
   runtimeDirectory?: string
 ): ScheduleInspection {
-  return withStores(repoRoot, runtimeDirectory, (stores) =>
+  return withReadStores(repoRoot, runtimeDirectory, (stores) =>
     inspection(stores.schedules.require(scheduleId), stores)
   );
 }
@@ -121,7 +129,7 @@ export function inspectSchedules(
   runtimeDirectory?: string
 ): ScheduleInspection[] {
   if (scheduleIds.length > 100) throw new Error("scheduleIds exceeds 100 items");
-  return withStores(repoRoot, runtimeDirectory, (stores) =>
+  return withReadStores(repoRoot, runtimeDirectory, (stores) =>
     scheduleIds.map((scheduleId) => inspection(stores.schedules.require(scheduleId), stores))
   );
 }
@@ -135,7 +143,7 @@ export function controlSchedule(
 ): ScheduleInspection {
   return withStores(repoRoot, runtimeDirectory, (stores) => {
     const current = stores.schedules.require(scheduleId);
-    if (action === "resume" && current.revision.schemaVersion !== "ScheduleRevision@2") {
+    if (action === "resume" && current.revision.schemaVersion === "ScheduleRevision@1") {
       throw new Error("legacy_trigger_execution_closed: migrate this Schedule to a bound Run");
     }
     return inspection(stores.schedules.setStatus(scheduleId, action, at), stores);
@@ -165,7 +173,7 @@ export function runScheduleNow(
   return withStores(repoRoot, runtimeDirectory, (stores) => {
     return stores.runtime.withImmediateTransaction(() => {
       const schedule = stores.schedules.require(scheduleId);
-      if (schedule.revision.schemaVersion !== "ScheduleRevision@2") {
+      if (schedule.revision.schemaVersion === "ScheduleRevision@1") {
         throw new Error("legacy_trigger_execution_closed: migrate this Schedule to a bound Run");
       }
       const idempotencyKey = text(requestId, "requestId", 256);
@@ -178,9 +186,33 @@ export function runScheduleNow(
           `Schedule cannot run now from ${schedule.definition.status}: ${scheduleId}`
         );
       }
-      const boundState = stores.runs.projection(schedule.revision.sourceBinding.runId);
+      const binding = schedule.revision.schemaVersion === "ScheduleRevision@2"
+        ? schedule.revision.sourceBinding
+        : proactiveTargetRunBinding(schedule.revision.target);
+      if (binding === undefined) {
+        if (schedule.revision.externalRefBinding !== undefined) {
+          throw new Error("Run-now cannot bypass Schedule external-ref freshness admission");
+        }
+        const externalWorkflow = schedule.revision.schemaVersion === "ScheduleRevision@3" &&
+          schedule.revision.target.kind === "external_workflow";
+        const activeWorkflow = externalWorkflow &&
+          stores.schedules.unterminatedRuns(scheduleId).length > 0;
+        const status = activeWorkflow && schedule.revision.overlapPolicy === "skip"
+          ? "skipped"
+          : "queued";
+        return stores.schedules.insertRun({
+          scheduleId,
+          occurrenceKey,
+          scheduledFor: at,
+          scheduleRevision: schedule.definition.currentRevision,
+          status,
+          decisionReason: status === "skipped" ? "manual-overlap-skip" : "manual",
+          createdAt: at
+        });
+      }
+      const boundState = stores.runs.projection(binding.runId);
       if (boundState === undefined) {
-        throw new Error(`Bound Agent Run not found: ${schedule.revision.sourceBinding.runId}`);
+        throw new Error(`Bound Agent Run not found: ${binding.runId}`);
       }
       if (boundState !== undefined && [
         "succeeded", "failed", "needs_human", "cancelled"
@@ -202,7 +234,7 @@ export function runScheduleNow(
         scheduledFor: at,
         scheduleRevision: schedule.definition.currentRevision,
         status,
-        agentRunId: schedule.revision.sourceBinding.runId,
+        agentRunId: binding.runId,
         decisionReason: pendingBoundOccurrence !== undefined
           ? `manual-overlap-coalesced:${pendingBoundOccurrence.runId}`
           : status === "skipped"
@@ -227,7 +259,7 @@ export function runScheduleNow(
           occurrence: inserted.run,
           revision: schedule.revision,
           freshnessEvidence: [
-            `schedule-definition:${schedule.revision.sourceBinding.source.definitionRevision}`
+            `schedule-definition:${binding.source.definitionRevision}`
           ],
           at
         })
@@ -242,7 +274,7 @@ export function listScheduleOccurrences(
   runtimeDirectory?: string,
   limit = 100
 ): ScheduleOccurrenceInspection[] {
-  return withStores(repoRoot, runtimeDirectory, (stores) =>
+  return withReadStores(repoRoot, runtimeDirectory, (stores) =>
     stores.schedules.runs(scheduleId, limit).map((run) => runInspection(run, stores))
   );
 }
@@ -252,7 +284,7 @@ export function traceScheduleOccurrence(
   runId: string,
   runtimeDirectory?: string
 ): ScheduleOccurrenceInspection {
-  return withStores(repoRoot, runtimeDirectory, (stores) =>
+  return withReadStores(repoRoot, runtimeDirectory, (stores) =>
     runInspection(stores.schedules.requireRun(runId), stores)
   );
 }
@@ -265,6 +297,36 @@ export function resolveUnknownScheduledRun(
   at = new Date().toISOString()
 ): ScheduleOccurrenceInspection {
   return withStores(repoRoot, runtimeDirectory, (stores) => {
+    const current = stores.schedules.requireRun(runId);
+    const revision = stores.schedules.requireRevision(
+      current.scheduleId,
+      current.scheduleRevision
+    );
+    if (revision.schemaVersion === "ScheduleRevision@3" &&
+      revision.target.kind === "external_workflow") {
+      return stores.runtime.withImmediateTransaction(() => {
+        const execution = stores.externalWorkflows.execution({
+          kind: "schedule",
+          id: current.scheduleId,
+          definitionRevision: `ScheduleRevision@3:${current.scheduleRevision}`
+        }, current.occurrenceKey);
+        if (execution === undefined) {
+          throw new Error(`External workflow execution not found for occurrence: ${runId}`);
+        }
+        const resolved = stores.externalWorkflows.resolveUnknownInTransaction(
+          execution.executionId,
+          outcome,
+          `Owner resolved Schedule occurrence ${runId} as ${outcome}`,
+          at
+        );
+        const run = stores.schedules.patchRun(runId, {
+          status: outcome,
+          decisionReason: `external-workflow-manual-resolved-${outcome}`,
+          completedAt: resolved.completedAt ?? at
+        }, at);
+        return runInspection(run, stores);
+      });
+    }
     const resolved = stores.schedules.resolveUnknownRun(runId, outcome, at);
     return runInspection(resolved, stores);
   });
@@ -275,6 +337,7 @@ interface Stores {
   readonly runtime: RuntimeStore;
   readonly runs: AgentRunStore;
   readonly foundation: LocalFoundationStore;
+  readonly externalWorkflows: ExternalWorkflowStore;
   readonly workspace: string;
 }
 
@@ -284,11 +347,29 @@ function withStores<T>(
   callback: (stores: Stores) => T
 ): T {
   const paths = runtimePaths(repoRoot, runtimeDirectory);
-  const database = openRuntimeDatabase(paths.database);
-  const foundation = new LocalFoundationStore(database);
-  const runtime = new RuntimeStoreImplementation(database);
-  const runs = new AgentRunStore(database);
-  const schedules = new ScheduledTaskStore(database);
+  return withOpenedStores(openRuntimeDatabase(paths.database), true, callback);
+}
+
+function withReadStores<T>(
+  repoRoot: string,
+  runtimeDirectory: string | undefined,
+  callback: (stores: Stores) => T
+): T {
+  const paths = runtimePaths(repoRoot, runtimeDirectory);
+  return withOpenedStores(openRuntimeDatabaseReadOnly(paths.database), false, callback);
+}
+
+function withOpenedStores<T>(
+  database: ReturnType<typeof openRuntimeDatabase>,
+  migrate: boolean,
+  callback: (stores: Stores) => T
+): T {
+  const options = { migrate } as const;
+  const foundation = new LocalFoundationStore(database, options);
+  const runtime = new RuntimeStoreImplementation(database, options);
+  const runs = new AgentRunStore(database, options);
+  const schedules = new ScheduledTaskStore(database, options);
+  const externalWorkflows = new ExternalWorkflowStore(database);
   try {
     const local = foundation.foundation();
     if (local === undefined) throw new Error("Local foundation is not initialized");
@@ -300,6 +381,7 @@ function withStores<T>(
       runtime,
       runs,
       foundation,
+      externalWorkflows,
       workspace: local.workspacePath
     });
   } finally {
@@ -333,13 +415,24 @@ function inspection(schedule: Schedule, stores: Stores): ScheduleInspection {
 
 function runInspection(
   run: ScheduleOccurrence,
-  stores: Pick<Stores, "runtime" | "schedules" | "runs">
+  stores: Pick<Stores, "runtime" | "schedules" | "runs" | "externalWorkflows">
 ): ScheduleOccurrenceInspection {
+  const actionReceipt = stores.schedules.actionReceipt(run);
+  const visibleRun = actionReceipt === undefined ? run : { ...run, actionReceipt };
   const audit = run.eventId === undefined ? undefined : stores.runtime.audit(run.eventId);
   const agentRun = run.agentRunId === undefined
     ? undefined
     : stores.runs.projection(run.agentRunId);
   const cycle = run.cycleId === undefined ? undefined : stores.runs.cycle(run.cycleId);
+  const revision = stores.schedules.requireRevision(run.scheduleId, run.scheduleRevision);
+  const externalWorkflowExecution = revision.schemaVersion === "ScheduleRevision@3" &&
+    revision.target.kind === "external_workflow"
+    ? stores.externalWorkflows.execution({
+        kind: "schedule",
+        id: run.scheduleId,
+        definitionRevision: `ScheduleRevision@3:${run.scheduleRevision}`
+      }, run.occurrenceKey)
+    : undefined;
   const callbacks = stores.schedules.callbackOccurrences(run).map((occurrence) => {
     const deliveryId = callbackDeliveryId(occurrence.receipt);
     const delivery = deliveryId === undefined ? undefined : stores.runtime.delivery(deliveryId);
@@ -349,7 +442,8 @@ function runInspection(
     };
   });
   return {
-    run,
+    run: visibleRun,
+    ...(externalWorkflowExecution === undefined ? {} : { externalWorkflowExecution }),
     ...(audit === undefined ? {} : { audit }),
     ...(agentRun === undefined ? {} : { agentRun }),
     ...(cycle === undefined ? {} : { cycle }),

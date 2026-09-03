@@ -85,13 +85,12 @@ export function finiteNonNegative(value: unknown): number | undefined {
 }
 
 export function invocationTimeoutMilliseconds(
-  event: AgentInputEvent | ChatDispatchEvent,
-  fallback: number
-): number {
+  event: AgentInputEvent | ChatDispatchEvent
+): number | undefined {
   const configured = event.type === "agent.request"
     ? event.runContext?.invocationBudget?.totalTimeoutMilliseconds
     : undefined;
-  return boundedTimeout(configured ?? fallback);
+  return configured === undefined ? undefined : boundedTimeout(configured);
 }
 
 export function agentInvocationProgress(input: {
@@ -142,7 +141,9 @@ export function agentInvocationFailure(input: {
     schemaVersion: "AgentInvocationFailure@1",
     failedAt: input.trace.failedAt,
     reason: input.trace.reason,
-    totalTimeoutMilliseconds: input.trace.totalTimeoutMilliseconds,
+    ...(input.trace.totalTimeoutMilliseconds === undefined
+      ? {}
+      : { totalTimeoutMilliseconds: input.trace.totalTimeoutMilliseconds }),
     meaningfulOutputTimeoutMilliseconds: input.trace.meaningfulOutputTimeoutMilliseconds,
     protocolStop: input.trace.protocolStop,
     recovery: input.workspaceAccess === "write"

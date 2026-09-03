@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed, inject, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, inject, nextTick, ref, watch } from "vue";
 import { routerKey } from "vue-router";
-import { requestJson } from "@/api/client";
+import { boundedError, requestJson } from "@/api/client";
 import {
   errorResponseSchema,
   chatRunHandoffReceiptSchema,
-  freeChatModeViewSchema,
+  chatRunProposalDecisionReceiptSchema,
+  chatRunProposalPreflightSchema,
   localChatPresenceViewSchema,
   localChatViewSchema,
   networkSafetyViewSchema,
@@ -21,7 +22,11 @@ import ChatComposer from "@/components/ChatComposer.vue";
 import ChatContextPanel from "@/components/ChatContextPanel.vue";
 import ChatGovernancePanel from "@/components/ChatGovernancePanel.vue";
 import type { ChatListItem, ChatTimelineMessage } from "@/types/chat";
-import type { LocalAgent } from "@/types/local";
+import type {
+  ChatRunProposal,
+  ChatRunWorkspaceSelection,
+  LocalAgent
+} from "@/types/local";
 
 const selectedId = ref<string>("local");
 const router = inject(routerKey, null);
@@ -36,19 +41,12 @@ const composer = computed({
 });
 const replyingTo = ref<ChatTimelineMessage | null>(null);
 const pending = ref<string | null>(null);
-const intent = ref<"continue_recent" | "choose_from_themes" | "directed">(
-  "continue_recent"
-);
-const directedBrief = ref("");
-const intentError = ref<string | null>(null);
-const now = ref(Date.now());
-let clock: ReturnType<typeof setInterval> | undefined;
-onMounted(() => {
-  clock = setInterval(() => { now.value = Date.now(); }, 1_000);
-});
-onBeforeUnmount(() => {
-  if (clock !== undefined) clearInterval(clock);
-});
+const proposalOperations = ref<Record<string, "preflight" | "start" | "decline">>({});
+const proposalErrors = ref<Record<string, string>>({});
+const proposalOverlays = ref<Record<string, {
+  readonly sourceRevision: string;
+  readonly proposal: ChatRunProposal;
+}>>({});
 const chatTimelineRef = ref<InstanceType<typeof ChatTimeline> | null>(null);
 const pollingPaused = computed(() => pending.value !== null);
 const {
@@ -71,12 +69,6 @@ const presenceQuery = useApi({
 const governanceQuery = useApi({
   url: "/api/chat/governance",
   schema: topicGovernanceViewSchema,
-  interval: 2_000,
-  paused: pollingPaused
-});
-const freeChatQuery = useApi({
-  url: "/api/chat/free-chat",
-  schema: freeChatModeViewSchema,
   interval: 2_000,
   paused: pollingPaused
 });
@@ -115,7 +107,6 @@ const mutation = useMutation({
       refreshChat(),
       presenceQuery.refresh(),
       governanceQuery.refresh(),
-      freeChatQuery.refresh(),
       topicSchedulesQuery.refresh(),
       serverTopicsQuery.refresh(),
       networkQuery.refresh()
@@ -137,9 +128,9 @@ const workHandoffMutation = useMutation({
 });
 const presenceAgents = computed(() => presenceQuery.data.value?.agents ?? []);
 const error = computed(() =>
-  mutation.error.value ?? workHandoffMutation.error.value ?? intentError.value ??
+  mutation.error.value ?? workHandoffMutation.error.value ??
   loadError.value ?? presenceQuery.error.value ??
-  governanceQuery.error.value ?? freeChatQuery.error.value ?? topicSchedulesQuery.error.value
+  governanceQuery.error.value ?? topicSchedulesQuery.error.value
 );
 
 const chats = computed<ChatListItem[]>(() => {
@@ -217,8 +208,6 @@ const joinCandidates = computed(() => (networkQuery.data.value?.agents ?? [])
   })));
 
 const showAgentPicker = ref(false);
-const starterAttempts = new Set<string>();
-
 const activeParticipantIds = computed(() => new Set(
   governanceQuery.data.value?.activeParticipantAgentIds ?? []
 ));
@@ -234,7 +223,21 @@ const activeAgents = computed(() =>
 );
 
 const visibleMessages = computed<readonly ChatTimelineMessage[]>(() => {
-  if (selectedIsLocal.value) return chatView.value?.messages.items ?? [];
+  if (selectedIsLocal.value) {
+    return (chatView.value?.messages.items ?? []).map((message) => {
+      const source = message.runProposals;
+      if (source === undefined) return message;
+      return {
+        ...message,
+        runProposals: source.map((proposal) => {
+          const overlay = proposalOverlays.value[proposal.proposalId];
+          return overlay?.sourceRevision === proposal.revision
+            ? overlay.proposal
+            : proposal;
+        })
+      };
+    });
+  }
   return (selectedTopic.value?.events ?? []).map((event) => event.publisher.kind === "human"
     ? {
         eventId: event.eventId,
@@ -258,107 +261,6 @@ const visibleMessages = computed<readonly ChatTimelineMessage[]>(() => {
       });
 });
 
-const conversationLabel = computed(() => {
-  if (governanceQuery.data.value?.governance.status === "paused") return "Topic paused";
-  if (pending.value === "activation") return "Waking Agents";
-  const state = chatView.value?.conversation.state;
-  if (state === "starter_pending") return "Ready to start";
-  if (state === "active") return "Agents are responding";
-  if (state === "all_silent") return "Stopped · everyone stayed silent";
-  if (state === "budget_exhausted") return "Stopped · turn budget reached";
-  return "Idle";
-});
-
-const activationExplanation = computed(() => {
-  const reason = chatView.value?.conversation.latestReason;
-  if (reason === "topic_opened") return "Started by the Topic starter";
-  if (reason === "manual") return "Started with Wake now";
-  if (reason === "participant_message") return "Continued after an Agent message";
-  if (reason === "resumed") return "Resumed by the Owner";
-  if (reason === "scheduled") return "Started on schedule";
-  return "Starter wakes one listening Agent on an empty Topic";
-});
-
-const conversationExplanation = computed(() => {
-  const speakers = chatView.value?.conversation.activeSpeakerHandles ?? [];
-  if (governanceQuery.data.value?.governance.status === "paused") {
-    return "New conversation attention is stopped; a running turn may finish.";
-  }
-  if (pending.value === "activation") return "Creating one canonical conversation root…";
-  return speakers.length === 0
-    ? freeChatStatus.value ?? activationExplanation.value
-    : `${speakers.map((speaker) => `@${speaker}`).join(", ")} ${
-      speakers.length === 1 ? "is" : "are"
-    } thinking · ${activationExplanation.value}`;
-});
-
-const freeChatStatus = computed(() => {
-  const mode = freeChatQuery.data.value?.mode;
-  if (mode?.status !== "active") return null;
-  const remaining = Math.max(0, Date.parse(mode.sample.idleDeadline) - now.value);
-  const minutes = Math.floor(remaining / 60_000);
-  const seconds = Math.floor((remaining % 60_000) / 1_000);
-  return `Free Chat · ${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")} ` +
-    `until ${mode.sample.participantCount} Agent${mode.sample.participantCount === 1 ? "" : "s"}`;
-});
-
-const intentInput = computed(() => {
-  const brief = directedBrief.value.trim();
-  return {
-    intent: intent.value,
-    ...(intent.value === "directed" ? { brief } : {})
-  };
-});
-
-watch(() => governanceQuery.data.value?.governance.conversationPolicy.defaultIntent,
-  (value, previous) => {
-    if (value !== undefined && previous === undefined) intent.value = value;
-  });
-
-async function activate(strategy: "starter" | "manual") {
-  if (pending.value || !selectedIsLocal.value) return;
-  const topicId = chatView.value?.chat.topicId;
-  if (topicId === undefined) return;
-  if (strategy === "manual" && !validIntent()) return;
-  pending.value = "activation";
-  await mutation.execute({
-    path: "/api/chat/activate",
-    body: {
-      strategy,
-      idempotencyKey: strategy === "starter"
-        ? `topic-open:${topicId}:v1`
-        : globalThis.crypto.randomUUID(),
-      ...(strategy === "starter" ? {} : intentInput.value)
-    }
-  });
-  pending.value = null;
-}
-
-function validIntent(): boolean {
-  intentError.value = null;
-  if (intent.value === "directed" && directedBrief.value.trim() === "") {
-    intentError.value = "Discuss a brief requires a conversation goal.";
-    return false;
-  }
-  return true;
-}
-
-watch(
-  () => ({
-    topicId: chatView.value?.chat.topicId,
-    messages: chatView.value?.messages.items.length ?? 0,
-    agents: activeAgents.value.length,
-    state: chatView.value?.conversation.state
-  }),
-  ({ topicId, messages, agents, state }) => {
-    if (topicId === undefined || messages !== 0 || agents === 0 ||
-      state !== "starter_pending" || starterAttempts.has(topicId)) return;
-    starterAttempts.add(topicId);
-    void activate("starter");
-  },
-  { immediate: true }
-);
-
 function mention(agent: LocalAgent) {
   const token = `@${agent.handle} `;
   if (!composer.value.toLocaleLowerCase().includes(`@${agent.handle.toLocaleLowerCase()}`)) {
@@ -378,6 +280,125 @@ async function handoffToRun(message: ChatTimelineMessage) {
   if (receipt !== null) {
     await router?.push({ name: "steward", query: { runId: receipt.run.runId } });
   }
+}
+
+async function preflightProposal(
+  proposal: ChatRunProposal,
+  selection: ChatRunWorkspaceSelection
+) {
+  if (!selectedIsLocal.value || proposalOperations.value[proposal.proposalId] !== undefined) {
+    return;
+  }
+  proposalOperations.value[proposal.proposalId] = "preflight";
+  delete proposalErrors.value[proposal.proposalId];
+  const sourceRevision = proposalOverlays.value[proposal.proposalId]?.sourceRevision ??
+    proposal.revision;
+  try {
+    const receipt = await requestJson(
+      proposalActionPath(proposal, "preflight"),
+      chatRunProposalPreflightSchema,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Rollerskate-Request": "console"
+        },
+        body: JSON.stringify({ revision: sourceRevision, ...workspaceBody(selection) })
+      }
+    );
+    proposalOverlays.value[proposal.proposalId] = {
+      sourceRevision: receipt.sourceRevision,
+      proposal: receipt.proposal
+    };
+  } catch (reason) {
+    if (selection !== undefined) delete proposalOverlays.value[proposal.proposalId];
+    proposalErrors.value[proposal.proposalId] = boundedError(reason);
+  } finally {
+    delete proposalOperations.value[proposal.proposalId];
+  }
+}
+
+async function confirmProposal(
+  proposal: ChatRunProposal,
+  selection?: ChatRunWorkspaceSelection
+) {
+  if (!selectedIsLocal.value || !proposal.ready || proposal.linkedRun !== undefined ||
+    proposalOperations.value[proposal.proposalId] !== undefined) return;
+  proposalOperations.value[proposal.proposalId] = "start";
+  delete proposalErrors.value[proposal.proposalId];
+  try {
+    await requestJson(
+      proposalActionPath(proposal, "confirm"),
+      chatRunHandoffReceiptSchema,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Rollerskate-Request": "console"
+        },
+        body: JSON.stringify({
+          revision: proposal.revision,
+          ...(selection === undefined ? {} : workspaceBody(selection))
+        })
+      }
+    );
+    delete proposalOverlays.value[proposal.proposalId];
+    await Promise.all([refreshChat(), presenceQuery.refresh()]);
+  } catch (reason) {
+    delete proposalOverlays.value[proposal.proposalId];
+    proposalErrors.value[proposal.proposalId] = boundedError(reason);
+  } finally {
+    delete proposalOperations.value[proposal.proposalId];
+  }
+}
+
+async function declineProposal(proposal: ChatRunProposal) {
+  if (!selectedIsLocal.value || proposal.linkedRun !== undefined ||
+    proposal.decision !== undefined ||
+    proposalOperations.value[proposal.proposalId] !== undefined) return;
+  proposalOperations.value[proposal.proposalId] = "decline";
+  delete proposalErrors.value[proposal.proposalId];
+  const revision = proposalOverlays.value[proposal.proposalId]?.sourceRevision ??
+    proposal.revision;
+  try {
+    await requestJson(
+      proposalActionPath(proposal, "decline"),
+      chatRunProposalDecisionReceiptSchema,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Rollerskate-Request": "console"
+        },
+        body: JSON.stringify({ revision })
+      }
+    );
+    delete proposalOverlays.value[proposal.proposalId];
+    await refreshChat();
+  } catch (reason) {
+    proposalErrors.value[proposal.proposalId] = boundedError(reason);
+  } finally {
+    delete proposalOperations.value[proposal.proposalId];
+  }
+}
+
+function proposalActionPath(
+  proposal: ChatRunProposal,
+  action: "preflight" | "confirm" | "decline"
+) {
+  const messageId = encodeURIComponent(proposal.sourceMessageEventId);
+  const dispatchId = encodeURIComponent(proposal.dispatchEventId);
+  return `/api/chat/proposals/${messageId}/${dispatchId}/${action}`;
+}
+
+function workspaceBody(selection: ChatRunWorkspaceSelection) {
+  return selection.kind === "path"
+    ? { workspaceKind: selection.kind, workspacePath: selection.path }
+    : { workspaceKind: selection.kind };
+}
+
+async function openRun(runId: string) {
+  await router?.push({ name: "steward", query: { runId } });
 }
 
 async function send(body: string) {
@@ -435,25 +456,19 @@ async function refreshAll() {
     refreshChat(),
     presenceQuery.refresh(),
     governanceQuery.refresh(),
-    freeChatQuery.refresh(),
     topicSchedulesQuery.refresh(),
     serverTopicsQuery.refresh(),
     networkQuery.refresh()
   ]);
 }
 
-async function governanceAction(action: "pause" | "resume" | "resume-and-wake") {
+async function governanceAction(action: "pause" | "resume") {
   const expectedRevision = governanceQuery.data.value?.actionAvailability.expectedRevision;
   if (pending.value || expectedRevision === undefined) return;
   pending.value = `governance:${action}`;
   await mutation.execute({
     path: `/api/chat/governance/${action}`,
-    body: {
-      expectedRevision,
-      ...(action === "resume-and-wake"
-        ? { idempotencyKey: globalThis.crypto.randomUUID() }
-        : {})
-    }
+    body: { expectedRevision }
   });
   pending.value = null;
 }
@@ -465,24 +480,6 @@ async function participantAction(action: "add" | "remove", agent: LocalAgent) {
   await mutation.execute({
     path: `/api/chat/governance/participants/${encodeURIComponent(agent.principalId)}/${action}`,
     body: { expectedRevision }
-  });
-  pending.value = null;
-}
-
-async function freeChatAction(action: "start" | "continue-now" | "exit") {
-  const availability = freeChatQuery.data.value?.actionAvailability;
-  if (pending.value || availability === undefined) return;
-  if (action === "start" && (!availability.start || !validIntent())) return;
-  if (action === "continue-now" && !availability.continueNow) return;
-  if (action === "exit" && !availability.exit) return;
-  const expectedRevision = availability.expectedRevision;
-  if (action !== "start" && expectedRevision === undefined) return;
-  pending.value = `free-chat:${action}`;
-  await mutation.execute({
-    path: `/api/chat/free-chat/${action}`,
-    body: action === "start"
-      ? { idempotencyKey: globalThis.crypto.randomUUID(), ...intentInput.value }
-      : { expectedRevision }
   });
   pending.value = null;
 }
@@ -611,73 +608,16 @@ async function setHistoryAccess(agent: LocalAgent, action: "grant" | "revoke") {
           :current-human-id="currentHumanId"
           :allow-reply="selectedIsLocal"
           :allow-work-handoff="selectedIsLocal"
+          :pending="pending"
+          :proposal-operations="proposalOperations"
+          :proposal-errors="proposalErrors"
           @reply="reply"
           @handoff="handoffToRun"
+          @preflight-proposal="preflightProposal"
+          @confirm-proposal="confirmProposal"
+          @decline-proposal="declineProposal"
+          @open-run="openRun"
         />
-        <div v-if="selectedIsLocal" class="conversation-bar" aria-live="polite">
-          <div class="conversation-state">
-            <strong>{{ conversationLabel }}</strong>
-            <span>{{ conversationExplanation }}</span>
-          </div>
-          <div class="conversation-controls">
-            <label class="intent-control">
-              <span>Intent</span>
-              <select v-model="intent" aria-label="Conversation intent" :disabled="pending !== null">
-                <option value="continue_recent">Continue naturally</option>
-                <option value="choose_from_themes">Pick a topic</option>
-                <option value="directed">Discuss a brief</option>
-              </select>
-            </label>
-            <input
-              v-if="intent === 'directed'"
-              v-model="directedBrief"
-              class="brief-input"
-              type="text"
-              maxlength="4096"
-              aria-label="Conversation brief"
-              placeholder="What should the Agents discuss?"
-              :disabled="pending !== null"
-            />
-            <div class="conversation-actions">
-              <span class="budget-label">
-                {{ chatView?.conversation.remainingTurns ?? 8 }} of
-                {{ chatView?.conversation.turnBudget ?? 8 }} turns left
-              </span>
-              <template v-if="freeChatQuery.data.value?.mode?.status === 'active'">
-                <button
-                  type="button"
-                  class="secondary-button wake-button"
-                  :disabled="pending !== null ||
-                    !freeChatQuery.data.value?.actionAvailability.continueNow"
-                  @click="freeChatAction('continue-now')"
-                >{{ pending === "free-chat:continue-now" ? "Inviting…" : "Continue now" }}</button>
-                <button
-                  type="button"
-                  class="secondary-button wake-button"
-                  :disabled="pending !== null || !freeChatQuery.data.value?.actionAvailability.exit"
-                  @click="freeChatAction('exit')"
-                >{{ pending === "free-chat:exit" ? "Exiting…" : "Exit Free Chat" }}</button>
-              </template>
-              <template v-else>
-                <button
-                  type="button"
-                  class="secondary-button wake-button"
-                  :disabled="pending !== null || activeAgents.length === 0 ||
-                    governanceQuery.data.value?.governance.status !== 'active' ||
-                    chatView?.conversation.state === 'active'"
-                  @click="activate('manual')"
-                >{{ pending === "activation" ? "Waking…" : "Wake now" }}</button>
-                <button
-                  type="button"
-                  class="secondary-button wake-button"
-                  :disabled="pending !== null ||
-                    !freeChatQuery.data.value?.actionAvailability.start"
-                  @click="freeChatAction('start')"
-                >{{ pending === "free-chat:start" ? "Starting…" : "Start Free Chat" }}</button>
-              </template>
-            </div>
-          </div>
-        </div>
         <ChatComposer
           v-model="composer"
           :agents="chatView?.agents ?? []"
@@ -816,35 +756,6 @@ async function setHistoryAccess(agent: LocalAgent, action: "grant" | "revoke") {
 .picker-title { margin-bottom: 8px; color: var(--text-secondary); font-size: 11px; font-weight: 700; text-transform: uppercase; }
 .picker-empty { color: var(--text-secondary); font-size: 12px; }
 .inline-error { padding: 9px 16px; background: var(--danger-soft); color: var(--danger); border-bottom: 1px solid #fecaca; }
-.conversation-bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 9px 16px;
-  border-top: 1px solid var(--border);
-  background: var(--surface-2);
-}
-.conversation-state { display: grid; gap: 2px; min-width: 0; }
-.conversation-state strong { font-size: 12px; }
-.conversation-state span,
-.budget-label { color: var(--text-secondary); font-size: 11px; }
-.conversation-controls { display: flex; align-items: center; justify-content: flex-end; gap: 8px; min-width: 0; }
-.intent-control { display: flex; align-items: center; gap: 5px; color: var(--text-secondary); font-size: 10px; }
-.intent-control select,
-.brief-input {
-  min-width: 0;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 5px 7px;
-  background: var(--surface-1);
-  color: var(--text-primary);
-  font: inherit;
-  font-size: 11px;
-}
-.brief-input { width: min(220px, 24vw); }
-.conversation-actions { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
-.wake-button { white-space: nowrap; }
 .mobile-context { display: none; border-bottom: 1px solid var(--border); }
 .mobile-context > summary {
   padding: 9px 16px;
@@ -877,17 +788,5 @@ async function setHistoryAccess(agent: LocalAgent, action: "grant" | "revoke") {
   }
   .chat-list-panel { display: none; }
   .chat-panel { min-height: 0; }
-  .conversation-bar { align-items: flex-start; }
-  .conversation-controls { display: grid; justify-items: end; }
-  .conversation-actions { justify-content: flex-end; }
-  .conversation-state span { max-width: 34ch; }
-  .brief-input { width: min(240px, 42vw); }
-}
-@media (max-width: 520px) {
-  .conversation-bar { display: grid; gap: 8px; }
-  .conversation-controls { justify-items: stretch; }
-  .intent-control { justify-content: space-between; }
-  .brief-input { width: 100%; box-sizing: border-box; }
-  .conversation-actions { justify-content: space-between; }
 }
 </style>

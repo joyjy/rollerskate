@@ -12,7 +12,7 @@ import { initializeRuntimeSchema } from "../src/infrastructure/sqlite/schema.js"
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
-test("schema v69 adds bounded Run source binding and cycle occurrence envelope", async () => {
+test("schema v72 adds bounded Run source binding and cycle occurrence envelope", async () => {
   const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v65-"));
   const databasePath = join(directory, "runtime.db");
   try {
@@ -107,7 +107,7 @@ test("schema v69 adds bounded Run source binding and cycle occurrence envelope",
       readOnlyCheck.close();
     }
 
-    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 69);
+    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 72);
     const database = new DatabaseSync(databasePath, { readOnly: true });
     try {
       const runColumns = database.prepare("PRAGMA table_info(agent_runs)").all() as

@@ -2,8 +2,13 @@
 import { computed, nextTick, onMounted, ref, watch } from "vue";
 import { formatDateTime } from "@/utils/format";
 import ChatReadProgress from "./ChatReadProgress.vue";
+import ChatRunProposalCard from "./ChatRunProposalCard.vue";
 import type { ChatListItem, ChatTimelineMessage } from "@/types/chat";
-import type { LocalAgent } from "@/types/local";
+import type {
+  ChatRunProposal,
+  ChatRunWorkspaceSelection,
+  LocalAgent
+} from "@/types/local";
 
 const props = defineProps<{
   chat: ChatListItem | null;
@@ -12,11 +17,18 @@ const props = defineProps<{
   currentHumanId?: string;
   allowReply?: boolean;
   allowWorkHandoff?: boolean;
+  pending?: string | null;
+  proposalOperations?: Readonly<Record<string, "preflight" | "start" | "decline">>;
+  proposalErrors?: Readonly<Record<string, string>>;
 }>();
 
 const emit = defineEmits<{
   reply: [message: ChatTimelineMessage];
   handoff: [message: ChatTimelineMessage];
+  preflightProposal: [proposal: ChatRunProposal, selection: ChatRunWorkspaceSelection];
+  confirmProposal: [proposal: ChatRunProposal, selection?: ChatRunWorkspaceSelection];
+  declineProposal: [proposal: ChatRunProposal];
+  openRun: [runId: string];
 }>();
 
 type TimelineItem =
@@ -68,6 +80,24 @@ function scrollToMessage(eventId: string) {
   target?.focus({ preventScroll: true });
 }
 
+function preflightProposal(
+  proposal: ChatRunProposal,
+  selection: ChatRunWorkspaceSelection
+) {
+  emit("preflightProposal", proposal, selection);
+}
+
+function confirmProposal(
+  proposal: ChatRunProposal,
+  selection?: ChatRunWorkspaceSelection
+) {
+  emit("confirmProposal", proposal, selection);
+}
+
+function declineProposal(proposal: ChatRunProposal) {
+  emit("declineProposal", proposal);
+}
+
 watch(() => props.messages.length, async () => {
   await nextTick();
   if (isNearBottom()) scrollToBottom();
@@ -117,7 +147,8 @@ defineExpose({ scrollToBottom, scrollToMessage });
                 @click="emit('reply', item.message)"
               >Reply</button>
               <button
-                v-if="allowWorkHandoff && item.message.sender.kind === 'owner'"
+                v-if="allowWorkHandoff && item.message.sender.kind === 'owner' &&
+                  (item.message.runProposals?.length ?? 0) === 0"
                 type="button"
                 class="handoff-action"
                 @click="emit('handoff', item.message)"
@@ -142,6 +173,17 @@ defineExpose({ scrollToBottom, scrollToMessage });
           <div v-if="item.message.targets" class="target-chip">
             to {{ item.message.targets.map((target) => `@${target.handleSnapshot}`).join(", ") }}
           </div>
+          <ChatRunProposalCard
+            v-for="proposal in item.message.runProposals ?? []"
+            :key="proposal.proposalId"
+            :proposal="proposal"
+            :operation="proposalOperations?.[proposal.proposalId]"
+            :error="proposalErrors?.[proposal.proposalId]"
+            @preflight="preflightProposal"
+            @start="confirmProposal"
+            @decline="declineProposal"
+            @open-run="emit('openRun', $event)"
+          />
         </div>
       </article>
 

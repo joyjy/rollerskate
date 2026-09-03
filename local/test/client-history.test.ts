@@ -14,6 +14,8 @@ import { postLocalChatMessage } from "../src/application/chat/control.js";
 import { ChatHandler } from "../src/application/chat/handler.js";
 import { withChatHistoryContinuation } from
   "../src/application/chat/agent-continuation.js";
+import { createChatReadToolContext } from
+  "../src/application/chat/read-tool-policy.js";
 import {
   clientHistoryAudits,
   grantClientHistoryAccess,
@@ -416,4 +418,68 @@ test("non-Codex Chat keeps structured same-client history continuation", async (
 
   assert.equal(calls, 2);
   assert.equal(result.providerSessionId, "kimi-session");
+});
+
+test("Kimi Chat can use the provider-neutral safe read request fallback", async () => {
+  let calls = 0;
+  const adapter = withChatHistoryContinuation({
+    adapterId: "kimi-read-tools-fixture",
+    workspace: "/workspace",
+    providerPolicy: KIMI_POLICY_OBSERVATION,
+    async invoke(input) {
+      calls += 1;
+      if (calls === 1) return {
+        providerSessionId: "kimi-read-tools-session",
+        outcome: {
+          kind: "message" as const,
+          body: JSON.stringify({
+            schema: "ChatReadToolRequest@1",
+            tool: "describe_capabilities",
+            arguments: {}
+          })
+        }
+      };
+      assert.equal(input.providerSessionId, "kimi-read-tools-session");
+      assert.match(input.event.prompt, /ChatReadCapabilities@1/);
+      assert.match(input.event.prompt, /mutationAllowed/);
+      return {
+        providerSessionId: "kimi-read-tools-session",
+        outcome: {
+          kind: "message" as const,
+          body: JSON.stringify({
+            schema: "ChatDecision@1",
+            speech: { action: "silent", reason: "Capabilities confirmed." },
+            presence: { scope: "topic", mode: "available", wakeKeywords: [] }
+          })
+        }
+      };
+    }
+  }, {
+    chatHistory: () => {
+      throw new Error("Chat history was not requested");
+    },
+    clientHistory: () => {
+      throw new Error("Client history was not requested");
+    },
+    chatReadTools: () => createChatReadToolContext({ repoRoot: "/repo" })
+  });
+  const eventId = "evt_019f92c9-0000-7000-8000-000000000005";
+  const result = await adapter.invoke({
+    event: {
+      eventId,
+      type: "chat.dispatch",
+      source: { kind: "handler" },
+      agentId: "prn_kimi",
+      topicId: "topic-local",
+      sourceAttentionEventId: eventId,
+      targetHandleSnapshot: "kimi",
+      promptResourceId: "rollerskate.chat.free-turn.v1",
+      prompt: "respond",
+      destinationIds: [],
+      causality: { rootEventId: eventId, hop: 1 },
+      createdAt: AT
+    } satisfies ChatDispatchEvent
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.providerSessionId, "kimi-read-tools-session");
 });

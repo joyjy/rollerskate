@@ -48,6 +48,7 @@ export class TopicGovernanceAdmissionPolicy implements RuntimeAgentExecutionGuar
     source: TopicAttentionSource,
     candidates: readonly LocalAgent[]
   ): TopicAttentionAdmission {
+    if (syntheticActivationRejection(source) !== undefined) return skipped();
     const governance = this.#getGovernance(source.topicId);
     if (governance === undefined) return unrestricted(candidates);
     const rejection = governanceRejection(governance, source);
@@ -76,12 +77,14 @@ export class TopicGovernanceAdmissionPolicy implements RuntimeAgentExecutionGuar
     at: string
   ): RuntimeAgentExecutionGuardDecision {
     if (event.type !== "chat.dispatch") return { outcome: "allow" };
-    const governance = this.#getGovernance(event.topicId);
-    if (governance === undefined) return { outcome: "allow" };
     const source = this.#runtime.event(event.sourceAttentionEventId);
     if (source?.type !== "chat.activation" && source?.type !== "chat.message") {
       return skipDecision("topic-attention-source-unavailable");
     }
+    const syntheticRejection = syntheticActivationRejection(source);
+    if (syntheticRejection !== undefined) return skipDecision(syntheticRejection);
+    const governance = this.#getGovernance(event.topicId);
+    if (governance === undefined) return { outcome: "allow" };
     const rejection = governanceRejection(governance, source);
     if (rejection !== undefined) return skipDecision(rejection);
     const agent = this.#listAgents().find(({ principalId }) => principalId === event.agentId);
@@ -114,11 +117,10 @@ export function governanceRejection(
   }
   if (governance.status === "paused") return "topic-paused";
   if (source.type === "chat.activation") {
+    const retired = syntheticActivationRejection(source);
+    if (retired !== undefined) return retired;
     if (source.contextRevision !== governance.revision) {
       return "topic-governance-revision-changed";
-    }
-    if (source.strategyId === "starter" && !governance.strategyPolicy.starterEnabled) {
-      return "topic-starter-disabled";
     }
     if (source.strategyId === "scheduled" && !governance.strategyPolicy.scheduledEnabled) {
       return "topic-scheduled-disabled";
@@ -133,6 +135,13 @@ export function governanceRejection(
     return "topic-participant-message-disabled";
   }
   return undefined;
+}
+
+function syntheticActivationRejection(source: TopicAttentionSource): string | undefined {
+  return source.type === "chat.activation" &&
+    (source.strategyId === "manual" || source.strategyId === "starter")
+    ? "topic-synthetic-activation-retired"
+    : undefined;
 }
 
 function unrestricted(candidates: readonly LocalAgent[]): TopicAttentionAdmission {

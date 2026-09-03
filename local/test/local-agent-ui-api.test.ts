@@ -102,33 +102,13 @@ test("loopback Console API manages local Agents without Server login", async () 
     });
     assert.equal(resumedTopic.response.status, 200);
     assert.equal((resumedTopic.body as { outcome: string }).outcome, "applied");
-    assert.equal((await jsonRequest(`${origin}/api/chat`).then(({ body }) => body) as {
-      conversation: { state: string };
-    }).conversation.state, "starter_pending");
-
-    const woke = await jsonRequest(`${origin}/api/chat/governance/resume-and-wake`, {
+    assert.equal("conversation" in ((await jsonRequest(`${origin}/api/chat`)).body as object), false);
+    const retiredWake = await jsonRequest(`${origin}/api/chat/governance/resume-and-wake`, {
       method: "POST",
       headers: consoleHeaders(),
       body: JSON.stringify({ expectedRevision: 3, idempotencyKey: "api-resume-wake" })
     });
-    assert.equal(woke.response.status, 200);
-    assert.equal((woke.body as {
-      activation: { status: string; event: { reason: string } };
-    }).activation.status, "accepted");
-    assert.equal((woke.body as {
-      activation: { event: { reason: string } };
-    }).activation.event.reason, "resumed");
-    const duplicateWake = await jsonRequest(
-      `${origin}/api/chat/governance/resume-and-wake`,
-      {
-        method: "POST",
-        headers: consoleHeaders(),
-        body: JSON.stringify({ expectedRevision: 3, idempotencyKey: "api-resume-wake" })
-      }
-    );
-    assert.equal((duplicateWake.body as {
-      activation: { status: string };
-    }).activation.status, "duplicate");
+    assert.equal(retiredWake.response.status, 405);
 
     const rejectedActivity = await jsonRequest(
       `${origin}/api/network/activity/alice/grant`,
@@ -366,41 +346,16 @@ test("loopback Console API manages local Agents without Server login", async () 
       governance: { participants: Array<{ status: string }> };
     }).governance.participants.map(({ status }) => status), ["active"]);
 
-    const initialFreeChat = await jsonRequest(`${origin}/api/chat/free-chat`);
-    assert.equal((initialFreeChat.body as {
-      actionAvailability: { start: boolean };
-    }).actionAvailability.start, true);
-    const startedFreeChat = await jsonRequest(`${origin}/api/chat/free-chat/start`, {
+    const retiredFreeChat = await jsonRequest(`${origin}/api/chat/free-chat`, {
+      headers: consoleHeaders()
+    });
+    assert.equal(retiredFreeChat.response.status, 404);
+    const retiredFreeChatStart = await jsonRequest(`${origin}/api/chat/free-chat/start`, {
       method: "POST",
       headers: consoleHeaders(),
-      body: JSON.stringify({
-        idempotencyKey: "api-free-chat",
-        intent: "directed",
-        brief: "Discuss API ergonomics."
-      })
+      body: JSON.stringify({ idempotencyKey: "api-free-chat" })
     });
-    assert.equal(startedFreeChat.response.status, 201);
-    assert.equal((startedFreeChat.body as {
-      mode: { sample: { conversationIntent: { mode: string } } };
-    }).mode.sample.conversationIntent.mode, "directed");
-    const continuedFreeChat = await jsonRequest(
-      `${origin}/api/chat/free-chat/continue-now`,
-      {
-        method: "POST",
-        headers: consoleHeaders(),
-        body: JSON.stringify({ expectedRevision: 1 })
-      }
-    );
-    assert.equal(continuedFreeChat.response.status, 200);
-    const exitedFreeChat = await jsonRequest(`${origin}/api/chat/free-chat/exit`, {
-      method: "POST",
-      headers: consoleHeaders(),
-      body: JSON.stringify({ expectedRevision: 2 })
-    });
-    assert.equal(exitedFreeChat.response.status, 200);
-    assert.equal((exitedFreeChat.body as {
-      mode: { status: string };
-    }).mode.status, "exited");
+    assert.equal(retiredFreeChatStart.response.status, 405);
 
     const scheduled = await jsonRequest(`${origin}/api/chat/schedules`, {
       method: "POST",

@@ -11,6 +11,8 @@ import {
   scheduleOccurrenceView,
   traceScheduleOccurrenceView
 } from "../../application/schedule/query.js";
+import { migrateLegacyScheduleToExternalWorkflow } from
+  "../../application/proactive/source-migration.js";
 
 interface Output {
   readonly write: (text: string) => void;
@@ -21,6 +23,7 @@ const HELP = [
   "  scripts/rs schedule list",
   "  scripts/rs schedule inspect|pause|resume|cancel <schedule-id>",
   "  scripts/rs schedule run-now <schedule-id> --request-id <idempotency-key>",
+  "  scripts/rs schedule migrate-workflow <schedule-id> --workflow-ref <ref> --expected-revision <n> --request-id <idempotency-key>",
   "  scripts/rs schedule occurrences <schedule-id> [--limit <count>]",
   "  scripts/rs schedule runs <schedule-id> [--limit <count>] (legacy alias)",
   "  scripts/rs schedule trace <run-id>",
@@ -68,6 +71,22 @@ export function runScheduleCommand(
     write(output, runScheduleNow(repoRoot, rest[0]!, rest[2]!, runtimeDirectory));
     return 0;
   }
+  if (command === "migrate-workflow") {
+    if (rest.length !== 7 || rest[1] !== "--workflow-ref" ||
+      rest[3] !== "--expected-revision" || rest[5] !== "--request-id") {
+      throw new Error(
+        "schedule migrate-workflow requires <id> --workflow-ref <ref> " +
+        "--expected-revision <n> --request-id <idempotency-key>"
+      );
+    }
+    write(output, migrateLegacyScheduleToExternalWorkflow(repoRoot, {
+      scheduleId: rest[0]!,
+      workflowRef: rest[2]!,
+      expectedRevision: commandInteger(rest[4], "expectedRevision"),
+      requestId: rest[6]!
+    }, runtimeDirectory));
+    return 0;
+  }
   if (command === "occurrences" || command === "runs") {
     if (rest.length !== 1 && !(rest.length === 3 && rest[1] === "--limit")) {
       throw new Error(`schedule ${command} requires <id> [--limit <count>]`);
@@ -100,7 +119,7 @@ export function runScheduleCommand(
   }
   throw new Error(
     "schedule requires list, inspect, pause, resume, cancel, " +
-    "run-now, occurrences, runs, trace or resolve"
+    "run-now, migrate-workflow, occurrences, runs, trace or resolve"
   );
 }
 

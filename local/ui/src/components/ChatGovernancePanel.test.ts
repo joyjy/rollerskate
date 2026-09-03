@@ -83,7 +83,6 @@ function governance(agentId: string) {
         governanceRevision: 2
       }],
       strategyPolicy: {
-        starterEnabled: true,
         participantMessageEnabled: true,
         scheduledEnabled: true
       },
@@ -98,7 +97,6 @@ function governance(agentId: string) {
       expectedRevision: 2,
       pause: true,
       resume: false,
-      resumeAndWake: false,
       participantAddAgentIds: [],
       participantRemoveAgentIds: [agentId]
     }

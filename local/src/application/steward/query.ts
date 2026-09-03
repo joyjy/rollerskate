@@ -123,6 +123,10 @@ export interface StewardRunDetailView {
   readonly workspaceRevisionError: string | null;
 }
 
+export interface StewardRunInspectionOptions {
+  readonly inspectCurrentWorkspaceRevision?: boolean;
+}
+
 export interface TriggerSourceView {
   readonly kind: "schedule" | "subscription" | "continuous_subscription";
   readonly id: string;
@@ -272,7 +276,8 @@ export function latestStewardRunView(
 export function inspectStewardRunView(
   repoRoot: string,
   runId: string,
-  runtimeDirectory?: string
+  runtimeDirectory?: string,
+  options: StewardRunInspectionOptions = {}
 ): StewardRunDetailView {
   return withStores(repoRoot, runtimeDirectory, (stores) => {
     const run = stores.runs.requireProjection(runId);
@@ -291,11 +296,13 @@ export function inspectStewardRunView(
       ...requests.map((request) => request.agentId),
       ...exchanges.flatMap((item) => [item.fromAgentId, item.toAgentId])
     ]);
-    const workspace = attempt(() =>
-      run.workspaceGrant === undefined
-        ? undefined
-        : workspaceRevision(run.workspaceGrant.root)
-    );
+    const workspace = options.inspectCurrentWorkspaceRevision === false
+      ? { value: undefined, error: undefined }
+      : attempt(() =>
+          run.workspaceGrant === undefined
+            ? undefined
+            : workspaceRevision(run.workspaceGrant.root)
+        );
     const cycles = stores.runs.cycles(run.runId, 1_000);
     const steps = requests
       .map((request) => stepView(

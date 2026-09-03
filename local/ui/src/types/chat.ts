@@ -32,4 +32,5 @@ export type ChatTimelineMessage = LocalChatMessage | {
   readonly replyToEventId?: string;
   readonly targets?: LocalChatMessage["targets"];
   readonly readProgress?: LocalChatMessage["readProgress"];
+  readonly runProposals?: never;
 };

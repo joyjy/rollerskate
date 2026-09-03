@@ -220,7 +220,7 @@ test("Topic governance remains application-owned and does not create a Core stat
   const bootstrap = readFileSync(resolve(sourceRoot, "bootstrap/runtime.ts"), "utf8");
   assert.doesNotMatch(
     bootstrap,
-    /starterEnabled|participantMessageEnabled|scheduledEnabled|choose_from_themes/,
+    /participantMessageEnabled|scheduledEnabled|choose_from_themes/,
     "bootstrap may materialize Topic governance but cannot own its policy"
   );
   assert.match(
@@ -278,17 +278,20 @@ test("ordinary SQLite stores share one immediate transaction template", () => {
     .sort();
   assert.deepEqual(rawTransactionOwners, [
     "infrastructure/sqlite/schema/index.ts",
-      "infrastructure/sqlite/schema/v44-migration.ts",
-      "infrastructure/sqlite/schema/v59-migration.ts",
-      "infrastructure/sqlite/schema/v60-migration.ts",
-      "infrastructure/sqlite/schema/v61-migration.ts",
-      "infrastructure/sqlite/schema/v62-migration.ts",
-      "infrastructure/sqlite/schema/v63-migration.ts",
-      "infrastructure/sqlite/schema/v64-migration.ts",
-      "infrastructure/sqlite/schema/v65-migration.ts",
-      "infrastructure/sqlite/schema/v66-migration.ts",
+    "infrastructure/sqlite/schema/v44-migration.ts",
+    "infrastructure/sqlite/schema/v59-migration.ts",
+    "infrastructure/sqlite/schema/v60-migration.ts",
+    "infrastructure/sqlite/schema/v61-migration.ts",
+    "infrastructure/sqlite/schema/v62-migration.ts",
+    "infrastructure/sqlite/schema/v63-migration.ts",
+    "infrastructure/sqlite/schema/v64-migration.ts",
+    "infrastructure/sqlite/schema/v65-migration.ts",
+    "infrastructure/sqlite/schema/v66-migration.ts",
     "infrastructure/sqlite/schema/v67-migration.ts",
     "infrastructure/sqlite/schema/v68-migration.ts",
+    "infrastructure/sqlite/schema/v69-migration.ts",
+    "infrastructure/sqlite/schema/v70-migration.ts",
+    "infrastructure/sqlite/schema/v71-migration.ts",
     "infrastructure/sqlite/transaction.ts"
   ]);
 });

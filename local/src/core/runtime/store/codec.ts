@@ -2,7 +2,10 @@ import {
   type ChatAttentionReceipt,
   type ChatDecisionReceipt
 } from "../../../infrastructure/sqlite/runtime-mappers.js";
-import { parseChatPresence } from "../../chat/model.js";
+import {
+  parseChatPresence,
+  parseChatRunProposalDraft
+} from "../../chat/model.js";
 import type {
   ChatAttentionPlan,
   ChatAttentionReason
@@ -219,14 +222,23 @@ export function parseChatAttentionReceiptList(value: string | null): ChatAttenti
 export function parseChatDecisionReceipt(value: string | null): ChatDecisionReceipt | undefined {
   if (value === null) return undefined;
   const parsed = parseJsonObject(value, "Execution receipt");
-  if (parsed.schema !== "ChatDecisionReceipt@1") return undefined;
+  if (parsed.schema !== "ChatDecisionReceipt@1" &&
+    parsed.schema !== "ChatDecisionReceipt@2") return undefined;
   if (typeof parsed.dispatchEventId !== "string" ||
-    (parsed.speechAction !== "reply" && parsed.speechAction !== "silent") ||
+    (parsed.speechAction !== "reply" && parsed.speechAction !== "silent" &&
+      parsed.speechAction !== "propose_run") ||
+    (parsed.speechAction === "propose_run" && parsed.schema !== "ChatDecisionReceipt@2") ||
     (parsed.speechAction === "silent" && parsed.silenceReason !== undefined &&
       (typeof parsed.silenceReason !== "string" ||
         parsed.silenceReason.trim() === "" || parsed.silenceReason.length > 200)) ||
     typeof parsed.createdAt !== "string") {
     throw new Error("Chat decision receipt is malformed");
+  }
+  const proposal = parsed.proposal === undefined
+    ? undefined
+    : parseChatRunProposalDraft(parsed.proposal);
+  if ((parsed.speechAction === "propose_run") !== (proposal !== undefined)) {
+    throw new Error("Chat decision proposal receipt is malformed");
   }
   const presence = parsed.presenceTransition === undefined
     ? undefined
@@ -246,6 +258,7 @@ export function parseChatDecisionReceipt(value: string | null): ChatDecisionRece
     ...(parsed.speechAction === "silent" && typeof parsed.silenceReason === "string"
       ? { silenceReason: parsed.silenceReason as string }
       : {}),
+    ...(proposal === undefined ? {} : { proposal }),
     ...(presence === undefined ? {} : { presenceTransition: presence }),
     ...(typeof parsed.replyEventId === "string" ? { replyEventId: parsed.replyEventId } : {}),
     ...(profile === undefined
@@ -271,7 +284,8 @@ export function parseAgentInvocationReceipt(
   if (value === null) return undefined;
   const receipt = parseJsonObject(value, "Execution receipt");
   if ((!nested && receipt.schema !== "AgentInvocationReceipt@1") ||
-    (nested && receipt.schema !== "ChatDecisionReceipt@1")) {
+    (nested && receipt.schema !== "ChatDecisionReceipt@1" &&
+      receipt.schema !== "ChatDecisionReceipt@2")) {
     return undefined;
   }
   const candidate = receipt.invocation;
@@ -368,7 +382,9 @@ export function normalizeAgentInvocationFailure(
   if (typeof candidate.failedAt !== "string" ||
     !["stall", "deadline", "protocol_exit", "cancelled", "protocol_error"]
       .includes(candidate.reason as string) ||
-    !validBoundedInteger(candidate.totalTimeoutMilliseconds, 1, 900_000) ||
+    (candidate.reason === "deadline" && candidate.totalTimeoutMilliseconds === undefined) ||
+    (candidate.totalTimeoutMilliseconds !== undefined &&
+      !validBoundedInteger(candidate.totalTimeoutMilliseconds, 1, 900_000)) ||
     !validBoundedInteger(candidate.meaningfulOutputTimeoutMilliseconds, 1, 900_000) ||
     !["requested", "acknowledged", "unavailable"]
       .includes(candidate.protocolStop as string) ||
@@ -389,7 +405,9 @@ export function normalizeAgentInvocationFailure(
     ...progress,
     failedAt,
     reason: candidate.reason as AgentInvocationFailure["reason"],
-    totalTimeoutMilliseconds: candidate.totalTimeoutMilliseconds as number,
+    ...(candidate.totalTimeoutMilliseconds === undefined
+      ? {}
+      : { totalTimeoutMilliseconds: candidate.totalTimeoutMilliseconds as number }),
     meaningfulOutputTimeoutMilliseconds:
       candidate.meaningfulOutputTimeoutMilliseconds as number,
     protocolStop: candidate.protocolStop as AgentInvocationFailure["protocolStop"],

@@ -10,7 +10,10 @@ import { startStewardRunFromIntent } from
   "../src/application/steward/intent-control.js";
 import { activateRunSourceOccurrenceInTransaction } from
   "../src/application/steward/source-control.js";
-import { cancelStewardRun } from "../src/application/steward/control.js";
+import {
+  cancelStewardRun,
+  retryStewardOrchestrator
+} from "../src/application/steward/control.js";
 import { StewardModule } from "../src/application/steward/module.js";
 import {
   AgentHandler,
@@ -58,9 +61,10 @@ test("RunDecision@3 await_source and source cycle execute through the Runtime lo
     workspace: fixture.paths.workspace,
     async invoke(input) {
       prompts.push(input.event.prompt);
+      invocation += 1;
+      if (invocation === 2) throw new Error("transient source orchestrator failure");
       const body = outputs.shift();
       if (body === undefined) throw new Error("scripted RunDecision@3 output exhausted");
-      invocation += 1;
       return {
         providerSessionId: `codex-source-session-${invocation}`,
         outcome: { kind: "message", body },
@@ -107,6 +111,17 @@ test("RunDecision@3 await_source and source cycle execute through the Runtime lo
       "2026-08-26T01:01:01.000Z");
     results.handle(claim(runtime, "result", "2026-08-26T01:01:02.000Z"),
       "2026-08-26T01:01:02.000Z");
+    const retryQueued = runs.requireProjection(bound.runId);
+    assert.equal(retryQueued.status, "awaiting_orchestrator");
+    assert.equal(runs.cycle(activated.cycle.cycleId)?.status, "active");
+    const retryRequest = runtime.eventsForRoot(bound.rootEventId).find((event) =>
+      event.source.externalId?.includes(":occurrence-retry:")
+    );
+    assert.equal(retryRequest?.type, "agent.request");
+    await agents.handle(claim(runtime, "agent", "2026-08-26T01:01:03.000Z"),
+      "2026-08-26T01:01:03.000Z");
+    results.handle(claim(runtime, "result", "2026-08-26T01:01:04.000Z"),
+      "2026-08-26T01:01:04.000Z");
     const afterCycle = runs.requireProjection(bound.runId);
     const resultReceipts = database.prepare(`
       SELECT receipt_json FROM executions
@@ -120,6 +135,192 @@ test("RunDecision@3 await_source and source cycle execute through the Runtime lo
     assert.match(prompts[1]!, /TriggerOccurrenceEnvelope@1/u);
     assert.match(prompts[1]!, /await_source is invalid now/u);
     assert.doesNotMatch(prompts[1]!, /For await_source use:/u);
+    assert.equal(prompts[2], prompts[1]);
+  } finally {
+    runs.close();
+    runtime.close();
+    database.close();
+    fixture.close();
+  }
+});
+
+test("standalone read-only Steward retries once and keeps exact Owner recovery", async () => {
+  const fixture = setup();
+  const started = startStewardRunFromIntent(fixture.repo, intent("standalone-retry"),
+    fixture.runtimeDirectory, "2026-08-26T01:05:00.000Z");
+  let invocation = 0;
+  const prompts: string[] = [];
+  const database = openRuntimeDatabase(fixture.paths.database);
+  const runtime = new RuntimeStore(database);
+  const runs = new AgentRunStore(database);
+  const manifest = new StewardModule({ runs, runtime }).manifest();
+  const adapter: RuntimeAgentAdapter = {
+    adapterId: "standalone-bounded-retry",
+    workspace: fixture.paths.workspace,
+    async invoke(input) {
+      invocation += 1;
+      prompts.push(input.event.prompt);
+      if (invocation <= 2) throw new Error(`standalone failure ${invocation}`);
+      return {
+        providerSessionId: "standalone-recovered",
+        outcome: { kind: "message", body: JSON.stringify(finishDecision(2, "run")) }
+      };
+    }
+  };
+  const agents = new AgentHandler({
+    store: runtime,
+    adapters: new Map([[started.run.stewardAgentId, adapter]]),
+    executionGuards: manifest.executionGuards
+  });
+  const results = new ResultHandler(runtime, manifest.resultContinuations);
+  try {
+    for (const [agentAt, resultAt] of [
+      ["2026-08-26T01:05:01.000Z", "2026-08-26T01:05:02.000Z"],
+      ["2026-08-26T01:05:03.000Z", "2026-08-26T01:05:04.000Z"]
+    ] as const) {
+      await agents.handle(claim(runtime, "agent", agentAt), agentAt);
+      results.handle(claim(runtime, "result", resultAt), resultAt);
+    }
+    assert.equal(invocation, 2);
+    const awaiting = runs.requireProjection(started.run.runId);
+    assert.equal(awaiting.status, "awaiting_orchestrator");
+    assert.equal(awaiting.activeCycleId, undefined);
+    assert.equal(awaiting.stepCount, 0);
+    assert.equal(awaiting.version, 2);
+    assert.match(prompts[0]!, /Current Run version: 1/);
+    assert.match(prompts[1]!, /Current Run version: 2/);
+
+    const recovered = retryStewardOrchestrator(
+      fixture.repo,
+      started.run.runId,
+      "recover-standalone",
+      fixture.runtimeDirectory,
+      "2026-08-26T01:06:00.000Z"
+    );
+    assert.equal(recovered.status, "accepted");
+    assert.equal(retryStewardOrchestrator(
+      fixture.repo,
+      started.run.runId,
+      "recover-standalone",
+      fixture.runtimeDirectory,
+      "2026-08-26T01:06:00.000Z"
+    ).status, "duplicate");
+    await agents.handle(claim(runtime, "agent", "2026-08-26T01:06:01.000Z"),
+      "2026-08-26T01:06:01.000Z");
+    results.handle(claim(runtime, "result", "2026-08-26T01:06:02.000Z"),
+      "2026-08-26T01:06:02.000Z");
+    assert.match(prompts[2]!, /Current Run version: 2/);
+    assert.equal(runs.requireProjection(started.run.runId).status, "succeeded");
+  } finally {
+    runs.close();
+    runtime.close();
+    database.close();
+    fixture.close();
+  }
+});
+
+test("source Steward retry is bounded and Owner can recover the exact cycle", async () => {
+  const fixture = setup();
+  const started = startStewardRunFromIntent(fixture.repo, intent("bounded-source-retry"),
+    fixture.runtimeDirectory, "2026-08-26T01:10:00.000Z");
+  let invocation = 0;
+  const database = openRuntimeDatabase(fixture.paths.database);
+  const runtime = new RuntimeStore(database);
+  const runs = new AgentRunStore(database);
+  const manifest = new StewardModule({
+    runs,
+    runtime,
+    bindSource: ({ run }) => scheduleBinding(run)
+  }).manifest();
+  const adapter: RuntimeAgentAdapter = {
+    adapterId: "steward-source-bounded-retry",
+    workspace: fixture.paths.workspace,
+    async invoke() {
+      invocation += 1;
+      if (invocation === 1) {
+        return {
+          providerSessionId: "bounded-source-root",
+          outcome: { kind: "message", body: JSON.stringify(awaitScheduleDecision(1)) }
+        };
+      }
+      if (invocation < 4) throw new Error(`source failure ${invocation - 1}`);
+      return {
+        providerSessionId: "bounded-source-recovered",
+        outcome: { kind: "message", body: JSON.stringify(finishDecision(3, "cycle")) }
+      };
+    }
+  };
+  const agents = new AgentHandler({
+    store: runtime,
+    adapters: new Map([[started.run.stewardAgentId, adapter]]),
+    executionGuards: manifest.executionGuards
+  });
+  const results = new ResultHandler(runtime, manifest.resultContinuations);
+  try {
+    await agents.handle(claim(runtime, "agent", "2026-08-26T01:10:01.000Z"),
+      "2026-08-26T01:10:01.000Z");
+    results.handle(claim(runtime, "result", "2026-08-26T01:10:02.000Z"),
+      "2026-08-26T01:10:02.000Z");
+    const bound = runs.requireProjection(started.run.runId);
+    const activated = runtime.withImmediateTransaction(() =>
+      activateRunSourceOccurrenceInTransaction({
+        runtime,
+        runs,
+        runId: bound.runId,
+        envelope: occurrenceEnvelope(
+          bound,
+          "bounded-retry-occurrence",
+          "bounded-retry-revision",
+          "2026-08-26T01:11:00.000Z"
+        ),
+        at: "2026-08-26T01:11:00.000Z"
+      }));
+    for (const [agentAt, resultAt] of [
+      ["2026-08-26T01:11:01.000Z", "2026-08-26T01:11:02.000Z"],
+      ["2026-08-26T01:11:03.000Z", "2026-08-26T01:11:04.000Z"]
+    ] as const) {
+      await agents.handle(claim(runtime, "agent", agentAt), agentAt);
+      results.handle(claim(runtime, "result", resultAt), resultAt);
+    }
+    assert.equal(invocation, 3);
+    const pendingSourceExecutions = runtime.eventsForRoot(bound.rootEventId)
+      .filter((event) => event.type === "agent.request" &&
+        event.runContext?.cycleId === activated.cycle.cycleId)
+      .map((event) => runtime.executionForEvent(event.eventId)?.status)
+      .filter((status) => status === "queued" || status === "running");
+    assert.deepEqual(pendingSourceExecutions, []);
+    assert.equal(runs.requireProjection(bound.runId).status, "awaiting_orchestrator");
+    assert.equal(runs.cycle(activated.cycle.cycleId)?.status, "active");
+
+    const recovered = retryStewardOrchestrator(
+      fixture.repo,
+      bound.runId,
+      "recover-bounded-cycle",
+      fixture.runtimeDirectory,
+      "2026-08-26T01:12:00.000Z"
+    );
+    assert.equal(recovered.status, "accepted");
+    const replay = retryStewardOrchestrator(
+      fixture.repo,
+      bound.runId,
+      "recover-bounded-cycle",
+      fixture.runtimeDirectory,
+      "2026-08-26T01:12:00.000Z"
+    );
+    assert.equal(replay.status, "duplicate");
+    await agents.handle(claim(runtime, "agent", "2026-08-26T01:12:01.000Z"),
+      "2026-08-26T01:12:01.000Z");
+    results.handle(claim(runtime, "result", "2026-08-26T01:12:02.000Z"),
+      "2026-08-26T01:12:02.000Z");
+    assert.equal(runs.requireProjection(bound.runId).status, "awaiting_source");
+    assert.equal(runs.cycle(activated.cycle.cycleId)?.status, "succeeded");
+    assert.equal(retryStewardOrchestrator(
+      fixture.repo,
+      bound.runId,
+      "recover-bounded-cycle",
+      fixture.runtimeDirectory,
+      "2026-08-26T01:12:03.000Z"
+    ).status, "duplicate");
   } finally {
     runs.close();
     runtime.close();

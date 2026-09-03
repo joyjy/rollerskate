@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { realpathSync, statSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -23,7 +23,6 @@ import {
   runnerToolNames,
   runnerTurnCount,
   runnerUsage,
-  DEFAULT_MEANINGFUL_OUTPUT_TIMEOUT_MILLISECONDS,
   RunnerInvocationError,
   type RunnerTurnReceipt,
   type RunnerUsage
@@ -32,7 +31,7 @@ import {
 interface PiRequest {
   readonly event: AgentInputEvent | ChatDispatchEvent;
   readonly providerSessionId: string;
-  readonly chatHistoryContext?: PiChatHistoryContext;
+  readonly chatToolContext?: PiChatToolContext;
 }
 
 interface PiDecodedResponse {
@@ -49,41 +48,63 @@ export interface PiRuntimeAgentOptions {
   readonly meaningfulOutputTimeoutMilliseconds?: number;
   readonly maxOutputBytes?: number;
   readonly launchArgs?: readonly string[];
-  readonly resolveChatHistoryContext?: (
+  readonly resolveChatToolContext?: (
     input: Pick<PiRequest, "event" | "providerSessionId">
-  ) => PiChatHistoryContext | undefined;
+  ) => PiChatToolContext | undefined;
+  readonly chatReadToolGrant?: {
+    readonly tools: readonly string[];
+    readonly manifestDigest: string;
+  };
 }
 
-export interface PiChatHistoryContext {
+export interface PiChatToolContext {
+  readonly repoRoot?: string;
   readonly runtimeDirectory: string;
   readonly topicId: string;
-  readonly sourceMessageEventId: string;
+  readonly sourceMessageEventId?: string;
 }
 
-export const PI_CHAT_HISTORY_CONTEXT_ENV = "ROLLERSKATE_CHAT_HISTORY_CONTEXT";
+export const PI_CHAT_TOOL_CONTEXT_ENV = "ROLLERSKATE_CHAT_TOOL_CONTEXT";
+export const PI_GIT_WORKSPACE_ENV = "ROLLERSKATE_GIT_WORKSPACE";
 
 const piChatHistoryExtension = fileURLToPath(new URL(
   "../../../resources/agents/pi-chat-history.mjs",
   import.meta.url
 ));
 
+const piReadonlyGitExtension = fileURLToPath(new URL(
+  "../../../resources/agents/pi-readonly-git.mjs",
+  import.meta.url
+));
+
 export class PiRuntimeAgent implements RuntimeAgentAdapter {
-  public readonly adapterId = "pi-runtime-rpc-v1";
+  public readonly adapterId: string;
   public readonly providerPolicy;
   public readonly workspace: string;
   readonly #launchArgs: readonly string[];
-  readonly #processOptions: Omit<PiRuntimeAgentOptions, "resolveChatHistoryContext">;
-  readonly #resolveChatHistoryContext: PiRuntimeAgentOptions["resolveChatHistoryContext"];
+  readonly #processOptions: Omit<PiRuntimeAgentOptions, "resolveChatToolContext">;
+  readonly #resolveChatToolContext: PiRuntimeAgentOptions["resolveChatToolContext"];
+  readonly #chatReadToolNames: readonly string[];
+  readonly #chatReadToolManifestDigest: string;
 
   public constructor(options: PiRuntimeAgentOptions) {
     this.workspace = workspace(options.projectRoot);
     this.#launchArgs = [...(options.launchArgs ?? [])];
-    this.#resolveChatHistoryContext = options.resolveChatHistoryContext;
+    this.#resolveChatToolContext = options.resolveChatToolContext;
+    const grant = validatedChatReadToolGrant(options.chatReadToolGrant);
+    this.#chatReadToolNames = grant.tools;
+    this.#chatReadToolManifestDigest = grant.manifestDigest;
+    const resources = piPolicyResources(
+      this.#chatReadToolNames,
+      this.#chatReadToolManifestDigest
+    );
     this.providerPolicy = providerPolicyObservationFromArgv(
       "pi",
       piOptions(undefined, this.#launchArgs),
-      piPolicyHelperSource
+      piPolicyHelperSource,
+      resources
     );
+    this.adapterId = `pi-runtime-rpc-v1:${this.providerPolicy.hook.helperDigest}`;
     this.#processOptions = options;
   }
 
@@ -93,43 +114,51 @@ export class PiRuntimeAgent implements RuntimeAgentAdapter {
       event: input.event,
       providerSessionId: input.providerSessionId ?? randomUUID()
     };
-    const chatHistoryContext = this.#resolveChatHistoryContext?.(resolutionInput);
+    const chatToolContext = this.#resolveChatToolContext?.(resolutionInput);
     const request = {
       ...resolutionInput,
-      ...(chatHistoryContext === undefined
+      ...(chatToolContext === undefined
         ? {}
-        : { chatHistoryContext })
+        : { chatToolContext })
     } satisfies PiRequest;
     const access = piWorkspaceAccess(request.event);
-    const totalTimeoutMilliseconds = invocationTimeoutMilliseconds(
-      input.event,
-      this.#processOptions.timeoutMilliseconds
-    );
+    const totalTimeoutMilliseconds = invocationTimeoutMilliseconds(input.event);
     const meaningfulOutputTimeoutMilliseconds =
       this.#processOptions.meaningfulOutputTimeoutMilliseconds ??
-      DEFAULT_MEANINGFUL_OUTPUT_TIMEOUT_MILLISECONDS;
+      this.#processOptions.timeoutMilliseconds;
+    const resources = piPolicyResources(
+      this.#chatReadToolNames,
+      this.#chatReadToolManifestDigest
+    );
+    const currentBasePolicy = providerPolicyObservationFromArgv(
+      "pi",
+      piOptions(undefined, this.#launchArgs),
+      piPolicyHelperSource,
+      resources
+    );
+    if (currentBasePolicy.hook.helperDigest !== this.providerPolicy.hook.helperDigest) {
+      throw new Error("pi bundled extension content changed; restart the Runtime");
+    }
     providerPolicyObservationFromArgv(
       "pi",
-      piArgs(request, this.#launchArgs),
+      piArgs(request, this.#launchArgs, this.#chatReadToolNames),
       piPolicyHelperSource,
-      {},
+      resources,
       access
     );
     const process = new PiRpcRunner({
       adapterId: this.adapterId,
       executable: this.#processOptions.executable,
-      args: piArgs(request, this.#launchArgs),
+      args: piArgs(request, this.#launchArgs, this.#chatReadToolNames),
       environment: {
         ...this.#processOptions.environment,
-        ...(request.chatHistoryContext === undefined
+        [PI_GIT_WORKSPACE_ENV]: this.workspace,
+        ...(request.chatToolContext === undefined
           ? {}
-          : { [PI_CHAT_HISTORY_CONTEXT_ENV]: JSON.stringify(request.chatHistoryContext) })
+          : { [PI_CHAT_TOOL_CONTEXT_ENV]: JSON.stringify(request.chatToolContext) })
       },
       workingDirectory: this.workspace,
-      timeoutMilliseconds: this.#processOptions.timeoutMilliseconds,
-      meaningfulOutputTimeoutMilliseconds:
-        this.#processOptions.meaningfulOutputTimeoutMilliseconds ??
-        DEFAULT_MEANINGFUL_OUTPUT_TIMEOUT_MILLISECONDS,
+      meaningfulOutputTimeoutMilliseconds,
       maxOutputBytes: this.#processOptions.maxOutputBytes ?? 1_048_576
     });
     let result: RunnerTurnReceipt;
@@ -173,14 +202,23 @@ export class PiRuntimeAgent implements RuntimeAgentAdapter {
 
 function piArgs(
   request: PiRequest,
-  launchArgs: readonly string[]
+  launchArgs: readonly string[],
+  chatReadToolNames: readonly string[] = []
 ): string[] {
   const access = piWorkspaceAccess(request.event);
+  const chatToolNames = request.chatToolContext === undefined
+    ? []
+    : [
+        ...(request.chatToolContext.sourceMessageEventId === undefined
+          ? []
+          : ["read_chat_history"]),
+        ...chatReadToolNames
+      ];
   return [
     ...piOptions(
       access,
       launchArgs,
-      request.chatHistoryContext !== undefined
+      chatToolNames
     ),
     "--session-id", request.providerSessionId
   ];
@@ -201,16 +239,36 @@ function piWorkspaceAccess(
 function piOptions(
   access: "read" | "write" | undefined,
   launchArgs: readonly string[],
-  chatHistory: boolean = false
+  chatToolNames: readonly string[] = []
 ): string[] {
+  rejectPiResourceLaunchArgs(launchArgs);
   return [
     ...launchArgs,
+    "--no-extensions",
+    "--no-skills",
+    "--no-prompt-templates",
+    "--no-themes",
+    "--no-context-files",
     "--mode", "rpc",
-    ...(chatHistory ? ["--extension", piChatHistoryExtension] : []),
+    ...(access !== "write" ? ["--extension", piReadonlyGitExtension] : []),
+    ...(chatToolNames.length > 0 ? ["--extension", piChatHistoryExtension] : []),
     "--tools", access === "write"
-      ? `read,write,edit,bash,grep,find,ls${chatHistory ? ",read_chat_history" : ""}`
-      : `read,grep,find,ls${chatHistory ? ",read_chat_history" : ""}`
+      ? ["read", "write", "edit", "bash", "grep", "find", "ls", ...chatToolNames].join(",")
+      : ["read", "grep", "find", "ls", "read_git_diff", ...chatToolNames].join(",")
   ];
+}
+
+function rejectPiResourceLaunchArgs(launchArgs: readonly string[]): void {
+  const controlled = new Set([
+    "-e", "--extension", "--skill", "--prompt-template", "--theme", "--use-theme",
+    "--system-prompt", "--append-system-prompt"
+  ]);
+  if (launchArgs.some((argument) => {
+    const option = argument.startsWith("--") ? argument.split("=", 1)[0]! : argument;
+    return controlled.has(option);
+  })) {
+    throw new Error("pi resource and prompt loading is controlled by the Runtime adapter");
+  }
 }
 
 function piResponse(receipt: RunnerTurnReceipt): PiDecodedResponse {
@@ -238,8 +296,38 @@ function piResponse(receipt: RunnerTurnReceipt): PiDecodedResponse {
 const piPolicyHelperSource = [
   piArgs.toString(),
   piOptions.toString(),
+  validatedChatReadToolGrant.toString(),
+  rejectPiResourceLaunchArgs.toString(),
   piWorkspaceAccess.toString()
 ].join("\n");
+
+function piPolicyResources(
+  chatReadToolNames: readonly string[] = [],
+  chatReadToolManifestDigest = ""
+):
+Readonly<Record<string, string>> {
+  return {
+    piReadonlyGitExtensionPath: piReadonlyGitExtension,
+    piReadonlyGitExtensionSource: readFileSync(piReadonlyGitExtension, "utf8"),
+    piChatHistoryExtensionPath: piChatHistoryExtension,
+    piChatHistoryExtensionSource: readFileSync(piChatHistoryExtension, "utf8"),
+    piChatReadToolNames: chatReadToolNames.join(","),
+    piChatReadToolManifestDigest: chatReadToolManifestDigest
+  };
+}
+
+function validatedChatReadToolGrant(
+  grant: PiRuntimeAgentOptions["chatReadToolGrant"]
+): { readonly tools: readonly string[]; readonly manifestDigest: string } {
+  if (grant === undefined) return { tools: [], manifestDigest: "" };
+  const tools = [...grant.tools];
+  if (!/^[a-f0-9]{64}$/u.test(grant.manifestDigest) ||
+    tools.length === 0 || new Set(tools).size !== tools.length ||
+    tools.some((name) => !/^[a-z][a-z0-9_]{1,63}$/u.test(name))) {
+    throw new Error("Pi Chat read tool grant is malformed");
+  }
+  return { tools, manifestDigest: grant.manifestDigest };
+}
 
 function piTokenUsage(usage: RunnerUsage | undefined) {
   if (usage === undefined) return undefined;

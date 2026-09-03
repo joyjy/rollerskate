@@ -11,11 +11,9 @@ import {
   suspendLocalAgent
 } from "../src/application/agent/control.js";
 import {
-  activateLocalChat,
   dispatchLocalChatMessage,
   localChatView,
   postLocalChatMessage,
-  resumeAndWakeLocalChat,
   rotateLocalAgentSession
 } from "../src/application/chat/control.js";
 import {
@@ -189,41 +187,6 @@ test("Pause and Resume are idempotent, conflict-safe, durable and do not wake Ch
   }
 });
 
-test("Resume & wake requires a key and creates at most one resumed activation", () => {
-  const fixture = runtimeFixture("resume-wake");
-  try {
-    const alice = addLocalAgent(fixture.repo, "alice", "codex", fixture.options);
-    materializeLocalTopicGovernance(
-      fixture.repo, fixture.runtime, "2026-07-31T10:00:00.000Z"
-    );
-    pauseLocalTopic(fixture.repo, 1, fixture.options);
-    assert.throws(
-      () => resumeAndWakeLocalChat(fixture.repo, 2, " ", fixture.options),
-      /requires an idempotency key/
-    );
-    const first = resumeAndWakeLocalChat(
-      fixture.repo, 2, "resume-wake-once", fixture.options
-    );
-    assert.equal(first.governance.outcome, "applied");
-    assert.equal(first.activation?.status, "accepted");
-    assert.equal(first.activation?.event.type, "chat.activation");
-    if (first.activation?.event.type !== "chat.activation") {
-      assert.fail("expected chat.activation");
-    }
-    assert.equal(first.activation.event.reason, "resumed");
-    assert.deepEqual(first.activation.event.candidateAgentIds, [alice.principalId]);
-
-    const repeated = resumeAndWakeLocalChat(
-      fixture.repo, 2, "resume-wake-once", fixture.options
-    );
-    assert.equal(repeated.governance.outcome, "unchanged");
-    assert.equal(repeated.activation?.status, "duplicate");
-    assert.equal(repeated.activation?.event.eventId, first.activation.event.eventId);
-  } finally {
-    fixture.close();
-  }
-});
-
 test("participant controls preserve unrelated Agent and Chat state and allow an empty roster", () => {
   const fixture = runtimeFixture("participant-controls");
   try {
@@ -306,7 +269,6 @@ test("governance validation rejects invalid theme policy and participant state",
     status: "active",
     participants: [],
     strategyPolicy: {
-      starterEnabled: true,
       participantMessageEnabled: true,
       scheduledEnabled: true
     },
@@ -349,7 +311,7 @@ test("governance validation rejects invalid theme policy and participant state",
   }), /receiptId must match/);
 });
 
-test("schema v69 upgrades v53 and materializes governance from existing active Agents", () => {
+test("schema v72 upgrades v53 and materializes governance from existing active Agents", () => {
   const fixture = runtimeFixture("migration");
   try {
     const foundation = localRuntimeSnapshot(fixture.repo, fixture.options).foundation;
@@ -373,8 +335,8 @@ test("schema v69 upgrades v53 and materializes governance from existing active A
     legacy.close();
 
     const diagnostics = initializeRuntimeSchema(databasePath);
-    assert.equal(diagnostics.schemaVersion, 69);
-    assert.equal(diagnostics.tables.length, 29);
+    assert.equal(diagnostics.schemaVersion, 72);
+    assert.equal(diagnostics.tables.length, 32);
     const store = new TopicGovernanceStore(databasePath);
     try {
       const governance = store.require(foundation.topicId);
@@ -391,7 +353,7 @@ test("schema v69 upgrades v53 and materializes governance from existing active A
   }
 });
 
-test("starter, manual, Human and Agent continuation share governance admission", () => {
+test("synthetic activation is retired while source messages obey governance", () => {
   const fixture = runtimeFixture("admission");
   try {
     const alice = addLocalAgent(fixture.repo, "alice", "codex", fixture.options);
@@ -404,57 +366,58 @@ test("starter, manual, Human and Agent continuation share governance admission",
     const runtime = new RuntimeStore(join(fixture.runtime, "runtime.db"));
     const chat = new LocalChatStore(join(fixture.runtime, "runtime.db"));
     try {
-      const paused = store.commitRevision(materialized.governance.topicId, {
-        expectedRevision: 1,
-        action: "pause",
-        actor: { kind: "owner", principalId: "owner" },
-        changedFields: ["status"],
-        next: { ...materialized.governance, status: "paused" }
-      }, "2026-07-31T08:01:00.000Z").governance;
-      assert.throws(() => activateLocalChat(fixture.repo, {
-        strategy: "starter",
-        idempotencyKey: "paused-starter"
-      }, fixture.options), /Topic is paused/);
-      assert.throws(() => activateLocalChat(fixture.repo, {
-        strategy: "manual",
-        idempotencyKey: "paused-manual"
-      }, fixture.options), /Topic is paused/);
-
       const policy = admissionPolicy(fixture, store, runtime);
-      const pausedMessage = postLocalChatMessage(
+      const synthetic = runtime.createChatActivation({
+        topicId: materialized.governance.topicId,
+        reason: "manual",
+        strategyId: "manual",
+        conversationIntent: {
+          schema: "ConversationIntentSnapshot@1",
+          mode: "continue_recent",
+          governanceRevision: materialized.governance.revision
+        },
+        candidateAgentIds: [alice.principalId],
+        idempotencyKey: "retired-manual",
+        turnBudget: 1,
+        contextRevision: materialized.governance.revision
+      }, "2026-07-31T08:01:00.000Z").event;
+      if (synthetic.type !== "chat.activation") assert.fail("expected chat.activation");
+      assert.deepEqual(policy.admitAttention(synthetic, [alice]).candidates, []);
+      assert.deepEqual(policy.admitAttention({
+        ...synthetic,
+        strategyId: "starter"
+      }, [alice]).candidates, []);
+
+      const sourceMessage = postLocalChatMessage(
         fixture.repo,
-        "Human message while paused",
+        "Human message with an auditable source",
         fixture.options
       ).message;
-      const pausedExecution = runtime.claimDueExecutions(
+      const sourceExecution = runtime.claimDueExecutions(
         20,
         "2026-07-31T08:02:00.000Z"
-      ).find(({ eventId }) => eventId === pausedMessage.eventId);
-      assert.ok(pausedExecution);
-      assert.deepEqual(new ChatHandler({
+      ).find(({ eventId }) => eventId === sourceMessage.eventId);
+      assert.ok(sourceExecution);
+      assert.equal(new ChatHandler({
         store: runtime,
         chat,
         listAgents: () => localRuntimeSnapshot(fixture.repo, fixture.options).agents,
         admissionPolicy: policy
-      }).handle(pausedExecution, "2026-07-31T08:02:00.000Z"), []);
+      }).handle(sourceExecution, "2026-07-31T08:02:00.000Z").length, 1);
 
-      const active = store.commitRevision(paused.topicId, {
-        expectedRevision: 2,
-        action: "resume",
-        actor: { kind: "owner", principalId: "owner" },
-        changedFields: ["status"],
-        next: { ...paused, status: "active" }
-      }, "2026-07-31T08:03:00.000Z").governance;
-      const participantDisabled = store.commitRevision(active.topicId, {
-        expectedRevision: 3,
+      const participantDisabled = store.commitRevision(materialized.governance.topicId, {
+        expectedRevision: 1,
         action: "strategy_policy_update",
         actor: { kind: "owner", principalId: "owner" },
         changedFields: ["strategyPolicy.participantMessageEnabled"],
         next: {
-          ...active,
-          strategyPolicy: { ...active.strategyPolicy, participantMessageEnabled: false }
+          ...materialized.governance,
+          strategyPolicy: {
+            ...materialized.governance.strategyPolicy,
+            participantMessageEnabled: false
+          }
         }
-      }, "2026-07-31T08:04:00.000Z").governance;
+      }, "2026-07-31T08:03:00.000Z").governance;
       const agentMessage = chat.admitExternalAgentMessage({
         source: { kind: "server", externalId: "agent-continuation-disabled" },
         topicId: participantDisabled.topicId,
@@ -464,11 +427,11 @@ test("starter, manual, Human and Agent continuation share governance admission",
         },
         body: "Agent continuation",
         activation: { strategyId: "participant-message", turnBudget: 8 },
-        at: "2026-07-31T08:05:00.000Z"
+        at: "2026-07-31T08:04:00.000Z"
       }).message;
       const agentExecution = runtime.claimDueExecutions(
         20,
-        "2026-07-31T08:06:00.000Z"
+        "2026-07-31T08:05:00.000Z"
       ).find(({ eventId }) => eventId === agentMessage.eventId);
       assert.ok(agentExecution);
       assert.deepEqual(new ChatHandler({
@@ -476,41 +439,8 @@ test("starter, manual, Human and Agent continuation share governance admission",
         chat,
         listAgents: () => localRuntimeSnapshot(fixture.repo, fixture.options).agents,
         admissionPolicy: policy
-      }).handle(agentExecution, "2026-07-31T08:06:00.000Z"), []);
+      }).handle(agentExecution, "2026-07-31T08:05:00.000Z"), []);
       assert.equal(runtime.chatAttentionReceipts(agentMessage.eventId).length, 0);
-
-      const starterDisabled = store.commitRevision(participantDisabled.topicId, {
-        expectedRevision: 4,
-        action: "strategy_policy_update",
-        actor: { kind: "owner", principalId: "owner" },
-        changedFields: ["strategyPolicy.starterEnabled"],
-        next: {
-          ...participantDisabled,
-          strategyPolicy: { ...participantDisabled.strategyPolicy, starterEnabled: false }
-        }
-      }, "2026-07-31T08:07:00.000Z").governance;
-      assert.throws(() => activateLocalChat(fixture.repo, {
-        strategy: "starter",
-        idempotencyKey: "disabled-starter"
-      }, fixture.options), /starter strategy is disabled/);
-      const manual = activateLocalChat(fixture.repo, {
-        strategy: "manual",
-        idempotencyKey: "manual-remains-enabled",
-        intentPolicy: {
-          kind: "fixed_directed",
-          brief: "Review the release boundary together."
-        }
-      }, fixture.options);
-      assert.equal(manual.status, "accepted");
-      assert.equal(manual.event.type, "chat.activation");
-      assert.equal(manual.event.contextRevision, starterDisabled.revision);
-      assert.deepEqual(manual.event.candidateAgentIds, [alice.principalId]);
-      assert.deepEqual(manual.event.conversationIntent, {
-        schema: "ConversationIntentSnapshot@1",
-        mode: "directed",
-        brief: "Review the release boundary together.",
-        governanceRevision: starterDisabled.revision
-      });
     } finally {
       chat.close();
       runtime.close();

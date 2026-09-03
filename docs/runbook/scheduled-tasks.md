@@ -1,16 +1,16 @@
 ---
 type: Runbook
 title: Rollerskate Scheduled Task
-description: 通过 Steward Run 建立、观察和控制 Local one-shot/cron source。
-tags: [rollerskate, local, scheduled-task, cron, steward-run]
+description: 通过 Steward Run 或 Owner-registered external workflow 建立、观察和控制 Local one-shot/cron source。
+tags: [rollerskate, local, scheduled-task, cron, steward-run, external-workflow]
 timestamp: 2026-08-26
 ---
 
 # Scheduled Task
 
-v0.5.5 起，Scheduled Task 只拥有时间、misfire、overlap 和 occurrence recovery；所有工作执行都属于 Steward Run。Owner 以 `RunIntent@1` 创建 Run，Steward 的 `await_source` 决策原子建立 `ScheduleRevision@2` 与 Run binding。due occurrence 只激活绑定 Run 的一个 cycle，不直接调用 Agent。
+Scheduled Task 只拥有时间、misfire、overlap 和 occurrence recovery。Agent 工作由 Steward Run 承担；同库确定性 mutation 由 Owner application action 承担；受控 Git/网络/进程工作由 Owner-registered external workflow 承担。三者都编译为 `ScheduleRevision@3` 的 `ProactiveTarget@1`，公共 Schedule 不接受 raw Agent、prompt、command、argv 或 grant。
 
-旧 `ScheduleRevision@1` 仍可读取、暂停和取消；`schedule create/update/resume/run-now` 已关闭 legacy callback admission。完整参数索引见 [CLI Command Reference](./cli-reference.md)，时间与恢复语义见 [Local Scheduled Task architecture](../architecture/scheduled-task.md)。
+旧 `ScheduleRevision@1` 仍可读取、暂停和取消；`schedule create/update` 已关闭 legacy callback admission，未迁移的 V1 不能 resume/run-now。Owner 可把 paused V1 显式迁移为 registered external workflow，保留同一个 Schedule ID 和旧 occurrence history。完整参数索引见 [CLI Command Reference](./cli-reference.md)，时间与恢复语义见 [Local Scheduled Task architecture](../architecture/scheduled-task.md)。
 
 ## 创建 one-shot Run
 
@@ -61,7 +61,50 @@ cron 使用 `triggerIntent: "cron"`，并在 objective 中明确 cron expression
 }
 ```
 
-Steward 只能选择 admitted kind 和 participant，并以 `schedule.once@1` 或 `schedule.cron@1` 建立 source。Schedule owner 校验 expression、timezone、interval ceiling、deadline、misfire 和 overlap policy。
+Steward 只能选择 admitted kind 和 participant，并以 `schedule.once@1` 或 `schedule.cron@1` 建立 source。Schedule owner 校验 expression、timezone、interval ceiling、deadline、misfire 和 overlap policy，最终写 current `ScheduleRevision@3`。
+
+## 迁移 legacy Schedule 到 external workflow
+
+先由 Owner 在默认 runtime root 的 `~/.rollerskate/external-workflows.json` 写入 mode-0600 registry。registration 固定 versioned ref/input schema/input、file URL executable/cwd、原始 argv 数组、exact environment、filesystem roots、network declaration、timeout/output bound 与 retry；加载时把 executable content digest 纳入 registration digest。host child 不经过 shell，也不获得 Runtime ambient environment。该声明不是 OS sandbox，workflow 本身仍必须只在固定参数和 roots 内操作。
+
+```json
+{
+  "schemaVersion": "OwnerExternalWorkflowRegistry@1",
+  "workflows": [{
+    "schemaVersion": "OwnerExternalWorkflowRegistration@1",
+    "ref": "workflow:maintenance/example@1",
+    "inputSchema": "MaintenanceInput@1",
+    "fixedInput": { "mode": "dry-run" },
+    "command": {
+      "executable": "file:///absolute/project/scripts/maintenance",
+      "arguments": ["--dry-run"],
+      "cwd": "file:///absolute/project",
+      "environment": { "PATH": "/usr/bin:/bin" },
+      "timeoutMilliseconds": 1800000,
+      "maxOutputBytes": 131072
+    },
+    "authority": {
+      "filesystemRoots": ["file:///absolute/project"],
+      "networkAccess": true
+    },
+    "retry": { "maxAttempts": 2, "backoffMilliseconds": 30000 }
+  }]
+}
+```
+
+先 pause legacy source，记录 `schedule inspect` 返回的 current revision，再执行幂等迁移：
+
+```bash
+chmod 600 ~/.rollerskate/external-workflows.json
+scripts/rs schedule migrate-workflow <schedule-id> \
+  --workflow-ref workflow:maintenance/example@1 \
+  --expected-revision <legacy-revision> \
+  --request-id <stable-migration-id>
+scripts/rs schedule resume <schedule-id>
+scripts/rs schedule run-now <schedule-id> --request-id <stable-occurrence-id>
+```
+
+首次运行应使用 registry 固定的 dry-run 参数。`schedule occurrences`/`trace` 会显示 external execution ID、attempt、lease/effect boundary 与 terminal receipt。nonzero exit 是 failed；timeout、abort 或 effect boundary 后 crash 是 unknown，Runtime 不重放。Owner 先检查 workflow 自己的 LWW/remote receipt，再用 `schedule resolve <run-id> succeeded|failed` 追加 manual resolution；原 unknown receipt不会被覆盖。
 
 ## 查询与控制
 
@@ -84,7 +127,7 @@ pause 期间不积累 backfill；cancel 保留 definition、occurrence 和 Run h
 ## 验收
 
 1. `run preflight` 在 Event 前拒绝错误 workspace、inactive Agent、effect 冲突或超出 deadline/trigger authority 的请求。
-2. source 创建后是 `ScheduleRevision@2`，且 definition 不含 Agent prompt、workspace 或 callback。
-3. duplicate tick、misfire 与 overlap 都由 Schedule owner形成唯一 occurrence/receipt；每个 accepted occurrence 最多激活一个 Run cycle。
-4. Runtime 重启后从同一 occurrence/Run binding receipt 恢复，不重复执行 worker side effect。
-5. 用户只需 Run Workspace 即可判断 cycle 结果；时间诊断再沿 deep link 查看 Schedule。
+2. source 创建或迁移后是 `ScheduleRevision@3`，且 definition 不含 raw Agent、prompt、workspace、callback、executable、argv 或 grant。
+3. duplicate tick、misfire 与 overlap 都由 Schedule owner形成唯一 occurrence；每个 accepted occurrence 最多激活一个 Run cycle、action receipt 或 external execution。
+4. Runtime 重启后从同一 occurrence 和 owning durable receipt 恢复；external workflow 只在 pre-effect boundary 内按 budget retry，unknown 不盲目重放。
+5. Run target 从 Run Workspace 判断结果；external target 从 Schedule occurrence、external receipt 与业务 LWW 联合判断。

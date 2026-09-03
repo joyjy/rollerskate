@@ -25,7 +25,6 @@ export interface CodexAppServerRunnerOptions {
   readonly executable: string;
   readonly environment: Readonly<Record<string, string>>;
   readonly workingDirectory: string;
-  readonly timeoutMilliseconds: number;
   readonly meaningfulOutputTimeoutMilliseconds: number;
   readonly maxOutputBytes: number;
   readonly threadParameters: Readonly<Record<string, unknown>>;
@@ -40,10 +39,12 @@ export class CodexAppServerRunner implements AgentRunner {
 
   public invoke(request: RunnerTurnRequest): Promise<RunnerTurnReceipt> {
     const startedAt = new Date().toISOString();
-    const totalTimeoutMilliseconds = runnerTimeoutMilliseconds(
-      request.totalTimeoutMilliseconds ?? this.#options.timeoutMilliseconds,
-      "totalTimeoutMilliseconds"
-    );
+    const totalTimeoutMilliseconds = request.totalTimeoutMilliseconds === undefined
+      ? undefined
+      : runnerTimeoutMilliseconds(
+          request.totalTimeoutMilliseconds,
+          "totalTimeoutMilliseconds"
+        );
     const meaningfulOutputTimeoutMilliseconds = runnerMeaningfulTimeoutMilliseconds(
       request.meaningfulOutputTimeoutMilliseconds ??
         this.#options.meaningfulOutputTimeoutMilliseconds
@@ -356,9 +357,11 @@ export class CodexAppServerRunner implements AgentRunner {
       });
 
       resetMeaningfulTimeout();
-      totalTimeout = setTimeout(() => {
-        terminate("deadline", `agent invocation timed out: ${this.#options.adapterId}`);
-      }, totalTimeoutMilliseconds);
+      if (totalTimeoutMilliseconds !== undefined) {
+        totalTimeout = setTimeout(() => {
+          terminate("deadline", `agent invocation timed out: ${this.#options.adapterId}`);
+        }, totalTimeoutMilliseconds);
+      }
       child.stdout.on("data", (chunk: Buffer) => {
         if (settled) return;
         try {
@@ -383,7 +386,7 @@ export class CodexAppServerRunner implements AgentRunner {
         id: 0,
         method: "initialize",
         params: {
-          clientInfo: { name: "rollerskate-local", version: "0.5.6" },
+          clientInfo: { name: "rollerskate-local", version: "0.5.7" },
           capabilities: {}
         }
       });

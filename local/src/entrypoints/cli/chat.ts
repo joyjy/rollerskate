@@ -1,7 +1,6 @@
 import {
   localChatPresenceView,
   postLocalChatMessage,
-  resumeAndWakeLocalChat,
   rotateLocalAgentSession,
   setLocalChatPresence
 } from "../../application/chat/control.js";
@@ -13,13 +12,6 @@ import {
 } from "../../application/topic/governance-control.js";
 import { inspectLocalTopicGovernance } from
   "../../application/topic/governance-query.js";
-import {
-  continueLocalFreeChatNow,
-  exitLocalFreeChat,
-  startLocalFreeChat
-} from "../../application/topic/free-chat-control.js";
-import { inspectLocalFreeChat } from
-  "../../application/topic/free-chat-query.js";
 import {
   cancelLocalTopicActivationSchedule,
   createLocalTopicActivationSchedule,
@@ -90,34 +82,6 @@ export function runChatCommand(
     }
     throw new Error("chat schedule requires status, create, pause, resume or cancel");
   }
-  if (command === "free") {
-    const [action, ...freeArguments] = rest;
-    if (action === "status") {
-      rejectArguments(freeArguments);
-      output.write(`${JSON.stringify(
-        inspectLocalFreeChat(repoRoot, runtimeDirectory), null, 2
-      )}\n`);
-      return 0;
-    }
-    if (action === "start") {
-      const input = parseFreeChatStart(freeArguments);
-      output.write(`${JSON.stringify(
-        startLocalFreeChat(repoRoot, input, options), null, 2
-      )}\n`);
-      return 0;
-    }
-    if (action === "continue-now" || action === "exit") {
-      const expectedRevision = parseExpectedRevision(
-        freeArguments, `chat free ${action}`
-      );
-      const result = action === "continue-now"
-        ? continueLocalFreeChatNow(repoRoot, expectedRevision, options)
-        : exitLocalFreeChat(repoRoot, expectedRevision, options);
-      output.write(`${JSON.stringify(result, null, 2)}\n`);
-      return 0;
-    }
-    throw new Error("chat free requires status, start, continue-now or exit");
-  }
   if (command === "governance") {
     rejectArguments(rest);
     output.write(`${JSON.stringify(
@@ -131,16 +95,6 @@ export function runChatCommand(
       ? pauseLocalTopic(repoRoot, expectedRevision, options)
       : resumeLocalTopic(repoRoot, expectedRevision, options);
     output.write(`${JSON.stringify(result, null, 2)}\n`);
-    return 0;
-  }
-  if (command === "resume-and-wake") {
-    const change = parseResumeAndWake(rest);
-    output.write(`${JSON.stringify(resumeAndWakeLocalChat(
-      repoRoot,
-      change.expectedRevision,
-      change.idempotencyKey,
-      options
-    ), null, 2)}\n`);
     return 0;
   }
   if (command === "participant") {
@@ -220,7 +174,7 @@ export function runChatCommand(
     return 0;
   }
   throw new Error(
-    "chat requires schedule, governance, pause, resume, resume-and-wake, participant, " +
+    "chat requires schedule, governance, pause, resume, participant, " +
     "post, history, status, presence set or session new"
   );
 }
@@ -298,79 +252,11 @@ function parseTopicScheduleCreate(arguments_: readonly string[]) {
   };
 }
 
-function parseFreeChatStart(arguments_: readonly string[]) {
-  let idempotencyKey: string | undefined;
-  let intent: "continue_recent" | "choose_from_themes" | "directed" | undefined;
-  let brief: string | undefined;
-  for (let offset = 0; offset < arguments_.length; offset += 2) {
-    const option = arguments_[offset];
-    const value = arguments_[offset + 1];
-    if (value === undefined) throw new Error(`${option} requires a value`);
-    if (option === "--idempotency-key" && idempotencyKey === undefined) {
-      idempotencyKey = value;
-    } else if (option === "--intent" && intent === undefined &&
-      (value === "continue_recent" || value === "choose_from_themes" ||
-        value === "directed")) {
-      intent = value;
-    } else if (option === "--brief" && brief === undefined) {
-      brief = value;
-    } else {
-      throw new Error(`unexpected chat free start option: ${option}`);
-    }
-  }
-  if (idempotencyKey === undefined) {
-    throw new Error("chat free start requires --idempotency-key");
-  }
-  if (intent === "directed" && brief === undefined) {
-    throw new Error("directed Free Chat intent requires --brief");
-  }
-  if (intent !== "directed" && brief !== undefined) {
-    throw new Error("--brief requires --intent directed");
-  }
-  return {
-    idempotencyKey,
-    ...(intent === undefined ? {} : {
-      intentPolicy: intent === "directed"
-        ? { kind: "fixed_directed" as const, brief: brief! }
-        : { kind: intent }
-    })
-  };
-}
-
 function parseExpectedRevision(arguments_: readonly string[], command: string): number {
   if (arguments_.length !== 2 || arguments_[0] !== "--revision") {
     throw new Error(`${command} requires --revision <positive-integer>`);
   }
   return parseBoundedInteger(arguments_[1]!, `${command} revision`, 1, 1_000_000);
-}
-
-function parseResumeAndWake(arguments_: readonly string[]): {
-  readonly expectedRevision: number;
-  readonly idempotencyKey: string;
-} {
-  let expectedRevision: number | undefined;
-  let idempotencyKey: string | undefined;
-  for (let offset = 0; offset < arguments_.length; offset += 2) {
-    const option = arguments_[offset];
-    const value = arguments_[offset + 1];
-    if (value === undefined) throw new Error(`${option} requires a value`);
-    if (option === "--revision" && expectedRevision === undefined) {
-      expectedRevision = parseBoundedInteger(
-        value, "chat resume-and-wake revision", 1, 1_000_000
-      );
-    } else if (option === "--idempotency-key" && idempotencyKey === undefined &&
-      value.trim() !== "") {
-      idempotencyKey = value;
-    } else {
-      throw new Error(`unexpected chat resume-and-wake option: ${option}`);
-    }
-  }
-  if (expectedRevision === undefined || idempotencyKey === undefined) {
-    throw new Error(
-      "chat resume-and-wake requires --revision and --idempotency-key"
-    );
-  }
-  return { expectedRevision, idempotencyKey };
 }
 
 function parseChatHistoryOptions(arguments_: readonly string[]): ChatTimelineOptions {

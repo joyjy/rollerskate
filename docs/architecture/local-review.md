@@ -101,7 +101,7 @@ Vikunja Task URL 只是 Host 在 start 时传入的普通 destination snapshot�
 
 - `local/src/modules/spec/registry.ts`：`SpecRef@1`、Run 主链 canonical identity、legacy discriminator mapping、compatibility status 与 workflow artifact digest 的唯一 registry；payload parser 仍由各领域 owner 持有。
 - `local/src/modules/steward/state-machine.ts`：两种持久 orchestration mode 与三种启动语义的 Run lifecycle、single-child、checkpoint、decision、cancel、budget 和 continuation 纯策略；`result-contract.ts` 独立拥有 autonomous `AgentTurnResult@1`，`caller-contract.ts` / `run-contract-v3.ts` 拥有三版 Orchestrator binding、`AgentStepResult@1`、`AgentRunCheckpoint@1`、`OrchestratorState@1` 与三版 Run decision。
-- `local/src/application/steward/control.ts`、`query.ts`、`module.ts` 与 `result-recovery.ts`：start/cancel/decide、summary/detail/timeline、Runtime module manifest，以及 bounded autonomous result adjudication/retry gate。
+- `local/src/application/steward/control.ts`、`query.ts`、`module.ts`、`result-recovery.ts` 与 `orchestrator-retry.ts`：start/cancel/decide/manual Orchestrator retry、summary/detail/timeline、Runtime module manifest，以及 bounded autonomous result adjudication 与 source-initial Orchestrator recovery gate。
 - `local/src/infrastructure/sqlite/agent-run-store.ts`：`agent_runs` CAS、`agent_run_cycles` revision lifecycle、`agent_run_decisions` receipt、cycle-scoped Session、write-workspace exclusion 与 transactional continuation。
 - `local/src/core/runtime/model.ts` 与 generic ResultHandler：不透明 Agent output、`resultContractId` routing、`AgentStepCompletion@1` 和 completion callback 原语；不导入或解析具体 result contract，也不引用 workflow/role 名称。
 - `local/resources/workflows/review.md`：`review@1` frontmatter、输入与协作规约。

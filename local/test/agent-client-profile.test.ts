@@ -4,7 +4,8 @@ import test from "node:test";
 import {
   agentExecutionConfig,
   agentClients,
-  runtimeAdapterId
+  runtimeAdapterId,
+  runtimeAdapterIdMatches
 } from "../src/modules/agent/client-profile.js";
 
 test("Agent client catalog includes native Claude Code, Kimi Code and Pi adapters", () => {
@@ -18,6 +19,8 @@ test("Agent client catalog includes native Claude Code, Kimi Code and Pi adapter
   assert.equal(runtimeAdapterId("claude-code"), "claude-code-runtime-json-v1");
   assert.equal(runtimeAdapterId("kimi-code"), "kimi-code-runtime-acp-v1");
   assert.equal(runtimeAdapterId("pi"), "pi-runtime-rpc-v1");
+  assert.equal(runtimeAdapterIdMatches("pi", `pi-runtime-rpc-v1:${"a".repeat(64)}`), true);
+  assert.equal(runtimeAdapterIdMatches("pi", "pi-runtime-rpc-v1"), false);
 });
 
 test("Agent launch args preserve argv boundaries and reject adapter-owned flags", () => {
@@ -51,6 +54,14 @@ test("Agent launch args preserve argv boundaries and reject adapter-owned flags"
   );
   assert.throws(
     () => agentExecutionConfig("pi", ["--api-key", "sk-secret"]),
+    /controlled by the pi adapter/
+  );
+  assert.throws(
+    () => agentExecutionConfig("pi", ["--extension=/tmp/untrusted.mjs"]),
+    /controlled by the pi adapter/
+  );
+  assert.throws(
+    () => agentExecutionConfig("pi", ["--skill", "/tmp/untrusted-skill"]),
     /controlled by the pi adapter/
   );
 });

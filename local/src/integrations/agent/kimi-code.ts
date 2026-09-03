@@ -25,7 +25,6 @@ import {
   runnerToolNames,
   runnerTurnCount,
   runnerUsage,
-  DEFAULT_MEANINGFUL_OUTPUT_TIMEOUT_MILLISECONDS,
   RunnerInvocationError,
   type RunnerTurnReceipt,
   type RunnerUsage
@@ -83,21 +82,17 @@ export class KimiCodeRuntimeAgent implements RuntimeAgentAdapter {
       executable: options.executable,
       environment: kimiEnvironment(options.environment),
       workingDirectory: this.workspace,
-      timeoutMilliseconds: options.timeoutMilliseconds,
       maxOutputBytes: options.maxOutputBytes ?? 1_048_576,
       meaningfulOutputTimeoutMilliseconds:
         options.meaningfulOutputTimeoutMilliseconds ??
-        DEFAULT_MEANINGFUL_OUTPUT_TIMEOUT_MILLISECONDS
+        options.timeoutMilliseconds
     });
   }
 
   public async invoke(input: Parameters<RuntimeAgentAdapter["invoke"]>[0]):
   Promise<Awaited<ReturnType<RuntimeAgentAdapter["invoke"]>>> {
     const access = kimiWorkspaceAccess(input.event);
-    const totalTimeoutMilliseconds = invocationTimeoutMilliseconds(
-      input.event,
-      this.#client.defaultTimeoutMilliseconds
-    );
+    const totalTimeoutMilliseconds = invocationTimeoutMilliseconds(input.event);
     const providerSessionId = kimiProviderSessionId(input.providerSessionId, access);
     providerPolicyObservationFromArgv(
       "kimi-code",

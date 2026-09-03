@@ -45,6 +45,8 @@ export interface ContinuousSubscriptionView {
   readonly pendingCycleId: string | null;
   readonly pendingAdmissionReceipt:
     ReturnType<ContinuousSubscriptionStore["require"]>["pendingAdmissionReceipt"] | null;
+  readonly latestActionReceipt:
+    ReturnType<ContinuousSubscriptionStore["require"]>["latestActionReceipt"] | null;
   readonly latestError: string | null;
   readonly archivedAt: string | null;
   readonly availableActions: {
@@ -188,7 +190,7 @@ export function controlContinuousSubscriptionView(
     const current = store.get(subscriptionId);
     if (current === undefined) return undefined;
     if (action === "resume" &&
-      current.definition.schemaVersion !== "ContinuousSubscriptionDefinition@2") {
+      current.definition.schemaVersion === "ContinuousSubscriptionDefinition@1") {
       throw new Error(
         "legacy_trigger_execution_closed: migrate this Continuous Subscription to a bound Run"
       );
@@ -267,6 +269,7 @@ function view(
       agentRunId: subscription.agentRunId ?? null,
       pendingCycleId: subscription.pendingCycleId ?? null,
       pendingAdmissionReceipt: subscription.pendingAdmissionReceipt ?? null,
+      latestActionReceipt: subscription.latestActionReceipt ?? null,
       latestError: subscription.latestError ?? null,
       archivedAt: subscription.archivedAt ?? null,
       availableActions: {

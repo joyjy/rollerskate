@@ -3,6 +3,117 @@ import { localAgentSchema } from "./local";
 import { chatPresenceSchema, runtimeEventSchema } from "./event";
 import { optionalString } from "./shared";
 
+export const chatRunProposalDraftSchema = v.object({
+  schema: v.literal("ChatRunProposalDraft@1"),
+  goal: optionalString,
+  scope: v.object({
+    include: v.array(v.string()),
+    exclude: v.array(v.string())
+  }),
+  acceptance: v.array(v.string()),
+  desiredEffect: v.optional(v.union([
+    v.literal("none"),
+    v.literal("read"),
+    v.literal("change")
+  ])),
+  workspaceRef: v.optional(v.literal("local:workspace")),
+  blockingQuestion: optionalString
+});
+
+export const chatRunProposalViewSchema = v.object({
+  schema: v.literal("ChatRunProposalView@2"),
+  proposalId: v.string(),
+  revision: v.string(),
+  sourceMessageEventId: v.string(),
+  sourceRootEventId: v.string(),
+  dispatchEventId: v.string(),
+  createdAt: v.string(),
+  chatLead: v.object({ agentId: v.string(), handle: v.string() }),
+  finalForm: chatRunProposalDraftSchema,
+  ready: v.boolean(),
+  blocker: v.optional(v.object({
+    code: v.union([
+      v.literal("workspace_required"),
+      v.literal("workspace_invalid"),
+      v.literal("clarification_required"),
+      v.literal("steward_unavailable"),
+      v.literal("admission_failed")
+    ]),
+    message: v.string(),
+    action: v.union([
+      v.literal("choose_workspace"),
+      v.literal("reply"),
+      v.literal("inspect_agents"),
+      v.literal("inspect_runtime")
+    ]),
+    detail: optionalString
+  })),
+  workspaceChoices: v.optional(v.array(v.object({
+    kind: v.union([v.literal("project"), v.literal("local"), v.literal("path")]),
+    label: v.string(),
+    root: optionalString
+  }))),
+  selectedWorkspace: v.optional(v.object({
+    kind: v.union([v.literal("project"), v.literal("local"), v.literal("path")]),
+    root: v.string()
+  })),
+  runOrchestrator: v.optional(v.object({ agentId: v.string(), handle: v.string() })),
+  participants: v.array(v.object({ agentId: v.string(), handle: v.string() })),
+  authority: v.optional(v.object({
+    summary: v.string(),
+    workspace: v.optional(v.object({
+      root: v.string(),
+      revision: v.string(),
+      access: v.union([v.literal("read"), v.literal("write")]),
+      effect: v.optional(v.union([
+        v.literal("must_change"),
+        v.literal("may_remain_unchanged")
+      ])),
+      networkAccess: v.boolean()
+    })),
+    maxSteps: v.number(),
+    maxDepth: v.number()
+  })),
+  linkedRun: v.optional(v.object({
+    runId: v.string(),
+    state: v.union([
+      v.literal("started"),
+      v.literal("needs_human"),
+      v.literal("terminal")
+    ]),
+    status: v.union([
+      v.literal("active"),
+      v.literal("waiting"),
+      v.literal("awaiting_orchestrator"),
+      v.literal("awaiting_source"),
+      v.literal("succeeded"),
+      v.literal("failed"),
+      v.literal("needs_human"),
+      v.literal("cancelled")
+    ]),
+    terminalSummary: optionalString,
+    updatedAt: v.string()
+  })),
+  decision: v.optional(v.object({
+    status: v.literal("declined"),
+    eventId: v.string(),
+    actorPrincipalId: v.string(),
+    decidedAt: v.string()
+  }))
+});
+
+export const chatRunProposalPreflightSchema = v.object({
+  schema: v.literal("ChatRunProposalPreflight@1"),
+  sourceRevision: v.string(),
+  proposal: chatRunProposalViewSchema
+});
+
+export const chatRunProposalDecisionReceiptSchema = v.object({
+  schema: v.literal("ChatRunProposalDecisionReceipt@1"),
+  status: v.union([v.literal("declined"), v.literal("duplicate")]),
+  proposal: chatRunProposalViewSchema
+});
+
 export const localChatViewSchema = v.object({
   chat: v.object({
     topicId: v.string(),
@@ -42,7 +153,8 @@ export const localChatViewSchema = v.object({
           reason: v.string(),
           failureReason: optionalString
         }))
-      }))
+      })),
+      runProposals: v.optional(v.array(chatRunProposalViewSchema))
     })),
     hasEarlier: v.boolean(),
     beforeEventId: optionalString
@@ -51,23 +163,7 @@ export const localChatViewSchema = v.object({
     principalId: v.string(),
     currentSessionId: optionalString,
     generation: v.number()
-  })),
-  conversation: v.object({
-    strategy: v.literal("starter"),
-    state: v.union([
-      v.literal("starter_pending"),
-      v.literal("active"),
-      v.literal("all_silent"),
-      v.literal("budget_exhausted"),
-      v.literal("idle")
-    ]),
-    turnBudget: v.number(),
-    usedTurns: v.number(),
-    remainingTurns: v.number(),
-    latestReason: optionalString,
-    activeSpeakerHandle: optionalString,
-    activeSpeakerHandles: v.array(v.string())
-  })
+  }))
 });
 
 export const localChatPresenceViewSchema = v.object({
@@ -97,6 +193,7 @@ export const localChatPresenceViewSchema = v.object({
       state: v.union([
         v.literal("thinking"),
         v.literal("replied"),
+        v.literal("proposed"),
         v.literal("silent"),
         v.literal("failed")
       ]),

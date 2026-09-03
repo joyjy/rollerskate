@@ -3,6 +3,8 @@ import {
   inspectSubscriptionView,
   listSubscriptionViews
 } from "../../application/subscription/control.js";
+import { subscriptionHistory } from
+  "../../application/subscription/query.js";
 
 interface Output {
   readonly write: (text: string) => void;
@@ -11,6 +13,7 @@ interface Output {
 const HELP = [
   "Usage:",
   "  scripts/rs subscription list",
+  "  scripts/rs subscription history <subscription-id> --json",
   "  scripts/rs subscription inspect|pause|resume|cancel <subscription-id>"
 ].join("\n");
 
@@ -45,6 +48,17 @@ export function runSubscriptionCommand(
     )}\n`);
     return 0;
   }
+  if (command === "history") {
+    if (rest.length !== 2 || rest[1] !== "--json") {
+      throw new Error("subscription history requires <subscription-id> --json");
+    }
+    output.write(`${JSON.stringify(
+      subscriptionHistory(repoRoot, rest[0]!, runtimeDirectory),
+      null,
+      2
+    )}\n`);
+    return 0;
+  }
   if (command === "pause" || command === "resume" || command === "cancel") {
     if (rest.length !== 1) throw new Error(`subscription ${command} requires exactly one id`);
     output.write(`${JSON.stringify(
@@ -54,5 +68,5 @@ export function runSubscriptionCommand(
     )}\n`);
     return 0;
   }
-  throw new Error("subscription requires list, inspect, pause, resume or cancel");
+  throw new Error("subscription requires list, history, inspect, pause, resume or cancel");
 }

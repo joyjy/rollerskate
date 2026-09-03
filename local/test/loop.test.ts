@@ -172,7 +172,7 @@ test("offline agent request enters SQLite and is handled without Device, Room or
       try {
         assert.equal((schemaVersion.prepare(`
           SELECT value FROM schema_meta WHERE key = 'schema_version'
-        `).get() as { value: string }).value, "69");
+        `).get() as { value: string }).value, "72");
       } finally {
         schemaVersion.close();
       }

@@ -3,6 +3,7 @@ import type { DatabaseSync } from "node:sqlite";
 import {
   newEventId,
   parseChatMessageTargets,
+  parseChatRunProposalDecision,
   requireEventId,
   type Event,
   type EventSourceKind,
@@ -755,6 +756,10 @@ export class LocalChatStore {
     }
     const sender = payload.sender as ChatMessageEvent["sender"];
     const targets = parseChatMessageTargets(payload, eventId);
+    const runProposalDecision = parseChatRunProposalDecision(
+      payload.runProposalDecision,
+      eventId
+    );
     const replyToEventId = typeof payload.replyToEventId === "string"
       ? payload.replyToEventId
       : undefined;
@@ -770,6 +775,7 @@ export class LocalChatStore {
       ...(replyToEventId === undefined ? {} : { replyToEventId }),
       ...(conversation === undefined ? {} : { conversation }),
       ...(targets === undefined ? {} : { targets }),
+      ...(runProposalDecision === undefined ? {} : { runProposalDecision }),
       ...(dispatchCard === undefined ? {} : { dispatchCard })
     };
   }

@@ -2,11 +2,14 @@ import type { ExternalRefTriggerGuard } from
   "../../modules/external-resource/trigger-binding.js";
 import type { TriggerOccurrenceEnvelope } from
   "../../modules/steward/source-contract.js";
+import type { RunSourceBinding } from "../../modules/steward/source-contract.js";
 import type {
   BoundScheduleRevision,
   Schedule,
-  ScheduledRun
+  ScheduledRun,
+  TargetedScheduleRevision
 } from "./model.js";
+import { proactiveTargetRunBinding } from "../../modules/proactive/target.js";
 import { activateScheduleOccurrenceInTransaction } from "./run-binding.js";
 import type { ScheduledTaskStore } from "./store.js";
 import { latestCronOccurrence } from "./time.js";
@@ -37,6 +40,8 @@ export type BoundScheduleDecision =
   | { readonly kind: "failed"; readonly run: ScheduledRun }
   | { readonly kind: "skip"; readonly run: ScheduledRun }
   | { readonly kind: "queue"; readonly run: ScheduledRun };
+
+type RunTargetScheduleRevision = BoundScheduleRevision | TargetedScheduleRevision;
 
 export class BoundScheduleRuntime {
   readonly #store: ScheduledTaskStore;
@@ -89,13 +94,14 @@ export class BoundScheduleRuntime {
   }
 
   public async decideDue(schedule: Schedule, at: string): Promise<BoundScheduleDecision> {
-    if (schedule.revision.schemaVersion !== "ScheduleRevision@2") {
-      throw new Error("ScheduleRevision@2 is required for Run occurrence admission");
-    }
-    const freshness = await this.#freshness(schedule.revision);
+    const initialRevision = requireRunTargetRevision(schedule.revision);
+    const initialBinding = runTargetBinding(initialRevision);
+    const freshness = await this.#freshness(initialRevision);
     return this.#store.withImmediateTransaction(() => {
       const current = this.#store.require(schedule.definition.scheduleId);
-      if (current.revision.schemaVersion !== "ScheduleRevision@2" ||
+      const currentRevision = requireRunTargetRevision(current.revision);
+      const currentBinding = runTargetBinding(currentRevision);
+      if (currentBinding.runId !== initialBinding.runId ||
         current.definition.currentRevision !== schedule.definition.currentRevision ||
         current.definition.nextOccurrenceKey !== schedule.definition.nextOccurrenceKey) {
         throw new Error(`Schedule occurrence changed before admission: ${schedule.definition.scheduleId}`);
@@ -105,8 +111,8 @@ export class BoundScheduleRuntime {
       if (firstAt === undefined || occurrenceKey === undefined) {
         throw new Error(`Active Schedule has no next occurrence: ${current.definition.scheduleId}`);
       }
-      const latest = current.revision.kind === "cron"
-        ? latestCronOccurrence(current.revision.expression, current.revision.timezone!, at)
+      const latest = currentRevision.kind === "cron"
+        ? latestCronOccurrence(currentRevision.expression, currentRevision.timezone!, at)
         : { scheduledFor: firstAt, occurrenceKey, missingLocalTime: false };
       const lastAt = Date.parse(latest.scheduledFor) >= Date.parse(firstAt)
         ? latest.scheduledFor
@@ -117,12 +123,12 @@ export class BoundScheduleRuntime {
         occurrenceKey,
         scheduledFor: firstAt,
         scheduleRevision: current.definition.currentRevision,
-        agentRunId: current.revision.sourceBinding.runId,
+        agentRunId: currentBinding.runId,
         ...(coalescedThrough === undefined ? {} : { coalescedThrough }),
         createdAt: at
       } as const;
       const misfire = current.definition.nextOccurrenceMissing ||
-        Date.parse(at) > Date.parse(firstAt) + current.revision.misfireGraceMilliseconds;
+        Date.parse(at) > Date.parse(firstAt) + currentRevision.misfireGraceMilliseconds;
       let result: BoundScheduleDecision;
       if (freshness.status !== "matched") {
         const status = freshness.status === "rejected" ? "skipped" : "failed";
@@ -134,7 +140,7 @@ export class BoundScheduleRuntime {
             decisionReason: freshness.reason
           }).run
         };
-      } else if (misfire && current.revision.misfirePolicy === "skip") {
+      } else if (misfire && currentRevision.misfirePolicy === "skip") {
         result = {
           kind: "skip",
           run: this.#store.insertDueRunInTransaction({
@@ -146,7 +152,7 @@ export class BoundScheduleRuntime {
           }).run
         };
       } else {
-        const runState = this.#requireRunState(current.revision);
+        const runState = this.#requireRunState(currentRevision);
         const terminal = isTerminalRunState(runState.status);
         const active = !terminal && (runState.status !== "awaiting_source" ||
           runState.activeCycleId !== undefined);
@@ -161,10 +167,10 @@ export class BoundScheduleRuntime {
           };
           this.#reconcileSourceLifecycle(
             current,
-            current.revision.sourceBinding.runId,
+            currentBinding.runId,
             at
           );
-        } else if (active && current.revision.overlapPolicy === "skip") {
+        } else if (active && currentRevision.overlapPolicy === "skip") {
           result = {
             kind: "skip",
             run: this.#store.insertDueRunInTransaction({
@@ -203,7 +209,7 @@ export class BoundScheduleRuntime {
               store: this.#store,
               adapter: this.#runBinding,
               occurrence,
-              revision: current.revision,
+              revision: currentRevision,
               freshnessEvidence: freshness.evidence,
               at
             })
@@ -220,7 +226,7 @@ export class BoundScheduleRuntime {
 
   public async admitPending(
     run: ScheduledRun,
-    revision: BoundScheduleRevision,
+    revision: RunTargetScheduleRevision,
     at: string
   ): Promise<"admitted" | "deferred" | "failed" | "skipped"> {
     if (this.#runBinding === undefined) {
@@ -260,7 +266,7 @@ export class BoundScheduleRuntime {
           decisionReason: `bound-run-${runState.status}`,
           completedAt: at
         }, at);
-        this.#reconcileSourceLifecycle(schedule, revision.sourceBinding.runId, at);
+        this.#reconcileSourceLifecycle(schedule, runTargetBinding(revision).runId, at);
         return "skipped";
       }
       if (schedule.definition.status === "paused" &&
@@ -282,14 +288,15 @@ export class BoundScheduleRuntime {
     });
   }
 
-  async #freshness(revision: BoundScheduleRevision): Promise<
+  async #freshness(revision: RunTargetScheduleRevision): Promise<
     | { readonly status: "matched"; readonly evidence: readonly string[] }
     | { readonly status: "rejected" | "failed"; readonly reason: string }
   > {
     if (revision.externalRefBinding === undefined) {
+      const binding = runTargetBinding(revision);
       return {
         status: "matched",
-        evidence: [`schedule-definition:${revision.sourceBinding.source.definitionRevision}`]
+        evidence: [`schedule-definition:${binding.source.definitionRevision}`]
       };
     }
     if (this.#externalRefGuard === undefined) {
@@ -303,7 +310,7 @@ export class BoundScheduleRuntime {
       return {
         status: "matched",
         evidence: [
-          `schedule-definition:${revision.sourceBinding.source.definitionRevision}`,
+          `schedule-definition:${runTargetBinding(revision).source.definitionRevision}`,
           `external-ref:${revision.externalRefBinding.ref.revision}`
         ]
       };
@@ -312,34 +319,60 @@ export class BoundScheduleRuntime {
     }
   }
 
-  #requireRunState(revision: BoundScheduleRevision): NonNullable<
+  #requireRunState(revision: RunTargetScheduleRevision): NonNullable<
     ReturnType<ScheduleRunBindingAdapter["runState"]>
   > {
     if (this.#runBinding === undefined) {
-      throw new Error("ScheduleRevision@2 Run binding adapter is unavailable");
+      throw new Error("Schedule Steward Run target adapter is unavailable");
     }
-    const state = this.#runBinding.runState(revision.sourceBinding.runId);
+    const binding = runTargetBinding(revision);
+    const state = this.#runBinding.runState(binding.runId);
     if (state === undefined) {
-      throw new Error(`Bound Agent Run not found: ${revision.sourceBinding.runId}`);
+      throw new Error(`Bound Agent Run not found: ${binding.runId}`);
     }
     return state;
   }
 
   #reconcileSourceLifecycle(schedule: Schedule, agentRunId: string, at: string): void {
-    if (schedule.revision.schemaVersion !== "ScheduleRevision@2" ||
-      this.#runBinding === undefined) return;
+    if (this.#runBinding === undefined) return;
+    const binding = schedule.revision.schemaVersion === "ScheduleRevision@2"
+      ? schedule.revision.sourceBinding
+      : schedule.revision.schemaVersion === "ScheduleRevision@3"
+        ? proactiveTargetRunBinding(schedule.revision.target)
+        : undefined;
+    if (binding === undefined) return;
     const state = this.#runBinding.runState(agentRunId);
     if (state === undefined || !isTerminalRunState(state.status)) return;
     if (schedule.definition.status !== "active" && schedule.definition.status !== "paused") {
       return;
     }
-    const action = schedule.revision.sourceBinding.cancellationPolicy === "cancel_source"
+    const action = binding.cancellationPolicy === "cancel_source"
       ? "cancel"
       : schedule.definition.status === "active"
         ? "pause"
         : undefined;
     if (action !== undefined) this.#store.setStatus(schedule.definition.scheduleId, action, at);
   }
+}
+
+function requireRunTargetRevision(revision: Schedule["revision"]): RunTargetScheduleRevision {
+  runTargetBinding(revision);
+  if (revision.schemaVersion === "ScheduleRevision@1") {
+    throw new Error("Schedule requires a Steward Run target");
+  }
+  return revision;
+}
+
+function runTargetBinding(revision: Schedule["revision"]): RunSourceBinding {
+  const binding = revision.schemaVersion === "ScheduleRevision@2"
+    ? revision.sourceBinding
+    : revision.schemaVersion === "ScheduleRevision@3"
+      ? proactiveTargetRunBinding(revision.target)
+      : undefined;
+  if (binding === undefined) {
+    throw new Error("Schedule requires a Steward Run target");
+  }
+  return binding;
 }
 
 function latestCoalesced(run: ScheduledRun, candidate: string): string {

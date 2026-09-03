@@ -48,16 +48,25 @@ Agent Run 不新增 `steward.*` Event 或专用 Handler。generic ResultHandler 
 owner | agent chat.message
   -> ChatHandler
   -> 对每个 Local Agent 应用 scoped presence 与 attention 状态机
-     dispatch -> chat.dispatch -> AgentHandler -> ChatDecision@1
+     dispatch -> chat.dispatch -> AgentHandler -> ChatDecision@1 | @2
        reply -> agent chat.message -> ChatHandler
        silent -> terminal decision receipt
+       propose_run -> ChatDecisionReceipt@2 -> Chat-owned proposal projection
+         Owner confirms current revision -> RunIntent@1 compiler -> Steward Run
+         refresh -> linked agent_runs status/terminal summary -> source message card
        available | topic/global snoozed -> durable presence
      skip -> durable attention receipt
 ```
 
 Owner、system 与 Agent message 都是 immutable Event。Local Chat 固定为 `Local`，没有 CRUD 或独立 membership；ChatHandler 在 dispatch 时读取全部 Local Agent，并为每个 Agent 原子写入 dispatched/skipped attention receipt。明确 target 只 dispatch 对应 Agent；未指定 target 时所有 available Agent 都能自主判断 reply 或 silent。Presence 是 `Agent × (Global | Topic)` 的 current state，不是 Topic 配置；Agent decision 与 Owner CLI 都能更新，后写入者生效。active Global snooze 优先于 Topic，直接 mention、匹配的 literal wake keyword 与到期时间可以触发一次重新决策。旧 dispatch card Event 仍可读取，但新消息不再创建 card。
 
-Chat 行为约束来自独立资源 `prompt.chat.free-turn`。每条新 `chat.dispatch` 保存稳定的 `promptResourceId`；首次创建 Agent Session 时 prompt 带 bounded Topic bootstrap history，续接已有 Session 时只带该 Agent 上一次 dispatch 之后、且非该 Agent 自己发送的新消息 slice，当前消息始终单独作为 `latestMessage`。Codex、Claude Code 与 Pi 在 message-triggered dispatch 中获得只读 `read_chat_history` tool，可从 prompt 最早 cursor 继续读取当前 Topic 的 bounded earlier page；cursor 必须逐页衔接，单次 invocation 最多 20 页、累计 1 MiB。Kimi ACP adapter 当前未装配动态 MCP server，因此 prompt 明确公布 request fallback，并继续由同 Session `ChatHistoryRequest@1` continuation 提供 bounded page。attention receipt、decision receipt、presence transition、Session 与可选 reply 都进入 durable audit，不依赖 UI。
+`propose_run` 只允许 `ChatDecision@2` / `ChatMentionDecision@2` 表达 bounded goal、scope、acceptance、effect 和至多一个 blocker；Agent 不选择 workspace authority。它必须来自 exact Local Owner source message；activation/proactive conversation 可以保存同一 typed decision receipt，但不会投影 proposal。每个完成的 propose-run dispatch 按 `(createdAt,eventId)` 稳定投影为独立卡片，Chat Lead 只绑定该 dispatch 的 Agent；Codex Steward 仍由 Run admission 加入。Owner 可以逐卡拒绝未启动 proposal，拒绝作为带 `ChatRunProposalDecision@1` 的 immutable system `chat.message` 保存，不创建 Agent attention；刷新后投影仍为 declined，同一决策幂等。Owner 对需要 workspace 的卡片先选择 project、Local workspace 或显式绝对路径，application 以无副作用 preflight 固定 canonical Git root、revision、read/write grant 与 network-off authority，再确认该 proposal revision。确认在同一 SQLite transaction 内重新投影、重新编译 `RunIntent@1` 并调用既有 Steward admission，`owner_request_id=chat-work:<sourceMessageEventId>:<dispatchEventId>` 保证同一卡片 duplicate confirmation 只关联同一个 Run，不同卡片互不合并。
+
+Proposal card 的 declined 来自上述 decision Event；started、needs-human 和 terminal readback 只是 `agent_runs` current projection 的 Chat-owned 关联视图。两类终态卡片都不再编译 admission 或显示 workspace blocker。Run status、CAS、recovery、terminal summary 与 cancel 仍由 Steward/AgentRunStore 独占；Chat 不建立 proposal table、reconcile job 或第二套 Run 状态机。无 proposal 的 Owner message 继续允许旧显式 handoff；一旦 proposal 已投影，旧 handoff fail closed，避免绕过 revision confirmation。
+
+Chat 行为约束来自独立资源 `prompt.chat.free-turn`。每条新 `chat.dispatch` 保存稳定的 `promptResourceId`；首次创建 Agent Session 时 prompt 带 bounded Topic bootstrap history，续接已有 Session 时只带该 Agent 上一次 dispatch 之后、且非该 Agent 自己发送的新消息 slice，当前消息始终单独作为 `latestMessage`。Codex、Claude Code 与 pi 在 message-triggered dispatch 中获得只读 `read_chat_history` tool，可从 prompt 最早 cursor 继续读取当前 Topic 的 bounded earlier page；cursor 必须逐页衔接，单次 invocation 最多 20 页、累计 1 MiB。Kimi ACP adapter 当前未装配动态 MCP server，因此继续由同 Session `ChatHistoryRequest@1` continuation 提供 bounded page。
+
+每次 `chat.dispatch` 还持续提供 application-owned Rollerskate read tools：`describe_capabilities`、`subscription_history`、`get_run` 与 `event_trace`。调用必须携带当前消息或 bounded evidence 中已有的 exact Run/Event ID；Subscription 另接受已有的 exact ID 或至少八位十六进制的唯一前缀，无法唯一解析时返回带 `queryStatus` 与 `reasonCode` 的稳定结构化错误。policy 固定只读 annotation、严格参数 schema、每次调用 256 KiB、每轮 20 次与累计 1 MiB 预算，query projection 再移除 workspace path、Run raw prompt/output 和 control authority，并对允许返回的错误、结果摘要与 bounded Event/Subscription output 脱敏。Codex 与 Claude Code 通过 invocation-scoped `rollerskate_read` MCP server 调用，pi 通过 content-attested bundled extension 调用；Kimi 使用同 Session `ChatReadToolRequest@1` continuation。它们只能读取各领域 query 的 bounded evidence，不能枚举、修改、重放、重试或授予任何权限。attention receipt、decision receipt、presence transition、Session 与可选 reply 都进入 durable audit，不依赖 UI。
 
 Chats timeline 只显示 `chat.message`。`chat_messages` projection 从 message Event、attention receipt 与 dispatch Execution 计算固定 Agent 分母和 `read | reading | unread | failed`；read 表示对应 Agent Execution 成功处理，reply 与 silent 等价，不是用户 read cursor。`chat.dispatch` 和 legacy dispatch card 不进入 timeline，但仍可从 canonical Event trace 检查。
 

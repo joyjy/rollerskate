@@ -372,42 +372,12 @@ test("Chat CLI posts messages, controls scoped presence, reads status, and rotat
         "--runtime", runtime, "chat", "resume", "--revision", "2"
       ], {}, { write(text) { output += text; } });
       assert.equal((JSON.parse(output) as { outcome: string }).outcome, "applied");
-      output = "";
-      await runLocalApp(repo, [
+      await assert.rejects(() => runLocalApp(repo, [
         "--runtime", runtime, "chat", "free", "status"
-      ], {}, { write(text) { output += text; } });
-      assert.equal((JSON.parse(output) as {
-        actionAvailability: { start: boolean };
-      }).actionAvailability.start, true);
-      output = "";
-      await runLocalApp(repo, [
-        "--runtime", runtime, "chat", "free", "start",
-        "--idempotency-key", "cli-free-chat",
-        "--intent", "directed", "--brief", "Discuss CLI ergonomics."
-      ], {}, { write(text) { output += text; } });
-      assert.equal((JSON.parse(output) as {
-        mode: { sample: { conversationIntent: { mode: string } } };
-      }).mode.sample.conversationIntent.mode, "directed");
-      output = "";
-      await runLocalApp(repo, [
-        "--runtime", runtime, "chat", "free", "continue-now", "--revision", "1"
-      ], {}, { write(text) { output += text; } });
-      assert.equal((JSON.parse(output) as { outcome: string }).outcome, "applied");
-      output = "";
-      await runLocalApp(repo, [
-        "--runtime", runtime, "chat", "free", "exit", "--revision", "2"
-      ], {}, { write(text) { output += text; } });
-      assert.equal((JSON.parse(output) as {
-        mode: { status: string };
-      }).mode.status, "exited");
-      output = "";
-      await runLocalApp(repo, [
-        "--runtime", runtime, "chat", "resume-and-wake",
-        "--revision", "3", "--idempotency-key", "cli-resume-wake"
-      ], {}, { write(text) { output += text; } });
-      assert.equal((JSON.parse(output) as {
-        activation: { status: string; event: { reason: string } };
-      }).activation.event.reason, "resumed");
+      ]), /chat requires schedule, governance, pause, resume, participant/);
+      await assert.rejects(() => runLocalApp(repo, [
+        "--runtime", runtime, "chat", "resume-and-wake"
+      ]), /chat requires schedule, governance, pause, resume, participant/);
 
       output = "";
       assert.equal(await runLocalApp(repo, [

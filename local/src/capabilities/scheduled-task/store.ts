@@ -10,12 +10,19 @@ import { CallbackStore } from "../../infrastructure/callback/store.js";
 import { encodeExternalRefTriggerBinding } from
   "../../modules/external-resource/trigger-binding.js";
 import type { ProactiveCallbackOccurrence } from "../../modules/callback/proactive-model.js";
+import { parseDeterministicApplicationActionReceipt } from
+  "../../modules/proactive/target.js";
+import {
+  parseProactiveTarget,
+  type ExternalWorkflowProactiveTarget
+} from "../../modules/proactive/target.js";
 import {
   newScheduleId,
   requireScheduleId,
   requireScheduleRevision,
   type CreateScheduleInput,
   type CreateBoundScheduleInput,
+  type CreateTargetedScheduleInput,
   type ScheduledRun,
   type Schedule,
   type ScheduleDefinition,
@@ -32,7 +39,9 @@ import {
   mapRevision,
   normalizeRevision,
   normalizeBoundRevision,
+  normalizeTargetedRevision,
   encodeScheduleSourceBinding,
+  encodeProactiveTarget,
   scheduleDefinitionSnapshot,
   parseScheduleDefinitionSnapshot,
   targetChanged,
@@ -191,12 +200,122 @@ export class ScheduledTaskStore {
     return this.require(revision.scheduleId);
   }
 
+  public createTargetedInTransaction(
+    input: CreateTargetedScheduleInput,
+    createdAt = new Date().toISOString()
+  ): Schedule {
+    requireLocalId(input.ownerPrincipalId, "prn", "ownerPrincipalId");
+    const at = iso(createdAt, "createdAt");
+    const revision = normalizeTargetedRevision(input, at);
+    const existingById = this.get(revision.scheduleId);
+    if (existingById !== undefined) {
+      if (existingById.revision.schemaVersion === "ScheduleRevision@3" &&
+        scheduleDefinitionIdentity(existingById.revision) ===
+          scheduleDefinitionIdentity(revision)) {
+        return existingById;
+      }
+      throw new Error("Schedule ID is already bound to another definition");
+    }
+    const runId = revision.target.kind === "steward_run"
+      ? revision.target.sourceBinding.runId
+      : undefined;
+    if (runId !== undefined) {
+      const existing = this.boundForRun(runId);
+      if (existing !== undefined) {
+        throw new Error("Agent Run is already bound to another Schedule definition");
+      }
+    }
+    const next = initialOccurrence(revision, at);
+    this.#database.prepare(`
+      INSERT INTO schedules (
+        schedule_id, owner_principal_id, status, current_revision,
+        next_run_at, next_occurrence_key, next_occurrence_missing,
+        definition_schema, agent_id, kind, expression, expression_version, timezone,
+        misfire_policy, overlap_policy, misfire_grace_ms, session_policy,
+        fixed_session_id, prompt, workspace, source_binding_json, target_json,
+        external_ref_binding_json, revision_created_at, created_at, updated_at
+      ) VALUES (?, ?, 'active', 1, ?, ?, ?, 'ScheduleRevision@3', NULL, ?, ?, ?, ?,
+        ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?)
+    `).run(
+      revision.scheduleId,
+      input.ownerPrincipalId,
+      next?.scheduledFor ?? null,
+      next?.occurrenceKey ?? null,
+      next?.missingLocalTime === true ? 1 : 0,
+      revision.kind,
+      revision.expression,
+      revision.expressionVersion,
+      revision.timezone ?? null,
+      revision.misfirePolicy,
+      revision.overlapPolicy,
+      revision.misfireGraceMilliseconds,
+      encodeProactiveTarget(revision.target),
+      encodeExternalRefTriggerBinding(revision.externalRefBinding),
+      revision.createdAt,
+      at,
+      at
+    );
+    return this.require(revision.scheduleId);
+  }
+
+  public migrateLegacyToExternalWorkflowInTransaction(input: {
+    readonly scheduleId: string;
+    readonly expectedRevision: number;
+    readonly target: ExternalWorkflowProactiveTarget;
+    readonly at: string;
+  }): Schedule {
+    if (!this.#database.isTransaction) {
+      throw new Error("Schedule external workflow migration requires an owning transaction");
+    }
+    const current = this.require(input.scheduleId);
+    if (current.definition.status !== "paused") {
+      throw new Error("Legacy Schedule must be paused before external workflow migration");
+    }
+    if (current.definition.currentRevision !== input.expectedRevision ||
+      current.revision.schemaVersion !== "ScheduleRevision@1") {
+      throw new Error(`Schedule revision conflict: ${input.scheduleId}`);
+    }
+    if (this.unterminatedRuns(input.scheduleId).length > 0) {
+      throw new Error("Legacy Schedule has unterminated occurrences");
+    }
+    const target = parseProactiveTarget(input.target, {
+      kind: "schedule",
+      id: input.scheduleId,
+      definitionRevision: `ScheduleRevision@3:${input.expectedRevision + 1}`
+    });
+    if (target.kind !== "external_workflow") {
+      throw new Error("Schedule migration requires an external workflow target");
+    }
+    const at = iso(input.at, "at");
+    const changed = this.#database.prepare(`
+      UPDATE schedules
+      SET current_revision = current_revision + 1,
+        definition_schema = 'ScheduleRevision@3', agent_id = NULL,
+        session_policy = NULL, fixed_session_id = NULL, prompt = NULL,
+        workspace = NULL, source_binding_json = NULL, target_json = ?,
+        revision_created_at = ?, updated_at = ?
+      WHERE schedule_id = ? AND status = 'paused' AND current_revision = ?
+        AND definition_schema = 'ScheduleRevision@1'
+    `).run(
+      encodeProactiveTarget(target),
+      at,
+      at,
+      input.scheduleId,
+      input.expectedRevision
+    );
+    if (changed.changes !== 1) {
+      throw new Error(`Schedule revision conflict: ${input.scheduleId}`);
+    }
+    return this.require(input.scheduleId);
+  }
+
   public boundForRun(runId: string): Schedule | undefined {
     const row = this.#database.prepare(`
       SELECT schedule_id
       FROM schedules
       WHERE json_extract(source_binding_json, '$.runId') = ?
-    `).get(runId) as { schedule_id: string } | undefined;
+        OR json_extract(target_json, '$.sourceBinding.runId') = ?
+    `).get(runId, runId) as { schedule_id: string } | undefined;
     return row === undefined ? undefined : this.require(row.schedule_id);
   }
 
@@ -264,7 +383,8 @@ export class ScheduledTaskStore {
         definition_schema,
         expression, expression_version, timezone, misfire_policy,
         overlap_policy, misfire_grace_ms, session_policy, fixed_session_id,
-        prompt, workspace, source_binding_json, revision_created_at AS created_at
+        prompt, workspace, source_binding_json, target_json,
+        revision_created_at AS created_at
         , external_ref_binding_json
       FROM schedules
       WHERE schedule_id = ? AND current_revision = ?
@@ -531,6 +651,18 @@ export class ScheduledTaskStore {
     });
   }
 
+  public actionReceipt(run: ScheduledRun) {
+    const row = this.#database.prepare(`
+      SELECT receipt_json FROM deterministic_action_receipts
+      WHERE source_kind = 'schedule' AND source_id = ? AND occurrence_key = ?
+    `).get(run.scheduleId, run.occurrenceKey) as { receipt_json: string } | undefined;
+    return row === undefined
+      ? undefined
+      : parseDeterministicApplicationActionReceipt(
+          JSON.parse(row.receipt_json) as unknown
+        );
+  }
+
   public reconcileCallbacks(at = new Date().toISOString()): number {
     return this.#callbacks.reconcileCompleted(at, { ownerKinds: ["schedule"] });
   }
@@ -652,4 +784,9 @@ export class ScheduledTaskStore {
     return row === undefined ? undefined : mapDefinition(row);
   }
 
+}
+
+function scheduleDefinitionIdentity(revision: ScheduleRevision): string {
+  const { createdAt: _createdAt, ...definition } = scheduleDefinitionSnapshot(revision);
+  return JSON.stringify(definition);
 }

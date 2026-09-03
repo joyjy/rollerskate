@@ -190,6 +190,14 @@ export class RuntimeStore {
     return this.#chat.createActivationInTransaction(input, at);
   }
 
+  public recordChatRunProposalDeclinedInTransaction(input: {
+    readonly sourceMessageEventId: string;
+    readonly dispatchEventId: string;
+    readonly actorPrincipalId: string;
+  }, at: string) {
+    return this.#chat.recordRunProposalDeclinedInTransaction(input, at);
+  }
+
   public audit(eventId: string): RuntimeAudit | undefined {
     return this.#audit.audit(eventId);
   }
@@ -270,12 +278,13 @@ export class RuntimeStore {
         throw new Error(`Chat reply route is only valid for chat.dispatch: ${event.eventId}`);
       }
       if (event.type === "chat.dispatch" && receipt.chatDecision !== undefined) {
-        const expectedSchema = event.promptResourceId === chatMentionPromptResourceId
-          ? "ChatMentionDecision@1"
-          : "ChatDecision@1";
-        if (receipt.chatDecision.schema !== expectedSchema) {
+        const expectedSchemas = event.promptResourceId === chatMentionPromptResourceId
+          ? ["ChatMentionDecision@1", "ChatMentionDecision@2"]
+          : ["ChatDecision@1", "ChatDecision@2"];
+        if (!expectedSchemas.includes(receipt.chatDecision.schema)) {
           throw new Error(
-            `Chat Agent outcome must use ${expectedSchema} for ${event.promptResourceId}`
+            `Chat Agent outcome must use ${expectedSchemas.join(" or ")} for ` +
+              event.promptResourceId
           );
         }
       }
@@ -341,11 +350,16 @@ export class RuntimeStore {
         this.#database.prepare(`
           UPDATE executions SET receipt_json = ? WHERE execution_id = ?
         `).run(JSON.stringify({
-          schema: "ChatDecisionReceipt@1",
+          schema: decision.schema.endsWith("@2")
+            ? "ChatDecisionReceipt@2"
+            : "ChatDecisionReceipt@1",
           dispatchEventId: event.eventId,
           speechAction: decision.speech.action,
           ...(decision.speech.action === "silent"
             ? { silenceReason: decision.speech.reason }
+            : {}),
+          ...(decision.speech.action === "propose_run"
+            ? { proposal: decision.speech.proposal }
             : {}),
           ...("presence" in decision
             ? { presenceTransition: decision.presence }

@@ -85,6 +85,23 @@ const reservedOptions: Readonly<Record<AgentClient, ReadonlySet<string>>> = {
     "--no-builtin-tools",
     "-nt",
     "--no-tools",
+    "-e",
+    "--extension",
+    "-ne",
+    "--no-extensions",
+    "--skill",
+    "-ns",
+    "--no-skills",
+    "--prompt-template",
+    "-np",
+    "--no-prompt-templates",
+    "--theme",
+    "--use-theme",
+    "--no-themes",
+    "-nc",
+    "--no-context-files",
+    "--system-prompt",
+    "--append-system-prompt",
     "-r",
     "--resume",
     "-c",
@@ -117,7 +134,7 @@ export function runtimeAdapterId(client: AgentClient): string {
 
 export function runtimeAdapterIdMatches(client: AgentClient, adapterId: string): boolean {
   const expected = runtimeAdapterId(client);
-  return client === "kimi-code"
+  return client === "kimi-code" || client === "pi"
     ? new RegExp(`^${expected}:[a-f0-9]{64}$`).test(adapterId)
     : adapterId === expected;
 }

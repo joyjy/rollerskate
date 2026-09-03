@@ -14,7 +14,7 @@ import { runtimePaths } from "../src/infrastructure/runtime/config.js";
 import { AgentRunStore } from "../src/infrastructure/sqlite/agent-run-store.js";
 import { initializeRuntimeSchema } from "../src/infrastructure/sqlite/schema.js";
 
-test("schema v69 adds reversible archive visibility without changing Run lifecycle", () => {
+test("schema v72 adds reversible archive visibility without changing Run lifecycle", () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-schema-v63-repo-"));
   const runtimeDirectory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v63-runtime-"));
   const paths = runtimePaths(repo, runtimeDirectory);
@@ -41,7 +41,7 @@ test("schema v69 adds reversible archive visibility without changing Run lifecyc
       legacy.close();
     }
 
-    assert.equal(initializeRuntimeSchema(paths.database).schemaVersion, 69);
+    assert.equal(initializeRuntimeSchema(paths.database).schemaVersion, 72);
     const database = new DatabaseSync(paths.database, { readOnly: true });
     try {
       const columns = database.prepare("PRAGMA table_info(agent_runs)").all() as

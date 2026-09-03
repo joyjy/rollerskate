@@ -26,7 +26,7 @@ import type { RuntimeHandlerKind } from "../src/core/runtime/model.js";
 import { RuntimeStore } from "../src/core/runtime/store.js";
 import { LocalChatStore } from "../src/infrastructure/sqlite/chat-store.js";
 
-test("Free Chat runs reply, silence, scoped snooze, deterministic wake, and Session resume end to end",
+test("source-driven Chat runs reply, silence, scoped snooze, wake keyword, and Session resume end to end",
   async () => {
     const repo = mkdtempSync(join(tmpdir(), "rollerskate-free-chat-repo-"));
     const runtimeDirectory = mkdtempSync(join(tmpdir(), "rollerskate-free-chat-runtime-"));

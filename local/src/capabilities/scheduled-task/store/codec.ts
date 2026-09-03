@@ -12,6 +12,10 @@ import {
   type RunSourceBinding
 } from "../../../modules/steward/source-contract.js";
 import {
+  parseProactiveTarget,
+  type ProactiveTarget
+} from "../../../modules/proactive/target.js";
+import {
   decodeExternalRefTriggerBinding,
   parseExternalRefTriggerBinding
 } from "../../../modules/external-resource/trigger-binding.js";
@@ -21,6 +25,7 @@ import {
   requireScheduledRunId,
   type BoundScheduleRevision,
   type CreateBoundScheduleInput,
+  type CreateTargetedScheduleInput,
   type LegacyScheduleRevision,
   type ScheduleOccurrenceAdmissionReceipt,
   type ScheduledRun,
@@ -28,7 +33,8 @@ import {
   type ScheduleDefinition,
   type ScheduleRevision,
   type ScheduleRevisionInput,
-  type ScheduleStatus
+  type ScheduleStatus,
+  type TargetedScheduleRevision
 } from "../model.js";
 import {
   canonicalCronExpression,
@@ -54,7 +60,7 @@ export interface DefinitionRow {
 export interface RevisionRow {
   schedule_id: string;
   revision: number;
-  definition_schema: "ScheduleRevision@1" | "ScheduleRevision@2";
+  definition_schema: "ScheduleRevision@1" | "ScheduleRevision@2" | "ScheduleRevision@3";
   agent_id: string | null;
   kind: ScheduleRevision["kind"];
   expression: string;
@@ -68,6 +74,7 @@ export interface RevisionRow {
   prompt: string | null;
   workspace: string | null;
   source_binding_json: string | null;
+  target_json: string | null;
   external_ref_binding_json: string | null;
   created_at: string;
 }
@@ -212,6 +219,57 @@ export function normalizeBoundRevision(
   };
 }
 
+export function normalizeTargetedRevision(
+  input: CreateTargetedScheduleInput,
+  createdAt: string
+): TargetedScheduleRevision {
+  requireScheduleId(input.scheduleId);
+  const expression = input.kind === "once"
+    ? canonicalOnceExpression(input.expression)
+    : canonicalCronExpression(input.expression);
+  const timezone = input.kind === "cron"
+    ? requireIanaTimezone(input.timezone ?? "")
+    : undefined;
+  if (input.kind === "once" && input.timezone !== undefined) {
+    throw new Error("once schedule must not define timezone");
+  }
+  if (input.misfirePolicy !== "skip" && input.misfirePolicy !== "run_once") {
+    throw new Error(`unsupported misfire policy: ${input.misfirePolicy}`);
+  }
+  if (input.overlapPolicy !== "skip" && input.overlapPolicy !== "queue") {
+    throw new Error(`unsupported overlap policy: ${input.overlapPolicy}`);
+  }
+  const expectedSource = {
+    kind: "schedule" as const,
+    id: input.scheduleId,
+    definitionRevision: "ScheduleRevision@3:1"
+  };
+  const target = parseProactiveTarget(input.target, expectedSource);
+  if (target.kind === "steward_run" &&
+    target.sourceBinding.occurrencePolicy !== (input.kind === "once" ? "one_shot" : "recurring")) {
+    throw new Error("ScheduleRevision@3 target occurrence policy does not match its definition");
+  }
+  return {
+    schemaVersion: "ScheduleRevision@3",
+    scheduleId: input.scheduleId,
+    revision: 1,
+    kind: input.kind,
+    expression,
+    expressionVersion: input.kind === "once" ? "once-rfc3339-v1" : "cron-v1",
+    ...(timezone === undefined ? {} : { timezone }),
+    misfirePolicy: input.misfirePolicy,
+    overlapPolicy: input.overlapPolicy,
+    misfireGraceMilliseconds: bounded(
+      input.misfireGraceMilliseconds, 0, 604_800_000, "misfireGraceMilliseconds"
+    ),
+    target,
+    ...(input.externalRefBinding === undefined
+      ? {}
+      : { externalRefBinding: parseExternalRefTriggerBinding(input.externalRefBinding) }),
+    createdAt: iso(createdAt, "createdAt")
+  };
+}
+
 function legacyAgentCallback(input: ScheduleRevisionInput): ProactiveCallbackDefinition {
   return {
     callbackId: "agent",
@@ -239,6 +297,25 @@ function legacyAgentCallback(input: ScheduleRevisionInput): ProactiveCallbackDef
 export function scheduleDefinitionSnapshot(
   revision: ScheduleRevision
 ): Readonly<Record<string, unknown>> {
+  if (revision.schemaVersion === "ScheduleRevision@3") {
+    return {
+      schema: "ScheduleDefinitionSnapshot@3",
+      scheduleId: revision.scheduleId,
+      revision: revision.revision,
+      kind: revision.kind,
+      expression: revision.expression,
+      expressionVersion: revision.expressionVersion,
+      ...(revision.timezone === undefined ? {} : { timezone: revision.timezone }),
+      misfirePolicy: revision.misfirePolicy,
+      overlapPolicy: revision.overlapPolicy,
+      misfireGraceMilliseconds: revision.misfireGraceMilliseconds,
+      target: revision.target,
+      ...(revision.externalRefBinding === undefined
+        ? {}
+        : { externalRefBinding: revision.externalRefBinding }),
+      createdAt: revision.createdAt
+    };
+  }
   if (revision.schemaVersion === "ScheduleRevision@2") {
     return {
       schema: "ScheduleDefinitionSnapshot@2",
@@ -292,11 +369,15 @@ export function parseScheduleDefinitionSnapshot(value: string): ScheduleRevision
     throw new Error("ScheduledRun definition snapshot must be valid JSON");
   }
   if (!isRecord(parsed) || (parsed.schema !== "ScheduleDefinitionSnapshot@1" &&
-    parsed.schema !== "ScheduleDefinitionSnapshot@2")) {
+    parsed.schema !== "ScheduleDefinitionSnapshot@2" &&
+    parsed.schema !== "ScheduleDefinitionSnapshot@3")) {
     throw new Error("ScheduledRun definition snapshot schema is unsupported");
   }
   if (parsed.schema === "ScheduleDefinitionSnapshot@2") {
     return parseBoundScheduleDefinitionSnapshot(parsed);
+  }
+  if (parsed.schema === "ScheduleDefinitionSnapshot@3") {
+    return parseTargetedScheduleDefinitionSnapshot(parsed);
   }
   if (typeof parsed.scheduleId !== "string" ||
     typeof parsed.revision !== "number" ||
@@ -353,6 +434,66 @@ export function parseScheduleDefinitionSnapshot(value: string): ScheduleRevision
       ? {}
       : { externalRefBinding: parseExternalRefTriggerBinding(parsed.externalRefBinding) }),
     createdAt: parsed.createdAt
+  };
+}
+
+function parseTargetedScheduleDefinitionSnapshot(
+  parsed: Readonly<Record<string, unknown>>
+): TargetedScheduleRevision {
+  const common = parseScheduleSnapshotCommon(parsed, "ScheduleDefinitionSnapshot@3");
+  const source = {
+    kind: "schedule" as const,
+    id: common.scheduleId,
+    definitionRevision: `ScheduleRevision@3:${common.revision}`
+  };
+  return {
+    schemaVersion: "ScheduleRevision@3",
+    ...common,
+    target: parseProactiveTarget(parsed.target, source)
+  };
+}
+
+function parseScheduleSnapshotCommon(
+  parsed: Readonly<Record<string, unknown>>,
+  schema: string
+): Omit<TargetedScheduleRevision, "schemaVersion" | "target"> {
+  const required = [
+    "schema", "scheduleId", "revision", "kind", "expression", "expressionVersion",
+    "misfirePolicy", "overlapPolicy", "misfireGraceMilliseconds", "target", "createdAt"
+  ];
+  const optional = ["timezone", "externalRefBinding"];
+  const unknown = Object.keys(parsed).filter(
+    (key) => !required.includes(key) && !optional.includes(key)
+  );
+  if (parsed.schema !== schema || unknown.length > 0 ||
+    required.some((key) => parsed[key] === undefined) ||
+    typeof parsed.scheduleId !== "string" || typeof parsed.revision !== "number" ||
+    (parsed.kind !== "once" && parsed.kind !== "cron") ||
+    typeof parsed.expression !== "string" ||
+    (parsed.expressionVersion !== "once-rfc3339-v1" && parsed.expressionVersion !== "cron-v1") ||
+    (parsed.misfirePolicy !== "skip" && parsed.misfirePolicy !== "run_once") ||
+    (parsed.overlapPolicy !== "skip" && parsed.overlapPolicy !== "queue") ||
+    typeof parsed.misfireGraceMilliseconds !== "number" ||
+    typeof parsed.createdAt !== "string") {
+    throw new Error(`${schema} is malformed`);
+  }
+  return {
+    scheduleId: requireScheduleId(textValue(parsed.scheduleId, "snapshot.scheduleId", 256)),
+    revision: requireScheduleRevision(parsed.revision, "snapshot.revision"),
+    kind: parsed.kind,
+    expression: textValue(parsed.expression, "snapshot.expression", 512),
+    expressionVersion: parsed.expressionVersion,
+    ...(typeof parsed.timezone === "string" ? { timezone: parsed.timezone } : {}),
+    misfirePolicy: parsed.misfirePolicy,
+    overlapPolicy: parsed.overlapPolicy,
+    misfireGraceMilliseconds: bounded(
+      parsed.misfireGraceMilliseconds, 0, 604_800_000,
+      "snapshot.misfireGraceMilliseconds"
+    ),
+    ...(parsed.externalRefBinding === undefined
+      ? {}
+      : { externalRefBinding: parseExternalRefTriggerBinding(parsed.externalRefBinding) }),
+    createdAt: isoValue(parsed.createdAt, "snapshot.createdAt")
   };
 }
 
@@ -454,6 +595,28 @@ export function mapDefinition(row: DefinitionRow): ScheduleDefinition {
 
 export function mapRevision(row: RevisionRow): ScheduleRevision {
   const externalRefBinding = decodeExternalRefTriggerBinding(row.external_ref_binding_json);
+  if (row.definition_schema === "ScheduleRevision@3") {
+    if (row.target_json === null) throw new Error("ScheduleRevision@3 target is missing");
+    return {
+      schemaVersion: "ScheduleRevision@3",
+      scheduleId: row.schedule_id,
+      revision: row.revision,
+      kind: row.kind,
+      expression: row.expression,
+      expressionVersion: row.expression_version,
+      ...(row.timezone === null ? {} : { timezone: row.timezone }),
+      misfirePolicy: row.misfire_policy,
+      overlapPolicy: row.overlap_policy,
+      misfireGraceMilliseconds: row.misfire_grace_ms,
+      target: parseProactiveTarget(JSON.parse(row.target_json) as unknown, {
+        kind: "schedule",
+        id: row.schedule_id,
+        definitionRevision: `ScheduleRevision@3:${row.revision}`
+      }),
+      ...(externalRefBinding === undefined ? {} : { externalRefBinding }),
+      createdAt: row.created_at
+    };
+  }
   if (row.definition_schema === "ScheduleRevision@2") {
     if (row.source_binding_json === null) {
       throw new Error("ScheduleRevision@2 source binding is missing");
@@ -539,6 +702,10 @@ export function decodeScheduleSourceBinding(value: string): BoundScheduleRevisio
     throw new Error("Schedule source binding must be valid JSON");
   }
   return requireScheduleSourceBinding(parsed);
+}
+
+export function encodeProactiveTarget(target: ProactiveTarget): string {
+  return JSON.stringify(parseProactiveTarget(target));
 }
 
 export function parseScheduleOccurrenceAdmissionReceipt(

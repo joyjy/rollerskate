@@ -20,6 +20,7 @@ import {
 import { parseExternalRefTriggerBinding } from
   "../../modules/external-resource/trigger-binding.js";
 import type { RunSourceBinding } from "../../modules/steward/source-contract.js";
+import { stewardRunProactiveTarget } from "../../modules/proactive/target.js";
 import type { RegisteredSubscriptionPlugin } from "./plugin-registry.js";
 import { resolveSpecToken } from "../../modules/spec/registry.js";
 
@@ -119,8 +120,8 @@ export function subscriptionSourceBindingRegistrar(input: {
       ? input.continuous.boundForRun(run.runId)?.subscriptionId ?? localId("sub")
       : input.oneShot.boundForRun(run.runId)?.subscriptionId ?? localId("sub");
     const definitionRevision = continuous
-      ? "ContinuousSubscriptionDefinition@2:1"
-      : "SubscriptionDefinition@4:1";
+      ? "ContinuousSubscriptionDefinition@3:1"
+      : "SubscriptionDefinition@5:1";
     const binding: RunSourceBinding = {
       schemaVersion: "RunSourceBinding@1",
       runId: run.runId,
@@ -152,26 +153,26 @@ export function subscriptionSourceBindingRegistrar(input: {
       }
     };
     if (continuous) {
-      const definition: BoundContinuousSubscriptionDefinition = {
-        schemaVersion: "ContinuousSubscriptionDefinition@2",
+      const definition = {
+        schemaVersion: "ContinuousSubscriptionDefinition@3" as const,
         revision: 1,
         title: parameters.title,
         probe,
         intervalMilliseconds: parameters.intervalMilliseconds,
-        sourceBinding: binding,
+        target: stewardRunProactiveTarget(binding),
         ...(parameters.externalRefBinding === undefined
           ? {}
           : { externalRefBinding: parameters.externalRefBinding })
       };
       resolveSpecToken(definition.schemaVersion, { kind: "contract" });
-      input.continuous.createBoundInTransaction({
+      input.continuous.createTargetedInTransaction({
         ...definition,
         subscriptionId
       }, at);
       return binding;
     }
-    const definition: BoundSubscriptionDefinition = {
-      schemaVersion: "SubscriptionDefinition@4",
+    const definition = {
+      schemaVersion: "SubscriptionDefinition@5" as const,
       revision: "1",
       title: parameters.title,
       probe: {
@@ -182,13 +183,13 @@ export function subscriptionSourceBindingRegistrar(input: {
       intervalMilliseconds: parameters.intervalMilliseconds,
       maxWaitMilliseconds: parameters.maxWaitMilliseconds!,
       maxAttempts: parameters.maxAttempts!,
-      sourceBinding: binding,
+      target: stewardRunProactiveTarget(binding),
       ...(parameters.externalRefBinding === undefined
         ? {}
         : { externalRefBinding: parameters.externalRefBinding })
     };
     resolveSpecToken(definition.schemaVersion, { kind: "contract" });
-    input.oneShot.createBoundInTransaction({
+    input.oneShot.createTargetedInTransaction({
       ...definition,
       subscriptionId
     }, at);

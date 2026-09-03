@@ -77,8 +77,10 @@ test("Runtime artifact revision changes with executable JavaScript", () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-runtime-revision-"));
   try {
     const localDist = join(repo, "local", "dist", "src");
+    const localResources = join(repo, "local", "dist", "resources", "agents");
     const protocolDist = join(repo, "packages", "protocol", "dist", "src");
     mkdirSync(localDist, { recursive: true });
+    mkdirSync(localResources, { recursive: true });
     mkdirSync(protocolDist, { recursive: true });
     writeFileSync(join(localDist, "main.js"), "export const revision = 1;\n");
     writeFileSync(join(protocolDist, "index.js"), "export const protocol = 1;\n");
@@ -87,6 +89,12 @@ test("Runtime artifact revision changes with executable JavaScript", () => {
     assert.equal(runtimeArtifactRevision(repo), first);
     writeFileSync(join(localDist, "main.js"), "export const revision = 2;\n");
     assert.notEqual(runtimeArtifactRevision(repo), first);
+    const withSourceChange = runtimeArtifactRevision(repo);
+    writeFileSync(join(localResources, "extension.mjs"), "export const revision = 1;\n");
+    assert.notEqual(runtimeArtifactRevision(repo), withSourceChange);
+    const withExtension = runtimeArtifactRevision(repo);
+    writeFileSync(join(localResources, "profile.md"), "Runtime prompt policy\n");
+    assert.notEqual(runtimeArtifactRevision(repo), withExtension);
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }
@@ -291,7 +299,7 @@ test("Runtime failures and Event/Workload CLI share the application projections"
   }
 });
 
-test("Run and Event CLI queries do not write to a read-only Runtime", async () => {
+test("Run, Event, Schedule, and Subscription CLI queries do not write to a read-only Runtime", async () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-readonly-query-repo-"));
   const runtimeDirectory = mkdtempSync(
     join(tmpdir(), "rollerskate-readonly-query-state-")
@@ -342,6 +350,7 @@ test("Run and Event CLI queries do not write to a read-only Runtime", async () =
     };
 
     const writableDatabase = openRuntimeDatabase(paths.database);
+    let subscriptionId: string | undefined;
     const runtime = new RuntimeStore(writableDatabase);
     const runs = new AgentRunStore(writableDatabase);
     const oneShot = new SubscriptionStore(writableDatabase);
@@ -392,6 +401,8 @@ test("Run and Event CLI queries do not write to a read-only Runtime", async () =
         bindSource,
         at: "2026-08-27T12:00:00.000Z"
       }));
+      subscriptionId = continuous.boundForRun(started.run.runId)?.subscriptionId;
+      assert.notEqual(subscriptionId, undefined);
     } finally {
       continuous.close();
       oneShot.close();
@@ -414,7 +425,9 @@ test("Run and Event CLI queries do not write to a read-only Runtime", async () =
       ["run", "inspect", started.run.runId],
       ["run", "trace", started.run.runId],
       ["event", "list"],
-      ["event", "trace", started.rootEventId]
+      ["event", "trace", started.rootEventId],
+      ["schedule", "list"],
+      ["subscription", "history", subscriptionId!, "--json"]
     ]) {
       let output = "";
       assert.equal(await runLocalApp(repo, [

@@ -52,9 +52,16 @@ import { assertV65SchemaShape, migrateV65Schema } from "./v65-migration.js";
 import { assertV66SchemaShape, migrateV66Schema } from "./v66-migration.js";
 import { assertV67SchemaShape, migrateV67Schema } from "./v67-migration.js";
 import { assertV68SchemaShape, migrateV68Schema } from "./v68-migration.js";
+import {
+  assertV69SchemaShape,
+  migrateV69Schema,
+  retireSyntheticChatActivationState
+} from "./v69-migration.js";
+import { assertV70SchemaShape, migrateV70Schema } from "./v70-migration.js";
+import { assertV71SchemaShape, migrateV71Schema } from "./v71-migration.js";
 import { assertNoLiveRuntimeSchemaUpgrade } from "./upgrade-guard.js";
 
-export const LOCAL_SCHEMA_VERSION = 69;
+export const LOCAL_SCHEMA_VERSION = 72;
 
 export function assertCurrentLocalSchema(database: DatabaseSync): void {
   const declaredVersion = schemaVersion(database);
@@ -94,9 +101,42 @@ export function migrateLocalDatabase(database: DatabaseSync): void {
     migrateCurrentRuntimeData(database);
     return;
   }
+  if (declaredVersion === 71) {
+    assertV71SchemaShape(database);
+    migrateV71Schema(database, LOCAL_SCHEMA_VERSION);
+    backfillScheduleCallbacks(database);
+    migrateCurrentRuntimeData(database);
+    return;
+  }
+  if (declaredVersion === 70) {
+    assertV70SchemaShape(database);
+    migrateV70Schema(database, 71);
+    assertV71SchemaShape(database);
+    migrateV71Schema(database, LOCAL_SCHEMA_VERSION);
+    backfillScheduleCallbacks(database);
+    migrateCurrentRuntimeData(database);
+    return;
+  }
+  if (declaredVersion === 69) {
+    assertV69SchemaShape(database);
+    migrateV69Schema(database, 70);
+    assertV70SchemaShape(database);
+    migrateV70Schema(database, 71);
+    assertV71SchemaShape(database);
+    migrateV71Schema(database, LOCAL_SCHEMA_VERSION);
+    backfillScheduleCallbacks(database);
+    migrateCurrentRuntimeData(database);
+    return;
+  }
   if (declaredVersion === 68) {
     assertV68SchemaShape(database);
-    migrateV68Schema(database, LOCAL_SCHEMA_VERSION);
+    migrateV68Schema(database, 69);
+    assertV69SchemaShape(database);
+    migrateV69Schema(database, 70);
+    assertV70SchemaShape(database);
+    migrateV70Schema(database, 71);
+    assertV71SchemaShape(database);
+    migrateV71Schema(database, LOCAL_SCHEMA_VERSION);
     backfillScheduleCallbacks(database);
     migrateCurrentRuntimeData(database);
     return;
@@ -286,6 +326,7 @@ function migrateCurrentRuntimeData(database: DatabaseSync): void {
       WHERE adapter_id = 'kimi-code-runtime-jsonl-v1'
     )
   `);
+  retireSyntheticChatActivationState(database);
   migrateLegacyAgentTurnOutputs(database);
 }
 
@@ -397,14 +438,14 @@ function isCurrentSchema(database: DatabaseSync): boolean {
     ) && tableColumns(database, "agent_runs").includes("archived_at") &&
     tableColumns(database, "agent_runs").includes("source_binding_json") &&
     tableColumns(database, "agent_run_cycles").includes("source_envelope_json") &&
-    ["definition_schema", "source_binding_json"].every(
+    ["definition_schema", "source_binding_json", "target_json"].every(
       (column) => tableColumns(database, "schedules").includes(column)
     ) && ["agent_run_id", "cycle_id", "admission_receipt_json"].every(
       (column) => tableColumns(database, "scheduled_runs").includes(column)
-    ) && ["source_binding_json", "agent_run_id", "cycle_id",
+    ) && ["source_binding_json", "target_json", "agent_run_id", "cycle_id",
       "admission_receipt_json"].every(
       (column) => tableColumns(database, "subscriptions").includes(column)
-    ) && ["definition_schema", "source_binding_json", "agent_run_id",
+    ) && ["definition_schema", "source_binding_json", "target_json", "agent_run_id",
       "pending_cycle_id", "pending_admission_receipt_json"].every(
       (column) => tableColumns(database, "continuous_subscriptions").includes(column)
     ) &&
@@ -437,5 +478,11 @@ function upgradeFromV67(database: DatabaseSync): void {
   assertV67SchemaShape(database);
   migrateV67Schema(database, 68);
   assertV68SchemaShape(database);
-  migrateV68Schema(database, LOCAL_SCHEMA_VERSION);
+  migrateV68Schema(database, 69);
+  assertV69SchemaShape(database);
+  migrateV69Schema(database, 70);
+  assertV70SchemaShape(database);
+  migrateV70Schema(database, 71);
+  assertV71SchemaShape(database);
+  migrateV71Schema(database, LOCAL_SCHEMA_VERSION);
 }

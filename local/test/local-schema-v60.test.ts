@@ -14,7 +14,7 @@ import {
 } from "../src/infrastructure/sqlite/foundation-store.js";
 import { initializeRuntimeSchema } from "../src/infrastructure/sqlite/schema.js";
 
-test("schema v69 preserves v60 autonomous Runs and adds caller decision state", () => {
+test("schema v72 preserves v60 autonomous Runs and adds caller decision state", () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-schema-v60-repo-"));
   const runtimeDirectory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v60-runtime-"));
   const paths = runtimePaths(repo, runtimeDirectory);
@@ -34,7 +34,7 @@ test("schema v69 preserves v60 autonomous Runs and adds caller decision state", 
 
     downgradeAgentRunsToV60(paths.database);
     assert.equal(declaredVersion(paths.database), 60);
-    assert.equal(initializeRuntimeSchema(paths.database).schemaVersion, 69);
+    assert.equal(initializeRuntimeSchema(paths.database).schemaVersion, 72);
 
     const database = new DatabaseSync(paths.database);
     try {

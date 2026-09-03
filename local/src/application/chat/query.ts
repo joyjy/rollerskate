@@ -16,6 +16,7 @@ import {
   localRuntimeSnapshot,
   type LocalControlOptions
 } from "../agent/control.js";
+import type { ChatRunProposalView } from "./run-proposal.js";
 
 export interface ChatTimelineOptions {
   readonly beforeEventId?: string;
@@ -24,6 +25,7 @@ export interface ChatTimelineOptions {
 
 export interface ChatMessageView extends ChatMessageSummary {
   readonly readProgress?: ChatReadProgress;
+  readonly runProposals?: readonly ChatRunProposalView[];
 }
 
 export interface ChatMessageViewPage {
@@ -73,7 +75,14 @@ export function chatMessageViewsFromStore(
   topicId: string,
   options: ChatTimelineOptions = {}
 ): ChatMessageViewPage {
-  const page = store.messagePage(topicId, options);
+  return chatMessageViewsFromPage(store, topicId, store.messagePage(topicId, options));
+}
+
+export function chatMessageViewsFromPage(
+  store: Pick<LocalChatStore, "readProgressForMessages">,
+  topicId: string,
+  page: ChatMessagePage
+): ChatMessageViewPage {
   const visibleItems = page.items.filter((item) => item.dispatchCard === undefined);
   const progress = store.readProgressForMessages(visibleItems.map((item) => item.eventId));
   return {

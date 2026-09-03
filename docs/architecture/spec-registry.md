@@ -39,7 +39,7 @@ Canonical grammar 固定为 `spec:rollerskate/<name>@<major>`，由 `SpecRef@1` 
 
 - intake/compiler：`RunIntent@1`、`StewardRunRequest@2`、`RunAuthorityEnvelope@1`；
 - orchestration：`OrchestratorBinding@3`、`RunDecision@3`、`AgentStepResult@1`、`AgentRunCheckpoint@1`；
-- source binding：`RunSourceBinding@1`、`ScheduleRevision@2`、`SubscriptionDefinition@4`、`ContinuousSubscriptionDefinition@2`、`TriggerOccurrenceEnvelope@1`；
+- source/target binding：`RunSourceBinding@1`、`ProactiveTarget@1`、`ScheduleRevision@3`、`SubscriptionDefinition@5`、`ContinuousSubscriptionDefinition@3`、`TriggerOccurrenceEnvelope@1`、`DeterministicApplicationActionReceipt@1`；
 - source templates：`schedule.once@1`、`schedule.cron@1`、`subscription.until@1`、`subscription.continuous@1`；
 - workflows：`review@1`、`mr-readiness@1`、`forum@1`、`continuous-observation-monitor@1`，四者是 file-backed artifact 并绑定 digest；
 - result contracts：`agent-turn-result@1`、`agent-step-result@1`、`run-decision@3`、`agent-turn-adjudication@1`、`agent-turn-retry-result@1`；

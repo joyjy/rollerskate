@@ -88,7 +88,7 @@ Notice 不是 Event type。`application/notice` 通过 `notices` 读取由 `agen
 - 特有字段：`agentId`、`prompt`，可选 `sessionId` 与 host-owned `runContext`。
 - `AgentRunContext@1` 只包含通用协调信息：`runId`、`stepId`、可选 `parentStepId`、按 orchestration mode 选择的 result contract、effective workspace grant snapshot，以及 autonomous mode 可选的 immutable completion callback binding。它不包含 workflow、Reviewer/Implementer、Caller decision 或其他领域字段。
 - callback request 还携带 bounded `AgentStepCompletion@1`，记录 child request/result/Execution、terminal outcome、summary、artifact references 与 observed workspace revision；它恢复 admission 时固定的 caller Session。
-- 当前生产者：Steward Run control、Chat/Interactive Channel application 与 persisted legacy callback reconciliation。公共 `agent request` 已关闭；ScheduleRevision@2 与 Subscription V4/V2 只激活 Run cycle，不直接创建自己的 Agent request。
+- 当前生产者：Steward Run control、Chat/Interactive Channel application 与 persisted legacy callback reconciliation。公共 `agent request` 已关闭；current Schedule/Subscription 的 Run target 只激活 Run cycle，application action target 与 Schedule external workflow target 都不创建 Agent request。
 - Route：`AgentHandler`。
 - 成功结果：创建子 `agent.result`，包含不透明 output 和 Session；存在 result contract 时由注册 continuation 后续校验。
 - 最终失败：创建失败的子 `agent.result`。
@@ -123,10 +123,10 @@ Agent input 的 typed terminal result。
 
 ## `chat.activation`
 
-Topic 策略产生的 immutable attention root，使 Agent 可以在没有新 Human message 时主动首发或继续推进。
+显式 Topic schedule 产生的 immutable attention root，使 Agent 可以在没有新 message 时按 Owner 配置的时间获得一次 conversation attention。
 
 - 特有字段：`topicId`、`reason`、`strategyId`、`strategyRevision`、`contextRevision`、稳定排序并去重的 `candidateAgentIds`、`turnBudget`、`expiresAt`，可选 `sourceEventId`。
-- 当前可执行策略：Local Console 暴露 `starter` 和 `manual`；同一 Local conversation root 中的 Agent message 通过 `participant-message` 进入同一 ChatHandler 路径。Server Topic Agent event 在协议没有携带可验证的 activation/cycle token 前只进入 timeline，不自动创建新的 attention root，避免每次跨 Runtime 回帖重新获得预算。`scheduled` 与 `resumed` 只保留在版本化 Event vocabulary 中，当前没有 Console 或 Scheduled Task admission，不能据此宣称已交付。
+- 当前可执行策略只有 Topic-owned `scheduled`；同一 Local conversation root 中的 Agent message 作为 `chat.message` source 进入 ChatHandler。`starter`、`manual` 与 `resumed` 只为历史 Event 可读性保留在版本化 vocabulary，application admission 对前两者 fail closed，Console/API/CLI 不提供创建入口。Server Topic Agent event 在协议没有携带可验证的 activation/cycle token 前只进入 timeline，不自动创建新的 attention root。
 - `source.externalId`：由 application 提供的 activation idempotency key；相同 key 只创建一个 Event/Execution。
 - Route：`ChatHandler`。Presence、Agent lifecycle、candidate snapshot 与 expiry 共同决定 dispatch/skip receipt。
 - `turnBudget` 是整个 activation root 的 dispatch 上限；Store 在同一 immediate transaction 中按 `rootEventId` 计数并截停后续 dispatch。预算耗尽、全部 silent、全部 skip 或 expiry 都是确定性停止，不产生伪造 Human message。
@@ -200,7 +200,7 @@ owner | agent chat.message
   -> ChatDecision@1
   -> agent chat.message | silent | failed Execution
 
-chat.activation [starter | manual | scheduled]
+chat.activation [scheduled]
   -> ChatHandler
   -> bounded chat.dispatch
   -> agent chat.message

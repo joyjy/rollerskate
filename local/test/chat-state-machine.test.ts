@@ -51,6 +51,63 @@ test("ChatDecision@1 validates speech and scoped presence", () => {
   );
 });
 
+test("ChatDecision@2 admits a bounded Run proposal and keeps incomplete work blocked", () => {
+  assert.deepEqual(parseChatDecision(JSON.stringify({
+    schema: "ChatDecision@2",
+    speech: {
+      action: "propose_run",
+      proposal: {
+        schema: "ChatRunProposalDraft@1",
+        goal: "Inspect the regression",
+        scope: { include: ["Read the failing path"], exclude: ["Do not deploy"] },
+        acceptance: ["Root cause is evidenced"],
+        desiredEffect: "read",
+        workspaceRef: "local:workspace"
+      }
+    },
+    presence: { scope: "topic", mode: "available", wakeKeywords: [] }
+  }), now), {
+    schema: "ChatDecision@2",
+    speech: {
+      action: "propose_run",
+      proposal: {
+        schema: "ChatRunProposalDraft@1",
+        goal: "Inspect the regression",
+        scope: { include: ["Read the failing path"], exclude: ["Do not deploy"] },
+        acceptance: ["Root cause is evidenced"],
+        desiredEffect: "read",
+        workspaceRef: "local:workspace"
+      }
+    },
+    presence: { scope: "topic", mode: "available", wakeKeywords: [] }
+  });
+  const blocked = parseChatDecision(JSON.stringify({
+    schema: "ChatDecision@2",
+    speech: {
+      action: "propose_run",
+      proposal: {
+        schema: "ChatRunProposalDraft@1",
+        goal: "Inspect the regression"
+      }
+    },
+    presence: { scope: "topic", mode: "available", wakeKeywords: [] }
+  }), now);
+  assert.equal(blocked.speech.action, "propose_run");
+  if (blocked.speech.action !== "propose_run") return;
+  assert.equal(
+    blocked.speech.proposal.blockingQuestion,
+    "Please clarify scope.include, acceptance, desiredEffect before starting this Run."
+  );
+  assert.throws(() => parseChatDecision(JSON.stringify({
+    schema: "ChatDecision@1",
+    speech: {
+      action: "propose_run",
+      proposal: { schema: "ChatRunProposalDraft@1" }
+    },
+    presence: { scope: "topic", mode: "available", wakeKeywords: [] }
+  }), now), /must be reply or silent/u);
+});
+
 test("ChatMentionDecision@1 decides speech without changing presence", () => {
   assert.deepEqual(parseChatMentionDecision(JSON.stringify({
     schema: "ChatMentionDecision@1",
@@ -74,6 +131,24 @@ test("ChatMentionDecision@1 decides speech without changing presence", () => {
     })),
     /must use schema ChatMentionDecision@1/
   );
+});
+
+test("ChatMentionDecision@2 can propose work without changing presence", () => {
+  const decision = parseChatMentionDecision(JSON.stringify({
+    schema: "ChatMentionDecision@2",
+    speech: {
+      action: "propose_run",
+      proposal: {
+        schema: "ChatRunProposalDraft@1",
+        goal: "Summarize the evidence",
+        scope: { include: ["Read the supplied context"], exclude: [] },
+        acceptance: ["A bounded summary is returned"],
+        desiredEffect: "none"
+      }
+    }
+  }));
+  assert.equal(decision.speech.action, "propose_run");
+  assert.equal("presence" in decision, false);
 });
 
 test("public Chat profile context rejects stale, mismatched and unbounded snapshots", () => {

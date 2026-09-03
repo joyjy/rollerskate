@@ -7,7 +7,13 @@ import {
   parseChatPresence,
   type ChatPresence
 } from "../../chat/model.js";
-import { newEventId, type ChatDispatchEvent, type ChatMessageEvent } from "../../event/model.js";
+import {
+  newEventId,
+  requireEventId,
+  type ChatDispatchEvent,
+  type ChatMessageEvent,
+  type ChatRunProposalDecision
+} from "../../event/model.js";
 import { runtimeId, type RuntimeExecution } from "../model.js";
 import {
   bounded,
@@ -366,6 +372,90 @@ export class RuntimeChatStore {
     const event = this.#query.event(eventId);
     if (event?.type !== "chat.message") throw new Error(`Event is not chat.message: ${eventId}`);
     return event;
+  }
+
+  public recordRunProposalDeclinedInTransaction(input: {
+    readonly sourceMessageEventId: string;
+    readonly dispatchEventId: string;
+    readonly actorPrincipalId: string;
+  }, at: string): {
+    readonly status: "declined" | "duplicate";
+    readonly event: ChatMessageEvent;
+  } {
+    const sourceMessageEventId = requireEventId(
+      input.sourceMessageEventId,
+      "sourceMessageEventId"
+    );
+    const dispatchEventId = requireEventId(input.dispatchEventId, "dispatchEventId");
+    const actorPrincipalId = requireText(input.actorPrincipalId, "actorPrincipalId");
+    const externalId = `chat-run-proposal-decision:${sourceMessageEventId}:${dispatchEventId}`;
+    const existing = this.#database.prepare(`
+      SELECT event_id FROM events
+      WHERE source_kind = 'cli' AND source_external_id = ?
+    `).get(externalId) as { event_id: string } | undefined;
+    if (existing !== undefined) {
+      const event = this.#query.event(existing.event_id);
+      if (event?.type !== "chat.message" ||
+        event.runProposalDecision?.sourceMessageEventId !== sourceMessageEventId ||
+        event.runProposalDecision.dispatchEventId !== dispatchEventId ||
+        event.runProposalDecision.action !== "declined" ||
+        event.runProposalDecision.actor.principalId !== actorPrincipalId) {
+        throw new Error(`Chat Run proposal decision idempotency collision: ${externalId}`);
+      }
+      return { status: "duplicate", event };
+    }
+    const source = this.#query.event(sourceMessageEventId);
+    if (source?.type !== "chat.message" || source.sender.kind !== "owner") {
+      throw new Error("Run proposal source must be an exact Owner message");
+    }
+    if (source.sender.principalId !== actorPrincipalId) {
+      throw new Error("Run proposal decision actor must own the source message");
+    }
+    const dispatch = this.#query.event(dispatchEventId);
+    if (dispatch?.type !== "chat.dispatch" ||
+      dispatch.sourceMessageEventId !== sourceMessageEventId ||
+      dispatch.topicId !== source.topicId ||
+      dispatch.causality.rootEventId !== source.causality.rootEventId) {
+      throw new Error("Run proposal decision must target the exact Chat dispatch");
+    }
+    const decidedAt = iso(at);
+    const decision: ChatRunProposalDecision = {
+      schema: "ChatRunProposalDecision@1",
+      sourceMessageEventId,
+      dispatchEventId,
+      action: "declined",
+      actor: { kind: "owner", principalId: actorPrincipalId },
+      decidedAt
+    };
+    const eventId = newEventId();
+    this.#database.prepare(`
+      INSERT INTO events (
+        event_id, type, source_kind, source_external_id, agent_id, prompt,
+        outcome, output, error, payload_json, session_id, destination_ids_json,
+        destination_snapshots_json, root_event_id, parent_event_id, causal_hop,
+        created_at
+      ) VALUES (?, 'chat.message', 'cli', ?, NULL, NULL, NULL, NULL, NULL, ?, NULL,
+        '[]', '[]', ?, ?, ?, ?)
+    `).run(
+      eventId,
+      externalId,
+      JSON.stringify({
+        topicId: source.topicId,
+        sender: { kind: "system", handleSnapshot: "System" },
+        body: `Owner declined Run proposal from @${dispatch.targetHandleSnapshot}.`,
+        replyToEventId: sourceMessageEventId,
+        runProposalDecision: decision
+      }),
+      source.causality.rootEventId,
+      dispatchEventId,
+      dispatch.causality.hop + 1,
+      decidedAt
+    );
+    const event = this.#query.event(eventId);
+    if (event?.type !== "chat.message") {
+      throw new Error(`Created Event is not chat.message: ${eventId}`);
+    }
+    return { status: "declined", event };
   }
 
   public applyPresence(dispatch: ChatDispatchEvent, presence: ChatPresence, at: string): void {

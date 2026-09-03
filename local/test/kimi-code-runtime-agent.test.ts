@@ -10,6 +10,8 @@ import { KimiCodeRuntimeAgent } from "../src/integrations/agent/kimi-code.js";
 import { providerPolicyObservationFromArgv } from
   "../src/integrations/agent/provider-policy.js";
 
+const rawResultDirective = "The first non-whitespace character of your entire response must be the opening brace `{` of the requested result object. Do not wrap the result in Markdown code fences or add any preamble.";
+
 const readProfile = `---
 name: read
 description: read
@@ -18,6 +20,14 @@ tools:
   - Grep
   - Glob
 ---
+
+\${base_prompt}
+
+Operate read-only. Do not modify files or execute commands. Follow the Rollerskate prompt and return only its requested result contract.
+
+Do not emit plans, progress updates, acknowledgements, tool preambles, or summaries as assistant message text. Keep intermediate work in ACP thought and tool updates. Emit exactly one assistant message only after the work is complete, containing only the raw result contract requested by the Event prompt.
+
+${rawResultDirective}
 `;
 const writeProfile = `---
 name: write
@@ -30,6 +40,14 @@ tools:
   - Edit
   - Bash
 ---
+
+\${base_prompt}
+
+Work only inside the workspace authorized by the Rollerskate prompt. You may create and edit files and run commands needed to complete the requested engineering task. Follow the Rollerskate prompt and return only its requested result contract.
+
+Do not emit plans, progress updates, acknowledgements, tool preambles, or summaries as assistant message text. Keep intermediate work in ACP thought and tool updates. Emit exactly one assistant message only after the work is complete, containing only the raw result contract requested by the Event prompt.
+
+${rawResultDirective}
 `;
 
 test("Kimi Code uses ACP v1, exact Session resume and model configuration", async () => {
@@ -119,6 +137,29 @@ test("Kimi Code permission policy rejects writes for read grants and allows writ
   });
 });
 
+test("Kimi Code prompt prevents leading narration for strict Event results", async () => {
+  for (const access of ["read", "write"] as const) {
+    const fixture = kimiFixture({ toolKind: "read" });
+    const agent = new KimiCodeRuntimeAgent({
+      executable: fixture.executable,
+      projectRoot: fixture.workspace,
+      environment: {},
+      timeoutMilliseconds: 3_000
+    });
+
+    await agent.invoke({ event: runEvent(fixture.workspace, access) });
+
+    const prompt = promptText(invocation(fixture.invocation).messages);
+    assert.match(prompt,
+      /Do not emit plans, progress updates, acknowledgements, tool preambles, or summaries as assistant message text\./u);
+    assert.match(prompt, /Keep intermediate work in ACP thought and tool updates\./u);
+    assert.match(prompt,
+      /Emit exactly one assistant message only after the work is complete, containing only the raw result contract requested by the Event prompt\./u);
+    assert.match(prompt,
+      /The first non-whitespace character of your entire response must be the opening brace `\{`/u);
+  }
+});
+
 test("Kimi Code ignores oversized ACP trace content and keeps the terminal result", async () => {
   const fixture = kimiFixture({ toolKind: "read", oversizedTraceBytes: 2_000_000 });
   const agent = new KimiCodeRuntimeAgent({
@@ -175,20 +216,20 @@ test("Kimi Code honors an explicit Run deadline without extending it for progres
     projectRoot: fixture.workspace,
     environment: {},
     timeoutMilliseconds: 1_000,
-    meaningfulOutputTimeoutMilliseconds: 500
+    meaningfulOutputTimeoutMilliseconds: 3_000
   });
   const progress: unknown[] = [];
 
   await assert.rejects(
     agent.invoke({
-      event: runEvent(undefined, "read", 500),
+      event: runEvent(undefined, "read", 1_500),
       reportProgress: (update) => progress.push(update)
     }),
     (error: unknown) => {
       assert.equal(error instanceof AgentInvocationError, true);
       const failure = (error as AgentInvocationError).failure;
       assert.equal(failure.reason, "deadline");
-      assert.equal(failure.totalTimeoutMilliseconds, 500);
+      assert.equal(failure.totalTimeoutMilliseconds, 1_500);
       assert.equal(failure.recovery, "explicit_read_only_resume");
       assert.equal(failure.providerSessionId,
         "rollerskate-kimi-session-v1:read:session_fixture");
@@ -199,6 +240,21 @@ test("Kimi Code honors an explicit Run deadline without extending it for progres
   );
   assert.equal(progress.length > 1, true);
   assert.equal(methodCount(invocation(fixture.invocation).messages, "session/cancel"), 1);
+});
+
+test("Kimi Code progress can outlive the adapter timeout without a Run deadline", async () => {
+  const fixture = kimiFixture({ meaningfulThenCompleteMilliseconds: 2_500 });
+  const agent = new KimiCodeRuntimeAgent({
+    executable: fixture.executable,
+    projectRoot: fixture.workspace,
+    environment: {},
+    timeoutMilliseconds: 1_500
+  });
+
+  const result = await agent.invoke({ event: runEvent() });
+
+  assert.deepEqual(result.outcome, { kind: "message", body: "done" });
+  assert.equal(methodCount(invocation(fixture.invocation).messages, "session/cancel"), 0);
 });
 
 test("Kimi Code rejects malformed or out-of-range Run deadlines", async () => {
@@ -279,6 +335,24 @@ test("Kimi ACP policy fingerprint covers both bundled prompt policies", () => {
   ), /ACP provider policy is not enforced/);
 });
 
+test("Kimi ACP policy rejects bundled prompts that omit the raw-result first-character directive", () => {
+  const argv = ["acp"];
+  const readWithoutDirective = readProfile.replace(rawResultDirective, "");
+  assert.throws(() => providerPolicyObservationFromArgv(
+    "kimi-code",
+    argv,
+    "fixture-helper",
+    { kimiReadOnlyAgent: readWithoutDirective, kimiWritableAgent: writeProfile }
+  ), /raw-result first-character directive/);
+  assert.throws(() => providerPolicyObservationFromArgv(
+    "kimi-code",
+    argv,
+    "fixture-helper",
+    { kimiReadOnlyAgent: readProfile, kimiWritableAgent: writeProfile.replace(rawResultDirective, "") },
+    "write"
+  ), /raw-result first-character directive/);
+});
+
 test("Kimi ACP launch args reject controls other than model selection", () => {
   const workspace = mkdtempSync(join(tmpdir(), "rollerskate-kimi-acp-policy-"));
   assert.throws(() => new KimiCodeRuntimeAgent({
@@ -296,6 +370,7 @@ function kimiFixture(options: {
   readonly multipleMessages?: boolean;
   readonly stall?: boolean;
   readonly meaningfulForever?: boolean;
+  readonly meaningfulThenCompleteMilliseconds?: number;
   readonly cancelled?: boolean;
   readonly exitBeforeSettlement?: boolean;
 }): { readonly workspace: string; readonly executable: string; readonly invocation: string } {
@@ -346,7 +421,11 @@ process.stdin.on("data", (chunk) => {
     }
     if (message.method === "session/prompt") {
       promptRequest = message;
-      ${options.cancelled === true ? `send({ jsonrpc: "2.0", id: promptRequest.id, result: { stopReason: "cancelled" } });` : options.exitBeforeSettlement === true ? `process.exit(143);` : options.stall === true ? `setInterval(() => update({ sessionUpdate: "session_info_update", title: "noise" }), 5);` : options.meaningfulForever === true ? `setInterval(() => update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "thinking fixture" } }), 5);` : `
+      ${options.cancelled === true ? `send({ jsonrpc: "2.0", id: promptRequest.id, result: { stopReason: "cancelled" } });` : options.exitBeforeSettlement === true ? `process.exit(143);` : options.stall === true ? `setInterval(() => update({ sessionUpdate: "session_info_update", title: "noise" }), 5);` : options.meaningfulThenCompleteMilliseconds !== undefined ? `const updates = setInterval(() => update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "thinking fixture" } }), 50);
+      setTimeout(() => {
+        clearInterval(updates);
+        completePrompt();
+      }, ${options.meaningfulThenCompleteMilliseconds});` : options.meaningfulForever === true ? `setInterval(() => update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "thinking fixture" } }), 5);` : `
       update({ sessionUpdate: "tool_call", toolCallId: "tool_1", title: "Read fixture", kind: ${JSON.stringify(options.toolKind ?? "read")}, status: "pending"${options.oversizedTraceBytes === undefined ? "" : `, rawInput: "x".repeat(${options.oversizedTraceBytes})`} });
       send({ jsonrpc: "2.0", id: "permission", method: "session/request_permission", params: {
         sessionId: "session_fixture",
@@ -391,6 +470,17 @@ function permissionOutcome(messages: readonly Record<string, unknown>[]): string
   const response = messages.find((message) => message.id === "permission");
   return (response?.result as { outcome?: { optionId?: string } } | undefined)
     ?.outcome?.optionId;
+}
+
+function promptText(messages: readonly Record<string, unknown>[]): string {
+  const prompt = paramsFor(messages, "session/prompt").prompt as Array<{
+    readonly type: string;
+    readonly text?: string;
+  }>;
+  return prompt
+    .filter((block) => block.type === "text")
+    .map((block) => block.text ?? "")
+    .join("");
 }
 
 function runEvent(

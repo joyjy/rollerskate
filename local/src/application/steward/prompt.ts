@@ -147,6 +147,8 @@ export function callerOrchestratedStepPrompt(
     "",
     "Complete one bounded Worker step. The admitted Caller, not this Worker, owns the whole Run decision.",
     "Do not delegate and do not claim to terminalize the Run.",
+    "Keep summary between 1 and 4096 characters. Keep each result array at no more than 100 non-empty strings, each no longer than 2048 characters.",
+    "Do not copy large tool output into the result. Report exact bounded metadata and only the shortest excerpt needed as evidence.",
     "Return exactly this JSON shape with no code fence or extra fields:",
     JSON.stringify({
       schemaVersion: "AgentStepResult@1",

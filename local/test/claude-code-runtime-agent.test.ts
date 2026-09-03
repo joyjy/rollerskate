@@ -43,7 +43,13 @@ process.stdin.on("end", () => {
     resolveMcpServers: () => [{
       name: "rollerskate_chat",
       command: process.execPath,
-      args: ["chat-history.js"]
+      args: ["chat-history.js"],
+      tools: ["read_chat_history"]
+    }, {
+      name: "rollerskate_read",
+      command: process.execPath,
+      args: ["chat-read-tools.js"],
+      tools: ["describe_capabilities", "get_run"]
     }]
   });
   assert.equal(agent.providerPolicy.client, "claude-code");
@@ -62,9 +68,13 @@ process.stdin.on("end", () => {
   assert.deepEqual(request.args.slice(-2), ["--resume", "claude-existing-session"]);
   assert.ok(request.args.includes("--strict-mcp-config"));
   assert.deepEqual(request.args.slice(
-    request.args.indexOf("--allowedTools"),
-    request.args.indexOf("--allowedTools") + 2
-  ), ["--allowedTools", "mcp__rollerskate_chat__read_chat_history"]);
+    request.args.indexOf("--allowedTools") + 1,
+    request.args.indexOf("--resume")
+  ), [
+    "mcp__rollerskate_chat__read_chat_history",
+    "mcp__rollerskate_read__describe_capabilities",
+    "mcp__rollerskate_read__get_run"
+  ]);
   assert.ok(!request.args.includes("claude"));
   assert.match(request.input, /Prompt:\nrespond directly/);
   assert.equal(result.providerSessionId, "claude-provider-session");

@@ -692,7 +692,10 @@ export function createSchema(database: DatabaseSync): void {
       max_attempts INTEGER NOT NULL,
       attempt_count INTEGER NOT NULL DEFAULT 0,
       definition_schema TEXT NOT NULL CHECK(
-        definition_schema IN ('SubscriptionDefinition@3', 'SubscriptionDefinition@4')
+        definition_schema IN (
+          'SubscriptionDefinition@3', 'SubscriptionDefinition@4',
+          'SubscriptionDefinition@5'
+        )
       ),
       definition_revision TEXT NOT NULL,
       definition_digest TEXT NOT NULL,
@@ -721,6 +724,11 @@ export function createSchema(database: DatabaseSync): void {
           json_valid(source_binding_json) AND length(source_binding_json) <= 16384
         )
       ),
+      target_json TEXT CHECK(
+        target_json IS NULL OR (
+          json_valid(target_json) AND length(target_json) <= 65536
+        )
+      ),
       agent_run_id TEXT REFERENCES agent_runs(run_id),
       cycle_id TEXT UNIQUE REFERENCES agent_run_cycles(cycle_id),
       admission_receipt_json TEXT CHECK(
@@ -734,10 +742,12 @@ export function createSchema(database: DatabaseSync): void {
       CHECK(
         (definition_schema = 'SubscriptionDefinition@3'
           AND owner_agent_id IS NOT NULL AND source_binding_json IS NULL
+          AND target_json IS NULL
           AND agent_run_id IS NULL AND cycle_id IS NULL
           AND admission_receipt_json IS NULL)
         OR (definition_schema = 'SubscriptionDefinition@4'
           AND owner_agent_id IS NULL AND source_binding_json IS NOT NULL
+          AND target_json IS NULL
           AND agent_run_id IS NOT NULL
           AND json_extract(source_binding_json, '$.schemaVersion') = 'RunSourceBinding@1'
           AND json_extract(source_binding_json, '$.runId') = agent_run_id
@@ -745,6 +755,30 @@ export function createSchema(database: DatabaseSync): void {
           AND json_extract(source_binding_json, '$.source.id') = subscription_id
           AND json_extract(source_binding_json, '$.source.definitionRevision') =
             'SubscriptionDefinition@4:' || definition_revision)
+        OR (definition_schema = 'SubscriptionDefinition@5'
+          AND owner_agent_id IS NULL AND source_binding_json IS NULL
+          AND target_json IS NOT NULL
+          AND json_extract(target_json, '$.schemaVersion') = 'ProactiveTarget@1'
+          AND json_extract(target_json, '$.kind') IN ('steward_run', 'application_action')
+          AND (
+            (json_extract(target_json, '$.kind') = 'steward_run'
+              AND agent_run_id IS NOT NULL
+              AND json_extract(target_json, '$.sourceBinding.schemaVersion') =
+                'RunSourceBinding@1'
+              AND json_extract(target_json, '$.sourceBinding.runId') = agent_run_id
+              AND json_extract(target_json, '$.sourceBinding.source.kind') = 'subscription'
+              AND json_extract(target_json, '$.sourceBinding.source.id') = subscription_id
+              AND json_extract(target_json, '$.sourceBinding.source.definitionRevision') =
+                'SubscriptionDefinition@5:' || definition_revision)
+            OR (json_extract(target_json, '$.kind') = 'application_action'
+              AND agent_run_id IS NULL AND cycle_id IS NULL
+              AND admission_receipt_json IS NULL
+              AND json_type(target_json, '$.actionRef') = 'text'
+              AND json_extract(target_json, '$.registrationDigest') GLOB
+                'sha256:[0-9a-f]*'
+              AND length(json_extract(target_json, '$.registrationDigest')) = 71
+              AND json_type(target_json, '$.input') IS NOT NULL)
+          ))
       ),
       CHECK(
         (cycle_id IS NULL AND admission_receipt_json IS NULL)
@@ -766,7 +800,8 @@ export function createSchema(database: DatabaseSync): void {
       current_revision INTEGER NOT NULL CHECK(current_revision >= 1),
       definition_schema TEXT NOT NULL DEFAULT 'ContinuousSubscriptionDefinition@1' CHECK(
         definition_schema IN (
-          'ContinuousSubscriptionDefinition@1', 'ContinuousSubscriptionDefinition@2'
+          'ContinuousSubscriptionDefinition@1', 'ContinuousSubscriptionDefinition@2',
+          'ContinuousSubscriptionDefinition@3'
         )
       ),
       plugin_path TEXT NOT NULL,
@@ -806,6 +841,11 @@ export function createSchema(database: DatabaseSync): void {
           json_valid(source_binding_json) AND length(source_binding_json) <= 16384
         )
       ),
+      target_json TEXT CHECK(
+        target_json IS NULL OR (
+          json_valid(target_json) AND length(target_json) <= 65536
+        )
+      ),
       agent_run_id TEXT REFERENCES agent_runs(run_id),
       pending_cycle_id TEXT UNIQUE REFERENCES agent_run_cycles(cycle_id),
       pending_admission_receipt_json TEXT CHECK(
@@ -824,10 +864,12 @@ export function createSchema(database: DatabaseSync): void {
       CHECK(
         (definition_schema = 'ContinuousSubscriptionDefinition@1'
           AND owner_agent_id IS NOT NULL AND source_binding_json IS NULL
+          AND target_json IS NULL
           AND agent_run_id IS NULL AND pending_cycle_id IS NULL
           AND pending_admission_receipt_json IS NULL)
         OR (definition_schema = 'ContinuousSubscriptionDefinition@2'
           AND owner_agent_id IS NULL AND source_binding_json IS NOT NULL
+          AND target_json IS NULL
           AND agent_run_id IS NOT NULL
           AND json_extract(source_binding_json, '$.schemaVersion') = 'RunSourceBinding@1'
           AND json_extract(source_binding_json, '$.runId') = agent_run_id
@@ -836,6 +878,31 @@ export function createSchema(database: DatabaseSync): void {
           AND json_extract(source_binding_json, '$.source.id') = subscription_id
           AND json_extract(source_binding_json, '$.source.definitionRevision') =
             'ContinuousSubscriptionDefinition@2:' || current_revision)
+        OR (definition_schema = 'ContinuousSubscriptionDefinition@3'
+          AND owner_agent_id IS NULL AND source_binding_json IS NULL
+          AND target_json IS NOT NULL
+          AND json_extract(target_json, '$.schemaVersion') = 'ProactiveTarget@1'
+          AND json_extract(target_json, '$.kind') IN ('steward_run', 'application_action')
+          AND (
+            (json_extract(target_json, '$.kind') = 'steward_run'
+              AND agent_run_id IS NOT NULL
+              AND json_extract(target_json, '$.sourceBinding.schemaVersion') =
+                'RunSourceBinding@1'
+              AND json_extract(target_json, '$.sourceBinding.runId') = agent_run_id
+              AND json_extract(target_json, '$.sourceBinding.source.kind') =
+                'continuous_subscription'
+              AND json_extract(target_json, '$.sourceBinding.source.id') = subscription_id
+              AND json_extract(target_json, '$.sourceBinding.source.definitionRevision') =
+                'ContinuousSubscriptionDefinition@3:' || current_revision)
+            OR (json_extract(target_json, '$.kind') = 'application_action'
+              AND agent_run_id IS NULL AND pending_cycle_id IS NULL
+              AND pending_admission_receipt_json IS NULL
+              AND json_type(target_json, '$.actionRef') = 'text'
+              AND json_extract(target_json, '$.registrationDigest') GLOB
+                'sha256:[0-9a-f]*'
+              AND length(json_extract(target_json, '$.registrationDigest')) = 71
+              AND json_type(target_json, '$.input') IS NOT NULL)
+          ))
       ),
       CHECK(
         (pending_cycle_id IS NULL AND pending_admission_receipt_json IS NULL)
@@ -921,6 +988,203 @@ export function createSchema(database: DatabaseSync): void {
     );
     CREATE INDEX IF NOT EXISTS proactive_callback_occurrences_status
       ON proactive_callback_occurrences(status, owner_kind, owner_id, created_at, ordinal);
+    CREATE TABLE IF NOT EXISTS deterministic_action_receipts (
+      receipt_id TEXT PRIMARY KEY,
+      source_kind TEXT NOT NULL CHECK(source_kind IN (
+        'schedule', 'subscription', 'continuous_subscription'
+      )),
+      source_id TEXT NOT NULL,
+      definition_revision TEXT NOT NULL,
+      occurrence_key TEXT NOT NULL,
+      target_digest TEXT NOT NULL CHECK(
+        target_digest GLOB 'sha256:[0-9a-f]*' AND length(target_digest) = 71
+      ),
+      action_ref TEXT NOT NULL CHECK(
+        action_ref GLOB 'action:*@[1-9]*' AND length(action_ref) <= 256
+      ),
+      status TEXT NOT NULL CHECK(status IN ('succeeded', 'skipped', 'failed')),
+      receipt_json TEXT NOT NULL CHECK(
+        json_valid(receipt_json) AND length(receipt_json) <= 65536
+        AND json_extract(receipt_json, '$.schemaVersion') =
+          'DeterministicApplicationActionReceipt@1'
+        AND json_extract(receipt_json, '$.receiptId') = receipt_id
+        AND json_extract(receipt_json, '$.source.kind') = source_kind
+        AND json_extract(receipt_json, '$.source.id') = source_id
+        AND json_extract(receipt_json, '$.source.definitionRevision') =
+          definition_revision
+        AND json_extract(receipt_json, '$.occurrenceKey') = occurrence_key
+        AND json_extract(receipt_json, '$.targetDigest') = target_digest
+        AND json_extract(receipt_json, '$.actionRef') = action_ref
+        AND json_extract(receipt_json, '$.status') = status
+      ),
+      created_at TEXT NOT NULL,
+      UNIQUE(source_kind, source_id, occurrence_key)
+    );
+    CREATE TABLE IF NOT EXISTS external_workflow_executions (
+      execution_id TEXT PRIMARY KEY,
+      source_kind TEXT NOT NULL CHECK(source_kind IN (
+        'schedule', 'subscription', 'continuous_subscription'
+      )),
+      source_id TEXT NOT NULL,
+      definition_revision TEXT NOT NULL,
+      occurrence_key TEXT NOT NULL,
+      target_digest TEXT NOT NULL CHECK(
+        target_digest GLOB 'sha256:[0-9a-f]*' AND length(target_digest) = 71
+      ),
+      workflow_ref TEXT NOT NULL CHECK(
+        workflow_ref GLOB 'workflow:*@[1-9]*' AND length(workflow_ref) <= 256
+      ),
+      registration_digest TEXT NOT NULL CHECK(
+        registration_digest GLOB 'sha256:[0-9a-f]*'
+        AND length(registration_digest) = 71
+      ),
+      target_json TEXT NOT NULL CHECK(
+        json_valid(target_json) AND length(target_json) <= 65536
+        AND json_extract(target_json, '$.schemaVersion') = 'ProactiveTarget@1'
+        AND json_extract(target_json, '$.kind') = 'external_workflow'
+        AND json_extract(target_json, '$.workflow.schemaVersion') =
+          'ExternalWorkflowTarget@1'
+        AND json_extract(target_json, '$.workflow.workflowRef') = workflow_ref
+        AND json_extract(target_json, '$.workflow.registrationDigest') =
+          registration_digest
+        AND json_extract(target_json, '$.workflow.executionPolicy.schemaVersion') =
+          'ExternalWorkflowExecutionPolicy@1'
+        AND json_type(target_json, '$.workflow.executionPolicy.maxAttempts') = 'integer'
+        AND json_extract(target_json, '$.workflow.executionPolicy.maxAttempts') =
+          max_attempts
+        AND json_type(
+          target_json, '$.workflow.executionPolicy.retryBackoffMilliseconds'
+        ) = 'integer'
+        AND json_extract(
+          target_json, '$.workflow.executionPolicy.retryBackoffMilliseconds'
+        ) BETWEEN 1000 AND 3600000
+      ),
+      observation_json TEXT NOT NULL CHECK(
+        json_valid(observation_json) AND length(observation_json) <= 65536
+      ),
+      status TEXT NOT NULL CHECK(status IN (
+        'queued', 'claimed', 'running', 'retry_wait', 'succeeded', 'failed', 'unknown'
+      )),
+      attempt_count INTEGER NOT NULL CHECK(
+        attempt_count >= 0 AND attempt_count <= max_attempts
+      ),
+      max_attempts INTEGER NOT NULL CHECK(max_attempts BETWEEN 1 AND 5),
+      next_attempt_at TEXT NOT NULL,
+      lease_owner TEXT,
+      lease_token TEXT,
+      lease_expires_at TEXT,
+      effect_started_at TEXT,
+      receipt_json TEXT CHECK(receipt_json IS NULL OR (
+        json_valid(receipt_json) AND length(receipt_json) <= 131072
+        AND json_extract(receipt_json, '$.schemaVersion') =
+          'ExternalWorkflowExecutionReceipt@1'
+        AND json_extract(receipt_json, '$.executionId') = execution_id
+        AND json_extract(receipt_json, '$.source.kind') = source_kind
+        AND json_extract(receipt_json, '$.source.id') = source_id
+        AND json_extract(receipt_json, '$.source.definitionRevision') =
+          definition_revision
+        AND json_extract(receipt_json, '$.occurrenceKey') = occurrence_key
+        AND json_extract(receipt_json, '$.targetDigest') = target_digest
+        AND json_extract(receipt_json, '$.workflowRef') = workflow_ref
+        AND json_extract(receipt_json, '$.registrationDigest') = registration_digest
+        AND json_extract(receipt_json, '$.resolution') = 'runtime'
+      )),
+      resolution_receipt_json TEXT CHECK(resolution_receipt_json IS NULL OR (
+        json_valid(resolution_receipt_json) AND length(resolution_receipt_json) <= 131072
+        AND json_extract(resolution_receipt_json, '$.schemaVersion') =
+          'ExternalWorkflowExecutionReceipt@1'
+        AND json_extract(resolution_receipt_json, '$.executionId') = execution_id
+        AND json_extract(resolution_receipt_json, '$.source.kind') = source_kind
+        AND json_extract(resolution_receipt_json, '$.source.id') = source_id
+        AND json_extract(resolution_receipt_json, '$.source.definitionRevision') =
+          definition_revision
+        AND json_extract(resolution_receipt_json, '$.occurrenceKey') = occurrence_key
+        AND json_extract(resolution_receipt_json, '$.targetDigest') = target_digest
+        AND json_extract(resolution_receipt_json, '$.workflowRef') = workflow_ref
+        AND json_extract(resolution_receipt_json, '$.registrationDigest') =
+          registration_digest
+        AND json_extract(resolution_receipt_json, '$.resolution') = 'manual'
+      )),
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      started_at TEXT,
+      completed_at TEXT,
+      updated_at TEXT NOT NULL,
+      UNIQUE(source_kind, source_id, occurrence_key),
+      CHECK(
+        (status IN ('claimed', 'running')
+          AND lease_owner IS NOT NULL AND lease_token IS NOT NULL
+          AND lease_expires_at IS NOT NULL)
+        OR (status NOT IN ('claimed', 'running')
+          AND lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL)
+      ),
+      CHECK(
+        (status IN ('queued', 'claimed', 'retry_wait') AND effect_started_at IS NULL)
+        OR (status IN ('running', 'succeeded', 'unknown')
+          AND effect_started_at IS NOT NULL)
+        OR status = 'failed'
+      ),
+      CHECK(
+        (status IN ('succeeded', 'failed', 'unknown') AND completed_at IS NOT NULL)
+        OR (status NOT IN ('succeeded', 'failed', 'unknown') AND completed_at IS NULL)
+      ),
+      CHECK(
+        (status NOT IN ('succeeded', 'failed', 'unknown')
+          AND receipt_json IS NULL AND resolution_receipt_json IS NULL)
+        OR (status = 'unknown' AND receipt_json IS NOT NULL
+          AND json_extract(receipt_json, '$.status') = 'unknown'
+          AND json_type(receipt_json, '$.error') = 'text'
+          AND resolution_receipt_json IS NULL)
+        OR (status IN ('succeeded', 'failed') AND receipt_json IS NOT NULL AND (
+          (json_extract(receipt_json, '$.status') = status
+            AND ((status = 'succeeded' AND json_type(receipt_json, '$.error') IS NULL)
+              OR (status = 'failed' AND json_type(receipt_json, '$.error') = 'text'))
+            AND resolution_receipt_json IS NULL)
+          OR (json_extract(receipt_json, '$.status') = 'unknown'
+            AND json_type(receipt_json, '$.error') = 'text'
+            AND resolution_receipt_json IS NOT NULL
+            AND json_extract(resolution_receipt_json, '$.status') = status
+            AND ((status = 'succeeded'
+                AND json_type(resolution_receipt_json, '$.error') IS NULL)
+              OR (status = 'failed'
+                AND json_type(resolution_receipt_json, '$.error') = 'text')))
+        ))
+      ),
+      CHECK(effect_started_at IS NULL OR status != 'claimed')
+    );
+    CREATE INDEX IF NOT EXISTS external_workflow_executions_due
+      ON external_workflow_executions(status, next_attempt_at);
+    CREATE TABLE IF NOT EXISTS proactive_source_migration_receipts (
+      receipt_id TEXT PRIMARY KEY,
+      request_id TEXT NOT NULL UNIQUE,
+      source_kind TEXT NOT NULL CHECK(source_kind = 'schedule'),
+      source_id TEXT NOT NULL,
+      from_definition_revision TEXT NOT NULL,
+      to_definition_revision TEXT NOT NULL,
+      target_digest TEXT NOT NULL CHECK(
+        target_digest GLOB 'sha256:[0-9a-f]*' AND length(target_digest) = 71
+      ),
+      workflow_ref TEXT NOT NULL CHECK(
+        workflow_ref GLOB 'workflow:*@[1-9]*' AND length(workflow_ref) <= 256
+      ),
+      receipt_json TEXT NOT NULL CHECK(
+        json_valid(receipt_json) AND length(receipt_json) <= 32768
+        AND json_extract(receipt_json, '$.schemaVersion') =
+          'ProactiveSourceMigrationReceipt@1'
+        AND json_extract(receipt_json, '$.receiptId') = receipt_id
+        AND json_extract(receipt_json, '$.requestId') = request_id
+        AND json_extract(receipt_json, '$.sourceKind') = source_kind
+        AND json_extract(receipt_json, '$.sourceId') = source_id
+        AND json_extract(receipt_json, '$.fromDefinitionRevision') =
+          from_definition_revision
+        AND json_extract(receipt_json, '$.toDefinitionRevision') =
+          to_definition_revision
+        AND json_extract(receipt_json, '$.targetDigest') = target_digest
+        AND json_extract(receipt_json, '$.workflowRef') = workflow_ref
+      ),
+      created_at TEXT NOT NULL,
+      UNIQUE(source_kind, source_id, from_definition_revision)
+    );
     CREATE TABLE IF NOT EXISTS schedules (
       schedule_id TEXT PRIMARY KEY,
       owner_principal_id TEXT NOT NULL REFERENCES agents(principal_id),
@@ -933,7 +1197,9 @@ export function createSchema(database: DatabaseSync): void {
       next_occurrence_missing INTEGER NOT NULL DEFAULT 0
         CHECK(next_occurrence_missing IN (0, 1)),
       definition_schema TEXT NOT NULL DEFAULT 'ScheduleRevision@1' CHECK(
-        definition_schema IN ('ScheduleRevision@1', 'ScheduleRevision@2')
+        definition_schema IN (
+          'ScheduleRevision@1', 'ScheduleRevision@2', 'ScheduleRevision@3'
+        )
       ),
       agent_id TEXT REFERENCES agents(principal_id),
       kind TEXT NOT NULL CHECK(kind IN ('once', 'cron')),
@@ -954,6 +1220,11 @@ export function createSchema(database: DatabaseSync): void {
       source_binding_json TEXT CHECK(
         source_binding_json IS NULL OR (
           json_valid(source_binding_json) AND length(source_binding_json) <= 16384
+        )
+      ),
+      target_json TEXT CHECK(
+        target_json IS NULL OR (
+          json_valid(target_json) AND length(target_json) <= 65536
         )
       ),
       external_ref_binding_json TEXT CHECK(
@@ -977,7 +1248,7 @@ export function createSchema(database: DatabaseSync): void {
         (definition_schema = 'ScheduleRevision@1'
           AND agent_id IS NOT NULL AND session_policy IS NOT NULL
           AND prompt IS NOT NULL AND workspace IS NOT NULL
-          AND source_binding_json IS NULL
+          AND source_binding_json IS NULL AND target_json IS NULL
           AND (
             (session_policy = 'new_each_run' AND fixed_session_id IS NULL)
             OR (session_policy = 'fixed' AND fixed_session_id IS NOT NULL)
@@ -985,12 +1256,61 @@ export function createSchema(database: DatabaseSync): void {
         OR (definition_schema = 'ScheduleRevision@2'
           AND agent_id IS NULL AND session_policy IS NULL
           AND fixed_session_id IS NULL AND prompt IS NULL AND workspace IS NULL
-          AND source_binding_json IS NOT NULL
+          AND source_binding_json IS NOT NULL AND target_json IS NULL
           AND json_extract(source_binding_json, '$.schemaVersion') = 'RunSourceBinding@1'
           AND json_extract(source_binding_json, '$.source.kind') = 'schedule'
           AND json_extract(source_binding_json, '$.source.id') = schedule_id
           AND json_extract(source_binding_json, '$.source.definitionRevision') =
             'ScheduleRevision@2:' || current_revision)
+        OR (definition_schema = 'ScheduleRevision@3'
+          AND agent_id IS NULL AND session_policy IS NULL
+          AND fixed_session_id IS NULL AND prompt IS NULL AND workspace IS NULL
+          AND source_binding_json IS NULL AND target_json IS NOT NULL
+          AND json_extract(target_json, '$.schemaVersion') = 'ProactiveTarget@1'
+          AND json_extract(target_json, '$.kind') IN (
+            'steward_run', 'application_action', 'external_workflow'
+          )
+          AND (
+            (json_extract(target_json, '$.kind') = 'application_action'
+              AND json_type(target_json, '$.actionRef') = 'text'
+              AND json_extract(target_json, '$.registrationDigest') GLOB
+                'sha256:[0-9a-f]*'
+              AND length(json_extract(target_json, '$.registrationDigest')) = 71
+              AND json_type(target_json, '$.input') IS NOT NULL)
+            OR (json_extract(target_json, '$.kind') = 'external_workflow'
+              AND json_extract(target_json, '$.workflow.schemaVersion') =
+                'ExternalWorkflowTarget@1'
+              AND json_type(target_json, '$.workflow.workflowRef') = 'text'
+              AND json_extract(target_json, '$.workflow.registrationDigest') GLOB
+                'sha256:[0-9a-f]*'
+              AND length(json_extract(
+                target_json, '$.workflow.registrationDigest'
+              )) = 71
+              AND json_type(target_json, '$.workflow.input') IS NOT NULL
+              AND json_extract(
+                target_json, '$.workflow.executionPolicy.schemaVersion'
+              ) = 'ExternalWorkflowExecutionPolicy@1'
+              AND json_extract(
+                target_json, '$.workflow.executionPolicy.maxAttempts'
+              ) BETWEEN 1 AND 5
+              AND json_type(
+                target_json, '$.workflow.executionPolicy.retryBackoffMilliseconds'
+              ) = 'integer'
+              AND json_extract(
+                target_json, '$.workflow.executionPolicy.retryBackoffMilliseconds'
+              ) BETWEEN 1000 AND 3600000)
+            OR (
+              json_extract(target_json, '$.kind') = 'steward_run'
+              AND
+              json_extract(target_json, '$.sourceBinding.schemaVersion') =
+                'RunSourceBinding@1'
+              AND
+              json_extract(target_json, '$.sourceBinding.source.kind') = 'schedule'
+              AND json_extract(target_json, '$.sourceBinding.source.id') = schedule_id
+              AND json_extract(target_json, '$.sourceBinding.source.definitionRevision') =
+                'ScheduleRevision@3:' || current_revision
+            )
+          ))
       )
     );
     CREATE INDEX IF NOT EXISTS schedules_due
@@ -998,6 +1318,9 @@ export function createSchema(database: DatabaseSync): void {
     CREATE UNIQUE INDEX IF NOT EXISTS schedules_bound_run
       ON schedules(json_extract(source_binding_json, '$.runId'))
       WHERE source_binding_json IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS schedules_target_run
+      ON schedules(json_extract(target_json, '$.sourceBinding.runId'))
+      WHERE json_extract(target_json, '$.kind') = 'steward_run';
     CREATE TABLE IF NOT EXISTS scheduled_runs (
       run_id TEXT PRIMARY KEY,
       schedule_id TEXT NOT NULL,
@@ -1049,6 +1372,14 @@ export function createSchema(database: DatabaseSync): void {
           'ScheduleDefinitionSnapshot@1' AND agent_run_id IS NULL)
         OR (json_extract(definition_snapshot_json, '$.schema') =
           'ScheduleDefinitionSnapshot@2' AND agent_run_id IS NOT NULL)
+        OR (json_extract(definition_snapshot_json, '$.schema') =
+          'ScheduleDefinitionSnapshot@3' AND (
+            (json_extract(definition_snapshot_json, '$.target.kind') = 'steward_run'
+              AND agent_run_id IS NOT NULL)
+            OR (json_extract(definition_snapshot_json, '$.target.kind') IN (
+              'application_action', 'external_workflow'
+            ) AND agent_run_id IS NULL)
+          ))
       )
     );
     CREATE INDEX IF NOT EXISTS scheduled_runs_schedule

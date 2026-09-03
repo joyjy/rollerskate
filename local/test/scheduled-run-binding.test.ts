@@ -29,7 +29,7 @@ import {
 } from "../src/infrastructure/sqlite/foundation-store.js";
 import { initializeRuntimeSchema } from "../src/infrastructure/sqlite/schema.js";
 
-test("ScheduleRevision@2 binds atomically and a due once occurrence only activates its Run", async () => {
+test("ScheduleRevision@3 binds atomically and a due once occurrence only activates its Run", async () => {
   const fixture = setup();
   const started = startStewardRunFromIntent(
     fixture.repo,
@@ -48,7 +48,7 @@ test("ScheduleRevision@2 binds atomically and a due once occurrence only activat
     }), "2026-08-26T04:00:01.000Z");
     assert.equal(bound.status, "awaiting_source");
     const schedule = context.schedules.boundForRun(bound.runId);
-    assert.equal(schedule?.revision.schemaVersion, "ScheduleRevision@2");
+    assert.equal(schedule?.revision.schemaVersion, "ScheduleRevision@3");
     assert.equal(schedule?.revision.agentId, undefined);
     assert.equal(schedule?.revision.prompt, undefined);
     assert.equal(schedule?.revision.workspace, undefined);
@@ -209,7 +209,7 @@ test("recurring Schedule owns misfire, overlap queue, duplicate run-now, restart
   }
 });
 
-test("queued ScheduleRevision@2 occurrence closes when a terminal Run pauses its source", async () => {
+test("queued ScheduleRevision@3 occurrence closes when a terminal Run pauses its source", async () => {
   const fixture = setup();
   const started = startStewardRunFromIntent(
     fixture.repo,
@@ -255,7 +255,7 @@ test("queued ScheduleRevision@2 occurrence closes when a terminal Run pauses its
   }
 });
 
-test("ScheduleRevision@2 keeps misfire and overlap skip source-owned", async () => {
+test("ScheduleRevision@3 keeps misfire and overlap skip source-owned", async () => {
   const fixture = setup();
   const once = startStewardRunFromIntent(
     fixture.repo,

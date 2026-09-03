@@ -6,18 +6,6 @@ const intentPolicySchema = v.union([
   v.object({ kind: v.literal("fixed_directed"), brief: v.string() })
 ]);
 
-const conversationIntentSchema = v.object({
-  schema: v.literal("ConversationIntentSnapshot@1"),
-  mode: v.union([
-    v.literal("continue_recent"),
-    v.literal("selected_theme"),
-    v.literal("directed")
-  ]),
-  brief: v.optional(v.string()),
-  themeId: v.optional(v.string()),
-  governanceRevision: v.number()
-});
-
 const governanceReceiptSchema = v.object({
   schema: v.literal("TopicGovernanceControlReceipt@1"),
   receiptId: v.string(),
@@ -53,7 +41,6 @@ export const topicGovernanceViewSchema = v.object({
       governanceRevision: v.number()
     })),
     strategyPolicy: v.object({
-      starterEnabled: v.boolean(),
       participantMessageEnabled: v.boolean(),
       scheduledEnabled: v.boolean()
     }),
@@ -79,90 +66,8 @@ export const topicGovernanceViewSchema = v.object({
     expectedRevision: v.number(),
     pause: v.boolean(),
     resume: v.boolean(),
-    resumeAndWake: v.boolean(),
     participantAddAgentIds: v.array(v.string()),
     participantRemoveAgentIds: v.array(v.string())
-  })
-});
-
-const freeChatReceiptSchema = v.object({
-  schema: v.literal("FreeChatModeReceipt@1"),
-  receiptId: v.string(),
-  modeId: v.string(),
-  topicId: v.string(),
-  sequence: v.number(),
-  action: v.union([
-    v.literal("started"),
-    v.literal("contribution_observed"),
-    v.literal("roster_changed"),
-    v.literal("activation_admitted"),
-    v.literal("cycle_silent"),
-    v.literal("continued_now"),
-    v.literal("exited"),
-    v.literal("stopped")
-  ]),
-  previousRevision: v.nullable(v.number()),
-  resultingRevision: v.number(),
-  cycleIndex: v.number(),
-  details: v.record(v.string(), v.union([v.string(), v.number(), v.boolean()])),
-  createdAt: v.string()
-});
-
-const freeChatModeSchema = v.object({
-  modeId: v.string(),
-  topicId: v.string(),
-  status: v.union([
-    v.literal("active"),
-    v.literal("exited"),
-    v.literal("stopped"),
-    v.literal("expired")
-  ]),
-  intentPolicy: intentPolicySchema,
-  strategyRevision: v.literal(1),
-  limits: v.object({
-    maxDurationMinutes: v.number(),
-    maxCycles: v.number(),
-    maxTurns: v.number(),
-    consecutiveSilenceLimit: v.number()
-  }),
-  cycleIndex: v.number(),
-  sample: v.object({
-    cycleIndex: v.number(),
-    sampledAt: v.string(),
-    idleDelayMinutes: v.number(),
-    idleDeadline: v.string(),
-    participantCount: v.number(),
-    candidateAgentIds: v.array(v.string()),
-    conversationIntent: conversationIntentSchema
-  }),
-  lastMeaningfulActivityAt: v.string(),
-  lastMeaningfulEventId: v.optional(v.string()),
-  consecutiveSilentCycles: v.number(),
-  admittedTurns: v.number(),
-  pendingActivationEventId: v.optional(v.string()),
-  revision: v.number(),
-  startedAt: v.string(),
-  updatedAt: v.string(),
-  stoppedAt: v.optional(v.string()),
-  stopReason: v.optional(v.union([
-    v.literal("owner_exit"),
-    v.literal("topic_paused"),
-    v.literal("empty_roster"),
-    v.literal("consecutive_silence"),
-    v.literal("max_duration"),
-    v.literal("max_cycles"),
-    v.literal("max_turns")
-  ]))
-});
-
-export const freeChatModeViewSchema = v.object({
-  mode: v.optional(freeChatModeSchema),
-  recentReceipts: v.array(freeChatReceiptSchema),
-  actionAvailability: v.object({
-    start: v.boolean(),
-    continueNow: v.boolean(),
-    exit: v.boolean(),
-    expectedRevision: v.optional(v.number())
   })
 });
 
@@ -225,7 +130,6 @@ export const topicActivationScheduleViewsSchema = v.array(
 );
 
 export type TopicGovernanceViewOutput = v.InferOutput<typeof topicGovernanceViewSchema>;
-export type FreeChatModeViewOutput = v.InferOutput<typeof freeChatModeViewSchema>;
 export type TopicActivationScheduleViewOutput = v.InferOutput<
   typeof topicActivationScheduleViewSchema
 >;

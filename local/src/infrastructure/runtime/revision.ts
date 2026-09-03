@@ -4,6 +4,7 @@ import { join, relative } from "node:path";
 
 const ARTIFACT_ROOTS = [
   "local/dist/src",
+  "local/dist/resources",
   "packages/protocol/dist/src"
 ] as const;
 
@@ -16,7 +17,7 @@ export function runtimeArtifactRevision(repoRoot: string): string {
       hash.update(`missing:${artifactRoot}\0`);
       continue;
     }
-    for (const path of javascriptFiles(root)) {
+    for (const path of runtimeArtifactFiles(root, artifactRoot === "local/dist/resources")) {
       hash.update(relative(repoRoot, path));
       hash.update("\0");
       hash.update(readFileSync(path));
@@ -26,13 +27,15 @@ export function runtimeArtifactRevision(repoRoot: string): string {
   return `rt1_${hash.digest("hex")}`;
 }
 
-function javascriptFiles(root: string): readonly string[] {
+function runtimeArtifactFiles(root: string, includeAllFiles: boolean): readonly string[] {
   const files: string[] = [];
   const visit = (directory: string): void => {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       const path = join(directory, entry.name);
       if (entry.isDirectory()) visit(path);
-      else if (entry.isFile() && entry.name.endsWith(".js")) files.push(path);
+      else if (entry.isFile() && (includeAllFiles || entry.name.endsWith(".js"))) {
+        files.push(path);
+      }
     }
   };
   visit(root);

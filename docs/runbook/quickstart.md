@@ -76,6 +76,19 @@ scripts/rs chat session new helper
 
 Agent result 产生本地通知后，Console 右上角 `Notices` 显示 bounded 未读数。打开 Notice Center 可查看投递结果、标记已读、确认并下钻 Subscription/Event；失败通知可继续进入 Runtime Failure。read/ack 保存在 SQLite，刷新或重启不会丢失。CLI 等价入口是 `scripts/rs notice list|inspect|mark-read|ack`。
 
+### 从 Chat proposal 启动 Run
+
+当 Agent 判断 Owner 的当前消息已经足够形成可执行工作时，可以在该消息下提出 Run proposal。每个 Agent 的 proposal 是独立卡片，固定展示 goal、in/out scope、acceptance、workspace effect、Chat Lead、Run Orchestrator、participants，以及缺信息时至多一个结构化 blocker。
+
+- Proposal 只是提醒，不会自动执行。需要读写文件时，先在卡片选择 `Rollerskate source`、Local runtime workspace 或其他绝对 Git workspace；`Use workspace` 只做无副作用预检，并显示 canonical root、workspace revision、read/write grant 与 network-off 状态。只有 `Ready for Owner` 且没有关联 Run 时才显示 `Start Run`。
+- 不采用某张卡片时选择 `Decline proposal`；拒绝只作用于该 Agent 的 exact proposal，刷新或重启后仍显示 `Declined`，不会影响同一消息下其他卡片。已启动的卡片不能再拒绝。
+- 选择 `Start Run` 只确认这张卡片屏幕上这一版 proposal + workspace revision 和 exact effect；proposal 或 workspace 漂移时，旧确认会被拒绝，需要重新预检。
+- `Needs clarification` 只显示一个 blocker，不提供启动按钮。应在 Chat 中补充信息，让 Agent 针对新的 Owner message 重新提案。
+- 启动后卡片从既有 Steward Run 回读 started、needs-human 或 terminal 状态与 bounded summary；选择 `Open Run` 进入 `/console/steward?runId=<runId>` 查看完整控制和诊断。
+- 没有 proposal 的 Owner message 仍可使用 `Hand off to Run`。已有 proposal 时该入口隐藏且 API fail closed，不能绕过 current-revision confirmation。
+
+Local Runtime 每张 proposal 卡片最多关联一个 `chat-work:<messageId>:<dispatchEventId>` Run。同一卡片的浏览器重试或重复选择 `Start Run` 只返回同一个 Run；同一 Owner message 下不同 Agent 的卡片可以各自启动，不共享 participant 或 Run identity。
+
 ## 4. 隔离测试 Runtime
 
 默认路径始终是 `~/.rollerskate/`，不读取当前仓库或启动目录里的旧 `.rollerskate/`。需要测试隔离时显式指定绝对路径：

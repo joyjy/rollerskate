@@ -16,7 +16,6 @@ export interface TopicGovernanceView {
     readonly expectedRevision: number;
     readonly pause: boolean;
     readonly resume: boolean;
-    readonly resumeAndWake: boolean;
     readonly participantAddAgentIds: readonly string[];
     readonly participantRemoveAgentIds: readonly string[];
   };
@@ -37,8 +36,6 @@ export function inspectLocalTopicGovernance(
       repoRoot,
       runtimeDirectory === undefined ? {} : { runtimeDirectory }
     ).agents;
-    const eligibleParticipantCount = agents.filter(({ principalId, status }) =>
-      status === "active" && activeParticipantSet.has(principalId)).length;
     return {
       governance: materialized.governance,
       activeParticipantAgentIds,
@@ -47,8 +44,6 @@ export function inspectLocalTopicGovernance(
         expectedRevision: materialized.governance.revision,
         pause: materialized.governance.status === "active",
         resume: materialized.governance.status === "paused",
-        resumeAndWake: materialized.governance.status === "paused" &&
-          eligibleParticipantCount > 0,
         participantAddAgentIds: agents
           .filter(({ principalId }) => !activeParticipantSet.has(principalId))
           .map(({ principalId }) => principalId),

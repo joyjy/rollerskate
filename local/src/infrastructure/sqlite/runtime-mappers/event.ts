@@ -5,6 +5,7 @@ import {
 } from "../../../core/chat/model.js";
 import {
   parseChatMessageTargets,
+  parseChatRunProposalDecision,
   type AgentResultEvent,
   type ChatDispatchEvent,
   type Event
@@ -102,6 +103,10 @@ export function mapEvent(row: EventRow): Event {
       throw new Error(`Chat message sender is malformed: ${row.event_id}`);
     }
     const targets = parseChatMessageTargets(payload, row.event_id);
+    const runProposalDecision = parseChatRunProposalDecision(
+      payload.runProposalDecision,
+      row.event_id
+    );
     const replyToEventId = payload.replyToEventId;
     if (replyToEventId !== undefined && typeof replyToEventId !== "string") {
       throw new Error(`Chat message reply reference is malformed: ${row.event_id}`);
@@ -146,6 +151,7 @@ export function mapEvent(row: EventRow): Event {
             }
           }),
       ...(targets === undefined ? {} : { targets }),
+      ...(runProposalDecision === undefined ? {} : { runProposalDecision }),
       ...(dispatchCard === undefined
         ? {}
         : {

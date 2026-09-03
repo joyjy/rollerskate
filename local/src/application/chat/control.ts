@@ -8,15 +8,15 @@ import {
   type ChatPresence,
   type ChatTimeline
 } from "../../core/chat/model.js";
-import type { ChatDispatchEvent } from "../../core/event/model.js";
 import { RuntimeStore } from "../../core/runtime/store.js";
 import {
   LocalChatStore,
   type ChatMessageAdmission
 } from "../../infrastructure/sqlite/chat-store.js";
+import { openRuntimeDatabase } from "../../infrastructure/sqlite/database.js";
 import { runtimePaths } from "../../infrastructure/runtime/config.js";
 import {
-  chatMessageViewsFromStore,
+  chatMessageViewsFromPage,
   chatTimelineFromStore,
   type ChatMessageViewPage,
   type ChatTimelineOptions
@@ -28,13 +28,11 @@ import {
 } from "../activity/client-history.js";
 import { materializeLocalTopicGovernance } from
   "../topic/governance-control.js";
-import type { FreeChatMode } from "../../modules/topic/free-chat.js";
-import type { TopicGovernance } from "../../modules/topic/governance.js";
-import {
-  resumeLocalTopic,
-  type TopicGovernanceControlResult
-} from "../topic/governance-control.js";
 import { startStewardRunFromIntent } from "../steward/intent-control.js";
+import {
+  projectChatRunProposals
+} from "./run-proposal.js";
+import { inspectCurrentChatRunProposal } from "./run-proposal-control.js";
 
 export interface LocalChatView {
   readonly chat: {
@@ -50,16 +48,6 @@ export interface LocalChatView {
     readonly currentSessionId?: string;
     readonly generation: number;
   }[];
-  readonly conversation: {
-    readonly strategy: "starter";
-    readonly state: "starter_pending" | "active" | "all_silent" | "budget_exhausted" | "idle";
-    readonly turnBudget: number;
-    readonly usedTurns: number;
-    readonly remainingTurns: number;
-    readonly latestReason?: string;
-    readonly activeSpeakerHandle?: string;
-    readonly activeSpeakerHandles: readonly string[];
-  };
 }
 
 export interface LocalChatPresenceView {
@@ -80,139 +68,11 @@ export interface LocalChatPresenceView {
       readonly truncated?: boolean;
     };
     readonly lastTurn?: {
-      readonly state: "thinking" | "replied" | "silent" | "failed";
+      readonly state: "thinking" | "replied" | "proposed" | "silent" | "failed";
       readonly at: string;
       readonly reason?: string;
     };
   }[];
-}
-
-export function activateLocalChat(
-  repoRoot: string,
-  input: {
-    readonly strategy: "starter" | "manual";
-    readonly idempotencyKey: string;
-    readonly turnBudget?: number;
-    readonly intentPolicy?: FreeChatMode["intentPolicy"];
-  },
-  options: LocalControlOptions = {}
-) {
-  return activateGovernedLocalChat(repoRoot, {
-    reason: input.strategy === "starter" ? "topic_opened" : "manual",
-    strategy: input.strategy,
-    idempotencyKey: input.idempotencyKey,
-    ...(input.turnBudget === undefined ? {} : { turnBudget: input.turnBudget }),
-    ...(input.intentPolicy === undefined ? {} : { intentPolicy: input.intentPolicy })
-  }, options);
-}
-
-export function resumeAndWakeLocalChat(
-  repoRoot: string,
-  expectedRevision: number,
-  idempotencyKey: string,
-  options: LocalControlOptions = {}
-): {
-  readonly governance: TopicGovernanceControlResult;
-  readonly activation?: ReturnType<RuntimeStore["createChatActivation"]>;
-} {
-  if (idempotencyKey.trim() === "") {
-    throw new Error("Resume & wake requires an idempotency key");
-  }
-  const governance = resumeLocalTopic(repoRoot, expectedRevision, options);
-  if (governance.outcome === "conflict") return { governance };
-  return {
-    governance,
-    activation: activateGovernedLocalChat(repoRoot, {
-      reason: "resumed",
-      strategy: "manual",
-      idempotencyKey
-    }, options)
-  };
-}
-
-function activateGovernedLocalChat(
-  repoRoot: string,
-  input: {
-    readonly reason: "topic_opened" | "manual" | "resumed";
-    readonly strategy: "starter" | "manual";
-    readonly idempotencyKey: string;
-    readonly turnBudget?: number;
-    readonly intentPolicy?: FreeChatMode["intentPolicy"];
-  },
-  options: LocalControlOptions
-) {
-  const snapshot = localRuntimeSnapshot(repoRoot, options);
-  const governance = materializeLocalTopicGovernance(
-    repoRoot,
-    options.runtimeDirectory,
-    now(options)
-  ).governance;
-  if (governance.status === "paused") throw new Error("Topic is paused");
-  if (input.strategy === "starter" && !governance.strategyPolicy.starterEnabled) {
-    throw new Error("Topic starter strategy is disabled");
-  }
-  const participantIds = new Set(governance.participants
-    .filter(({ status }) => status === "active")
-    .map(({ agentId }) => agentId));
-  const candidates = snapshot.agents
-    .filter((agent) => agent.status === "active" && participantIds.has(agent.principalId))
-    .sort((left, right) => left.handle.localeCompare(right.handle));
-  if (candidates.length === 0) throw new Error("No active Local Agent can start the Topic");
-  const runtime = new RuntimeStore(runtimePaths(repoRoot, options.runtimeDirectory).database);
-  try {
-    return runtime.createChatActivation({
-      topicId: snapshot.foundation.topicId,
-      reason: input.reason,
-      strategyId: input.strategy,
-      conversationIntent: conversationIntent(governance, input.intentPolicy),
-      candidateAgentIds: input.strategy === "starter"
-        ? [candidates[0]!.principalId]
-        : candidates.map((agent) => agent.principalId),
-      idempotencyKey: input.idempotencyKey,
-      turnBudget: input.turnBudget ?? 8,
-      strategyRevision: governance.revision,
-      contextRevision: governance.revision
-    }, now(options));
-  } finally {
-    runtime.close();
-  }
-}
-
-function conversationIntent(
-  governance: TopicGovernance,
-  requested?: FreeChatMode["intentPolicy"]
-) {
-  const policy = requested ?? { kind: governance.conversationPolicy.defaultIntent };
-  if (policy.kind === "continue_recent") {
-    return {
-      schema: "ConversationIntentSnapshot@1" as const,
-      mode: "continue_recent" as const,
-      governanceRevision: governance.revision
-    };
-  }
-  if (policy.kind === "fixed_directed") {
-    const brief = policy.brief.trim();
-    if (brief === "" || brief.length > 4_096) {
-      throw new Error("directed conversation intent requires a 1-4096 character brief");
-    }
-    return {
-      schema: "ConversationIntentSnapshot@1" as const,
-      mode: "directed" as const,
-      brief,
-      governanceRevision: governance.revision
-    };
-  }
-  const theme = governance.conversationPolicy.themes
-    .filter(({ status }) => status === "active")
-    .sort((left, right) => left.themeId.localeCompare(right.themeId))[0];
-  if (theme === undefined) throw new Error("Topic has no active conversation theme");
-  return {
-    schema: "ConversationIntentSnapshot@1" as const,
-    mode: "selected_theme" as const,
-    themeId: theme.themeId,
-    brief: theme.brief,
-    governanceRevision: governance.revision
-  };
 }
 
 export function localChatView(
@@ -222,43 +82,30 @@ export function localChatView(
 ): LocalChatView {
   const snapshot = localRuntimeSnapshot(repoRoot, options);
   const chat = openChat(repoRoot, options);
-  const runtime = new RuntimeStore(runtimePaths(repoRoot, options.runtimeDirectory).database);
+  const database = openRuntimeDatabase(
+    runtimePaths(repoRoot, options.runtimeDirectory).database
+  );
+  const runtime = new RuntimeStore(database);
   try {
     const events = chat.events(snapshot.foundation.topicId);
-    const activation = runtime.latestChatActivation(snapshot.foundation.topicId);
-    const activationEvents = activation === undefined
-      ? []
-      : runtime.eventsForRoot(activation.eventId);
-    const executionIsActive = (eventId: string) => {
-      const execution = runtime.executionForEvent(eventId);
-      return execution !== undefined &&
-        (execution.status === "queued" || execution.status === "running" ||
-          execution.status === "retry_wait");
-    };
-    const dispatches = activationEvents.filter(
-      (event): event is ChatDispatchEvent =>
-      event.type === "chat.dispatch");
-    const activeDispatches = dispatches.filter((dispatch) =>
-      executionIsActive(dispatch.eventId));
-    const active = activation !== undefined &&
-      activationEvents.some((event) =>
-        event.causality.rootEventId === activation.eventId &&
-        executionIsActive(event.eventId));
-    const activeSpeaker = activeDispatches.at(-1);
-    const decisions = dispatches.flatMap((dispatch) => {
-      const decision = runtime.chatDecisionReceipt(dispatch.eventId);
-      return decision === undefined ? [] : [decision];
+    const messagePage = chat.messagePage(snapshot.foundation.topicId, timelineOptions);
+    const messages = chatMessageViewsFromPage(
+      chat,
+      snapshot.foundation.topicId,
+      messagePage
+    );
+    const proposalMessages = messagePage.items.filter(
+      (message) => message.dispatchCard === undefined
+    );
+    const proposals = projectChatRunProposals({
+      repoRoot,
+      ...(options.runtimeDirectory === undefined
+        ? {}
+        : { runtimeDirectory: options.runtimeDirectory }),
+      database,
+      messages: proposalMessages,
+      agents: snapshot.agents
     });
-    const turnBudget = activation?.type === "chat.activation" ? activation.turnBudget : 8;
-    const usedTurns = dispatches.length;
-    const state = activation === undefined
-      ? events.some((event) => event.type === "chat.message") ? "idle" : "starter_pending"
-      : active ? "active"
-      : usedTurns >= turnBudget ? "budget_exhausted"
-      : decisions.length === usedTurns && decisions.length > 0 &&
-        decisions.every((decision) => decision.speechAction === "silent")
-        ? "all_silent"
-        : "idle";
     return {
       chat: {
         topicId: snapshot.foundation.topicId,
@@ -267,7 +114,15 @@ export function localChatView(
       agents: snapshot.agents,
       events,
       timeline: chatTimelineFromStore(chat, snapshot.foundation.topicId, timelineOptions),
-      messages: chatMessageViewsFromStore(chat, snapshot.foundation.topicId, timelineOptions),
+      messages: {
+        ...messages,
+        items: messages.items.map((message) => {
+          const messageProposals = proposals.get(message.eventId);
+          return messageProposals === undefined
+            ? message
+            : { ...message, runProposals: messageProposals.map(({ view }) => view) };
+        })
+      },
       sessions: snapshot.agents.map((agent) => {
         const current = chat.currentSession(agent.principalId);
         return {
@@ -277,25 +132,11 @@ export function localChatView(
             : { currentSessionId: current.sessionId }),
           generation: current.generation
         };
-      }),
-      conversation: {
-        strategy: "starter",
-        state,
-        turnBudget,
-        usedTurns,
-        remainingTurns: Math.max(0, turnBudget - usedTurns),
-        activeSpeakerHandles: [...new Set(activeDispatches.map((dispatch) =>
-          dispatch.targetHandleSnapshot))],
-        ...(activation?.type === "chat.activation"
-          ? { latestReason: activation.reason }
-          : {}),
-        ...(activeSpeaker === undefined
-          ? {}
-          : { activeSpeakerHandle: activeSpeaker.targetHandleSnapshot })
-      }
+      })
     };
   } finally {
     runtime.close();
+    database.close();
     chat.close();
   }
 }
@@ -351,6 +192,11 @@ export function handoffLocalChatMessageToRun(
     const message = chat.message(eventId);
     if (message.topicId !== snapshot.foundation.topicId || message.sender.kind !== "owner") {
       throw new Error("Only an Owner message in the Local Topic can be handed off to a Run");
+    }
+    if (inspectCurrentChatRunProposal(repoRoot, message, snapshot.agents, options) !== undefined) {
+      throw new Error(
+        "Owner messages with a Run proposal require current revision confirmation"
+      );
     }
     return startStewardRunFromIntent(repoRoot, {
       schemaVersion: "RunIntent@1",
@@ -412,7 +258,9 @@ export function localChatPresenceView(
             ? {
                 state: lastDecision.speechAction === "silent"
                   ? "silent" as const
-                  : "replied" as const,
+                  : lastDecision.speechAction === "propose_run"
+                    ? "proposed" as const
+                    : "replied" as const,
                 at: lastDecision.createdAt,
                 ...(lastDecision.silenceReason === undefined
                   ? {}

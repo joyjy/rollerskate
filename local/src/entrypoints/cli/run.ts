@@ -3,6 +3,7 @@ import { readFileSync, realpathSync } from "node:fs";
 import {
   cancelStewardRun,
   closeStewardRunSeries,
+  retryStewardOrchestrator,
   setStewardRunArchived,
   submitCallerRunDecision
 } from "../../application/steward/control.js";
@@ -94,6 +95,20 @@ export function runStewardCommand(
     write(output, cancelStewardRun(repoRoot, rest[0]!, runtimeDirectory));
     return 0;
   }
+  if (command === "retry-orchestrator") {
+    if (rest.length !== 3 || rest[1] !== "--request-id") {
+      throw new Error(
+        "run retry-orchestrator requires <run-id> --request-id <idempotency-key>"
+      );
+    }
+    write(output, retryStewardOrchestrator(
+      repoRoot,
+      rest[0]!,
+      text(rest[2], "requestId"),
+      runtimeDirectory
+    ));
+    return 0;
+  }
   if (command === "archive" || command === "unarchive") {
     requireCount(rest, 1, `run ${command} requires exactly one Steward Run id`);
     write(output, setStewardRunArchived(
@@ -133,7 +148,7 @@ export function runStewardCommand(
   }
   throw new Error(
     "run requires preflight, start, list, legacy-inventory, legacy-migration-plan, " +
-    "legacy-migrate, inspect, trace, decide, " +
+    "legacy-migrate, inspect, trace, decide, retry-orchestrator, " +
     "close, cancel, archive or unarchive"
   );
 }

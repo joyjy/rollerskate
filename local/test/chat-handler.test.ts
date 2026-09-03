@@ -9,6 +9,8 @@ import {
   loadChatMentionPromptResource,
   loadChatPromptResource
 } from "../src/application/chat/prompt.js";
+import { chatReadToolCapability } from
+  "../src/application/chat/read-tool-policy.js";
 import { addLocalAgent, localRuntimeSnapshot } from "../src/application/agent/control.js";
 import {
   localChatView,
@@ -148,7 +150,6 @@ test("Chat activation starts an empty Topic exactly once and enforces its turn b
       }).handle(continuation, at), []);
       assert.equal(runtime.claimDueExecutions(10, at).length, 0);
       const projected = localChatView(repo, options);
-      assert.equal(projected.conversation.state, "budget_exhausted");
       assert.ok(projected.messages.items.some((message) =>
         message.readProgress?.agents.some((agent) =>
           agent.reason === "turn-budget-exhausted")));
@@ -735,10 +736,12 @@ test("bundled Chat prompt is a separately loaded resource", () => {
       createdAt: "2026-07-25T12:00:00.000Z"
     },
     history: { items: [], hasEarlier: false },
+    readTools: chatReadToolCapability("tools"),
     now: "2026-07-25T12:00:00.000Z"
   });
   assert.equal(resource.resourceId, chatPromptResourceId);
-  assert.match(rendered, /ChatDecision@1/);
+  assert.match(rendered, /ChatDecision@2/);
+  assert.match(rendered, /ChatRunProposalDraft@1/);
   assert.match(rendered, /Your default is to contribute/);
   assert.match(rendered, /that thread is exhausted: start a fresh, specific subject/);
   assert.match(rendered, /history result is not by itself a reason to stay silent/);
@@ -778,10 +781,12 @@ test("direct mention uses a speech-only prompt resource", () => {
       createdAt: "2026-07-25T12:00:00.000Z"
     },
     history: { items: [], hasEarlier: false },
+    readTools: chatReadToolCapability("tools"),
     now: "2026-07-25T12:00:00.000Z"
   });
   assert.equal(resource.resourceId, chatMentionPromptResourceId);
-  assert.match(rendered, /ChatMentionDecision@1/);
+  assert.match(rendered, /ChatMentionDecision@2/);
+  assert.match(rendered, /propose_run/);
   assert.match(rendered, /cannot change Topic or Global presence/);
   assert.match(rendered, /real `list_client_threads` and `read_client_thread` tools/);
   assert.ok(!rendered.includes("type: Prompt"));

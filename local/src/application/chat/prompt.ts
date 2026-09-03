@@ -8,6 +8,7 @@ import {
 import type { ChatAttentionPlan } from "../../core/chat/state-machine.js";
 import type { ChatMessageEvent } from "../../core/event/model.js";
 import { loadPromptTemplate } from "../../infrastructure/resources/prompt-template.js";
+import type { ChatReadToolCapability } from "./read-tool-policy.js";
 
 const contextPlaceholder = "{{CHAT_CONTEXT_JSON}}";
 
@@ -23,6 +24,7 @@ export interface ChatPromptContext {
   readonly latestMessage?: ChatMessageEvent;
   readonly conversationIntent: ConversationIntentSnapshot;
   readonly history: ChatPromptHistory;
+  readonly readTools: ChatReadToolCapability;
   readonly chatHistory?:
     | {
         readonly schema: "ChatHistoryToolsCapability@1";

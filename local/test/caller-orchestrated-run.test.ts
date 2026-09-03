@@ -10,6 +10,7 @@ import {
   submitCallerRunDecision
 } from "../src/application/steward/control.js";
 import { StewardModule } from "../src/application/steward/module.js";
+import { callerOrchestratedStepPrompt } from "../src/application/steward/prompt.js";
 import { inspectStewardRunView } from "../src/application/steward/query.js";
 import {
   AgentHandler,
@@ -26,6 +27,15 @@ import {
   LocalFoundationStore
 } from "../src/infrastructure/sqlite/foundation-store.js";
 import { initializeRuntimeSchema } from "../src/infrastructure/sqlite/schema.js";
+
+test("Caller Worker prompt states the exact bounded result limits", () => {
+  const prompt = callerOrchestratedStepPrompt("Inspect bounded evidence");
+
+  assert.match(prompt, /summary between 1 and 4096 characters/);
+  assert.match(prompt, /no more than 100 non-empty strings/);
+  assert.match(prompt, /each no longer than 2048 characters/);
+  assert.match(prompt, /Do not copy large tool output into the result/);
+});
 
 test("Caller decisions continue the same Run with per-Agent Sessions and finish once", async () => {
   const fixture = setup();

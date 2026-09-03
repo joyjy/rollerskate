@@ -11,7 +11,7 @@ import { dropChatProjectionObjects } from
 
 const AT = "2026-08-14T08:00:00.000Z";
 
-test("schema v69 extends the public agent_client check and preserves referencing tables", () => {
+test("schema v72 extends the public agent_client check and preserves referencing tables", () => {
   const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v59-agent-check-"));
   const databasePath = join(directory, "runtime.db");
   try {
@@ -65,7 +65,7 @@ test("schema v69 extends the public agent_client check and preserves referencing
     }
 
     const diagnostics = initializeRuntimeSchema(databasePath);
-    assert.equal(diagnostics.schemaVersion, 69);
+    assert.equal(diagnostics.schemaVersion, 72);
 
     const migrated = new DatabaseSync(databasePath);
     try {
@@ -84,7 +84,7 @@ test("schema v69 extends the public agent_client check and preserves referencing
       migrated.prepare(`
         INSERT INTO agent_sessions (
           session_id, agent_id, adapter_id, provider_session_id, workspace, created_at, updated_at
-        ) VALUES (?, ?, 'pi-runtime-rpc-v1', ?, ?, ?, ?)
+        ) VALUES (?, ?, 'pi-runtime-jsonl-v1', ?, ?, ?, ?)
       `).run("ses_pi", "prn_pi", "provider_pi", directory, AT, AT);
       const violations = migrated.prepare("PRAGMA foreign_key_check").all();
       assert.equal(violations.length, 0);
