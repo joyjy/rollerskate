@@ -21,7 +21,7 @@ import { parseExternalRefTriggerBinding } from
   "../../modules/external-resource/trigger-binding.js";
 import type { RunSourceBinding } from "../../modules/steward/source-contract.js";
 import { stewardRunProactiveTarget } from "../../modules/proactive/target.js";
-import type { RegisteredSubscriptionPlugin } from "./plugin-registry.js";
+import { registeredSubscriptionProbe, type RegisteredSubscriptionPlugin } from "./plugin-registry.js";
 import { resolveSpecToken } from "../../modules/spec/registry.js";
 
 export type { RegisteredSubscriptionPlugin } from "./plugin-registry.js";
@@ -136,22 +136,7 @@ export function subscriptionSourceBindingRegistrar(input: {
       cancellationPolicy: parameters.cancellationPolicy,
       reconcilePolicy: "source_owned"
     };
-    const probe = {
-      plugin: {
-        path: plugin.path,
-        id: plugin.id,
-        schemaVersion: 1 as const,
-        config: parameters.pluginConfig
-      },
-      policy: {
-        workspaceRoot: plugin.workspaceRoot,
-        allowedHttpOrigins: plugin.allowedHttpOrigins,
-        allowedExecutables: plugin.allowedExecutables,
-        allowedEnvironment: [] as string[],
-        timeoutMilliseconds: 30_000,
-        maxOutputBytes: 65_536
-      }
-    };
+    const probe = registeredSubscriptionProbe(plugin, parameters.pluginConfig);
     if (continuous) {
       const definition = {
         schemaVersion: "ContinuousSubscriptionDefinition@3" as const,

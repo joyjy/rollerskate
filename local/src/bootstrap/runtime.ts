@@ -1,3 +1,7 @@
+import { observeOnlyAction } from "../application/subscription/observation-control.js";
+import { codexDesktopPushAction, codexDesktopActionSource } from "../application/proactive/codex-desktop-action.js";
+import { resolveCodexChatPush } from "../integrations/codex-desktop/chat-destination.js";
+import { admitChatWorkReturns, type ChatWorkReturnCursor } from "../application/chat/work-return.js";
 import { chmodSync, mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -53,7 +57,13 @@ import type { RuntimeHandlerKind } from "../core/runtime/model.js";
 import type { AgentInputEvent, ChatDispatchEvent } from "../core/event/model.js";
 import { RuntimeCycle } from "../core/runtime/cycle.js";
 import { RuntimeStore } from "../core/runtime/store.js";
-import { runLoop, type LoopPhase, type LoopResult } from "../core/loop.js";
+import {
+  LoopWakeSignal,
+  runLoop,
+  type LoopPhase,
+  type LoopResult
+} from "../core/loop.js";
+import { subscribeRuntimeWork } from "../core/runtime/wake.js";
 import {
   CODEX_CLIENT_HISTORY_POLICY_ENV,
   CodexRuntimeAgent
@@ -73,6 +83,8 @@ import {
 import { DeviceServerClient } from "../integrations/server/device-client.js";
 import { AgentServerClient } from "../integrations/server/agent-client.js";
 import { ServerTopicDeliveryAdapter } from "../integrations/server/topic-delivery.js";
+import { CodexDesktopDestinationAdapter, codexPushRunner } from "../integrations/codex-desktop/push.js";
+import { resolveCodexChatReplyRoute } from "../integrations/codex-desktop/chat-destination.js";
 import { VikunjaTaskDestinationAdapter } from
   "../integrations/vikunja/task-destination.js";
 import { PassiveTopicSync } from "../application/topic/sync.js";
@@ -98,11 +110,11 @@ import {
   withChatHistoryContinuation
 } from "../application/chat/agent-continuation.js";
 import {
-  chatReadToolDefinitions,
-  chatReadToolGrant,
-  createChatReadToolContext
+  chatToolDefinitions,
+  chatToolGrant,
+  createChatToolContext
 } from
-  "../application/chat/read-tool-policy.js";
+  "../application/chat/tool-policy.js";
 import {
   boundedChatPromptHistory,
   chatTimelineFromStore
@@ -140,6 +152,7 @@ export interface RuntimeStartOptions {
   readonly repoRoot: string;
   readonly runtimeDirectory?: string;
   readonly codexExecutable?: string;
+  readonly codexDesktopSocketPath?: string;
   readonly claudeCodeExecutable?: string;
   readonly kimiCodeExecutable?: string;
   readonly piExecutable?: string;
@@ -162,7 +175,7 @@ const CLIENT_HISTORY_MCP_ENTRYPOINT = fileURLToPath(
 const CHAT_HISTORY_MCP_ENTRYPOINT = fileURLToPath(
   new URL("../entrypoints/mcp/chat-history.js", import.meta.url)
 );
-const CHAT_READ_TOOLS_MCP_ENTRYPOINT = fileURLToPath(
+const CHAT_TOOLS_MCP_ENTRYPOINT = fileURLToPath(
   new URL("../entrypoints/mcp/chat-read-tools.js", import.meta.url)
 );
 
@@ -179,7 +192,12 @@ export async function startRuntime(
     options.repoRoot,
     runtimePathSet.runtimeDirectory
   );
-  const resources = await assembleRuntime(options);
+  const wakeSignal = new LoopWakeSignal();
+  const resources = await assembleRuntime(options, () => wakeSignal.wake());
+  const unsubscribeRuntimeWork = subscribeRuntimeWork(
+    runtimePathSet.database,
+    () => wakeSignal.wake()
+  );
   try {
     const reconciledAt = new Date().toISOString();
     resources.scheduledTaskStore.reconcileInterrupted(reconciledAt);
@@ -195,13 +213,19 @@ export async function startRuntime(
       routeIds: resources.routeIds,
       phases: resources.phases,
       paused: () => resources.loopControl.paused(),
+      wakeSignal,
+      nextWaitMilliseconds: (maximum) =>
+        Math.min(resources.runtimeCycle.nextWaitMilliseconds(maximum),
+          resources.continuousSubscriptions.nextWaitMilliseconds(maximum)),
       ...(options.pollMilliseconds === undefined
         ? {}
         : { pollMilliseconds: options.pollMilliseconds }),
       ...(options.output === undefined ? {} : { output: options.output })
     }, signal);
   } finally {
+    unsubscribeRuntimeWork();
     try {
+      resources.continuousSubscriptions.close();
       const externalSettled = await resources.externalWorkflows.settle();
       if (options.output !== undefined && (
         externalSettled.succeeded.length > 0 || externalSettled.failed.length > 0 ||
@@ -267,7 +291,10 @@ export async function startRuntime(
   }
 }
 
-async function assembleRuntime(options: RuntimeStartOptions) {
+async function assembleRuntime(
+  options: RuntimeStartOptions,
+  onWorkStateChanged: () => void
+) {
   const paths = runtimePaths(options.repoRoot, options.runtimeDirectory);
   mkdirSync(paths.runtimeDirectory, { recursive: true, mode: 0o700 });
   chmodSync(paths.runtimeDirectory, 0o700);
@@ -285,7 +312,7 @@ async function assembleRuntime(options: RuntimeStartOptions) {
   const runtimeDatabase = openRuntimeDatabase(paths.database);
   const applicationActions = new DeterministicApplicationActionRegistry(
     runtimeDatabase,
-    options.deterministicApplicationActions ?? []
+    [codexDesktopPushAction, observeOnlyAction, ...(options.deterministicApplicationActions ?? [])]
   );
   const externalWorkflowRegistry = loadOwnerExternalWorkflowRegistry(
     options.repoRoot,
@@ -348,7 +375,8 @@ async function assembleRuntime(options: RuntimeStartOptions) {
               : { excludedProviderSessionId: currentProviderSessionId })
           }
         ),
-        chatReadTools: () => createChatReadToolContext({
+        chatTools: (event) => createChatToolContext({
+          dispatchEventId: event.eventId,
           repoRoot: options.repoRoot,
           runtimeDirectory: paths.runtimeDirectory
         })
@@ -454,6 +482,11 @@ async function assembleRuntime(options: RuntimeStartOptions) {
       RuntimeDestinationAdapter["kind"],
       RuntimeDestinationAdapter
     >([["macos-notification", macOsNotification]]);
+    const resolveActionPush = codexDesktopActionSource(applicationActions);
+    deliveryAdapters.set("codex-desktop", new CodexDesktopDestinationAdapter(
+      input => resolveCodexChatPush(runtimeStore, input) ?? resolveActionPush(input),
+      codexPushRunner(options.codexDesktopSocketPath === undefined ? {} : { socketPath: options.codexDesktopSocketPath })
+    ));
     if (matrixDelivery !== undefined) {
       deliveryAdapters.set("matrix", matrixDelivery);
     }
@@ -483,6 +516,7 @@ async function assembleRuntime(options: RuntimeStartOptions) {
       applicationActions
     });
     const continuousSubscriptionStore = new ContinuousSubscriptionStore(runtimeDatabase, {
+      externalWorkflows: externalWorkflowStore,
       runBinding: subscriptionRunBinding,
       applicationActions
     });
@@ -495,6 +529,7 @@ async function assembleRuntime(options: RuntimeStartOptions) {
       })
     });
     const continuousSubscriptions = new ContinuousSubscriptionRuntime({
+      onSourceChanged: onWorkStateChanged,
       databasePath: paths.database,
       store: continuousSubscriptionStore,
       ...(externalRefGuard === undefined ? {} : { externalRefGuard }),
@@ -609,6 +644,7 @@ async function assembleRuntime(options: RuntimeStartOptions) {
         });
     const runtimeCycle = new RuntimeCycle({
       store: runtimeStore,
+      onWorkStateChanged,
       handlers: new Map<RuntimeHandlerKind, RuntimeEventHandler>([
         ["agent", new AgentHandler({
           store: runtimeStore,
@@ -617,7 +653,7 @@ async function assembleRuntime(options: RuntimeStartOptions) {
             ...modules.flatMap((module) => module.executionGuards),
             topicAdmission
           ],
-          resolveChatReplyRoute: serverTopics.resolveChatReplyRoute
+          resolveChatReplyRoute: (event) => resolveCodexChatReplyRoute(runtimeStore, event) ?? serverTopics.resolveChatReplyRoute(event)
         })],
         ["result", new ResultHandler(
           runtimeStore,
@@ -684,6 +720,7 @@ async function assembleRuntime(options: RuntimeStartOptions) {
         ...(options.fetch === undefined ? {} : { fetch: options.fetch })
       }
     });
+    let chatReturnCursor: ChatWorkReturnCursor | undefined;
     const phases: LoopPhase[] = [
       workRequestPhase(workRequests),
       subscriptionPhase(subscriptions),
@@ -695,6 +732,14 @@ async function assembleRuntime(options: RuntimeStartOptions) {
       topicActivationSchedulePhase(topicActivationSchedules),
       interactiveChannelPhase(interactiveChannels),
       proactiveCallbackPhase(proactiveCallbacks),
+      { scope: "chat.work-return", run: async () => {
+        const returned = admitChatWorkReturns({repoRoot: options.repoRoot,
+          runtimeDirectory: paths.runtimeDirectory, database: runtimeDatabase, runtime: runtimeStore,
+          ...(chatReturnCursor === undefined ? {} : { after: chatReturnCursor })});
+        chatReturnCursor = returned.nextCursor;
+        const { eventIds } = returned;
+        return eventIds.length === 0 ? undefined : {type: "chat.work_return", eventIds};
+      } },
       runtimeProgressPhase(runProgress),
       runtimePhase(runtimeCycle)
     ];
@@ -706,6 +751,7 @@ async function assembleRuntime(options: RuntimeStartOptions) {
       subscriptions,
       subscriptionStore,
       continuousSubscriptionStore,
+      continuousSubscriptions,
       proactiveCallbacks,
       externalWorkflows,
       externalWorkflowStore,
@@ -934,7 +980,7 @@ function runtimeAgentForClient(
       return new PiRuntimeAgent({
         executable: requireExecutable(options.piExecutable, "pi"),
         ...common,
-        chatReadToolGrant: chatReadToolGrant(),
+        chatToolGrant: chatToolGrant(),
         resolveChatToolContext: ({ event }) => event.type === "chat.dispatch"
           ? {
               repoRoot: options.repoRoot,
@@ -943,6 +989,7 @@ function runtimeAgentForClient(
                 options.runtimeDirectory
               ).runtimeDirectory,
               topicId: event.topicId,
+              dispatchEventId: event.eventId,
               ...(event.sourceMessageEventId === undefined
                 ? {}
                 : { sourceMessageEventId: event.sourceMessageEventId })
@@ -958,18 +1005,19 @@ function chatHistoryMcpServers(
 ) {
   if (event.type !== "chat.dispatch") return [];
   const paths = runtimePaths(options.repoRoot, options.runtimeDirectory);
-  const readTools = {
-    name: "rollerskate_read",
+  const chatTools = {
+    name: "rollerskate_tools",
     command: process.execPath,
-    tools: chatReadToolDefinitions.map(({ name }) => name),
+    tools: chatToolDefinitions.map(({ name }) => name),
     args: [
-      CHAT_READ_TOOLS_MCP_ENTRYPOINT,
+      CHAT_TOOLS_MCP_ENTRYPOINT,
+      "--dispatch-event-id", event.eventId,
       "--repo-root", options.repoRoot,
       "--runtime-directory",
       paths.runtimeDirectory
     ]
   };
-  if (event.sourceMessageEventId === undefined) return [readTools];
+  if (event.sourceMessageEventId === undefined) return [chatTools];
   return [{
     name: "rollerskate_chat",
     command: process.execPath,
@@ -981,7 +1029,7 @@ function chatHistoryMcpServers(
       "--topic-id", event.topicId,
       "--source-message-event-id", event.sourceMessageEventId
     ]
-  }, readTools];
+  }, chatTools];
 }
 
 function localRuntimeAgentKey(agent: LocalAgent, workspace: string): string {

@@ -66,6 +66,7 @@ export interface AdmitChatAttention {
 }
 
 export interface CreateChatActivation {
+  readonly sessionId?: string;
   readonly topicId: string;
   readonly reason: ChatActivationReason;
   readonly strategyId: ChatActivationStrategy;

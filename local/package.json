@@ -1,6 +1,6 @@
 {
   "name": "@rollerskate/local",
-  "version": "0.5.7",
+  "version": "0.6.0",
   "private": true,
   "type": "module",
   "bin": {
@@ -16,7 +16,7 @@
     "dev:ui": "npm --prefix ui run dev",
     "migrate": "node dist/src/bootstrap/migrate.js",
     "smoke:vikunja": "npm run build:runtime && node dist/src/smoke/vikunja-playground.js",
-    "test": "node --test dist/test/*.test.js",
+    "test": "node --test --test-concurrency=4 dist/test/*.test.js",
     "verify": "npm run build && npm test"
   },
   "engines": {

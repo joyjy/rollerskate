@@ -1,3 +1,7 @@
+import { channelSendDeliveryOutcome } from "../../modules/channel/model.js";
+import type { DatabaseSync } from "node:sqlite";
+import { openRuntimeDatabaseReadOnly } from "../../infrastructure/sqlite/database.js";
+import { assertCurrentLocalSchema } from "../../infrastructure/sqlite/schema/index.js";
 import { ChannelStore } from "../../infrastructure/sqlite/channel-store.js";
 import { LocalChatStore } from "../../infrastructure/sqlite/chat-store.js";
 import { TopicInboxStore } from "../../infrastructure/files/topic-inbox-store.js";
@@ -23,8 +27,10 @@ export function inspectInteractiveChannelBinding(
   bindingId: string,
   runtimeDirectory?: string
 ) {
-  const store = new ChannelStore(runtimePaths(repoRoot, runtimeDirectory).database);
+  const database = openRuntimeDatabaseReadOnly(runtimePaths(repoRoot, runtimeDirectory).database);
   try {
+    assertCurrentLocalSchema(database);
+    const store = new ChannelStore(database, { migrate: false });
     const binding = store.requireBinding(bindingId);
     return {
       binding,
@@ -34,7 +40,7 @@ export function inspectInteractiveChannelBinding(
       }))
     };
   } finally {
-    store.close();
+    database.close();
   }
 }
 
@@ -43,12 +49,15 @@ export function inspectInteractiveChannelFollow(
   followToken: string,
   runtimeDirectory?: string
 ) {
-  const store = new ChannelStore(runtimePaths(repoRoot, runtimeDirectory).database);
+  const database = openRuntimeDatabaseReadOnly(runtimePaths(repoRoot, runtimeDirectory).database);
   try {
+    assertCurrentLocalSchema(database);
+    const store = new ChannelStore(database, { migrate: false });
     const follow = store.requireFollow(followToken);
-    return { receipt: store.requireSend(follow.sendId), follow };
+    const receipt=store.requireSend(follow.sendId);
+    return { receipt, follow, deliveryOutcome:channelSendDeliveryOutcome(receipt) };
   } finally {
-    store.close();
+    database.close();
   }
 }
 
@@ -99,10 +108,12 @@ function channelDelta(
   if (afterCursor === undefined) return [];
   const paths = runtimePaths(repoRoot, runtimeDirectory);
   if (current.follow.channelRef.kind === "local-chat") {
-    const chat = new LocalChatStore(paths.database);
+    const database = openRuntimeDatabaseReadOnly(paths.database);
     try {
+      assertCurrentLocalSchema(database);
+      const chat = new LocalChatStore(database);
       return boundedDelta(chat.eventsAfter(
-        current.follow.channelRef.channelId, afterCursor, MAX_DELTA_EVENTS
+        current.follow.channelRef.channelId, afterCursor, MAX_DELTA_EVENTS, { messagesOnly: true }
       ).flatMap((event) => event.type !== "chat.message" ? [] : [{
           cursor: event.eventId,
           eventId: event.eventId,
@@ -115,7 +126,7 @@ function channelDelta(
             : "new_message"
         }]));
     } finally {
-      chat.close();
+      database.close();
     }
   }
   const inbox = new TopicInboxStore(paths.topicInbox);
@@ -160,4 +171,25 @@ function boundedDelta(events: readonly ChannelDeltaEvent[]): readonly ChannelDel
 
 function terminal(status: string): boolean {
   return ["quiet", "terminal", "failed", "expired", "stopped"].includes(status);
+}
+
+/** Bounded source-owned discovery for the invoking Agent. */
+export function listInteractiveChannels(database: DatabaseSync, agentId: string, page = 1) {
+  const rows = database.prepare(`SELECT binding_id FROM interactive_channel_bindings
+    WHERE agent_id = ? ORDER BY updated_at DESC, binding_id DESC LIMIT 21 OFFSET ?`)
+    .all(agentId,(page-1)*20) as {binding_id:string}[];
+  const store = new ChannelStore(database,{migrate:false});
+  try { return {page,hasMore:rows.length>20,items:rows.slice(0,20).map(row => ({
+    binding:store.requireBinding(row.binding_id),
+    follows:store.followsForBinding(row.binding_id,10)
+  }))}; } finally {store.close();}
+}
+
+/** Snapshot only. Unlike the CLI wait helper this never advances Runtime work. */
+export function readInteractiveChannelFollow(repoRoot: string, followToken: string,
+  options: ChannelFollowQueryOptions = {}) {
+  const current = inspectInteractiveChannelFollow(repoRoot,followToken,options.runtimeDirectory);
+  const afterCursor = options.afterCursor ?? current.receipt.observedCursor;
+  const delta = channelDelta(repoRoot,current,afterCursor,options.runtimeDirectory);
+  return {...current,delta,nextCursor:delta.at(-1)?.cursor ?? afterCursor};
 }

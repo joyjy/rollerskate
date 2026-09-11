@@ -1,6 +1,6 @@
+import { temporaryDirectory } from "./support/temp-directory.js";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -13,7 +13,7 @@ import { admitSameClientHistoryPolicy } from
   "../src/modules/agent/activity-policy.js";
 
 test("Codex uses app-server Threads, bounded events and protocol policy", async () => {
-  const workspace = mkdtempSync(join(tmpdir(), "rollerskate-codex-runtime-"));
+  const workspace = temporaryDirectory("rollerskate-codex-runtime-");
   const executable = join(workspace, "codex-fixture");
   const invocations = join(workspace, "invocations.jsonl");
   writeFileSync(executable, `#!${process.execPath}
@@ -70,6 +70,7 @@ rl.on("close", () => {
     projectRoot: workspace,
     environment: {},
     timeoutMilliseconds: 3_000,
+    launchArgs: ["--model", "gpt-5.6-sol", "--reasoning-effort", "medium"],
     resolveMcpServers: ({ event }) => event.type === "chat.dispatch"
       ? [{
           name: "rollerskate_client_history",
@@ -99,17 +100,29 @@ rl.on("close", () => {
     event: networkRunEvent("evt_019f92c9-0000-7000-8000-000000000004", workspace)
   });
 
+  const readNetworkEvent = networkRunEvent("evt_019f92c9-0000-7000-8000-000000000005", workspace);
+  if (readNetworkEvent.type !== "agent.request" || readNetworkEvent.runContext?.workspaceGrant === undefined) throw new Error("fixture grant missing");
+  await agent.invoke({event: {...readNetworkEvent, runContext: {...readNetworkEvent.runContext,
+    workspaceGrant: {...readNetworkEvent.runContext.workspaceGrant, access: "read"}}}, providerSessionId: "read-only-session"});
+
   type Invocation = {
     args: string[];
     messages: Array<{ id?: number; method: string; params?: Record<string, unknown> }>;
     policy?: string;
   };
-  const [fresh, resumed, withTools, networkRun] = readFileSync(invocations, "utf8")
+  const [fresh, resumed, withTools, networkRun, readNetwork] = readFileSync(invocations, "utf8")
     .trim().split("\n").map((line) => JSON.parse(line) as Invocation);
   assert.deepEqual(fresh!.args, ["app-server", "--stdio"]);
   assert.deepEqual(resumed!.args, ["app-server", "--stdio"]);
   const freshThread = message(fresh!, "thread/start");
   const resumedThread = message(resumed!, "thread/resume");
+  for (const thread of [freshThread, resumedThread]) {
+    assert.equal(thread.params!.model, "gpt-5.6-sol");
+    assert.equal((thread.params!.config as Record<string, unknown>).model_reasoning_effort, "medium");
+  }
+  for (const launchArgs of [["--reasoning-effort", "ultra"], ["--model"], ["--model", "a", "--model", "b"], ["--config", "sandbox=danger"]]) {
+    assert.throws(() => new CodexRuntimeAgent({ executable, projectRoot: workspace, environment: {}, timeoutMilliseconds: 3_000, launchArgs }));
+  }
   assert.equal(freshThread.params!.approvalPolicy, "never");
   assert.equal(freshThread.params!.sandbox, "read-only");
   assert.equal(resumedThread.params!.threadId, "desktop-session");
@@ -122,6 +135,9 @@ rl.on("close", () => {
   assert.match(JSON.stringify(resumedTurn.params), /Terminal observation:/);
   assert.match(JSON.stringify(resumedTurn.params), /terminal/);
   assert.equal(message(networkRun!, "thread/start").params!.sandbox, "workspace-write");
+  assert.equal(message(readNetwork!, "thread/resume").params!.sandbox, "read-only");
+  assert.deepEqual(message(readNetwork!, "turn/start").params!.sandboxPolicy, {type: "readOnly", networkAccess: true});
+  assert.deepEqual(message(fresh!, "turn/start").params!.sandboxPolicy, {type: "readOnly", networkAccess: false});
   assert.equal(fresh!.policy, undefined);
   assert.equal(resumed!.policy, undefined);
 
@@ -155,7 +171,7 @@ rl.on("close", () => {
 });
 
 test("Codex app-server fails closed on an unexpected approval request", async () => {
-  const workspace = mkdtempSync(join(tmpdir(), "rollerskate-codex-approval-"));
+  const workspace = temporaryDirectory("rollerskate-codex-approval-");
   const executable = join(workspace, "codex-fixture");
   writeFileSync(executable, `#!${process.execPath}
 const readline = require("node:readline");
@@ -175,7 +191,7 @@ rl.on("line", (line) => {
     executable,
     environment: {},
     workingDirectory: workspace,
-    meaningfulOutputTimeoutMilliseconds: 1_000,
+    meaningfulOutputTimeoutMilliseconds: 5_000,
     maxOutputBytes: 1_024,
     threadParameters: {
       cwd: workspace,
@@ -273,7 +289,7 @@ test("Codex distinguishes provider interruption from protocol exit", async () =>
     executable: cancelledFixture.executable,
     projectRoot: cancelledFixture.workspace,
     environment: {},
-    timeoutMilliseconds: 1_000
+    timeoutMilliseconds: 5_000
   });
   await assert.rejects(cancelledAgent.invoke({ event: boundedRunEvent() }),
     (error: unknown) => {
@@ -290,7 +306,7 @@ test("Codex distinguishes provider interruption from protocol exit", async () =>
     executable: exitedFixture.executable,
     projectRoot: exitedFixture.workspace,
     environment: {},
-    timeoutMilliseconds: 1_000
+    timeoutMilliseconds: 5_000
   });
   await assert.rejects(exitedAgent.invoke({ event: boundedRunEvent() }),
     (error: unknown) => {
@@ -312,7 +328,8 @@ test("Codex fails closed when a resumed Thread changes identity", async () => {
     executable: fixture.executable,
     projectRoot: fixture.workspace,
     environment: {},
-    timeoutMilliseconds: 1_000
+    // This tests protocol identity, not process startup latency under a parallel suite.
+    timeoutMilliseconds: 5_000
   });
 
   await assert.rejects(
@@ -448,7 +465,7 @@ function codexFixture(options: {
   readonly executable: string;
   readonly invocation: string;
 } {
-  const workspace = mkdtempSync(join(tmpdir(), "rollerskate-codex-streaming-"));
+  const workspace = temporaryDirectory("rollerskate-codex-streaming-");
   const executable = join(workspace, "codex-fixture");
   const invocation = join(workspace, "invocation.json");
   writeFileSync(executable, `#!${process.execPath}

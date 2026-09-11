@@ -1,3 +1,4 @@
+import { openRuntimeDatabaseReadOnly } from "../../infrastructure/sqlite/database.js";
 import { join } from "node:path";
 
 import type {
@@ -13,7 +14,7 @@ import {
 } from "../../infrastructure/sqlite/chat-store.js";
 import { runtimePaths } from "../../infrastructure/runtime/config.js";
 import {
-  localRuntimeSnapshot,
+  readLocalRuntimeSnapshot,
   type LocalControlOptions
 } from "../agent/control.js";
 import type { ChatRunProposalView } from "./run-proposal.js";
@@ -26,6 +27,7 @@ export interface ChatTimelineOptions {
 export interface ChatMessageView extends ChatMessageSummary {
   readonly readProgress?: ChatReadProgress;
   readonly runProposals?: readonly ChatRunProposalView[];
+  readonly works?: readonly import("../steward/work-query.js").StewardWorkView[];
 }
 
 export interface ChatMessageViewPage {
@@ -41,10 +43,11 @@ export interface ChatTimelineReader {
 }
 
 export function openChatTimelineReader(runtimeDirectory: string): ChatTimelineReader {
-  const store = new LocalChatStore(join(runtimeDirectory, "runtime.db"));
+  const database = openRuntimeDatabaseReadOnly(join(runtimeDirectory, "runtime.db"));
+  const store = new LocalChatStore(database);
   return {
     read: (topicId, options = {}) => chatTimelineFromStore(store, topicId, options),
-    close: () => store.close()
+    close: () => database.close()
   };
 }
 
@@ -53,12 +56,13 @@ export function localChatTimeline(
   options: LocalControlOptions = {},
   timeline: ChatTimelineOptions = {}
 ): ChatTimeline {
-  const topicId = localRuntimeSnapshot(repoRoot, options).foundation.topicId;
-  const store = new LocalChatStore(runtimePaths(repoRoot, options.runtimeDirectory).database);
+  const topicId = readLocalRuntimeSnapshot(repoRoot, options).foundation.topicId;
+  const database = openRuntimeDatabaseReadOnly(runtimePaths(repoRoot, options.runtimeDirectory).database);
+  const store = new LocalChatStore(database);
   try {
     return chatTimelineFromStore(store, topicId, timeline);
   } finally {
-    store.close();
+    database.close();
   }
 }
 

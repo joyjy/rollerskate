@@ -1,3 +1,4 @@
+import type { ExternalWorkflowRecoveryRequest, ExternalWorkflowRecoveryReceipt } from "../../modules/proactive/recovery.js";
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
@@ -400,6 +401,63 @@ export class ExternalWorkflowStore {
       throw new Error(`external workflow unknown resolution conflicted: ${executionId}`);
     }
     return this.requireExecution(executionId);
+  }
+
+  public recoveryReceipt(request: ExternalWorkflowRecoveryRequest): ExternalWorkflowRecoveryReceipt | undefined {
+    const row = this.#database.prepare(`SELECT request_json, receipt_json FROM external_workflow_recovery_receipts
+      WHERE source_kind = ? AND source_id = ? AND request_id = ?`)
+      .get(request.source.kind, request.source.id, request.requestId) as { request_json: string; receipt_json: string } | undefined;
+    if (row === undefined) return undefined;
+    if (row.request_json !== stableContractJson(request)) throw new Error("workflow recovery requestId conflict");
+    return JSON.parse(row.receipt_json) as ExternalWorkflowRecoveryReceipt;
+  }
+
+  public recoveryReceipts(source: Pick<TriggerSourceRef, "kind" | "id">): ExternalWorkflowRecoveryReceipt[] {
+    return (this.#database.prepare(`SELECT receipt_json FROM external_workflow_recovery_receipts
+      WHERE source_kind = ? AND source_id = ? ORDER BY rowid DESC LIMIT 50`)
+      .all(source.kind, source.id) as Array<{ receipt_json: string }>)
+      .map((row) => JSON.parse(row.receipt_json) as ExternalWorkflowRecoveryReceipt);
+  }
+
+  public recoverInTransaction(request: ExternalWorkflowRecoveryRequest, at = new Date().toISOString()): ExternalWorkflowRecoveryReceipt {
+    if (!this.#database.isTransaction) throw new Error("workflow recovery requires an owning transaction");
+    const duplicate = this.recoveryReceipt(request);
+    if (duplicate !== undefined) return duplicate;
+    const execution = this.requireExecution(request.executionId);
+    if (stableContractJson(execution.source) !== stableContractJson(request.source) ||
+      execution.attemptCount !== request.expectedAttemptCount) throw new Error("workflow recovery execution/revision/attempt conflict");
+    if (execution.receipt === undefined) throw new Error("workflow recovery requires a terminal receipt");
+    const timestamp = iso(at);
+    let outcome: ExternalWorkflowRecoveryReceipt["outcome"];
+    let resolvedReceipt: ExternalWorkflowExecutionReceipt | undefined;
+    if (request.action === "retry") {
+      if (execution.status !== "failed" || request.retrySafe !== true) {
+        throw new Error("workflow retry requires failed outcome and explicit retrySafe confirmation; resolve unknown first");
+      }
+      // Frozen target remains unchanged; this Owner decision grants exactly one more attempt.
+      const limit = integer(execution.attemptCount + 1, "retry attempt limit", 1, 1_000_000);
+      this.#database.prepare(`UPDATE external_workflow_executions SET status = 'queued', max_attempts = ?,
+        next_attempt_at = ?, effect_started_at = NULL, receipt_json = NULL, resolution_receipt_json = NULL,
+        last_error = NULL, completed_at = NULL, updated_at = ? WHERE execution_id = ?`)
+        .run(limit, timestamp, timestamp, execution.executionId);
+      outcome = "queued";
+    } else {
+      outcome = request.action === "resolve-succeeded" ? "succeeded" : "failed";
+      resolvedReceipt = this.resolveUnknownInTransaction(execution.executionId, outcome, request.reason, timestamp).receipt!;
+    }
+    const receipt: ExternalWorkflowRecoveryReceipt = {
+      schemaVersion: "ExternalWorkflowRecoveryReceipt@1", request,
+      occurrenceKey: execution.occurrenceKey, previousReceipt: execution.receipt,
+      ...(execution.unknownReceipt === undefined ? {} : { previousUnknownReceipt: execution.unknownReceipt }),
+      outcome, ...(resolvedReceipt === undefined ? {} : { resolvedReceipt }), acceptedAt: timestamp
+    };
+    this.#database.prepare(`INSERT INTO external_workflow_recovery_receipts
+      (source_kind, source_id, request_id, execution_id, request_json, receipt_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .run(request.source.kind, request.source.id, request.requestId, execution.executionId,
+        boundedJson(request, "workflow recovery request", 16_384),
+        boundedJson(receipt, "workflow recovery receipt", 393_216), timestamp);
+    return receipt;
   }
 
   public execution(

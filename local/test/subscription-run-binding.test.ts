@@ -319,7 +319,7 @@ function decision(
   parameters: Readonly<Record<string, unknown>>
 ) {
   return {
-    schemaVersion: "RunDecision@3",
+    schemaVersion: "RunDecision@5",
     action: "await_source",
     expectedRunVersion,
     rationale: "Wait for the registered Subscription source",

@@ -173,7 +173,7 @@ export class AcpRunner implements AgentRunner {
           const initialized = await context.request(acp.methods.agent.initialize, {
             protocolVersion: acp.PROTOCOL_VERSION,
             clientCapabilities: {},
-            clientInfo: { name: "Rollerskate Local", version: "0.5.7" }
+            clientInfo: { name: "Rollerskate Local", version: "0.6.0" }
           });
           if (initialized.protocolVersion !== acp.PROTOCOL_VERSION) {
             throw new Error(

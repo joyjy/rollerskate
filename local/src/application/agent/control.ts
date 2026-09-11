@@ -1,3 +1,7 @@
+import type { DatabaseSync } from "node:sqlite";
+import { openRuntimeDatabaseReadOnly } from "../../infrastructure/sqlite/database.js";
+import { assertCurrentLocalSchema } from "../../infrastructure/sqlite/schema/index.js";
+
 import { chmodSync, mkdirSync } from "node:fs";
 
 import {
@@ -54,28 +58,34 @@ export interface AgentSummary {
   readonly updatedAt: string;
 }
 
+// Control callers use this entry to initialize a fresh Local Runtime.
 export function localRuntimeSnapshot(
   repoRoot: string,
   options: LocalControlOptions = {}
 ): LocalRuntimeSnapshot {
   const resources = openLocalControl(repoRoot, options);
   try {
-    return {
-      foundation: resources.foundation,
-      agents: resources.store.listAgents()
-    };
+    return { foundation: resources.foundation, agents: resources.store.listAgents() };
   } finally {
     resources.store.close();
   }
+}
+
+export function readLocalRuntimeSnapshot(
+  repoRoot: string,
+  options: LocalControlOptions = {}
+): LocalRuntimeSnapshot {
+  return withLocalQuery(repoRoot, options, ({ store, foundation }) => ({
+    foundation, agents: store.listAgents()
+  }));
 }
 
 export function listAgents(
   repoRoot: string,
   options: LocalControlOptions = {}
 ): readonly AgentSummary[] {
-  const resources = openLocalControl(repoRoot, options);
-  const chatStore = new LocalChatStore(resources.databasePath);
-  try {
+  return withLocalQuery(repoRoot, options, (resources) => {
+    const chatStore = new LocalChatStore(resources.database);
     const agents = resources.store.listAgents();
     return agents.map((agent) => {
       const currentSession = chatStore.currentAgentSession(agent.principalId);
@@ -94,10 +104,7 @@ export function listAgents(
         updatedAt: agent.updatedAt
       };
     });
-  } finally {
-    chatStore.close();
-    resources.store.close();
-  }
+  });
 }
 
 export function inspectAgent(
@@ -211,4 +218,25 @@ function openLocalControl(
 
 function timestamp(options: LocalControlOptions): string {
   return (options.now ?? (() => new Date()))().toISOString();
+}
+
+function withLocalQuery<T>(
+  repoRoot: string,
+  options: LocalControlOptions,
+  query: (resources: {
+    readonly database: DatabaseSync;
+    readonly store: LocalFoundationStore;
+    readonly foundation: LocalFoundation;
+  }) => T
+): T {
+  const database = openRuntimeDatabaseReadOnly(runtimePaths(repoRoot, options.runtimeDirectory).database);
+  try {
+    assertCurrentLocalSchema(database);
+    const store = new LocalFoundationStore(database, { migrate: false });
+    const foundation = store.foundation();
+    if (foundation === undefined) throw new Error("Local foundation is not initialized; run scripts/rs start");
+    return query({ database, store, foundation });
+  } finally {
+    database.close();
+  }
 }

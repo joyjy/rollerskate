@@ -1,3 +1,5 @@
+import { runCapabilityRequest } from "./capability.js";
+import { runHumanQuestion } from "./human-input.js";
 import type { AgentRequestEvent } from "../../core/event/model.js";
 import type { DatabaseSync } from "node:sqlite";
 import { RuntimeStore, type RuntimeAudit } from "../../core/runtime/store.js";
@@ -46,8 +48,10 @@ import { assertCurrentLocalSchema } from
   "../../infrastructure/sqlite/schema/index.js";
 import { inspectScheduleViewForRunSource } from "../schedule/query.js";
 import { inspectSubscriptionViewForRunSource } from "../subscription/query.js";
+import { stewardRunIntervention, type StewardRunIntervention } from "./intervention.js";
 
 export interface StewardRunSummaryView {
+  readonly version: number;
   readonly runId: string;
   readonly rootEventId: string;
   readonly status: AgentRunProjection["status"];
@@ -102,6 +106,9 @@ export interface AgentExchangeCountView {
 }
 
 export interface StewardRunDetailView {
+  readonly intervention: StewardRunIntervention | null;
+  readonly capabilityRequest: ReturnType<typeof runCapabilityRequest>;
+  readonly humanQuestion: ReturnType<typeof runHumanQuestion>;
   readonly summary: StewardRunSummaryView;
   readonly projection: AgentRunProjection;
   readonly cycles: readonly AgentRunCycleProjection[];
@@ -124,6 +131,7 @@ export interface StewardRunDetailView {
 }
 
 export interface StewardRunInspectionOptions {
+  readonly database?: DatabaseSync;
   readonly inspectCurrentWorkspaceRevision?: boolean;
 }
 
@@ -154,6 +162,7 @@ export interface StewardOutputFolderView {
 
 export interface StewardOutputView {
   readonly outputId: string;
+  readonly id?: string;
   readonly stepId: string;
   readonly title: string;
   readonly kind: "primary" | "output" | "reference";
@@ -304,6 +313,7 @@ export function inspectStewardRunView(
             : workspaceRevision(run.workspaceGrant.root)
         );
     const cycles = stores.runs.cycles(run.runId, 1_000);
+    const decisions = stores.runs.decisions(run.runId);
     const steps = requests
       .map((request) => stepView(
         request,
@@ -313,13 +323,16 @@ export function inspectStewardRunView(
       ))
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
     return {
+      capabilityRequest: runCapabilityRequest(run, stores.runs, stores.runtime),
+      humanQuestion: runHumanQuestion(run,stores.runs,stores.runtime),
+      intervention: stewardRunIntervention(run, requests, stores.runtime),
       summary: summary(run, stores.foundation),
       projection: run,
       cycles,
       triggerSource: triggerSourceView(run, cycles, stores),
       checkpoint: run.checkpoint ?? null,
-      decisions: stores.runs.decisions(run.runId).map((record) => record.receipt),
-      orchestrationHistory: stores.runs.decisions(run.runId),
+      decisions: decisions.map((record) => record.receipt),
+      orchestrationHistory: decisions,
       participants: [...participantIds].map((agentId) =>
         agentReference(requireAgent(stores.foundation, agentId))),
       sessions: stores.runtime.sessions(1_000).filter(
@@ -328,24 +341,39 @@ export function inspectStewardRunView(
       exchanges,
       exchangeCounts: exchangeCounts(exchanges),
       steps,
-      outputFolders: outputFolders(cycles, steps),
+      outputFolders: outputFolders(cycles, steps, decisions),
       timeline: eventTraceViews(audits),
       currentWorkspaceRevision: workspace.value ?? null,
       workspaceRevisionError: workspace.error ?? null
     };
-  });
+  }, options.database);
 }
 
 function outputFolders(
   cycles: readonly AgentRunCycleProjection[],
-  steps: readonly StewardRunStepView[]
+  steps: readonly StewardRunStepView[],
+  decisions: readonly { readonly decision: AnyRunDecision; readonly receipt: AgentRunDecisionReceipt }[]
 ): readonly StewardOutputFolderView[] {
+  const accepted = decisions.flatMap(({ decision, receipt }) =>
+    (decision.schemaVersion === "RunDecision@4" || decision.schemaVersion === "RunDecision@5" || decision.schemaVersion === "RunDecision@6") && decision.action === "finish"
+      ? (decision.finish.outputs ?? []).map((output) => ({
+          cycleId: receipt.schemaVersion === "AgentRunDecisionReceipt@2" ? receipt.cycleId ?? null : null,
+          output: { ...output, schemaVersion: output.schemaVersion ?? null,
+            outputId: `${receipt.runId}:decision:${receipt.requestId}:output:${output.id}`,
+            stepId: receipt.sourceStepId, kind: "output" as const }
+        }))
+      : []
+  );
+  const forCycle = (cycleId: string | null) => [
+    ...outputsForSteps(steps.filter((step) => step.cycleId === cycleId)),
+    ...accepted.filter((item) => item.cycleId === cycleId).map((item) => item.output)
+  ];
   const cycleFolders = cycles.map((cycle) => ({
     cycleId: cycle.cycleId,
     sourceRevision: cycle.sourceRevision ?? null,
-    outputs: outputsForSteps(steps.filter((step) => step.cycleId === cycle.cycleId))
+    outputs: forCycle(cycle.cycleId)
   }));
-  const unscoped = outputsForSteps(steps.filter((step) => step.cycleId === null));
+  const unscoped = forCycle(null);
   return unscoped.length === 0
     ? cycleFolders
     : [{ cycleId: null, sourceRevision: null, outputs: unscoped }, ...cycleFolders];
@@ -369,6 +397,7 @@ function outputsForSteps(steps: readonly StewardRunStepView[]): StewardOutputVie
       ...(result?.schemaVersion === "AgentTurnResult@1" && result.action === "complete"
         ? (result.outputs ?? []).map((output) => ({
         outputId: `${step.stepId}:output:${output.id}`,
+        id: output.id,
         stepId: step.stepId,
         title: output.title,
         kind: "output" as const,
@@ -397,12 +426,12 @@ function primaryOutput(result: StewardRunStepView["result"]): string | null {
     return result.summary;
   }
   if ((result?.schemaVersion === "RunDecision@1" || result?.schemaVersion === "RunDecision@2" ||
-    result?.schemaVersion === "RunDecision@3") &&
+    result?.schemaVersion === "RunDecision@3" || result?.schemaVersion === "RunDecision@4" || result?.schemaVersion === "RunDecision@5" || result?.schemaVersion === "RunDecision@6") &&
     result.action === "finish") {
     return result.finish.summary;
   }
   if ((result?.schemaVersion === "RunDecision@1" || result?.schemaVersion === "RunDecision@2" ||
-    result?.schemaVersion === "RunDecision@3") &&
+    result?.schemaVersion === "RunDecision@3" || result?.schemaVersion === "RunDecision@4" || result?.schemaVersion === "RunDecision@5" || result?.schemaVersion === "RunDecision@6") &&
     result.action === "needs_human") {
     return result.rationale;
   }
@@ -491,10 +520,11 @@ interface Stores {
 function withStores<T>(
   repoRoot: string,
   runtimeDirectory: string | undefined,
-  callback: (stores: Stores) => T
+  callback: (stores: Stores) => T,
+  existingDatabase?: DatabaseSync
 ): T {
   const databasePath = runtimePaths(repoRoot, runtimeDirectory).database;
-  const database = openRuntimeDatabaseReadOnly(databasePath);
+  const database = existingDatabase ?? openRuntimeDatabaseReadOnly(databasePath);
   try {
     assertCurrentLocalSchema(database);
     const runs = new AgentRunStore(database, { migrate: false });
@@ -508,7 +538,7 @@ function withStores<T>(
       runs.close();
     }
   } finally {
-    database.close();
+    if (existingDatabase === undefined) database.close();
   }
 }
 
@@ -518,6 +548,7 @@ function summary(
 ): StewardRunSummaryView {
   return {
     runId: run.runId,
+    version: run.version,
     rootEventId: run.rootEventId,
     status: run.status,
     orchestrationMode: run.orchestrationMode,

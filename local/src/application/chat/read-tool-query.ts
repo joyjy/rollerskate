@@ -1,3 +1,5 @@
+import { listChatWork } from "./work-query.js";
+import { stewardWorkView } from "../steward/work-query.js";
 import { eventTrace } from "../event/query.js";
 import { inspectStewardRunView } from "../steward/query.js";
 import { subscriptionHistoryByReference } from "../subscription/query.js";
@@ -5,14 +7,16 @@ import { redact } from "../../integrations/activity/provider-source.js";
 import type { ChatReadToolContext } from "./read-tool-policy.js";
 
 export type ChatReadQuery =
+  | { readonly tool: "list_chat_work"; readonly beforeDispatchEventId?: string; readonly limit: number }
   | { readonly tool: "subscription_history"; readonly subscriptionId: string; readonly limit: number }
   | { readonly tool: "get_run"; readonly runId: string }
   | { readonly tool: "event_trace"; readonly eventId: string };
 
 export function queryChatReadTool(
-  context: Pick<ChatReadToolContext, "repoRoot" | "runtimeDirectory">,
+  context: Pick<ChatReadToolContext, "repoRoot" | "runtimeDirectory" | "dispatchEventId">,
   query: ChatReadQuery
 ): unknown {
+  if (query.tool === "list_chat_work") return listChatWork(context, query);
   if (query.tool === "subscription_history") {
     return subscriptionHistoryView(context, query.subscriptionId, query.limit);
   }
@@ -70,6 +74,7 @@ function runEvidenceView(
   );
   return {
     schemaVersion: "ChatRunEvidence@1",
+    work: stewardWorkView(view),
     summary: {
       runId: view.summary.runId,
       rootEventId: view.summary.rootEventId,

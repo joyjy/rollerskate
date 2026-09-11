@@ -1,7 +1,6 @@
+import { temporaryDirectory } from "./support/temp-directory.js";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -159,7 +158,7 @@ test("Subscription expires at its deadline without running callbacks", () => {
 });
 
 function testDatabase(): string {
-  return join(mkdtempSync(join(tmpdir(), "rollerskate-subscription-store-")), "runtime.db");
+  return join(temporaryDirectory("rollerskate-subscription-store-"), "runtime.db");
 }
 
 function seedAgent(database: string): string {

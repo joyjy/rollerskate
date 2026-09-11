@@ -21,6 +21,7 @@ import { RuntimeStore } from "../src/core/runtime/store.js";
 import { LocalChatStore } from "../src/infrastructure/sqlite/chat-store.js";
 import { AgentHandler, type RuntimeAgentAdapter } from "../src/core/runtime/handlers.js";
 import { startRuntime } from "../src/bootstrap/runtime.js";
+import { addLocalTopicParticipant, removeLocalTopicParticipant } from "../src/application/topic/governance-control.js";
 
 test("Local Chat autonomously dispatches a mention and resumes the per-Agent Session", async () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-chat-repo-"));
@@ -116,6 +117,29 @@ test("Local Chat autonomously dispatches a mention and resumes the per-Agent Ses
         principalId: alice.principalId,
         handleSnapshot: "Alice"
       }]);
+      // Reply selects the recipient; mentions in its body do not redirect it.
+      addLocalAgent(repo, "codex-sol", "codex", options);
+      const bob = addLocalAgent(repo, "bob", "codex", options);
+      addLocalTopicParticipant(repo, bob.principalId, 1, options);
+      for (const body of ["ask @codex-sol", "@Alice ask @codex-sol", "ask @bob"]) {
+        const followUp = postLocalChatMessage(repo, body, options, {
+          replyToEventId: reply!.eventId
+        });
+        assert.deepEqual(followUp.message.targets, [{
+          principalId: alice.principalId, handleSnapshot: "Alice"
+        }]);
+      }
+      assert.deepEqual(postLocalChatMessage(repo, "ask @bob", options).message.targets, [{
+        principalId: bob.principalId, handleSnapshot: "bob"
+      }]);
+      assert.equal(postLocalChatMessage(repo, "ask @codex-sol", options).message.targets, undefined);
+      assert.deepEqual(postLocalChatMessage(repo, "@Alice ask @codex-sol", options).message.targets, [{
+        principalId: alice.principalId, handleSnapshot: "Alice"
+      }]);
+      suspendLocalAgent(repo, alice.principalId, options);
+      assert.equal(postLocalChatMessage(repo, "follow up @codex-sol", options, {
+        replyToEventId: reply!.eventId
+      }).message.targets, undefined);
     } finally {
       runtime.close();
     }
@@ -127,6 +151,23 @@ test("Local Chat autonomously dispatches a mention and resumes the per-Agent Ses
         event.sourceMessageEventId === explicit.message.eventId
     ));
     assert.equal(localRuntimeSnapshot(repo, options).foundation.topicId, restarted.chat.topicId);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(runtimeDirectory, { recursive: true, force: true });
+  }
+});
+
+test("Local Chat treats removed recipients as plain text and allows an empty roster", () => {
+  const repo = mkdtempSync(join(tmpdir(), "rollerskate-chat-roster-repo-"));
+  const runtimeDirectory = mkdtempSync(join(tmpdir(), "rollerskate-chat-roster-runtime-"));
+  const options = { runtimeDirectory };
+  try {
+    const alice = addLocalAgent(repo, "alice", "codex", options);
+    postLocalChatMessage(repo, "@alice initial", options);
+    removeLocalTopicParticipant(repo, alice.principalId, 1, options);
+    assert.equal(postLocalChatMessage(repo, "@alice follow up", options).message.targets, undefined);
+    assert.equal(postLocalChatMessage(repo, "anyone here?", options).message.targets, undefined);
+    assert.equal(localChatView(repo, options).messages.items.length, 3);
   } finally {
     rmSync(repo, { recursive: true, force: true });
     rmSync(runtimeDirectory, { recursive: true, force: true });
@@ -367,20 +408,7 @@ test("silent and failed Local Agent outcomes terminate without agent.result rela
         "2099-07-23T12:00:00.000Z",
         1
       );
-      execution = runtime.claimDueExecutions(1, "2099-07-23T12:00:01.000Z")[0]!;
-      failed = runtime.failExecution(
-        execution.executionId,
-        "provider unavailable",
-        "2099-07-23T12:00:01.000Z",
-        1
-      );
-      execution = runtime.claimDueExecutions(1, "2099-07-23T12:00:02.000Z")[0]!;
-      failed = runtime.failExecution(
-        execution.executionId,
-        "provider unavailable",
-        "2099-07-23T12:00:02.000Z",
-        1
-      );
+      assert.equal(runtime.claimDueExecutions(1,"2099-07-23T12:00:02.000Z").length,0);
       assert.equal(failed.execution.status, "failed");
       assert.equal(failed.resultEvent, undefined);
       assert.equal(runtime.events().filter((event) => event.type === "agent.result").length, 0);
@@ -409,6 +437,46 @@ test("silent and failed Local Agent outcomes terminate without agent.result rela
     rmSync(runtimeDirectory, { recursive: true, force: true });
   }
 });
+
+for (const scenario of ["effect-then-error","crossed-session"] as const) {
+  test(`Chat ${scenario} never replays or switches the responsible Session`,async()=>{
+    const repo=mkdtempSync(join(tmpdir(),"rs-s4-chat-"));
+    const runtimeDirectory=mkdtempSync(join(tmpdir(),"rs-s4-runtime-"));
+    const options={runtimeDirectory};
+    const agent=addLocalAgent(repo,"alice","codex",options);
+    const runtime=new RuntimeStore(join(runtimeDirectory,"runtime.db"));
+    let calls=0,effects=0;
+    const handler=new AgentHandler({store:runtime,adapters:new Map([[agent.principalId,{
+      adapterId:"s4-fixture",workspace:repo,async invoke(input){
+        calls++;
+        if(calls===2 && scenario==="effect-then-error") {effects++;throw new Error("provider disconnected after tool effect");}
+        return {providerSessionId:calls===2 ? "crossed" : "original",outcome:{kind:"message" as const,body:decision("silent")}};
+      }
+    }]])});
+    try {
+      postLocalChatMessage(repo,"@alice hello",options);dispatchNextMessage(runtime,[agent],runtimeDirectory);
+      await handler.handle(runtime.claimDueExecutions()[0]!);
+      const session=runtime.currentLocalAgentSession(agent.principalId)!;
+      postLocalChatMessage(repo,"@alice perform this work",options);dispatchNextMessage(runtime,[agent],runtimeDirectory);
+      const execution=runtime.claimDueExecutions()[0]!;
+      assert.equal(execution.maxAttempts,1);
+      await handler.handle(execution);
+      assert.equal(runtime.executionForEvent(execution.eventId)?.status,"failed");
+      assert.equal(runtime.currentLocalAgentSession(agent.principalId)?.providerSessionId,session.providerSessionId);
+      const reopened=new RuntimeStore(join(runtimeDirectory,"runtime.db"));
+      try {reopened.reconcileInterrupted();assert.equal(reopened.claimDueExecutions(10,"2099-01-01T00:00:00.000Z").length,0);} finally {reopened.close();}
+      // Old persisted retry budgets cannot re-enable a tool-bearing Chat turn.
+      const database=new DatabaseSync(join(runtimeDirectory,"runtime.db"));
+      database.prepare("UPDATE executions SET status='retry_wait', max_attempts=3, next_attempt_at=? WHERE execution_id=?").run(new Date().toISOString(),execution.executionId);
+      database.close();
+      const retry=runtime.claimDueExecutions()[0]!;
+      await handler.handle(retry);
+      assert.equal(calls,2);
+      assert.equal(effects,scenario==="effect-then-error" ? 1 : 0);
+      assert.equal(runtime.executionForEvent(execution.eventId)?.status,"cancelled");
+    } finally {runtime.close();rmSync(repo,{recursive:true,force:true});rmSync(runtimeDirectory,{recursive:true,force:true});}
+  });
+}
 
 function dispatchNextMessage(
   runtime: RuntimeStore,

@@ -1,3 +1,5 @@
+import { assertProviderSessionIdentity } from "../../core/runtime/agent-invocation.js";
+import { redact } from "../../integrations/activity/provider-source.js";
 import {
   parseChatHistoryRequest,
   parseClientHistoryRequest,
@@ -17,11 +19,11 @@ import {
 } from "../../modules/agent/activity-policy.js";
 import { isAgentClient } from "../../modules/agent/client-profile.js";
 import {
-  callChatReadTool,
-  parseChatReadToolRequest,
-  type ChatReadToolContext,
-  type ChatReadToolRequest
-} from "./read-tool-policy.js";
+  callChatTool,
+  parseChatToolRequest,
+  type ChatToolContext,
+  type ChatToolRequest
+} from "./tool-policy.js";
 
 export interface ChatHistoryPageInput {
   readonly topicId: string;
@@ -39,7 +41,7 @@ export function withChatHistoryContinuation(
       policyReceipt: ProviderPolicyReceipt | undefined,
       currentProviderSessionId: string | undefined
     ) => ClientHistoryResult;
-    readonly chatReadTools?: () => ChatReadToolContext;
+    readonly chatTools?: (event: ChatDispatchEvent) => ChatToolContext;
   }
 ): RuntimeAgentAdapter {
   return {
@@ -73,26 +75,27 @@ async function continueHistoryRequests(
       policyReceipt: ProviderPolicyReceipt | undefined,
       currentProviderSessionId: string | undefined
     ) => ClientHistoryResult;
-    readonly chatReadTools?: () => ChatReadToolContext;
+    readonly chatTools?: (event: ChatDispatchEvent) => ChatToolContext;
   }
 ): Promise<AgentAdapterInvocation> {
   let receipt = initialReceipt;
+  assertProviderSessionIdentity(input.providerSessionId, receipt.providerSessionId);
   if (receipt.outcome.kind !== "message") return receipt;
   let chatRequest = parseChatHistoryRequest(receipt.outcome.body);
   let clientRequest = parseClientHistoryRequestForAdapter(adapter, receipt.outcome.body);
-  let readToolRequest = options.chatReadTools === undefined
+  let toolRequest = options.chatTools === undefined
     ? undefined
-    : parseChatReadToolRequestForAdapter(adapter, receipt.outcome.body);
-  if (chatRequest === undefined && clientRequest === undefined && readToolRequest === undefined) {
+    : parseChatToolRequestForAdapter(adapter, receipt.outcome.body);
+  if (chatRequest === undefined && clientRequest === undefined && toolRequest === undefined) {
     return receipt;
   }
-  const readTools = options.chatReadTools?.();
+  const chatTools = options.chatTools?.(input.event);
   let expectedCursor: string | undefined;
   let initializedChatCursor = false;
   let recalledMessages = 0;
   let recalledBytes = 0;
   let requests = 0;
-  while (chatRequest !== undefined || clientRequest !== undefined || readToolRequest !== undefined) {
+  while (chatRequest !== undefined || clientRequest !== undefined || toolRequest !== undefined) {
     if (requests >= 20) throw new Error("Chat history access exceeds twenty requests");
     requests += 1;
     let response: string;
@@ -147,21 +150,26 @@ async function continueHistoryRequests(
         JSON.stringify(result, null, 2)
       ].join("\n");
     } else {
-      const result = callChatReadTool(
-        readTools!,
-        readToolRequest!.tool,
-        readToolRequest!.arguments
-      );
+      // History and tool results share one response budget. Reserve envelope space
+      // before a tool can mutate, rather than discover overflow after admission.
+      chatTools!.returnedBytes = Math.max(chatTools!.returnedBytes, recalledBytes + 4_096);
+      let result: unknown;
+      try {
+        result = callChatTool(chatTools!,toolRequest!.tool,toolRequest!.arguments);
+      } catch (error) {
+        result = {status:"tool_error",error:redact(error instanceof Error ? error.message : String(error)).slice(0,500),
+          guidance:"Check the source state before deciding again. Do not replay the whole instruction or assume a failed response undid an effect."};
+      }
       response = [
-        `The Runtime accepted your ${readToolRequest!.tool} Chat read request.`,
-        "Here is the bounded, redacted, read-only Rollerskate evidence:",
-        JSON.stringify(result, null, 2)
+        `Rollerskate tool result for ${toolRequest!.tool}:`,
+        JSON.stringify(result)
       ].join("\n");
     }
     recalledBytes += Buffer.byteLength(response, "utf8");
     if (recalledMessages > 10_000 || recalledBytes > 1_048_576) {
       throw new Error("Chat history access exceeds the bounded context budget");
     }
+    const expectedSessionId = receipt.providerSessionId;
     receipt = await adapter.invoke({
       event: {
         ...input.event,
@@ -175,25 +183,26 @@ async function continueHistoryRequests(
       },
       providerSessionId: receipt.providerSessionId
     });
+    assertProviderSessionIdentity(expectedSessionId,receipt.providerSessionId);
     chatRequest = receipt.outcome.kind === "message"
       ? parseChatHistoryRequest(receipt.outcome.body)
       : undefined;
     clientRequest = receipt.outcome.kind === "message"
       ? parseClientHistoryRequestForAdapter(adapter, receipt.outcome.body)
       : undefined;
-    readToolRequest = options.chatReadTools !== undefined && receipt.outcome.kind === "message"
-      ? parseChatReadToolRequestForAdapter(adapter, receipt.outcome.body)
+    toolRequest = options.chatTools !== undefined && receipt.outcome.kind === "message"
+      ? parseChatToolRequestForAdapter(adapter, receipt.outcome.body)
       : undefined;
   }
   return receipt;
 }
 
-function parseChatReadToolRequestForAdapter(
+function parseChatToolRequestForAdapter(
   adapter: RuntimeAgentAdapter,
   body: string
-): ChatReadToolRequest | undefined {
+): ChatToolRequest | undefined {
   return adapter.providerPolicy?.client === "kimi-code"
-    ? parseChatReadToolRequest(body)
+    ? parseChatToolRequest(body)
     : undefined;
 }
 

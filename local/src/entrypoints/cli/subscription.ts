@@ -1,3 +1,6 @@
+import { desktopSubscriptionDeliveries } from "../../application/subscription/desktop-control.js";
+import { recoverFileSubscription, fileSubscriptionRecoveries } from "../../application/subscription/file-recovery.js";
+import { registerFileSubscription, readFileSubscriptionRegistration } from "../../application/subscription/file-control.js";
 import {
   controlSubscriptionView,
   inspectSubscriptionView,
@@ -13,6 +16,10 @@ interface Output {
 const HELP = [
   "Usage:",
   "  scripts/rs subscription list",
+  "  scripts/rs subscription deliveries <subscription-id>",
+  "  scripts/rs subscription register-file <definition.json>",
+  "  scripts/rs subscription recover-file <request.json>",
+  "  scripts/rs subscription recoveries <subscription-id>",
   "  scripts/rs subscription history <subscription-id> --json",
   "  scripts/rs subscription inspect|pause|resume|cancel <subscription-id>"
 ].join("\n");
@@ -27,6 +34,29 @@ export function runSubscriptionCommand(
   if (command === "--help") {
     if (rest.length > 0) throw new Error("subscription help accepts no additional arguments");
     output.write(`${HELP}\n`);
+    return 0;
+  }
+  if (command === "register-desktop") {
+    throw new Error("subscription registration is internal; use run preflight/start --source <plugin-ref> --input <business-input.json>");
+  }
+  if (command === "deliveries") {
+    if (rest.length !== 1) throw new Error("subscription deliveries requires one subscription id");
+    output.write(`${JSON.stringify(desktopSubscriptionDeliveries(repoRoot, rest[0]!, runtimeDirectory), null, 2)}\n`);
+    return 0;
+  }
+  if (command === "register-file") {
+    if (rest.length !== 1) throw new Error("subscription register-file requires one definition JSON path");
+    output.write(`${JSON.stringify(registerFileSubscription(repoRoot, readFileSubscriptionRegistration(rest[0]!), runtimeDirectory), null, 2)}\n`);
+    return 0;
+  }
+  if (command === "recover-file") {
+    if (rest.length !== 1) throw new Error("subscription recover-file requires one recovery JSON path");
+    output.write(`${JSON.stringify(recoverFileSubscription(repoRoot, readFileSubscriptionRegistration(rest[0]!), runtimeDirectory), null, 2)}\n`);
+    return 0;
+  }
+  if (command === "recoveries") {
+    if (rest.length !== 1) throw new Error("subscription recoveries requires one subscription id");
+    output.write(`${JSON.stringify(fileSubscriptionRecoveries(repoRoot, rest[0]!, runtimeDirectory), null, 2)}\n`);
     return 0;
   }
   if (command === "add") {
@@ -68,5 +98,5 @@ export function runSubscriptionCommand(
     )}\n`);
     return 0;
   }
-  throw new Error("subscription requires list, history, inspect, pause, resume or cancel");
+  throw new Error("subscription requires deliveries, register-file, recover-file, recoveries, list, history, inspect, pause, resume or cancel; create observations with run preflight/start");
 }

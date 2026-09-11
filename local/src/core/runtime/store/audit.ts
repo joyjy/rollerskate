@@ -25,9 +25,10 @@ export class RuntimeAuditQuery {
     const resultExecution = resultEvent === undefined || resultEvent.eventId === event.eventId
       ? undefined
       : this.#query.executionForEvent(resultEvent.eventId);
-    const deliveries = resultEvent === undefined
-      ? []
-      : this.#query.deliveriesForResultEvent(resultEvent.eventId).map((delivery) => {
+    const deliveries = [
+      ...(resultEvent === undefined ? [] : this.#query.deliveriesForResultEvent(resultEvent.eventId)),
+      ...this.#query.deliveriesForHostOrigin(event.eventId)
+    ].map((delivery) => {
           const destination = this.#query.destination(delivery.destinationId);
           if (destination === undefined) {
             throw new Error(`Destination not found: ${delivery.destinationId}`);

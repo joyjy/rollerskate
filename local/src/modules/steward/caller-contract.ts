@@ -1,3 +1,6 @@
+import { parseStewardRunDecisionV6, type StewardRunDecisionV6 } from "./run-contract-v6.js";
+import { parseStewardRunDecisionV5, type StewardRunDecisionV5 } from "./run-contract-v5.js";
+import { parseStewardRunDecisionV4, type StewardRunDecisionV4 } from "./run-contract-v4.js";
 import {
   parseRunSourceBinding,
   type RunSourceBinding
@@ -171,7 +174,7 @@ export type StewardRunDecision =
   | StewardFinishRunDecision
   | StewardNeedsHumanRunDecision;
 
-export type AnyRunDecision = RunDecision | StewardRunDecision | StewardRunDecisionV3;
+export type AnyRunDecision = StewardRunDecisionV6 | RunDecision | StewardRunDecision | StewardRunDecisionV3 | StewardRunDecisionV4 | StewardRunDecisionV5;
 
 interface AgentRunDecisionReceiptBase {
   readonly runId: string;
@@ -190,10 +193,11 @@ interface AgentRunDecisionReceiptBase {
 
 export interface AgentRunDecisionReceiptV1 extends AgentRunDecisionReceiptBase {
   readonly schemaVersion: "AgentRunDecisionReceipt@1";
-  readonly action: Exclude<AnyRunDecision["action"], "await_source">;
+  readonly action: Exclude<AnyRunDecision["action"], "await_source" | "ask_human">;
 }
 
 export interface AgentRunDecisionReceiptV2 extends AgentRunDecisionReceiptBase {
+  readonly action: Exclude<AnyRunDecision["action"], "ask_human">;
   readonly schemaVersion: "AgentRunDecisionReceipt@2";
   readonly resultingRunStatus:
     | "active"
@@ -206,7 +210,15 @@ export interface AgentRunDecisionReceiptV2 extends AgentRunDecisionReceiptBase {
   readonly cycleId?: string;
 }
 
+export interface AgentRunHumanQuestionReceipt extends AgentRunDecisionReceiptBase {
+  readonly schemaVersion: "AgentRunDecisionReceipt@3";
+  readonly action: "ask_human" | "request_capability";
+  readonly questionId: string;
+  readonly resultingRunStatus: "awaiting_orchestrator";
+}
+
 export type AgentRunDecisionReceipt =
+  | AgentRunHumanQuestionReceipt
   | AgentRunDecisionReceiptV1
   | AgentRunDecisionReceiptV2;
 
@@ -262,6 +274,13 @@ export function parseRunDecision(
     kind: "result-contract",
     ...(options.allowHistorical === true ? { allowHistorical: true } : {})
   });
+  if (["spec:rollerskate/run-decision@4", "spec:rollerskate/run-decision@5", "spec:rollerskate/run-decision@6"].includes(registered.ref) &&
+    Object.hasOwn(parsed, "outputs")) {
+    throw new Error(`${parsed.schemaVersion} has unknown top-level field: outputs; place deliverables in finish.outputs for action=finish`);
+  }
+  if (registered.ref === "spec:rollerskate/run-decision@6") return parseStewardRunDecisionV6(parsed);
+  if (registered.ref === "spec:rollerskate/run-decision@5") return parseStewardRunDecisionV5(parsed);
+  if (registered.ref === "spec:rollerskate/run-decision@4") return parseStewardRunDecisionV4(parsed);
   if (registered.ref === "spec:rollerskate/run-decision@3") {
     return parseStewardRunDecisionV3(parsed);
   }
@@ -478,7 +497,9 @@ export function latestOrchestratorState(
 ): OrchestratorState | undefined {
   for (const record of decisions) {
     if (record.decision.schemaVersion === "RunDecision@2" ||
-      record.decision.schemaVersion === "RunDecision@3") return record.decision.state;
+      record.decision.schemaVersion === "RunDecision@3" ||
+      record.decision.schemaVersion === "RunDecision@4" ||
+      record.decision.schemaVersion === "RunDecision@5" || record.decision.schemaVersion === "RunDecision@6") return record.decision.state;
   }
   return undefined;
 }
@@ -535,6 +556,12 @@ export function parseAgentRunDecisionReceipt(
   const optional = [
     "targetAgentId", "nextStepId", "nextEventId", "nextExecutionId", "terminalStatus"
   ] as const;
+  if (registered.ref === "spec:rollerskate/agent-run-decision-receipt@3") {
+    exactKeys(parsed,["schemaVersion","runId","requestId","expectedRunVersion","resultingRunVersion","sourceStepId","action","acceptedAt","questionId","resultingRunStatus"],"AgentRunDecisionReceipt@3");
+    if ((parsed.action !== "ask_human" && parsed.action !== "request_capability") || parsed.resultingRunStatus !== "awaiting_orchestrator") throw new Error("Invalid human question receipt");
+    return {...decisionReceiptCommon(parsed),schemaVersion:"AgentRunDecisionReceipt@3",action:parsed.action,
+      questionId:text(parsed.questionId,"questionId",256),resultingRunStatus:"awaiting_orchestrator"};
+  }
   if (registered.ref === "spec:rollerskate/agent-run-decision-receipt@2") {
     exactKeys(parsed, [
       ...commonKeys, "resultingRunStatus", "finishScope", "sourceBinding", "cycleId"
@@ -808,4 +835,11 @@ function iso(value: unknown, field: string): string {
   const timestamp = text(value, field, 64);
   if (!Number.isFinite(Date.parse(timestamp))) throw new Error(`${field} must be RFC3339`);
   return new Date(timestamp).toISOString();
+}
+
+export function stewardDecisionVersion(binding: CallerOrchestratorBinding | undefined): 2 | 3 | 4 | 5 | 6 {
+  if (binding?.decisionContractId === "run-decision@6") return 6;
+  if (binding?.decisionContractId === "run-decision@5") return 5;
+  if (binding?.decisionContractId === "run-decision@4") return 4;
+  return binding?.decisionContractId === "run-decision@3" ? 3 : 2;
 }

@@ -635,7 +635,7 @@ export function createSchema(database: DatabaseSync): void {
       origin_id TEXT NOT NULL,
       destination_id TEXT NOT NULL,
       destination_kind TEXT NOT NULL CHECK(destination_kind IN (
-        'matrix', 'macos-notification', 'server-topic', 'vikunja-task'
+        'matrix', 'macos-notification', 'server-topic', 'vikunja-task', 'codex-desktop'
       )),
       destination_address_json TEXT NOT NULL CHECK(json_valid(destination_address_json)),
       payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
@@ -801,21 +801,23 @@ export function createSchema(database: DatabaseSync): void {
       definition_schema TEXT NOT NULL DEFAULT 'ContinuousSubscriptionDefinition@1' CHECK(
         definition_schema IN (
           'ContinuousSubscriptionDefinition@1', 'ContinuousSubscriptionDefinition@2',
-          'ContinuousSubscriptionDefinition@3'
+          'ContinuousSubscriptionDefinition@3', 'ContinuousSubscriptionDefinition@4'
         )
       ),
-      plugin_path TEXT NOT NULL,
-      plugin_id TEXT NOT NULL,
-      plugin_config_json TEXT NOT NULL CHECK(
+      plugin_path TEXT,
+      plugin_id TEXT,
+      plugin_config_json TEXT CHECK(
         json_valid(plugin_config_json) AND length(plugin_config_json) <= 65536
       ),
-      policy_json TEXT NOT NULL CHECK(
+      policy_json TEXT CHECK(
         json_valid(policy_json) AND length(policy_json) <= 65536
       ),
-      interval_ms INTEGER NOT NULL CHECK(interval_ms >= 100),
+      interval_ms INTEGER CHECK(interval_ms >= 100),
+      file_source_json TEXT CHECK(file_source_json IS NULL OR (json_valid(file_source_json) AND length(file_source_json) <= 16384)),
+      file_listener_json TEXT CHECK(file_listener_json IS NULL OR (json_valid(file_listener_json) AND length(file_listener_json) <= 8192)),
       poll_count INTEGER NOT NULL DEFAULT 0 CHECK(poll_count >= 0),
       status TEXT NOT NULL CHECK(status IN ('active', 'paused', 'blocked', 'cancelled')),
-      next_poll_at TEXT NOT NULL,
+      next_poll_at TEXT,
       checkpoint_occurrence_key TEXT,
       checkpoint_observation_json TEXT CHECK(
         checkpoint_observation_json IS NULL OR (
@@ -858,11 +860,37 @@ export function createSchema(database: DatabaseSync): void {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       CHECK(
+        (definition_schema = 'ContinuousSubscriptionDefinition@4' AND file_source_json IS NOT NULL)
+        OR (definition_schema != 'ContinuousSubscriptionDefinition@4' AND file_source_json IS NULL
+          AND plugin_path IS NOT NULL AND plugin_id IS NOT NULL AND plugin_config_json IS NOT NULL
+          AND policy_json IS NOT NULL AND interval_ms IS NOT NULL AND next_poll_at IS NOT NULL)
+      ),
+      CHECK(
+        definition_schema != 'ContinuousSubscriptionDefinition@4' OR (
+          (json_extract(target_json, '$.kind') = 'steward_run'
+            AND agent_run_id IS NOT NULL
+            AND json_extract(target_json, '$.sourceBinding.runId') = agent_run_id
+            AND json_extract(target_json, '$.sourceBinding.source.kind') = 'continuous_subscription'
+            AND json_extract(target_json, '$.sourceBinding.source.id') = subscription_id
+            AND json_extract(target_json, '$.sourceBinding.source.definitionRevision') =
+              'ContinuousSubscriptionDefinition@4:' || current_revision)
+          OR (json_extract(target_json, '$.kind') IN ('application_action', 'external_workflow')
+            AND agent_run_id IS NULL AND pending_cycle_id IS NULL AND pending_admission_receipt_json IS NULL)
+        )
+      ),
+      CHECK(
         (pending_occurrence_key IS NULL AND pending_observation_json IS NULL)
         OR (pending_occurrence_key IS NOT NULL AND pending_observation_json IS NOT NULL)
       ),
       CHECK(
-        (definition_schema = 'ContinuousSubscriptionDefinition@1'
+        (definition_schema = 'ContinuousSubscriptionDefinition@4'
+          AND file_source_json IS NOT NULL AND json_extract(file_source_json, '$.kind') = 'file'
+          AND plugin_path IS NULL AND plugin_id IS NULL AND plugin_config_json IS NULL
+          AND policy_json IS NULL AND interval_ms IS NULL AND next_poll_at IS NULL
+          AND owner_agent_id IS NULL AND source_binding_json IS NULL
+          AND target_json IS NOT NULL AND json_extract(target_json, '$.schemaVersion') = 'ProactiveTarget@1'
+          AND json_extract(target_json, '$.kind') IN ('steward_run', 'application_action', 'external_workflow'))
+        OR (definition_schema = 'ContinuousSubscriptionDefinition@1'
           AND owner_agent_id IS NOT NULL AND source_binding_json IS NULL
           AND target_json IS NULL
           AND agent_run_id IS NULL AND pending_cycle_id IS NULL
@@ -1050,8 +1078,7 @@ export function createSchema(database: DatabaseSync): void {
         AND json_extract(target_json, '$.workflow.executionPolicy.schemaVersion') =
           'ExternalWorkflowExecutionPolicy@1'
         AND json_type(target_json, '$.workflow.executionPolicy.maxAttempts') = 'integer'
-        AND json_extract(target_json, '$.workflow.executionPolicy.maxAttempts') =
-          max_attempts
+        AND json_extract(target_json, '$.workflow.executionPolicy.maxAttempts') BETWEEN 1 AND 5
         AND json_type(
           target_json, '$.workflow.executionPolicy.retryBackoffMilliseconds'
         ) = 'integer'
@@ -1068,7 +1095,7 @@ export function createSchema(database: DatabaseSync): void {
       attempt_count INTEGER NOT NULL CHECK(
         attempt_count >= 0 AND attempt_count <= max_attempts
       ),
-      max_attempts INTEGER NOT NULL CHECK(max_attempts BETWEEN 1 AND 5),
+      max_attempts INTEGER NOT NULL CHECK(max_attempts BETWEEN 1 AND 1000000),
       next_attempt_at TEXT NOT NULL,
       lease_owner TEXT,
       lease_token TEXT,
@@ -1154,6 +1181,16 @@ export function createSchema(database: DatabaseSync): void {
     );
     CREATE INDEX IF NOT EXISTS external_workflow_executions_due
       ON external_workflow_executions(status, next_attempt_at);
+    CREATE TABLE IF NOT EXISTS external_workflow_recovery_receipts (
+      source_kind TEXT NOT NULL,
+      source_id TEXT NOT NULL,
+      request_id TEXT NOT NULL,
+      execution_id TEXT NOT NULL REFERENCES external_workflow_executions(execution_id),
+      request_json TEXT NOT NULL CHECK(json_valid(request_json) AND length(request_json) <= 16384),
+      receipt_json TEXT NOT NULL CHECK(json_valid(receipt_json) AND length(receipt_json) <= 393216),
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(source_kind, source_id, request_id)
+    );
     CREATE TABLE IF NOT EXISTS proactive_source_migration_receipts (
       receipt_id TEXT PRIMARY KEY,
       request_id TEXT NOT NULL UNIQUE,

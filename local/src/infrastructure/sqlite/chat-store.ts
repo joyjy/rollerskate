@@ -18,7 +18,7 @@ import {
   isChatAttentionReason,
   type ChatAttentionReason
 } from "../../core/chat/state-machine.js";
-import { runtimeId } from "../../core/runtime/model.js";
+import { runtimeId, type RuntimeDestination } from "../../core/runtime/model.js";
 import { openRuntimeDatabase } from "./database.js";
 import { rebuildChatMessageProjection } from "./schema/index.js";
 import { withImmediateTransaction } from "./transaction.js";
@@ -91,13 +91,15 @@ export interface ChatReadProgress {
 
 export class LocalChatStore {
   readonly #database: DatabaseSync;
+  readonly #ownsDatabase: boolean;
 
-  public constructor(databasePath: string) {
-    this.#database = openRuntimeDatabase(databasePath);
+  public constructor(database: string | DatabaseSync) {
+    this.#ownsDatabase = typeof database === "string";
+    this.#database = typeof database === "string" ? openRuntimeDatabase(database) : database;
   }
 
   public close(): void {
-    this.#database.close();
+    if (this.#ownsDatabase) this.#database.close();
   }
 
   public message(eventId: string): ChatMessageEvent {
@@ -109,6 +111,7 @@ export class LocalChatStore {
     readonly ownerPrincipalId: string;
     readonly body: string;
     readonly targets?: readonly ChatAgentChoice[];
+    readonly replyDestination?: RuntimeDestination;
     readonly replyToEventId?: string;
     readonly at?: string;
   }): ChatMessageAdmission {
@@ -143,7 +146,7 @@ export class LocalChatStore {
           throw new Error("Reply reference must belong to the same Topic");
         }
       }
-      this.#insertChatMessage(messageId, payload, at);
+      this.#insertChatMessage(messageId, payload, at, undefined, undefined, undefined, true, input.replyDestination);
       return { message: this.#requireChatMessage(messageId) };
     });
   }
@@ -204,6 +207,7 @@ export class LocalChatStore {
   public admitExternalAgentMessage(
     input: ExternalAgentChatMessageAdmission
   ): ChatMessageAdmission & { readonly status: "accepted" | "duplicate" } {
+    if (!this.#database.isTransaction) return withImmediateTransaction(this.#database, () => this.admitExternalAgentMessage(input));
     const payload = {
       topicId: requireText(input.topicId, "topicId"),
       sender: {
@@ -222,33 +226,31 @@ export class LocalChatStore {
           })
     };
     const externalId = requireText(input.source.externalId, "source.externalId");
-    return withImmediateTransaction(this.#database, () => {
-      const existing = this.#database.prepare(`
-        SELECT event_id FROM events
-        WHERE source_kind = ? AND source_external_id = ?
-      `).get(input.source.kind, externalId) as { event_id: string } | undefined;
-      if (existing !== undefined) {
-        const message = this.#requireChatMessage(existing.event_id);
-        if (message.topicId !== input.topicId || message.body !== input.body ||
-          message.sender.kind !== "agent" ||
-          message.sender.principalId !== input.sender.principalId ||
-          message.sender.handleSnapshot !== input.sender.handleSnapshot) {
-          throw new Error(`External Chat message changed during replay: ${externalId}`);
-        }
-        return { message, status: "duplicate" };
+    const existing = this.#database.prepare(`
+      SELECT event_id FROM events
+      WHERE source_kind = ? AND source_external_id = ?
+    `).get(input.source.kind, externalId) as { event_id: string } | undefined;
+    if (existing !== undefined) {
+      const message = this.#requireChatMessage(existing.event_id);
+      if (message.topicId !== input.topicId || message.body !== input.body ||
+        message.sender.kind !== "agent" ||
+        message.sender.principalId !== input.sender.principalId ||
+        message.sender.handleSnapshot !== input.sender.handleSnapshot) {
+        throw new Error(`External Chat message changed during replay: ${externalId}`);
       }
-      const messageId = newEventId();
-      this.#insertChatMessage(
-        messageId,
-        payload,
-        timestamp(input.at),
-        undefined,
-        externalId,
-        input.source.kind,
-        input.activation !== undefined
-      );
-      return { message: this.#requireChatMessage(messageId), status: "accepted" };
-    });
+      return { message, status: "duplicate" };
+    }
+    const messageId = newEventId();
+    this.#insertChatMessage(
+      messageId,
+      payload,
+      timestamp(input.at),
+      undefined,
+      externalId,
+      input.source.kind,
+      input.activation !== undefined
+    );
+    return { message: this.#requireChatMessage(messageId), status: "accepted" };
   }
 
   public hasCanonicalEvent(eventId: string): boolean {
@@ -367,25 +369,37 @@ export class LocalChatStore {
     return rows.map(({ event_id }) => this.#requireChatEvent(event_id));
   }
 
-  public eventsAfter(topicIdInput: string, afterEventId: string, limit = 200): readonly Event[] {
+  public eventsAfter(
+    topicIdInput: string,
+    afterEventId: string | undefined,
+    limit = 200,
+    options: { readonly messagesOnly?: boolean; readonly excludeAgentId?: string } = {}
+  ): readonly Event[] {
     const topicId = requireText(topicIdInput, "topicId");
-    const cursor = this.#database.prepare(`
+    const cursor = afterEventId === undefined ? undefined : this.#database.prepare(`
       SELECT event_id, created_at FROM events
       WHERE event_id = ?
         AND type IN ('chat.activation', 'chat.message', 'chat.dispatch')
         AND json_extract(payload_json, '$.topicId') = ?
     `).get(afterEventId, topicId) as { event_id: string; created_at: string } | undefined;
-    if (cursor === undefined) {
+    if (afterEventId !== undefined && cursor === undefined) {
       throw new Error(`Chat follow cursor is not an Event in Topic: ${afterEventId}`);
     }
     const rows = this.#database.prepare(`
       SELECT event_id FROM events
       WHERE type IN ('chat.activation', 'chat.message', 'chat.dispatch')
         AND json_extract(payload_json, '$.topicId') = ?
-        AND (created_at > ? OR (created_at = ? AND event_id > ?))
+        AND (? IS NULL OR created_at > ? OR (created_at = ? AND event_id > ?))
+        AND (? = 0 OR type = 'chat.message')
+        AND (? IS NULL OR json_extract(payload_json, '$.sender.kind') = 'owner'
+          OR (json_extract(payload_json, '$.sender.kind') = 'agent'
+            AND json_extract(payload_json, '$.sender.principalId') != ?))
       ORDER BY created_at ASC, event_id ASC LIMIT ?
     `).all(
-      topicId, cursor.created_at, cursor.created_at, cursor.event_id,
+      topicId, cursor?.event_id ?? null, cursor?.created_at ?? null,
+      cursor?.created_at ?? null, cursor?.event_id ?? null,
+      options.messagesOnly === true ? 1 : 0,
+      options.excludeAgentId ?? null, options.excludeAgentId ?? null,
       bounded(limit, 1, 1_000)
     ) as unknown as Array<{ event_id: string }>;
     return rows.map(({ event_id }) => this.#requireChatEvent(event_id));
@@ -543,7 +557,8 @@ export class LocalChatStore {
     parentEventId?: string,
     sourceExternalId?: string,
     sourceKind?: Event["source"]["kind"],
-    continueAttention = true
+    continueAttention = true,
+    replyDestination?: RuntimeDestination
   ): void {
     this.#database.prepare(`
       INSERT INTO events (
@@ -551,7 +566,7 @@ export class LocalChatStore {
         outcome, output, error, payload_json, session_id, destination_ids_json,
         destination_snapshots_json,
         root_event_id, parent_event_id, causal_hop, created_at
-      ) VALUES (?, 'chat.message', ?, ?, ?, NULL, NULL, NULL, NULL, ?, NULL, '[]', '[]',
+      ) VALUES (?, 'chat.message', ?, ?, ?, NULL, NULL, NULL, NULL, ?, NULL, ?, ?,
         ?, ?, ?, ?)
     `).run(
       eventId,
@@ -559,6 +574,8 @@ export class LocalChatStore {
       sourceExternalId ?? null,
       (payload.sender as { principalId?: string }).principalId ?? null,
       JSON.stringify(payload),
+      JSON.stringify(replyDestination === undefined ? [] : [replyDestination.destinationId]),
+      JSON.stringify(replyDestination === undefined ? [] : [replyDestination]),
       parentEventId ?? eventId,
       parentEventId ?? null,
       parentEventId === undefined ? 0 : 1,
@@ -621,7 +638,7 @@ export class LocalChatStore {
       INSERT INTO executions (
         execution_id, event_id, handler, status, attempt_count, max_attempts,
         next_attempt_at, created_at, updated_at
-      ) VALUES (?, ?, 'agent', 'queued', 0, 3, ?, ?, ?)
+      ) VALUES (?, ?, 'agent', 'queued', 0, 1, ?, ?, ?)
     `).run(executionId, eventId, at, at, at);
     return {
       event: this.#requireChatDispatch(eventId),
@@ -669,7 +686,7 @@ export class LocalChatStore {
   #requireChatEvent(eventId: string): Event {
     const row = this.#database.prepare(`
       SELECT event_id, type, source_kind, source_external_id, agent_id, prompt,
-             payload_json, session_id, root_event_id, parent_event_id, causal_hop, created_at
+             payload_json, session_id, destination_ids_json, root_event_id, parent_event_id, causal_hop, created_at
       FROM events WHERE event_id = ?
     `).get(eventId) as {
       event_id: string;
@@ -680,6 +697,7 @@ export class LocalChatStore {
       prompt: string | null;
       payload_json: string | null;
       session_id: string | null;
+      destination_ids_json: string;
       root_event_id: string;
       parent_event_id: string | null;
       causal_hop: number;
@@ -698,7 +716,7 @@ export class LocalChatStore {
         ...(row.source_external_id === null ? {} : { externalId: row.source_external_id })
       },
       ...(row.session_id === null ? {} : { sessionId: row.session_id }),
-      destinationIds: [] as readonly string[],
+      destinationIds: JSON.parse(row.destination_ids_json) as readonly string[],
       causality: {
         rootEventId: row.root_event_id,
         ...(row.parent_event_id === null ? {} : { parentEventId: row.parent_event_id }),

@@ -1,3 +1,4 @@
+import { DeterministicApplicationActionRegistry } from "../proactive/action-registry.js";
 import type { FreeSubscription } from "../../capabilities/subscription/model.js";
 import type { DatabaseSync } from "node:sqlite";
 import type {
@@ -30,6 +31,7 @@ import {
   type ListPageInput
 } from "../list-page.js";
 import { openRuntimeDatabaseReadOnly } from "../../infrastructure/sqlite/database.js";
+import { assertCurrentLocalSchema } from "../../infrastructure/sqlite/schema/index.js";
 
 export {
   subscriptionHistory,
@@ -135,7 +137,7 @@ export type SubscriptionRunSourceView = {
 } | {
   readonly kind: "continuous";
   readonly status: string;
-  readonly nextPollAt: string;
+  readonly nextPollAt: string | null;
   readonly pendingOccurrenceKey: string | null;
   readonly checkpointOccurrenceKey: string | null;
   readonly pendingCycleId: string | null;
@@ -426,13 +428,21 @@ function requireOwner(agentId: string, foundation: LocalFoundationStore): LocalA
 }
 
 function openQueryResources(repoRoot: string, runtimeDirectory?: string) {
-  const database = runtimePaths(repoRoot, runtimeDirectory).database;
-  return {
-    store: new SubscriptionStore(database),
-    callbacks: new CallbackStore(database),
-    foundation: new LocalFoundationStore(database),
-    runtime: new RuntimeStore(database)
-  };
+  const database = openRuntimeDatabaseReadOnly(runtimePaths(repoRoot, runtimeDirectory).database);
+  try {
+    assertCurrentLocalSchema(database);
+    const options = { migrate: false } as const;
+    return {
+      database,
+      store: new SubscriptionStore(database, { ...options, applicationActions: new DeterministicApplicationActionRegistry(database) }),
+      callbacks: new CallbackStore(database, options),
+      foundation: new LocalFoundationStore(database, options),
+      runtime: new RuntimeStore(database, options)
+    };
+  } catch (error) {
+    database.close();
+    throw error;
+  }
 }
 
 function callbackOwner(subscriptionId: string) {
@@ -492,4 +502,5 @@ function closeQueryResources(resources: ReturnType<typeof openQueryResources>): 
   resources.foundation.close();
   resources.callbacks.close();
   resources.store.close();
+  resources.database.close();
 }

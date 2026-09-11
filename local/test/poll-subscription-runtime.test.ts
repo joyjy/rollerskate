@@ -1,7 +1,7 @@
+import { temporaryDirectory } from "./support/temp-directory.js";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -11,7 +11,7 @@ import { PollProbeExecutor } from "../src/capabilities/subscription/plugin-runne
 import { LocalFoundationStore } from "../src/infrastructure/sqlite/foundation-store.js";
 
 test("Subscription runtime records terminal state and leaves callback admission to its phase", async () => {
-  const directory = mkdtempSync(join(tmpdir(), "rollerskate-subscription-runtime-"));
+  const directory = temporaryDirectory("rollerskate-subscription-runtime-");
   const database = join(directory, "runtime.db");
   const pluginPath = join(directory, "probe.mjs");
   writeFileSync(pluginPath, `export default {

@@ -218,14 +218,11 @@ export class InteractiveChannelRuntime {
   }
 
   #localEventsAfter(topicId: string, cursor: string | undefined, senderAgentId: string) {
-    const events = cursor === undefined
-      ? this.#chat.events(topicId, 200)
-      : this.#chat.eventsAfter(topicId, cursor, 200);
-    return events
-      .filter((event) => event.type === "chat.message" &&
-        (event.sender.kind === "owner" ||
-          (event.sender.kind === "agent" && event.sender.principalId !== senderAgentId)))
-      .slice(0, 100)
+    // Filter before LIMIT so non-replies cannot hide a later observation.
+    return this.#chat.eventsAfter(topicId, cursor, 100, {
+      messagesOnly: true,
+      excludeAgentId: senderAgentId
+    })
       .map(({ eventId, causality }) => ({
         cursor: eventId,
         rootEventId: causality.rootEventId

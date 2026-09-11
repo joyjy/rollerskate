@@ -2,7 +2,7 @@
 
 ![Rollerskate logo](assets/logo.png)
 
-Rollerskate v0.5.6 是 Local-first Agent proactive system。首次启动无需 Server、OIDC 或 Device enrollment：Runtime 自动建立全局 `~/.rollerskate/`、共享 LocalWorkspace、Owner Principal、唯一 `Local` Chat 与后台 Core Loop。产品能力包括 Subscription、Scheduled Task、Steward Run、Agent Run、Topic governance、可显式指定 intent 的长期 Free Chat、Topic activation schedule、same-client history、Interactive Channel send/follow/callback、Notice Center、公开 Agent/Topic profile 与原生 Server Topic 被动同步；Kimi、pi 与 Codex provider invocation 统一使用流式进度、独立 total/idle timeout、协议取消和有界失败恢复。基础产品入口仍是 `scripts/rs start`。
+Rollerskate v0.6.0 是 Local-first Agent proactive system。首次启动无需 Server、OIDC 或 Device enrollment：Runtime 自动建立全局 `~/.rollerskate/`、共享 LocalWorkspace、Owner Principal、唯一 `Local` Chat 与后台 Core Loop。产品能力包括 Subscription、Scheduled Task、Steward Run、Agent Run、source-driven Topic conversation、Chat-to-Run proposal/confirmation/reconcile、same-client history、安全只读 Chat tools、Subscription history、Interactive Channel send/follow/callback、Notice Center、公开 Agent/Topic profile 与原生 Server Topic 同步与受准入控制的 Chat ingress；Schedule 与 Subscription 通过统一 `ProactiveTarget@1` 激活已准入 Run、同库 application action 或 Owner-registered durable external workflow。基础产品入口仍是 `scripts/rs start`。
 
 ## Local product
 
@@ -33,7 +33,7 @@ Local Chat 的 Owner/system/Agent message 都是 immutable canonical Event。一
 
 ## Network profile and safety
 
-Server 功能仍通过 Local Console 的 `/console/network` 暴露，而不是再启动一套 Server admin UI。Network 页创建 browser pairing，并在新标签页通过 Server Web session 完成 OIDC Authorization Code + PKCE 登录；Human 显式批准 Device 后，Local 后端轮询 pairing 并兑换 credential。CLI `device login` 仍使用 Device Authorization Grant。Owner 随后可把现有 Local Agent enrollment/recovery 到 Server，查看 Server credential 与 public profile、创建或更新 Topic profile、让 Agent 加入 Topic，并使用 Agent credential 以幂等 transaction ID 发布消息。加入和频道历史显示 `主人 / 设备 / @Agent`，canonical namespace 使用稳定 Human、Device 与 Agent ID；Agent name 只在同一 Owner 内唯一，不同 Owner 可以重名。Local Runtime 只把 Server delivery 写入被动 Topic inbox，不自动创建本地 Agent Execution。
+Server 功能仍通过 Local Console 的 `/console/network` 暴露，而不是再启动一套 Server admin UI。Network 页创建 browser pairing，并在新标签页通过 Server Web session 完成 OIDC Authorization Code + PKCE 登录；Human 显式批准 Device 后，Local 后端轮询 pairing 并兑换 credential。CLI `device login` 仍使用 Device Authorization Grant。Owner 随后可把现有 Local Agent enrollment/recovery 到 Server，查看 Server credential 与 public profile、创建或更新 Topic profile、让 Agent 加入 Topic，并使用 Agent credential 以幂等 transaction ID 发布消息。加入和频道历史显示 `主人 / 设备 / @Agent`，canonical namespace 使用稳定 Human、Device 与 Agent ID；Agent name 只在同一 Owner 内唯一，不同 Owner 可以重名。Local Runtime 将 Server delivery 保存到 Topic inbox，并通过固定 bridge 将 Human 消息与符合条件的 Agent 消息按外部 source identity 去重，写入本地 canonical Chat Event；Human 消息进入 Chat Execution，后续 provider dispatch 仍由 Topic admission、participant 与 attention 规则决定。同步与崩溃恢复顺序见 [State and recovery](docs/architecture/state-and-recovery.md)。
 
 公开 profile 只包含公共身份、角色、disclosure 与表达规则。私有人格 prompt、workspace、memory、provider transcript、credential 和工具权限不上传 Server。Owner 可以按 Agent 显式授权或撤销 same-client history；provider policy、bounded scan/read、redaction 和 audit 只约束本地读取，不把 Server Topic 变成远端执行入口。Topic governance、带随机 idle/participant 策略的 Free Chat mode、scheduled activation 与原生 interactive Channel send/follow 进入 v0.5.2。当前通用 Run 支持 `forum@1`、manual caller 和默认 Codex Orchestrator；Vikunja 作为 read-only Connector 与普通 terminal writeback destination 使用，不建立 Project/effect 硬集成。从 RS UI 发起、观察和介入 Agent Run，并处理 External Requests 的 Interactive Run Workspace 进入 v0.6。
 
@@ -73,6 +73,8 @@ scripts/rs run legacy-migrate /absolute/path/to/approved-migration.json
 Local 的 core 拥有 canonical Event、durable Agent execution 与唯一长期运行的 loop；Subscription、Scheduled Task 与 Agent Run module 随源码发布，用户 Plugin 只能填入受限 strategy slot。完整源码归属与依赖方向以 [Source map](docs/architecture/source-map.md) 为准，运行语义见 [Local Runtime architecture](docs/architecture/local-runtime.md)。
 
 ## 开发验证
+
+全仓验证需要 Node.js 24+。`npm test` 构建并执行 Protocol、Local、Server 测试；`npm run verify` 继续执行 Console 测试。验证只依赖本仓库脚本和 npm workspaces。Local 测试最多并行运行 4 个测试文件，避免包含子进程的集成用例争抢资源而干扰启动时限断言。
 
 ```bash
 npm install

@@ -93,3 +93,10 @@ export interface ProviderPolicyObservationSnapshot {
     readonly helperDigest?: string;
   };
 }
+
+/** A resumed execution must not silently switch to a new provider conversation. */
+export function assertProviderSessionIdentity(expected: string | undefined, actual: string): void {
+  if (expected !== undefined && expected !== actual) {
+    throw new Error("Resumed provider Session identity does not match the request");
+  }
+}

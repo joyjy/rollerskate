@@ -1,3 +1,4 @@
+import { chatRunOriginSql, chatRunRequestId } from "./work-origin.js";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { isAbsolute } from "node:path";
@@ -18,9 +19,9 @@ import type {
   RunIntent,
   StewardRunRequest
 } from "../../modules/steward/admission-contract.js";
-import type { AgentRunStatus } from "../../modules/steward/state-machine.js";
+import { inspectStewardWork, type StewardWorkView } from "../steward/work-query.js";
 import { stableContractJson } from "../../modules/steward/contract-codec.js";
-import { compileRunIntentInDatabase } from "../steward/admission.js";
+import { compileRunIntentInDatabase, StewardUnavailableError } from "../steward/admission.js";
 
 export type ChatRunWorkspaceSelection =
   | { readonly kind: "project" }
@@ -83,13 +84,7 @@ export interface ChatRunProposalView {
     readonly maxSteps: number;
     readonly maxDepth: number;
   };
-  readonly linkedRun?: {
-    readonly runId: string;
-    readonly state: "started" | "needs_human" | "terminal";
-    readonly status: AgentRunStatus;
-    readonly terminalSummary?: string;
-    readonly updatedAt: string;
-  };
+  readonly linkedRun?: StewardWorkView;
   readonly decision?: {
     readonly status: "declined";
     readonly eventId: string;
@@ -126,14 +121,13 @@ interface ProposalDecisionRow {
   readonly payload_json: string;
   readonly receipt_json: string | null;
   readonly run_id: string | null;
-  readonly run_status: string | null;
-  readonly terminal_summary: string | null;
-  readonly run_updated_at: string | null;
+  readonly owner_request_id: string | null;
   readonly proposal_decision_event_id: string | null;
   readonly proposal_decision_payload_json: string | null;
 }
 
 interface ProposalCandidate {
+  readonly ownerRequestId?: string;
   readonly dispatchEventId: string;
   readonly agentId: string;
   readonly handle: string;
@@ -158,15 +152,13 @@ export function projectChatRunProposals(input: {
   const rows = input.database.prepare(`
     SELECT event.event_id, event.agent_id, event.created_at, event.payload_json,
       execution.receipt_json,
-      run.run_id, run.status AS run_status, run.terminal_summary,
-      run.updated_at AS run_updated_at,
+      run.run_id, run.owner_request_id,
       proposal_decision.event_id AS proposal_decision_event_id,
       proposal_decision.payload_json AS proposal_decision_payload_json
     FROM events AS event
     JOIN executions AS execution ON execution.event_id = event.event_id
     LEFT JOIN agent_runs AS run
-      ON run.owner_request_id = 'chat-work:' ||
-        json_extract(event.payload_json, '$.sourceMessageEventId') || ':' || event.event_id
+      ON ${chatRunOriginSql("event")}
     LEFT JOIN events AS proposal_decision
       ON proposal_decision.type = 'chat.message'
       AND proposal_decision.source_kind = 'cli'
@@ -194,13 +186,14 @@ export function projectChatRunProposals(input: {
       if (decision?.proposal === undefined) return [];
       const payload = parseDispatchPayload(row);
       return [{
+        ...(row.owner_request_id === null ? {} : { ownerRequestId: row.owner_request_id }),
         dispatchEventId: row.event_id,
         agentId: row.agent_id,
         handle: payload.targetHandleSnapshot,
         createdAt: row.created_at,
         decisionCreatedAt: decision.createdAt,
         proposal: decision.proposal,
-        ...linkedRun(row),
+        ...linkedRun(row, input),
         ...proposalDecision(row)
       }];
     }).sort((left, right) =>
@@ -262,7 +255,8 @@ function projectSelectedProposal(
           selected.dispatchEventId,
           selected.proposal,
           participantIds,
-          workspaceRef
+          workspaceRef,
+          selected.ownerRequestId
         ),
         input.database,
         input.runtimeDirectory
@@ -290,7 +284,8 @@ function projectSelectedProposal(
   });
   const agentsById = new Map(input.agents.map((agent) => [agent.principalId, agent]));
   const orchestrator = input.agents.find((agent) =>
-    agent.status === "active" && agent.handle === "codex");
+    agent.status === "active" && (admission?.stewardSelection === undefined
+      ? agent.handle === "codex" : agent.principalId === admission.stewardSelection.agentId));
   const visibleParticipantIds = admission?.authority.participantAgentIds ?? [...new Set([
     ...(orchestrator === undefined ? [] : [orchestrator.principalId]),
     ...participantIds
@@ -367,30 +362,12 @@ function proposalDecision(
 }
 
 function linkedRun(
-  row: ProposalDecisionRow
-): { readonly linkedRun?: NonNullable<ChatRunProposalView["linkedRun"]> } {
-  if (row.run_id === null || row.run_status === null || row.run_updated_at === null) return {};
-  const status = runStatus(row.run_status);
-  return {
-    linkedRun: {
-      runId: row.run_id,
-      state: status === "needs_human"
-        ? "needs_human"
-        : status === "succeeded" || status === "failed" || status === "cancelled"
-          ? "terminal"
-          : "started",
-      status,
-      ...(row.terminal_summary === null ? {} : { terminalSummary: row.terminal_summary }),
-      updatedAt: row.run_updated_at
-    }
+  row: ProposalDecisionRow,
+  context: { readonly repoRoot: string; readonly runtimeDirectory?: string; readonly database: DatabaseSync }
+): { readonly linkedRun?: StewardWorkView } {
+  return row.run_id === null ? {} : {
+    linkedRun: inspectStewardWork(context.repoRoot, row.run_id, context.runtimeDirectory, context.database)
   };
-}
-
-function runStatus(value: string): AgentRunStatus {
-  if (value === "active" || value === "waiting" || value === "awaiting_orchestrator" ||
-    value === "awaiting_source" || value === "succeeded" || value === "failed" ||
-    value === "needs_human" || value === "cancelled") return value;
-  throw new Error(`Chat proposal linked Run status is unsupported: ${value}`);
 }
 
 function parseDispatchPayload(row: ProposalDecisionRow): {
@@ -416,7 +393,8 @@ function runIntent(
   dispatchEventId: string,
   proposal: ChatRunProposalDraft,
   participantIds: readonly string[],
-  workspaceRef: string | undefined
+  workspaceRef: string | undefined,
+  existingRequestId?: string
 ): RunIntent {
   if (proposal.goal === undefined || proposal.scope.include.length === 0 ||
     proposal.acceptance.length === 0 || proposal.desiredEffect === undefined) {
@@ -425,7 +403,7 @@ function runIntent(
   const goal = proposal.goal;
   return {
     schemaVersion: "RunIntent@1",
-    requestId: `chat-work:${message.eventId}:${dispatchEventId}`,
+    requestId: existingRequestId ?? chatRunRequestId(message.eventId, dispatchEventId),
     objective: renderObjective(goal, proposal.scope),
     acceptance: proposal.acceptance,
     contextRefs: [
@@ -483,10 +461,10 @@ function admissionBlocker(
 ): ChatRunProposalBlocker {
   const detail = boundedError(error);
   const normalizedDetail = detail.toLocaleLowerCase();
-  if (detail.includes("active codex Steward Agent")) {
+  if (error instanceof StewardUnavailableError) {
     return {
       code: "steward_unavailable",
-      message: "An active @codex Steward is required before this Run can start.",
+      message: "The selected Steward Agent must be active before this Run can start.",
       action: "inspect_agents",
       detail
     };

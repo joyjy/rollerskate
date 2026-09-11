@@ -87,7 +87,7 @@ test("ScheduleRevision@3 binds atomically and a due once occurrence only activat
     assert.equal(occurrenceEvent?.source.kind, "handler");
     assert.equal(occurrenceEvent?.type === "agent.request"
       ? occurrenceEvent.runContext?.resultContractId
-      : undefined, "run-decision@3");
+      : undefined, "run-decision@6");
 
     const cycleId = occurrence.cycleId!;
     closeContext(context);
@@ -378,11 +378,11 @@ function decision(
   parameters: Readonly<Record<string, unknown>>
 ) {
   return {
-    schemaVersion: "RunDecision@3",
+    schemaVersion: "RunDecision@6",
     action: "await_source",
     expectedRunVersion,
     rationale: "Wait for the admitted Schedule",
-    checkedAcceptance: [],
+    checkedAcceptance: [{id: "a1", status: "pass", evidenceRefs: ["fixture:occurrence-receipt"]}],
     state: {
       schemaVersion: "OrchestratorState@1",
       goal: "Process occurrences",

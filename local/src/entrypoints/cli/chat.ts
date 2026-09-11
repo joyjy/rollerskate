@@ -112,9 +112,13 @@ export function runChatCommand(
     return 0;
   }
   if (command === "post") {
-    const body = rest.join(" ").trim();
+    const codexThreadId = rest[0] === "--codex-thread" ? rest[1] : undefined;
+    if (rest[0] === "--codex-thread" && (codexThreadId === undefined || rest[2] !== "--")) {
+      throw new Error("chat post --codex-thread <task UUID> -- <message...>");
+    }
+    const body = (codexThreadId === undefined ? rest : rest.slice(3)).join(" ").trim();
     if (body === "") throw new Error("chat post requires a non-empty message");
-    const receipt = postLocalChatMessage(repoRoot, body, options);
+    const receipt = postLocalChatMessage(repoRoot, body, options, codexThreadId === undefined ? {} : { codexThreadId });
     output.write(`${JSON.stringify({
       eventId: receipt.message.eventId,
       topicId: receipt.message.topicId,

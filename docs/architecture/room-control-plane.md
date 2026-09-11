@@ -10,7 +10,7 @@ timestamp: 2026-07-20
 
 [返回 architecture index](./index.md)
 
-本页只描述 v0.2 已实现的 legacy Server Room control plane。Local 产品已 clean cutover 为 `Local` Chat，不把它创建、迁移、同步或转换成 Server Room。v0.4.0 的原生 Server Topic、membership、Runtime subscription 与 fanout 是独立主链，当前事实见 [System topology](./system-topology.md) 与 [v0.4.0 verification](../verification/v0.4.0.md)；legacy Room 仍只用于兼容 Matrix control plane。
+本页只描述 v0.2 已实现的 legacy Server Room control plane。Local 产品已 clean cutover 为 `Local` Chat，不把它创建、迁移、同步或转换成 Server Room。v0.4.0 的原生 Server Topic、membership、Runtime subscription 与 fanout 是独立主链，当前事实见 [System topology](./system-topology.md)；legacy Room 仍只用于兼容 Matrix control plane。
 
 ## 产品事实与 Matrix 事实
 

@@ -1,7 +1,38 @@
 import * as v from "valibot";
 import { localAgentSchema } from "./local";
 import { chatPresenceSchema, runtimeEventSchema } from "./event";
-import { optionalString } from "./shared";
+import { optionalString, runHumanQuestionSchema } from "./shared";
+
+export const chatWorkViewSchema = v.object({
+    humanQuestion:v.optional(v.nullable(runHumanQuestionSchema)),
+    runId: v.string(),
+    label: optionalString,
+    version: v.optional(v.number()),
+    state: v.union([
+      v.literal("started"),
+      v.literal("needs_human"),
+      v.literal("terminal")
+    ]),
+    status: v.union([
+      v.literal("active"),
+      v.literal("waiting"),
+      v.literal("awaiting_orchestrator"),
+      v.literal("awaiting_source"),
+      v.literal("succeeded"),
+      v.literal("failed"),
+      v.literal("needs_human"),
+      v.literal("cancelled")
+    ]),
+    terminal: v.optional(v.boolean()),
+    attentionReason: optionalString,
+    outputs: v.optional(v.array(v.object({
+      outputId: v.string(), stepId: v.string(), title: v.string(),
+      kind: v.string(), contentType: v.string()
+    }))),
+    outputsTruncated: v.optional(v.boolean()),
+    terminalSummary: optionalString,
+    updatedAt: v.string()
+  });
 
 export const chatRunProposalDraftSchema = v.object({
   schema: v.literal("ChatRunProposalDraft@1"),
@@ -74,26 +105,7 @@ export const chatRunProposalViewSchema = v.object({
     maxSteps: v.number(),
     maxDepth: v.number()
   })),
-  linkedRun: v.optional(v.object({
-    runId: v.string(),
-    state: v.union([
-      v.literal("started"),
-      v.literal("needs_human"),
-      v.literal("terminal")
-    ]),
-    status: v.union([
-      v.literal("active"),
-      v.literal("waiting"),
-      v.literal("awaiting_orchestrator"),
-      v.literal("awaiting_source"),
-      v.literal("succeeded"),
-      v.literal("failed"),
-      v.literal("needs_human"),
-      v.literal("cancelled")
-    ]),
-    terminalSummary: optionalString,
-    updatedAt: v.string()
-  })),
+  linkedRun: v.optional(chatWorkViewSchema),
   decision: v.optional(v.object({
     status: v.literal("declined"),
     eventId: v.string(),
@@ -154,6 +166,7 @@ export const localChatViewSchema = v.object({
           failureReason: optionalString
         }))
       })),
+      works: v.optional(v.array(chatWorkViewSchema)),
       runProposals: v.optional(v.array(chatRunProposalViewSchema))
     })),
     hasEarlier: v.boolean(),

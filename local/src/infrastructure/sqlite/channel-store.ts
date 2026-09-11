@@ -65,12 +65,12 @@ export class ChannelStore {
   readonly #database: DatabaseSync;
   readonly #ownsDatabase: boolean;
 
-  public constructor(database: string | DatabaseSync) {
+  public constructor(database: string | DatabaseSync, options: { readonly migrate?: boolean } = {}) {
     this.#database = typeof database === "string"
       ? openInitializedRuntimeDatabase(database, migrateLocalDatabase)
       : database;
     this.#ownsDatabase = typeof database === "string";
-    if (!this.#ownsDatabase) migrateLocalDatabase(this.#database);
+    if (!this.#ownsDatabase && options.migrate !== false) migrateLocalDatabase(this.#database);
   }
 
   public close(): void {
@@ -180,6 +180,9 @@ export class ChannelStore {
     readonly receipt: ChannelSendReceipt;
     readonly follow: ChannelFollow;
   } {
+    if (!this.#database.isTransaction) {
+      return withImmediateTransaction(this.#database, () => this.reserveSend(input));
+    }
     const receipt = parseChannelSendReceipt(input.receipt);
     const follow = parseChannelFollow(input.follow);
     if (receipt.status !== "pending" || receipt.revision !== 1) {
@@ -191,46 +194,44 @@ export class ChannelStore {
       channelRefKey(follow.channelRef) !== channelRefKey(receipt.channelRef)) {
       throw new Error("Channel send and follow reservation identities must agree");
     }
-    return withImmediateTransaction(this.#database, () => {
-      const existing = this.sendForIdempotency(receipt.bindingId, receipt.idempotencyKey);
-      if (existing !== undefined) {
-        if (!sameSendRequest(existing, receipt)) {
-          throw new ChannelSendIdempotencyConflict(existing);
-        }
-        return {
-          created: false,
-          receipt: existing,
-          follow: this.requireFollow(existing.followToken)
-        };
+    const existing = this.sendForIdempotency(receipt.bindingId, receipt.idempotencyKey);
+    if (existing !== undefined) {
+      if (!sameSendRequest(existing, receipt)) {
+        throw new ChannelSendIdempotencyConflict(existing);
       }
-      const binding = this.requireBinding(receipt.bindingId);
-      if (binding.revision !== receipt.bindingRevision ||
-        binding.agentId !== receipt.senderAgentId ||
-        !interactiveChannelBindingAvailableAt(binding, receipt.createdAt) ||
-        !channelRefAllowed(binding, receipt.channelRef)) {
-        throw new Error("Interactive Channel binding authority changed before send admission");
-      }
-      if (follow.callback !== undefined &&
-        follow.callback.sessionId !== binding.callbackSessionId) {
-        throw new Error("Channel follow callback must use the exact bound Session");
-      }
-      this.#database.prepare(`
-        INSERT INTO channel_send_receipts (
-          send_id, binding_id, idempotency_key, channel_kind, channel_id,
-          receipt_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        receipt.sendId,
-        receipt.bindingId,
-        receipt.idempotencyKey,
-        receipt.channelRef.kind,
-        receipt.channelRef.channelId,
-        JSON.stringify(receipt),
-        receipt.createdAt
-      );
-      this.#insertFollow(follow);
-      return { created: true, receipt, follow };
-    });
+      return {
+        created: false,
+        receipt: existing,
+        follow: this.requireFollow(existing.followToken)
+      };
+    }
+    const binding = this.requireBinding(receipt.bindingId);
+    if (binding.revision !== receipt.bindingRevision ||
+      binding.agentId !== receipt.senderAgentId ||
+      !interactiveChannelBindingAvailableAt(binding, receipt.createdAt) ||
+      !channelRefAllowed(binding, receipt.channelRef)) {
+      throw new Error("Interactive Channel binding authority changed before send admission");
+    }
+    if (follow.callback !== undefined &&
+      follow.callback.sessionId !== binding.callbackSessionId) {
+      throw new Error("Channel follow callback must use the exact bound Session");
+    }
+    this.#database.prepare(`
+      INSERT INTO channel_send_receipts (
+        send_id, binding_id, idempotency_key, channel_kind, channel_id,
+        receipt_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      receipt.sendId,
+      receipt.bindingId,
+      receipt.idempotencyKey,
+      receipt.channelRef.kind,
+      receipt.channelRef.channelId,
+      JSON.stringify(receipt),
+      receipt.createdAt
+    );
+    this.#insertFollow(follow);
+    return { created: true, receipt, follow };
   }
 
   public getSend(sendId: string): ChannelSendReceipt | undefined {
@@ -271,29 +272,31 @@ export class ChannelStore {
     readonly expectedRevision: number;
     readonly next: ChannelSendReceipt;
   }): ChannelSendReceipt {
-    return withImmediateTransaction(this.#database, () => {
-      const current = this.requireSend(input.sendId);
-      if (current.revision !== input.expectedRevision) {
-        throw new ChannelSendRevisionConflict(input.expectedRevision, current);
-      }
-      const next = parseChannelSendReceipt(input.next);
-      if (!sameSendRequest(current, next) || next.sendId !== current.sendId ||
-        next.followToken !== current.followToken || next.transactionId !== current.transactionId ||
-        next.createdAt !== current.createdAt || next.revision !== current.revision + 1) {
-        throw new Error("Channel send transition changed request identity or revision");
-      }
-      if (current.status !== "pending") {
-        throw new Error(`Terminal Channel send cannot become ${next.status}`);
-      }
-      const result = this.#database.prepare(`
-        UPDATE channel_send_receipts SET receipt_json = ?
-        WHERE send_id = ? AND json_extract(receipt_json, '$.revision') = ?
-      `).run(JSON.stringify(next), next.sendId, current.revision);
-      if (result.changes !== 1) {
-        throw new ChannelSendRevisionConflict(input.expectedRevision, this.requireSend(input.sendId));
-      }
-      return next;
-    });
+    if (!this.#database.isTransaction) return withImmediateTransaction(this.#database, () => this.commitSend(input));
+    const current = this.requireSend(input.sendId);
+    if (current.revision !== input.expectedRevision) {
+      throw new ChannelSendRevisionConflict(input.expectedRevision, current);
+    }
+    const next = parseChannelSendReceipt(input.next);
+    if (!sameSendRequest(current, next) || next.sendId !== current.sendId ||
+      next.followToken !== current.followToken || next.transactionId !== current.transactionId ||
+      next.createdAt !== current.createdAt || next.revision !== current.revision + 1) {
+      throw new Error("Channel send transition changed request identity or revision");
+    }
+    if (current.deliveryAttempted === true && next.deliveryAttempted !== true) {
+      throw new Error("Channel delivery attempt evidence cannot be cleared");
+    }
+    if (current.status !== "pending") {
+      throw new Error(`Terminal Channel send cannot become ${next.status}`);
+    }
+    const result = this.#database.prepare(`
+      UPDATE channel_send_receipts SET receipt_json = ?
+      WHERE send_id = ? AND json_extract(receipt_json, '$.revision') = ?
+    `).run(JSON.stringify(next), next.sendId, current.revision);
+    if (result.changes !== 1) {
+      throw new ChannelSendRevisionConflict(input.expectedRevision, this.requireSend(input.sendId));
+    }
+    return next;
   }
 
   public getFollow(followToken: string): ChannelFollow | undefined {
@@ -352,30 +355,31 @@ export class ChannelStore {
     readonly expectedRevision: number;
     readonly next: ChannelFollow;
   }): ChannelFollow {
-    return withImmediateTransaction(this.#database, () => {
-      const current = this.requireFollow(input.followToken);
-      if (current.revision !== input.expectedRevision) {
-        throw new ChannelFollowRevisionConflict(input.expectedRevision, current);
-      }
-      const next = parseChannelFollow(input.next);
-      if (next.followToken !== current.followToken || next.sendId !== current.sendId ||
-        next.bindingId !== current.bindingId || next.bindingRevision !== current.bindingRevision ||
-        channelRefKey(next.channelRef) !== channelRefKey(current.channelRef) ||
-        next.condition !== current.condition || next.deadlineAt !== current.deadlineAt ||
-        next.createdAt !== current.createdAt || next.revision !== current.revision + 1) {
-        throw new Error("Channel follow transition changed identity, policy, or revision");
-      }
-      const result = this.#database.prepare(`
-        UPDATE channel_follows SET status = ?, state_json = ?, updated_at = ?
-        WHERE follow_token = ? AND json_extract(state_json, '$.revision') = ?
-      `).run(next.status, JSON.stringify(next), next.updatedAt, next.followToken, current.revision);
-      if (result.changes !== 1) {
-        throw new ChannelFollowRevisionConflict(
-          input.expectedRevision, this.requireFollow(input.followToken)
-        );
-      }
-      return next;
-    });
+    if (!this.#database.isTransaction) {
+      return withImmediateTransaction(this.#database, () => this.commitFollow(input));
+    }
+    const current = this.requireFollow(input.followToken);
+    if (current.revision !== input.expectedRevision) {
+      throw new ChannelFollowRevisionConflict(input.expectedRevision, current);
+    }
+    const next = parseChannelFollow(input.next);
+    if (next.followToken !== current.followToken || next.sendId !== current.sendId ||
+      next.bindingId !== current.bindingId || next.bindingRevision !== current.bindingRevision ||
+      channelRefKey(next.channelRef) !== channelRefKey(current.channelRef) ||
+      next.condition !== current.condition || next.deadlineAt !== current.deadlineAt ||
+      next.createdAt !== current.createdAt || next.revision !== current.revision + 1) {
+      throw new Error("Channel follow transition changed identity, policy, or revision");
+    }
+    const result = this.#database.prepare(`
+      UPDATE channel_follows SET status = ?, state_json = ?, updated_at = ?
+      WHERE follow_token = ? AND json_extract(state_json, '$.revision') = ?
+    `).run(next.status, JSON.stringify(next), next.updatedAt, next.followToken, current.revision);
+    if (result.changes !== 1) {
+      throw new ChannelFollowRevisionConflict(
+        input.expectedRevision, this.requireFollow(input.followToken)
+      );
+    }
+    return next;
   }
 
   #insertFollow(follow: ChannelFollow): void {

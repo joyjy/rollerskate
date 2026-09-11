@@ -102,7 +102,13 @@ function stepDepthPadding(step: AgentRunStepOutput): string {
         </div>
       </div>
 
-      <div v-if="run.checkpoint" class="checkpoint">
+      <div v-if="run.humanQuestion?.status === 'pending' || run.humanQuestion?.status === 'expired'" class="checkpoint" role="status">
+        <strong>{{ run.humanQuestion.status === 'pending' ? 'Waiting for your answer' : 'Question expired' }}</strong>
+        <span>{{ run.humanQuestion.question }}</span>
+        <RouterLink class="trace-link" to="/console/chats">Reply in Chat</RouterLink>
+      </div>
+
+      <div v-else-if="run.checkpoint" class="checkpoint">
         <strong>Awaiting Caller decision</strong>
         <span>{{ run.checkpoint.result.outcome }} · {{ run.checkpoint.result.summary }}</span>
         <span class="mono">run version {{ run.projection.version }} · {{ run.decisions.length }} accepted decision{{ run.decisions.length === 1 ? "" : "s" }}</span>

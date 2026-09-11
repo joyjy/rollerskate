@@ -44,6 +44,8 @@ Agent Run 不新增 `steward.*` Event 或专用 Handler。generic ResultHandler 
 
 ## Local Chat 主链
 
+Owner CLI 可在一条单 Agent Local Chat 请求的既有 Destination snapshot 中固定 `codex-desktop` 与 exact `threadId/agentId`。Chat application 建立绑定，integration 根据 canonical Owner source 与直接 dispatch 解析 `ChatReplyRoute`；Core 在保存 Agent reply 的同一事务内建立 host-origin Delivery，origin 为 reply Event。独立 Run、后续 reply/activation 和无绑定消息不继承该权限。Desktop adapter 从 canonical Event 回读正文与来源，并通过 RS 内置 Desktop IPC 传输发送；不在 Core、ResultHandler 或 provider adapter 中解析 Desktop IPC。操作与失败语义见 [Desktop push](../runbook/codex-desktop-push.md)。
+
 ```text
 owner | agent chat.message
   -> ChatHandler

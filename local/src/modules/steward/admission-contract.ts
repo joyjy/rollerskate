@@ -1,3 +1,5 @@
+import { parseAcceptanceContract, type AcceptanceContract } from "./acceptance.js";
+import { parseStewardSelection, type StewardSelection } from "./steward-policy.js";
 import { createHash } from "node:crypto";
 
 import { assertSpecCompatibility } from "../spec/registry.js";
@@ -27,6 +29,7 @@ export interface RunIntent {
   readonly resultDestinationRef?: string;
   readonly requestedParticipantRefs?: readonly string[];
   readonly terminalEvidence: readonly string[];
+  readonly dispatchNotes?: string;
 }
 
 export interface RunAuthorityEnvelope {
@@ -65,7 +68,11 @@ export type CompiledRunMandate =
     };
 
 export interface StewardRunRequest {
+  readonly acceptanceContract?: AcceptanceContract;
+  readonly dispatchNotes?: string;
+  readonly ownerNetworkAuthorized?: boolean;
   readonly schemaVersion: "StewardRunRequest@2";
+  readonly stewardSelection?: StewardSelection;
   readonly requestId: string;
   readonly idempotencyKey: string;
   readonly intentDigest: string;
@@ -95,10 +102,10 @@ export function parseRunIntent(value: unknown): RunIntent {
   exactContractKeys(input, [
     "schemaVersion", "requestId", "objective", "acceptance", "contextRefs",
     "workspaceRef", "desiredEffect", "triggerIntent", "resultDestinationRef",
-    "requestedParticipantRefs", "terminalEvidence"
+    "requestedParticipantRefs", "terminalEvidence", "dispatchNotes"
   ], "RunIntent@1", [
     "workspaceRef", "desiredEffect", "triggerIntent", "resultDestinationRef",
-    "requestedParticipantRefs"
+    "requestedParticipantRefs", "dispatchNotes"
   ]);
   if (input.schemaVersion !== "RunIntent@1") {
     throw new Error("RunIntent@1 schemaVersion is required");
@@ -116,6 +123,7 @@ export function parseRunIntent(value: unknown): RunIntent {
   }
   return {
     schemaVersion: "RunIntent@1",
+    ...(input.dispatchNotes === undefined ? {} : {dispatchNotes: contractText(input.dispatchNotes, "dispatchNotes")}),
     requestId: contractText(input.requestId, "requestId", 256),
     objective: contractText(input.objective, "objective"),
     acceptance: contractStringList(input.acceptance, "acceptance", { minimum: 1 }),
@@ -194,6 +202,7 @@ export function parseRunAuthorityEnvelope(value: unknown): RunAuthorityEnvelope 
 
 export function parseStewardRunRequest(value: unknown): StewardRunRequest {
   const input = contractRecord(value, "StewardRunRequest@2");
+  if (input.ownerNetworkAuthorized !== undefined && typeof input.ownerNetworkAuthorized !== "boolean") throw new Error("ownerNetworkAuthorized must be boolean");
   assertSpecCompatibility(
     "spec:rollerskate/steward-run-request@2",
     input.schemaVersion,
@@ -202,13 +211,17 @@ export function parseStewardRunRequest(value: unknown): StewardRunRequest {
   exactContractKeys(input, [
     "schemaVersion", "requestId", "idempotencyKey", "intentDigest", "objective",
     "acceptance", "contextRefs", "terminalEvidence", "mandate", "authority",
-    "resultDestination", "admissionDigest", "authoritySummary"
-  ], "StewardRunRequest@2", ["resultDestination"]);
+    "resultDestination", "admissionDigest", "authoritySummary", "stewardSelection", "acceptanceContract", "dispatchNotes", "ownerNetworkAuthorized"
+  ], "StewardRunRequest@2", ["resultDestination", "stewardSelection", "acceptanceContract", "dispatchNotes", "ownerNetworkAuthorized"]);
   if (input.schemaVersion !== "StewardRunRequest@2") {
     throw new Error("StewardRunRequest@2 schemaVersion is required");
   }
   return {
     schemaVersion: "StewardRunRequest@2",
+    ...(input.acceptanceContract === undefined ? {} : {acceptanceContract: parseAcceptanceContract(input.acceptanceContract)}),
+    ...(input.dispatchNotes === undefined ? {} : {dispatchNotes: contractText(input.dispatchNotes, "dispatchNotes")}),
+    ...(input.ownerNetworkAuthorized === true ? {ownerNetworkAuthorized: true} : {}),
+    ...(input.stewardSelection === undefined ? {} : { stewardSelection: parseStewardSelection(input.stewardSelection) }),
     requestId: contractText(input.requestId, "requestId", 256),
     idempotencyKey: contractText(input.idempotencyKey, "idempotencyKey", 512),
     intentDigest: digest(input.intentDigest, "intentDigest"),

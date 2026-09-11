@@ -1,3 +1,5 @@
+import { inspectStewardWork } from "../src/application/steward/work-query.js";
+import { stewardStatsView } from "../src/application/steward/stats-query.js";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -15,6 +17,7 @@ import {
   retryStewardOrchestrator
 } from "../src/application/steward/control.js";
 import { StewardModule } from "../src/application/steward/module.js";
+import { inspectStewardRunView } from "../src/application/steward/query.js";
 import {
   AgentHandler,
   ResultHandler,
@@ -38,7 +41,7 @@ import type { RunSourceBinding } from
 import { runAuthorityDigest } from
   "../src/modules/steward/admission-contract.js";
 
-test("RunDecision@3 await_source and source cycle execute through the Runtime loop", async () => {
+test("RunDecision@6 await_source and source cycle execute through the Runtime loop", async () => {
   const fixture = setup();
   const started = startStewardRunFromIntent(fixture.repo, intent("runtime-loop-run"),
     fixture.runtimeDirectory, "2026-08-26T01:00:00.000Z");
@@ -64,7 +67,7 @@ test("RunDecision@3 await_source and source cycle execute through the Runtime lo
       invocation += 1;
       if (invocation === 2) throw new Error("transient source orchestrator failure");
       const body = outputs.shift();
-      if (body === undefined) throw new Error("scripted RunDecision@3 output exhausted");
+      if (body === undefined) throw new Error("scripted RunDecision@6 output exhausted");
       return {
         providerSessionId: `codex-source-session-${invocation}`,
         outcome: { kind: "message", body },
@@ -91,7 +94,7 @@ test("RunDecision@3 await_source and source cycle execute through the Runtime lo
       "2026-08-26T01:00:02.000Z");
     const bound = runs.requireProjection(started.run.runId);
     assert.equal(bound.status, "awaiting_source");
-    assert.equal(runs.decisions(bound.runId)[0]?.decision.schemaVersion, "RunDecision@3");
+    assert.equal(runs.decisions(bound.runId)[0]?.decision.schemaVersion, "RunDecision@6");
 
     const activated = runtime.withImmediateTransaction(() =>
       activateRunSourceOccurrenceInTransaction({
@@ -130,7 +133,7 @@ test("RunDecision@3 await_source and source cycle execute through the Runtime lo
     `).all();
     assert.equal(afterCycle.status, "awaiting_source", JSON.stringify(resultReceipts));
     assert.equal(runs.cycle(activated.cycle.cycleId)?.status, "succeeded");
-    assert.match(prompts[0]!, /RunDecision@3/u);
+    assert.match(prompts[0]!, /RunDecision@6/u);
     assert.match(prompts[0]!, /For await_source use:/u);
     assert.match(prompts[1]!, /TriggerOccurrenceEnvelope@1/u);
     assert.match(prompts[1]!, /await_source is invalid now/u);
@@ -160,10 +163,16 @@ test("standalone read-only Steward retries once and keeps exact Owner recovery",
     async invoke(input) {
       invocation += 1;
       prompts.push(input.event.prompt);
-      if (invocation <= 2) throw new Error(`standalone failure ${invocation}`);
+      if (invocation === 2) throw new Error(`standalone failure ${invocation}`);
       return {
         providerSessionId: "standalone-recovered",
-        outcome: { kind: "message", body: JSON.stringify(finishDecision(2, "run")) }
+        outcome: { kind: "message", body: JSON.stringify({
+          ...finishDecision(invocation === 1 ? 999 : 2, "run"),
+          finish: { ...finishDecision(2, "run").finish, outputs: [{
+            id: "report", title: "Report", contentType: "application/json",
+            schemaVersion: "ExampleReport@1", value: { finding: "recovered" }
+          }] }
+        }) }
       };
     }
   };
@@ -189,6 +198,17 @@ test("standalone read-only Steward retries once and keeps exact Owner recovery",
     assert.equal(awaiting.version, 2);
     assert.match(prompts[0]!, /Current Run version: 1/);
     assert.match(prompts[1]!, /Current Run version: 2/);
+    const fallback = inspectStewardRunView(fixture.repo, started.run.runId,
+      fixture.runtimeDirectory).intervention;
+    assert.equal(fallback?.kind, "manual_fallback");
+    assert.equal(fallback.runVersion, awaiting.version);
+    assert.match(fallback.reason, /standalone failure 2/);
+    assert.deepEqual(fallback.allowedActions, ["retry_orchestrator", "decide", "cancel"]);
+
+    const work = inspectStewardWork(fixture.repo, started.run.runId, fixture.runtimeDirectory);
+    assert.equal(work.state, "needs_human");
+    assert.equal(work.terminal, false);
+    assert.equal(work.attentionReason, fallback.reason);
 
     const recovered = retryStewardOrchestrator(
       fixture.repo,
@@ -198,6 +218,9 @@ test("standalone read-only Steward retries once and keeps exact Owner recovery",
       "2026-08-26T01:06:00.000Z"
     );
     assert.equal(recovered.status, "accepted");
+    assert.equal(inspectStewardRunView(fixture.repo, started.run.runId,
+      fixture.runtimeDirectory).intervention, null);
+
     assert.equal(retryStewardOrchestrator(
       fixture.repo,
       started.run.runId,
@@ -211,6 +234,29 @@ test("standalone read-only Steward retries once and keeps exact Owner recovery",
       "2026-08-26T01:06:02.000Z");
     assert.match(prompts[2]!, /Current Run version: 2/);
     assert.equal(runs.requireProjection(started.run.runId).status, "succeeded");
+    const outputs = inspectStewardRunView(fixture.repo, started.run.runId,
+      fixture.runtimeDirectory).outputFolders.flatMap((folder) => folder.outputs);
+    const report = outputs.filter((output) => output.id === "report");
+    assert.equal(report.length, 1);
+    assert.deepEqual(report[0]?.value, { finding: "recovered" });
+    assert.equal(report[0]?.schemaVersion, "ExampleReport@1");
+    const finished = inspectStewardWork(fixture.repo, started.run.runId, fixture.runtimeDirectory);
+    assert.equal(finished.state, "terminal");
+    assert.equal(finished.terminal, true);
+    assert.equal(finished.intervention, null);
+    assert.equal(finished.outputs[0]?.title, "Report");
+    assert.equal("value" in finished.outputs[0]!, false);
+
+    const stats = stewardStatsView(fixture.repo, fixture.runtimeDirectory).groups[0]!;
+    assert.equal(stats.runs, 1);
+    assert.equal(stats.succeeded, 1);
+    assert.equal(stats.fallbackRuns, 1);
+    assert.equal(stats.fallbackRate, 1);
+    assert.equal(stats.successRate, 1);
+    assert.equal(stats.durationSamples, 1);
+    assert.equal(report[0]?.contentType, "application/json");
+    assert.equal(inspectStewardRunView(fixture.repo, started.run.runId,
+      fixture.runtimeDirectory).intervention, null);
   } finally {
     runs.close();
     runtime.close();
@@ -329,7 +375,7 @@ test("source Steward retry is bounded and Owner can recover the exact cycle", as
   }
 });
 
-test("RunDecision@3 binds one source and finish scope separates cycle from Run", () => {
+test("RunDecision@6 binds one source and finish scope separates cycle from Run", () => {
   const fixture = setup();
   const database = openRuntimeDatabase(fixture.paths.database);
   const runtime = new RuntimeStore(database);
@@ -342,7 +388,7 @@ test("RunDecision@3 binds one source and finish scope separates cycle from Run",
     assert.equal(rootEvent?.type, "agent.request");
     assert.equal(rootEvent?.type === "agent.request"
       ? rootEvent.runContext?.resultContractId
-      : undefined, "run-decision@3");
+      : undefined, "run-decision@6");
     const bound = runtime.withImmediateTransaction(() =>
       applyRunDecisionInTransaction({
         runtime,
@@ -387,7 +433,7 @@ test("RunDecision@3 binds one source and finish scope separates cycle from Run",
     assert.equal(occurrenceEvent?.type, "agent.request");
     assert.equal(occurrenceEvent?.type === "agent.request"
       ? occurrenceEvent.runContext?.resultContractId
-      : undefined, "run-decision@3");
+      : undefined, "run-decision@6");
     const replay = runtime.withImmediateTransaction(() =>
       activateRunSourceOccurrenceInTransaction({
         runtime,
@@ -659,7 +705,7 @@ function intent(requestId: string) {
 
 function awaitScheduleDecision(expectedRunVersion: number) {
   return {
-    schemaVersion: "RunDecision@3",
+    schemaVersion: "RunDecision@6",
     action: "await_source",
     expectedRunVersion,
     rationale: "Wait for the admitted schedule",
@@ -679,11 +725,11 @@ function finishDecision(
   outcome: "succeeded" | "failed" = "succeeded"
 ) {
   return {
-    schemaVersion: "RunDecision@3",
+    schemaVersion: "RunDecision@6",
     action: "finish",
     expectedRunVersion,
     rationale: `Finish ${scope}`,
-    checkedAcceptance: ["cycle receipt"],
+    checkedAcceptance: [{id: "a1", status: "pass", evidenceRefs: ["fixture:cycle-receipt"]}],
     state: state(),
     finish: {
       scope,
@@ -695,7 +741,7 @@ function finishDecision(
 
 function nextStepDecision(expectedRunVersion: number, agentId: string) {
   return {
-    schemaVersion: "RunDecision@3",
+    schemaVersion: "RunDecision@6",
     action: "next_step",
     expectedRunVersion,
     rationale: "Try an unadmitted Agent",

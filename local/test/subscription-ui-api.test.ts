@@ -1,9 +1,8 @@
+import { temporaryDirectory } from "./support/temp-directory.js";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
 import test from "node:test";
 
 import { LocalFoundationStore } from "../src/infrastructure/sqlite/foundation-store.js";
@@ -15,7 +14,7 @@ import { startUiServer } from "../src/entrypoints/console/launcher.js";
 import { RuntimeStore } from "../src/core/runtime/store.js";
 
 test("loopback UI API reads durable Subscriptions and applies explicit control actions", async () => {
-  const directory = mkdtempSync(join(tmpdir(), "rollerskate-subscription-ui-"));
+  const directory = temporaryDirectory("rollerskate-subscription-ui-");
   const database = join(directory, "runtime.db");
   const ownerAgentId = seedAgent(database);
   seedSession(database, directory, ownerAgentId);
@@ -91,7 +90,7 @@ test("loopback UI API reads durable Subscriptions and applies explicit control a
       failures: Array<{ owner: string }>;
     };
     assert.equal(runtimeView.status, "stopped");
-    assert.equal(runtimeView.version, "0.5.7");
+    assert.equal(runtimeView.version, "0.6.0");
     assert.deepEqual(runtimeView.controls, { pause: false, resume: false, recover: false });
     assert.ok(runtimeView.workload.ready >= 0);
     assert.ok(runtimeView.failures.every((failure) => failure.owner !== "runtime"));

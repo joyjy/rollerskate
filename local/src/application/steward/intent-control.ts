@@ -83,7 +83,7 @@ export function startStewardRunFromAdmissionInTransaction(
 function startInputFromAdmission(admission: StewardRunRequest): StartStewardRunInput {
   return {
     requestId: admission.idempotencyKey,
-    steward: "codex",
+    steward: admission.stewardSelection?.agentId ?? "codex",
     ...(admission.mandate.kind === "objective"
       ? { objective: renderIntentMandate(admission) }
       : {
@@ -118,6 +118,9 @@ function startInputFromAdmission(admission: StewardRunRequest): StartStewardRunI
       mode: "steward",
       admission: {
         digest: admission.admissionDigest,
+        ...(admission.acceptanceContract === undefined ? {} : {acceptanceContract: admission.acceptanceContract}),
+        ...(admission.ownerNetworkAuthorized === true ? {ownerNetworkAuthorized: true} : {}),
+        ...(admission.stewardSelection === undefined ? {} : { selection: admission.stewardSelection }),
         authority: admission.authority
       }
     },
@@ -131,8 +134,9 @@ function renderIntentMandate(request: StewardRunRequest): string {
   return [
     request.objective,
     "",
-    "Acceptance:",
-    ...request.acceptance.map((item) => `- ${item}`),
+    "Original acceptance (dispatch notes cannot weaken these requirements):",
+    ...request.acceptance.map((item, index) => `- a${index + 1}: ${item}`),
+    ...(request.dispatchNotes === undefined ? [] : ["Dispatch notes (execution advice only):", request.dispatchNotes]),
     "",
     "Terminal evidence:",
     ...request.terminalEvidence.map((item) => `- ${item}`),

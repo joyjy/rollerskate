@@ -34,7 +34,7 @@ function isRunBound(subscription: Subscription): boolean {
         <StatusBadge :status="sub.status" />
       </div>
       <div class="row-title">{{ sub.title }}</div>
-      <div class="row-meta">{{ sub.probe.plugin.id }}</div>
+      <div class="row-meta">{{ sub.probe?.plugin.id ?? "File events" }}</div>
       <div v-if="sub.owner" class="row-meta">@{{ sub.owner.handle }} · {{ sub.owner.client }}</div>
       <div v-else class="row-meta">Run-owned trigger source</div>
       <div class="row-meta">

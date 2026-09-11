@@ -1,10 +1,10 @@
 import { fileURLToPath } from "node:url";
 
 import {
-  callChatReadTool,
-  chatReadToolDefinitions,
-  createChatReadToolContext
-} from "../../application/chat/read-tool-policy.js";
+  callChatTool,
+  chatToolDefinitions,
+  createChatToolContext
+} from "../../application/chat/tool-policy.js";
 import {
   runStdioMcpToolServer,
   safeMcpError
@@ -12,15 +12,16 @@ import {
 
 async function main(): Promise<void> {
   const values = argumentsMap(process.argv.slice(2));
-  const context = createChatReadToolContext({
+  const context = createChatToolContext({
     repoRoot: required(values, "--repo-root"),
+    dispatchEventId: required(values, "--dispatch-event-id"),
     runtimeDirectory: required(values, "--runtime-directory")
   });
   await runStdioMcpToolServer({
-    name: "rollerskate-chat-read-tools",
-    version: "0.5.7",
-    tools: chatReadToolDefinitions,
-    call: (name, args) => callChatReadTool(context, name, args)
+    name: "rollerskate-chat-tools",
+    version: "0.6.0",
+    tools: chatToolDefinitions,
+    call: (name, args) => callChatTool(context, name, args)
   });
 }
 
@@ -31,7 +32,7 @@ function argumentsMap(argv: readonly string[]): ReadonlyMap<string, string> {
     const value = argv[index + 1];
     if (name === undefined || value === undefined || !name.startsWith("--") ||
       values.has(name)) {
-      throw new Error("Chat read tools MCP arguments are malformed");
+      throw new Error("Chat tools MCP arguments are malformed");
     }
     values.set(name, value);
   }
@@ -41,7 +42,7 @@ function argumentsMap(argv: readonly string[]): ReadonlyMap<string, string> {
 function required(values: ReadonlyMap<string, string>, key: string): string {
   const value = values.get(key);
   if (value === undefined || value.trim() === "" || value.includes("\0")) {
-    throw new Error(`Chat read tools MCP ${key} is required`);
+    throw new Error(`Chat tools MCP ${key} is required`);
   }
   return value;
 }

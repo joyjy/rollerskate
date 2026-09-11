@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { realpathSync, statSync } from "node:fs";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type {
@@ -15,6 +15,8 @@ import type {
   PollProbeResult
 } from "./plugin-contract.js";
 import type { ProbeExecutionPolicy } from "./model.js";
+
+import { parsePollProbe, validatePollProbe } from "./probe-validation.js";
 
 interface PluginHostRequest {
   readonly pluginPath: string;
@@ -45,7 +47,7 @@ export class PollPluginRunner {
       config,
       context
     });
-    return parseProbe(value);
+    return parsePollProbe(value);
   }
 
   public async evaluate(
@@ -146,12 +148,12 @@ export class PollProbeExecutor {
     this.#fetch = options.fetch ?? fetch;
   }
 
-  public execute(
+  public async execute(
     probe: PollProbe,
     policy: ProbeExecutionPolicy,
     signal?: AbortSignal
   ): Promise<PollProbeResult> {
-    validatePolicy(policy);
+    probe = validatePollProbe(probe, policy, this.#environment);
     return probe.kind === "http"
       ? this.#executeHttp(probe, policy, signal)
       : this.#executeCommand(probe, policy, signal);
@@ -195,16 +197,9 @@ export class PollProbeExecutor {
     policy: ProbeExecutionPolicy,
     signal?: AbortSignal
   ): Promise<CommandProbeResult> {
-    if (!isAbsolute(probe.executable)) {
-      throw new Error(`Command probe executable is not allowed: ${probe.executable}`);
-    }
     const executable = realpathSync(probe.executable);
-    if (!statSync(executable).isFile() || !policy.allowedExecutables.includes(executable)) {
-      throw new Error(`Command probe executable must resolve to an allowed file: ${probe.executable}`);
-    }
     const workspace = realpathSync(policy.workspaceRoot);
-    const cwd = realpathSync(resolve(probe.cwd ?? workspace));
-    if (!isWithin(workspace, cwd)) throw new Error(`Command probe cwd is outside workspace: ${cwd}`);
+    const cwd = realpathSync(resolve(workspace, probe.cwd ?? "."));
     const environment = resolveValues(probe.environment ?? {}, policy, this.#environment);
     return runCommand({
       executable,
@@ -216,18 +211,6 @@ export class PollProbeExecutor {
       ...(signal === undefined ? {} : { signal })
     });
   }
-}
-
-function parseProbe(value: unknown): PollProbe {
-  if (!isRecord(value)) throw new Error("Poll plugin plan result must be an object");
-  if (value.kind === "http" && typeof value.url === "string") {
-    return value as unknown as HttpPollProbe;
-  }
-  if (value.kind === "command" && typeof value.executable === "string" &&
-    Array.isArray(value.args) && value.args.every((item) => typeof item === "string")) {
-    return value as unknown as CommandPollProbe;
-  }
-  throw new Error("Poll plugin returned an unsupported probe");
 }
 
 function parseObservation(value: unknown): PollObservation {
@@ -247,15 +230,6 @@ function canonicalPluginPath(path: string): string {
   const canonical = realpathSync(path);
   if (!statSync(canonical).isFile()) throw new Error("Poll plugin path must be a file");
   return canonical;
-}
-
-function validatePolicy(policy: ProbeExecutionPolicy): void {
-  if (!isAbsolute(policy.workspaceRoot)) throw new Error("policy workspaceRoot must be absolute");
-  bounded(policy.timeoutMilliseconds, 100, 300_000, "probe timeout");
-  bounded(policy.maxOutputBytes, 1, 10_485_760, "probe output limit");
-  for (const origin of policy.allowedHttpOrigins) {
-    if (new URL(origin).origin !== origin) throw new Error(`allowed HTTP origin is not canonical: ${origin}`);
-  }
 }
 
 function resolveValues(
@@ -366,11 +340,6 @@ function runCommand(options: CommandRunOptions): Promise<CommandProbeResult> {
       }
     });
   });
-}
-
-function isWithin(root: string, target: string): boolean {
-  const path = relative(root, target);
-  return path === "" || (!path.startsWith("..") && !isAbsolute(path));
 }
 
 function bounded(value: number, minimum: number, maximum: number, field: string): number {

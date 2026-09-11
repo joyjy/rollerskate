@@ -1,3 +1,4 @@
+import { stewardDecisionVersion } from "../../modules/steward/caller-contract.js";
 import { createHash } from "node:crypto";
 
 import { RuntimeStore } from "../../core/runtime/store.js";
@@ -81,7 +82,9 @@ export function activateRunSourceOccurrenceInTransaction(input: {
       maxSteps: run.maxSteps,
       completedWorkerSteps: 0,
       participants: input.runs.activeParticipantTargets(participantIds),
-      contractVersion: 3,
+      contractVersion: stewardDecisionVersion(binding),
+      ...(binding.acceptanceContract === undefined ? {} : {acceptanceContract: binding.acceptanceContract}),
+      currentNetworkAccess: run.workspaceGrant?.networkAccess ?? false,
       ...(binding.authority.trigger === undefined
         ? {}
         : { triggerKinds: binding.authority.trigger.allowedKinds }),
@@ -94,7 +97,7 @@ export function activateRunSourceOccurrenceInTransaction(input: {
     }),
     runContext: {
       schemaVersion: "AgentRunContext@1",
-      resultContractId: "run-decision@3",
+      resultContractId: binding.decisionContractId,
       runId: run.runId,
       cycleId,
       stepId,

@@ -1,6 +1,6 @@
+import { temporaryDirectory } from "./support/temp-directory.js";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -11,7 +11,7 @@ import {
 } from "../src/capabilities/subscription/plugin-runner.js";
 
 test("TypeScript poll plugin plans a probe and evaluates a terminal result in the host", async () => {
-  const directory = mkdtempSync(join(tmpdir(), "rollerskate-plugin-runner-"));
+  const directory = temporaryDirectory("rollerskate-plugin-runner-");
   const plugin = join(directory, "pipeline.ts");
   writeFileSync(plugin, `
 interface Config { readonly url: string }
@@ -57,7 +57,7 @@ export default {
 });
 
 test("poll plugin cannot supply the Runtime-owned terminal identity", async () => {
-  const directory = mkdtempSync(join(tmpdir(), "rollerskate-plugin-terminal-key-"));
+  const directory = temporaryDirectory("rollerskate-plugin-terminal-key-");
   const plugin = join(directory, "deprecated-terminal-key.mjs");
   writeFileSync(plugin, `export default {
     kind: "subscription.probe",
@@ -91,7 +91,7 @@ test("poll plugin cannot supply the Runtime-owned terminal identity", async () =
 });
 
 test("user plugin must fill the subscription.probe slot and cannot present a Capability", async () => {
-  const directory = mkdtempSync(join(tmpdir(), "rollerskate-plugin-kind-"));
+  const directory = temporaryDirectory("rollerskate-plugin-kind-");
   const plugin = join(directory, "capability.ts");
   writeFileSync(plugin, `
 export default {
@@ -118,7 +118,7 @@ export default {
 });
 
 test("probe executor enforces HTTP origins and exact command executable", async () => {
-  const directory = realpathSync(mkdtempSync(join(tmpdir(), "rollerskate-probe-executor-")));
+  const directory = realpathSync(temporaryDirectory("rollerskate-probe-executor-"));
   const executable = realpathSync(process.execPath);
   const policy = {
     workspaceRoot: directory,
@@ -210,7 +210,7 @@ test("shell command completion plugin observes a fixed workspace receipt without
   const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
   const plugin = resolve(repoRoot, "examples/plugins/shell-command-completion.ts");
   const executable = realpathSync(resolve(repoRoot, "examples/probes/read-command-receipt"));
-  const workspace = realpathSync(mkdtempSync(join(tmpdir(), "rollerskate-command-receipt-")));
+  const workspace = realpathSync(temporaryDirectory("rollerskate-command-receipt-"));
   const config = {
     commandId: "acceptance-1",
     probeExecutable: executable,

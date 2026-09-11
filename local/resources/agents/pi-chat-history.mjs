@@ -2,10 +2,10 @@ import { join } from "node:path";
 
 import { callChatHistoryTool } from "../../src/entrypoints/mcp/chat-history.js";
 import {
-  callChatReadTool,
-  chatReadToolDefinitions,
-  createChatReadToolContext
-} from "../../src/application/chat/read-tool-policy.js";
+  callChatTool,
+  chatToolDefinitions,
+  createChatToolContext
+} from "../../src/application/chat/tool-policy.js";
 import { LocalChatStore } from "../../src/infrastructure/sqlite/chat-store.js";
 
 const contextEnvironment = "ROLLERSKATE_CHAT_TOOL_CONTEXT";
@@ -45,18 +45,19 @@ export default function registerRollerskateChatTools(pi) {
     });
   }
   if (input.repoRoot !== undefined) {
-    const context = createChatReadToolContext({
+    const context = createChatToolContext({
       repoRoot: input.repoRoot,
+      dispatchEventId: input.dispatchEventId,
       runtimeDirectory: input.runtimeDirectory
     });
-    for (const definition of chatReadToolDefinitions) {
+    for (const definition of chatToolDefinitions) {
       pi.registerTool({
         name: definition.name,
         label: definition.name,
         description: definition.description,
         parameters: definition.inputSchema,
         async execute(_toolCallId, params) {
-          return toolResult(callChatReadTool(context, definition.name, params));
+          return toolResult(callChatTool(context, definition.name, params));
         }
       });
     }

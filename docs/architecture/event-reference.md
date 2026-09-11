@@ -66,7 +66,7 @@ Notice 不是 Event type。`application/notice` 通过 `notices` 读取由 `agen
 - `source`：包含 `kind`，可包含用于幂等的 `externalId`。
 - `agentId`：仅与某个 Agent 相关的 Event 使用。
 - `sessionId`：需要绑定或续接 Agent Session 时使用。
-- `destinationIds`：传统 result 需要投递到外部 Destination 时使用；admission 同时固定对应 bounded Destination snapshots，Local Chat Event 通常为空。
+- `destinationIds`：传统 result 需要投递到外部 Destination 时使用；admission 同时固定对应 bounded Destination snapshots，Local Chat Event 通常为空；单 Agent Owner CLI 请求可固定一个 `codex-desktop` snapshot（`threadId/agentId`），只准入该请求的直接 reply Delivery，后续 message 不继承。
 - `causality`：`rootEventId`、可选 `parentEventId` 与 `hop`。
 - `createdAt`：ISO-8601 时间。
 
@@ -123,10 +123,10 @@ Agent input 的 typed terminal result。
 
 ## `chat.activation`
 
-显式 Topic schedule 产生的 immutable attention root，使 Agent 可以在没有新 message 时按 Owner 配置的时间获得一次 conversation attention。
+显式 Topic schedule 或已受理 Chat 工作的回流产生 immutable attention root，使 Agent 可以在没有新 message 时获得一次有明确来源的 conversation attention。
 
-- 特有字段：`topicId`、`reason`、`strategyId`、`strategyRevision`、`contextRevision`、稳定排序并去重的 `candidateAgentIds`、`turnBudget`、`expiresAt`，可选 `sourceEventId`。
-- 当前可执行策略只有 Topic-owned `scheduled`；同一 Local conversation root 中的 Agent message 作为 `chat.message` source 进入 ChatHandler。`starter`、`manual` 与 `resumed` 只为历史 Event 可读性保留在版本化 vocabulary，application admission 对前两者 fail closed，Console/API/CLI 不提供创建入口。Server Topic Agent event 在协议没有携带可验证的 activation/cycle token 前只进入 timeline，不自动创建新的 attention root。
+- 特有字段：`topicId`、`reason`、`strategyId`、`strategyRevision`、`contextRevision`、稳定排序并去重的 `candidateAgentIds`、`turnBudget`、`expiresAt`，可选 `sourceEventId` 与 exact Chat `sessionId`。
+- 当前可执行策略包括 Topic-owned `scheduled` 和 Chat application 的 `work-result`（reason=`work_result`）；后者固定原负责 Agent/Session，只返回已有 Run 的阻塞或终态证据；同一 Local conversation root 中的 Agent message 作为 `chat.message` source 进入 ChatHandler。`starter`、`manual` 与 `resumed` 只为历史 Event 可读性保留在版本化 vocabulary，application admission 对前两者 fail closed，Console/API/CLI 不提供创建入口。Server Topic Agent event 在协议没有携带可验证的 activation/cycle token 前只进入 timeline，不自动创建新的 attention root。
 - `source.externalId`：由 application 提供的 activation idempotency key；相同 key 只创建一个 Event/Execution。
 - Route：`ChatHandler`。Presence、Agent lifecycle、candidate snapshot 与 expiry 共同决定 dispatch/skip receipt。
 - `turnBudget` 是整个 activation root 的 dispatch 上限；Store 在同一 immediate transaction 中按 `rootEventId` 计数并截停后续 dispatch。预算耗尽、全部 silent、全部 skip 或 expiry 都是确定性停止，不产生伪造 Human message。

@@ -1,3 +1,5 @@
+import { FileEventListener } from "./file-source.js";
+import { FileSubscriptionSources } from "./file-source-runtime.js";
 import { PollPluginRunner, PollProbeExecutor } from "./plugin-runner.js";
 import { ContinuousSubscriptionStore } from "./continuous-store.js";
 import type { ExternalRefTriggerGuard } from
@@ -11,6 +13,7 @@ export interface ContinuousSubscriptionCycleResult {
 }
 
 export class ContinuousSubscriptionRuntime {
+  readonly #files: FileSubscriptionSources;
   readonly #databasePath: string;
   readonly #pluginRunner: PollPluginRunner;
   readonly #probeExecutor: PollProbeExecutor;
@@ -18,18 +21,24 @@ export class ContinuousSubscriptionRuntime {
   readonly #store: ContinuousSubscriptionStore | undefined;
 
   public constructor(options: {
+    readonly onSourceChanged?: () => void;
     readonly databasePath: string;
     readonly store?: ContinuousSubscriptionStore;
     readonly pluginRunner?: PollPluginRunner;
     readonly probeExecutor?: PollProbeExecutor;
     readonly externalRefGuard?: ExternalRefTriggerGuard;
   }) {
+    this.#files = new FileSubscriptionSources((source) => new FileEventListener(source, undefined, options.onSourceChanged));
     this.#databasePath = options.databasePath;
     this.#pluginRunner = options.pluginRunner ?? new PollPluginRunner();
     this.#probeExecutor = options.probeExecutor ?? new PollProbeExecutor();
     this.#externalRefGuard = options.externalRefGuard;
     this.#store = options.store;
   }
+
+  public nextWaitMilliseconds(maximum: number): number { return this.#files.nextWaitMilliseconds(maximum); }
+
+  public close(): void { this.#files.close(this.#store); }
 
   public async runCycle(
     signal: AbortSignal,
@@ -42,13 +51,18 @@ export class ContinuousSubscriptionRuntime {
         deltas: [] as string[],
         checkpointed: [
           ...store.finalizeCallbacks(at),
-          ...store.reconcileBoundOccurrences(at)
+          ...store.reconcileBoundOccurrences(at),
+          ...store.reconcileExternalWorkflows(at)
         ],
         failed: [] as string[]
       };
+      const files = this.#files.runCycle(store, signal, at);
+      result.deltas.push(...files.deltas);
+      result.failed.push(...files.failed);
       for (const candidate of store.due(at)) {
         if (signal.aborted) break;
         const subscription = store.beginPoll(candidate.subscriptionId, at);
+        if (subscription.definition.schemaVersion === "ContinuousSubscriptionDefinition@4") throw new Error("file source cannot poll");
         result.polled.push(subscription.subscriptionId);
         try {
           const freshnessEvidence = [

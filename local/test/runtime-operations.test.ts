@@ -15,7 +15,8 @@ import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { addLocalAgent } from "../src/application/agent/control.js";
+import { bindInteractiveChannel, sendInteractiveChannelMessage } from "../src/application/channel/control.js";
+import { addLocalAgent, localRuntimeSnapshot } from "../src/application/agent/control.js";
 import {
   subscriptionSourceBindingRegistrar
 } from "../src/application/subscription/source-binding.js";
@@ -299,7 +300,7 @@ test("Runtime failures and Event/Workload CLI share the application projections"
   }
 });
 
-test("Run, Event, Schedule, and Subscription CLI queries do not write to a read-only Runtime", async () => {
+test("Local diagnostic CLI queries do not write to a read-only Runtime", async () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-readonly-query-repo-"));
   const runtimeDirectory = mkdtempSync(
     join(tmpdir(), "rollerskate-readonly-query-state-")
@@ -372,7 +373,7 @@ test("Run, Event, Schedule, and Subscription CLI queries do not write to a read-
         runs,
         run: runs.requireProjection(started.run.runId),
         decision: {
-          schemaVersion: "RunDecision@3",
+          schemaVersion: "RunDecision@6",
           action: "await_source",
           expectedRunVersion: started.run.version,
           rationale: "Exercise the read-only source detail path",
@@ -410,6 +411,19 @@ test("Run, Event, Schedule, and Subscription CLI queries do not write to a read-
       runtime.close();
     }
 
+    const snapshot = localRuntimeSnapshot(repo, { runtimeDirectory });
+    const binding = bindInteractiveChannel(repo, {
+      agentId: snapshot.agents.find(({ handle }) => handle === "codex")!.principalId,
+      allowedChannelRefs: [{ kind: "local-chat", channelId: snapshot.foundation.topicId }],
+      expiresAt: "2099-01-01T00:00:00.000Z"
+    }, { runtimeDirectory });
+    const channel = await sendInteractiveChannelMessage(repo, {
+      bindingId: binding.bindingId,
+      channelRef: { kind: "local-chat", channelId: snapshot.foundation.topicId },
+      idempotencyKey: "readonly-channel",
+      body: "Read-only diagnostic fixture."
+    }, { runtimeDirectory });
+
     try {
       writableDatabase.exec("PRAGMA wal_checkpoint(TRUNCATE)");
       writableDatabase.exec("PRAGMA journal_mode = DELETE");
@@ -421,19 +435,29 @@ test("Run, Event, Schedule, and Subscription CLI queries do not write to a read-
     const before = readOnlyRuntimeSnapshot(runtimeDirectory, paths.database);
 
     for (const command of [
+      ["channel", "status", binding.bindingId],
+      ["channel", "follow", channel.receipt.followToken],
+      ["agent", "list"],
+      ["agent", "status", "codex"],
+      ["chat", "status"],
+      ["chat", "history"],
+      ["chat", "schedule", "status"],
+      ["notice", "list"],
       ["run", "list"],
       ["run", "inspect", started.run.runId],
       ["run", "trace", started.run.runId],
       ["event", "list"],
       ["event", "trace", started.rootEventId],
       ["schedule", "list"],
+      ["subscription", "list"],
+      ["subscription", "inspect", subscriptionId!],
       ["subscription", "history", subscriptionId!, "--json"]
     ]) {
       let output = "";
       assert.equal(await runLocalApp(repo, [
         "--runtime", runtimeDirectory, ...command
       ], {}, { write(text) { output += text; } }), 0);
-      assert.doesNotThrow(() => JSON.parse(output));
+      if (command[0] !== "agent") assert.doesNotThrow(() => JSON.parse(output));
     }
 
     assert.deepEqual(

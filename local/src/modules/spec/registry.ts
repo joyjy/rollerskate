@@ -256,7 +256,9 @@ const SUBSCRIPTION_CAPABILITY = normalizeSpecRef({ name: "subscription", major: 
 
 export const ROLLERSKATE_SPEC_REGISTRY = createSpecRegistry([
   contract("spec-ref", 1, "active", "local/src/modules/spec/registry.ts#SpecRefV1", "parseSpecRef", ["SpecRef@1"]),
+  contract("steward-policy", 1, "active", "local/src/modules/steward/steward-policy.ts#StewardPolicy", "parseStewardPolicy", ["StewardPolicy@1"]),
   contract("run-intent", 1, "active", "local/src/modules/steward/admission-contract.ts#RunIntent", "parseRunIntent", ["RunIntent@1"]),
+  contract("run-intent", 2, "active", "local/src/modules/run/intent.ts#DeterministicRunIntent", "parseWorkRunIntent", ["RunIntent@2"]),
   contract("steward-run-request", 2, "active", "local/src/modules/steward/admission-contract.ts#StewardRunRequest", "parseStewardRunRequest", ["StewardRunRequest@2"]),
   contract("run-authority-envelope", 1, "active", "local/src/modules/steward/admission-contract.ts#RunAuthorityEnvelope", "parseRunAuthorityEnvelope", ["RunAuthorityEnvelope@1"]),
   contract("orchestrator-binding", 1, "active", "local/src/modules/steward/caller-contract.ts#ManualCallerOrchestratorBinding", "parseCallerOrchestratorBinding", ["OrchestratorBinding@1"]),
@@ -265,6 +267,9 @@ export const ROLLERSKATE_SPEC_REGISTRY = createSpecRegistry([
   resultContract("run-decision", 1, "active", "local/src/modules/steward/caller-contract.ts#RunDecision", "parseRunDecision", ["RunDecision@1", "run-decision@1"]),
   resultContract("run-decision", 2, "historical", "local/src/modules/steward/caller-contract.ts#StewardRunDecision", "parseRunDecision", ["RunDecision@2", "run-decision@2"]),
   resultContract("run-decision", 3, "active", "local/src/modules/steward/run-contract-v3.ts#StewardRunDecisionV3", "parseStewardRunDecisionV3", ["RunDecision@3", "run-decision@3"]),
+  resultContract("run-decision", 4, "active", "local/src/modules/steward/run-contract-v4.ts#StewardRunDecisionV4", "parseStewardRunDecisionV4", ["RunDecision@4", "run-decision@4"]),
+  resultContract("run-decision", 6, "active", "local/src/modules/steward/run-contract-v6.ts#StewardRunDecisionV6", "parseStewardRunDecisionV6", ["RunDecision@6", "run-decision@6"]),
+  resultContract("run-decision", 5, "active", "local/src/modules/steward/run-contract-v5.ts#StewardRunDecisionV5", "parseStewardRunDecisionV5", ["RunDecision@5", "run-decision@5"]),
   resultContract("agent-step-result", 1, "active", "local/src/modules/steward/caller-contract.ts#AgentStepResult", "parseAgentStepResult", ["AgentStepResult@1", "agent-step-result@1"]),
   contract("agent-run-checkpoint", 1, "active", "local/src/modules/steward/caller-contract.ts#AgentRunCheckpoint", "parseAgentRunCheckpoint", ["AgentRunCheckpoint@1"]),
   contract("run-source-binding", 1, "active", "local/src/modules/steward/source-contract.ts#RunSourceBinding", "parseRunSourceBinding", ["RunSourceBinding@1"]),
@@ -277,6 +282,7 @@ export const ROLLERSKATE_SPEC_REGISTRY = createSpecRegistry([
   contract("continuous-subscription-definition", 1, "historical", "local/src/capabilities/subscription/continuous-model.ts#LegacyContinuousSubscriptionDefinition", "validateDefinition", ["ContinuousSubscriptionDefinition@1"]),
   contract("continuous-subscription-definition", 2, "historical", "local/src/capabilities/subscription/continuous-model.ts#BoundContinuousSubscriptionDefinition", "validateBoundDefinition", ["ContinuousSubscriptionDefinition@2"]),
   contract("continuous-subscription-definition", 3, "active", "local/src/capabilities/subscription/continuous-model.ts#TargetedContinuousSubscriptionDefinition", "validateTargetedDefinition", ["ContinuousSubscriptionDefinition@3"]),
+  contract("continuous-subscription-definition", 4, "active", "local/src/capabilities/subscription/continuous-model.ts#FileContinuousSubscriptionDefinition", "createFileInTransaction", ["ContinuousSubscriptionDefinition@4"]),
   contract("proactive-target", 1, "active", "local/src/modules/proactive/target.ts#ProactiveTarget", "parseProactiveTarget", ["ProactiveTarget@1"]),
   contract("deterministic-application-action-receipt", 1, "active", "local/src/modules/proactive/target.ts#DeterministicApplicationActionReceipt", "parseDeterministicApplicationActionReceipt", ["DeterministicApplicationActionReceipt@1"]),
   contract("trigger-occurrence-envelope", 1, "active", "local/src/modules/steward/source-contract.ts#TriggerOccurrenceEnvelope", "parseTriggerOccurrenceEnvelope", ["TriggerOccurrenceEnvelope@1"]),
@@ -286,6 +292,7 @@ export const ROLLERSKATE_SPEC_REGISTRY = createSpecRegistry([
   contract("orchestrator-state", 1, "active", "local/src/modules/steward/caller-contract.ts#OrchestratorState", "parseRunDecision", ["OrchestratorState@1"]),
   contract("agent-run-decision-receipt", 1, "historical", "local/src/modules/steward/caller-contract.ts#AgentRunDecisionReceiptV1", "parseAgentRunDecisionReceipt", ["AgentRunDecisionReceipt@1"]),
   contract("agent-run-decision-receipt", 2, "active", "local/src/modules/steward/caller-contract.ts#AgentRunDecisionReceiptV2", "parseAgentRunDecisionReceipt", ["AgentRunDecisionReceipt@2"]),
+  contract("agent-run-decision-receipt", 3, "active", "local/src/modules/steward/caller-contract.ts#AgentRunHumanQuestionReceipt", "parseAgentRunDecisionReceipt", ["AgentRunDecisionReceipt@3"]),
   resultContract("agent-turn-result", 1, "active", "local/src/modules/steward/result-contract.ts#AgentTurnResult", "parseAgentTurnResult", ["AgentTurnResult@1", "agent-turn-result@1"]),
   resultContract("agent-turn-adjudication", 1, "active", "local/src/modules/steward/result-adjudication.ts#AgentTurnAdjudication", "parseAgentTurnAdjudication", ["AgentTurnAdjudication@1", "agent-turn-adjudication@1"]),
   resultContract("agent-turn-retry-result", 1, "active", "local/src/application/steward/result-recovery.ts#AgentTurnRetryContinuation", "parseAgentTurnResult", ["agent-turn-retry-result@1"]),
@@ -316,7 +323,7 @@ export const ROLLERSKATE_SPEC_REGISTRY = createSpecRegistry([
     source: "local/resources/workflows/continuous-observation-monitor.md",
     parser: "workflowMandateSnapshot",
     payloadDiscriminators: ["continuous-observation-monitor@1"],
-    artifactDigest: "sha256:491771e15e000cffa1d9140bdb1e116a41af800a3b307893fd38ccd6e7d6cd16"
+    artifactDigest: "sha256:ef0c5098a785d83c31d6e8b88a26e07362fb401ed2eaad7c48b8da0d5922a112"
   }),
   spec("scheduled-task", 1, {
     kind: "capability", status: "active",

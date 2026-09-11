@@ -218,6 +218,11 @@ function preflight() {
         <span class="section-label">Run</span>
         <strong>{{ proposal.linkedRun.runId }}</strong>
         <p v-if="proposal.linkedRun.terminalSummary">{{ proposal.linkedRun.terminalSummary }}</p>
+        <p v-if="proposal.linkedRun.attentionReason">{{ proposal.linkedRun.attentionReason }}</p>
+        <ul v-if="proposal.linkedRun.outputs?.length" aria-label="Run outputs">
+          <li v-for="output in proposal.linkedRun.outputs" :key="output.outputId">{{ output.title }}</li>
+        </ul>
+        <p v-if="proposal.linkedRun.outputsTruncated">More outputs are available in the Run.</p>
       </div>
       <button
         type="button"
@@ -258,6 +263,8 @@ function preflight() {
 
 <style scoped>
 .run-proposal {
+  min-width: 0;
+  overflow-wrap: anywhere;
   margin-top: 12px;
   padding: 13px;
   border: 1px solid color-mix(in srgb, var(--primary) 38%, var(--border));

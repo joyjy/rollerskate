@@ -28,6 +28,10 @@ timestamp: 2026-07-17
 
 协议可以替换，Event persistence 保持中立，产品语义有明确承载层；代价是 handler 必须显式声明输入 state 和幂等边界，不能依赖 transport-specific convenience state。
 
+## 当前适用边界
+
+上文统一 Event 约束适用于进入 Agent/Handler 主链的消息。现有 `ProactiveTarget@1` 的 deterministic application action 与 external workflow 由 source/receipt 记录准入和执行事实；[确定性 Run](../unified-run.md) 复用这一边界，不为命令或观察创建虚假的 Agent Event/Execution。可追踪、去重、授权和恢复仍由各原 owner 负责，不能借此开放 generic ingress 或平行执行 loop。
+
 ## Revisit trigger
 
 只有当某类输入无法在统一 trace、dedupe、source 和 lifecycle contract 中安全表达，或显式 Turn 成为跨 handler 的稳定业务对象时，才重新评估。

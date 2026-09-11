@@ -113,6 +113,7 @@ test("RuntimeStore atomically admits Chat attention and completes routed reply D
       });
       assert.deepEqual(runtime.chatDecisionReceipt(dispatches[0]!.eventId), {
         dispatchEventId: dispatches[0]!.eventId,
+        sessionId: reply?.sessionId,
         speechAction: "reply",
         presenceTransition: {
           scope: "global",
@@ -411,10 +412,10 @@ test("proposal admission stays blocked without a Steward and ignores proactive p
       const blocked = localChatView(repo, options).messages.items[0]?.runProposals?.[0];
       assert.equal(blocked?.ready, false);
       assert.equal(blocked?.blocker?.code, "steward_unavailable");
-      assert.match(blocked?.blocker?.detail ?? "", /active codex Steward Agent/u);
+      assert.match(blocked?.blocker?.detail ?? "", /active supported Steward Agent/u);
       assert.throws(() => confirmLocalChatRunProposal(
         repo, source.eventId, blocked!.dispatchEventId, blocked!.revision, options
-      ), /active @codex Steward/u);
+      ), /selected Steward Agent must be active/u);
 
       const snapshot = localRuntimeSnapshot(repo, options);
       const activation = runtime.createChatActivation({
@@ -545,6 +546,7 @@ test("direct mention completion cannot change the Agent presence strategy", () =
       );
       assert.deepEqual(runtime.chatDecisionReceipt(dispatch.eventId), {
         dispatchEventId: dispatch.eventId,
+        sessionId: reply?.sessionId,
         speechAction: "reply",
         replyEventId: reply?.eventId,
         createdAt: at
@@ -685,7 +687,7 @@ test("Chat rejects a current Session when the provider policy adapter identity c
         }).handle(secondAgent, at);
 
         assert.equal(invocations, 0);
-        assert.equal(runtime.execution(secondAgent.executionId)?.status, "retry_wait");
+        assert.equal(runtime.execution(secondAgent.executionId)?.status, "failed");
         assert.match(
           runtime.execution(secondAgent.executionId)?.lastError ?? "",
           /adapter=mismatch/

@@ -1,3 +1,5 @@
+import { openRuntimeDatabase } from "../../infrastructure/sqlite/database.js";
+import type { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
 
 import type { LocalControlOptions } from "../agent/control.js";
@@ -10,6 +12,9 @@ import { TopicGovernanceStore } from "../../infrastructure/sqlite/topic-governan
 import { runtimePaths } from "../../infrastructure/runtime/config.js";
 import { RuntimeStore } from "../../core/runtime/store.js";
 import {
+  markChannelDeliveryAttempted,
+  interactiveChannelBindingAvailableAt,
+  channelRefAllowed,
   acceptChannelSend,
   channelRefKey,
   createChannelFollow,
@@ -111,9 +116,7 @@ export function revokeInteractiveChannel(
   }
 }
 
-export async function sendInteractiveChannelMessage(
-  repoRoot: string,
-  input: {
+export interface ChannelSendInput {
     readonly bindingId: string;
     readonly channelRef: ChannelRef;
     readonly idempotencyKey: string;
@@ -121,13 +124,12 @@ export async function sendInteractiveChannelMessage(
     readonly followCondition?: ChannelFollowCondition;
     readonly quietWindowMilliseconds?: number;
     readonly followDeadlineAt?: string;
-  },
-  options: ChannelControlOptions = {}
-) {
-  const at = timestamp(options);
-  const paths = runtimePaths(repoRoot, options.runtimeDirectory);
-  const store = new ChannelStore(paths.database);
-  const inbox = new TopicInboxStore(paths.topicInbox);
+}
+
+/** Admission only: the unique Runtime loop owns eventual delivery and follow. */
+export function reserveInteractiveChannelMessage(database: DatabaseSync, input: ChannelSendInput,
+  at: string, observedServerCursor?: string, notifyBoundSession = true) {
+  const store = new ChannelStore(database, {migrate:false});
   try {
     const binding = store.requireBinding(input.bindingId);
     const fingerprint = createHash("sha256").update(JSON.stringify({
@@ -135,7 +137,8 @@ export async function sendInteractiveChannelMessage(
       body: input.body,
       followCondition: input.followCondition ?? "quiet",
       quietWindowMilliseconds: input.quietWindowMilliseconds ?? 5_000,
-      followDeadlineAt: input.followDeadlineAt ?? null
+      followDeadlineAt: input.followDeadlineAt ?? null,
+      ...(!notifyBoundSession ? {notifyBoundSession:false} : {})
     })).digest("hex");
     const existing = store.sendForIdempotency(input.bindingId, input.idempotencyKey);
     if (existing !== undefined) {
@@ -143,30 +146,10 @@ export async function sendInteractiveChannelMessage(
         channelRefKey(existing.channelRef) !== channelRefKey(input.channelRef)) {
         throw new Error("Channel send idempotency key has different input");
       }
-      const receipt = existing.status === "pending"
-        ? await settlePendingChannelSend(repoRoot, existing, options)
-        : existing;
-      const currentFollow = store.requireFollow(receipt.followToken);
-      if (receipt.status === "accepted" && currentFollow.status === "waiting") {
-        store.commitFollow({
-          followToken: currentFollow.followToken,
-          expectedRevision: currentFollow.revision,
-          next: transitionChannelFollow(currentFollow, {
-            status: "active",
-            ...(receipt.observedCursor === undefined
-              ? {} : { currentCursor: receipt.observedCursor }),
-            at: receipt.updatedAt
-          })
-        });
-      }
-      return {
-        outcome: "unchanged" as const,
-        receipt,
-        follow: store.requireFollow(receipt.followToken)
-      };
+      return {created:false,receipt:existing,follow:store.requireFollow(existing.followToken)};
     }
     const observedCursor = input.channelRef.kind === "server-topic"
-      ? String(inbox.cursor(input.channelRef.channelId))
+      ? observedServerCursor
       : undefined;
     const pending = createPendingChannelSend({
       binding,
@@ -188,34 +171,35 @@ export async function sendInteractiveChannelMessage(
       quietWindowMilliseconds: input.quietWindowMilliseconds ?? 5_000,
       deadlineAt: input.followDeadlineAt ??
         new Date(Date.parse(at) + 5 * 60_000).toISOString(),
-      ...(binding.callbackSessionId === undefined
+      ...(!notifyBoundSession || binding.callbackSessionId === undefined
         ? {} : { callbackSessionId: binding.callbackSessionId })
     }, at);
-    const reserved = store.reserveSend({ receipt: pending, follow });
+    return store.reserveSend({ receipt: pending, follow });
+
+  } finally { store.close(); }
+}
+
+export async function sendInteractiveChannelMessage(repoRoot: string, input: ChannelSendInput,
+  options: ChannelControlOptions = {}) {
+  const paths = runtimePaths(repoRoot, options.runtimeDirectory);
+  const database = openRuntimeDatabase(paths.database);
+  const runtime = new RuntimeStore(database, {migrate:false});
+  const store = new ChannelStore(database, {migrate:false});
+  try {
+    const inbox = new TopicInboxStore(paths.topicInbox);
+    const reserved = runtime.withImmediateTransaction(() => reserveInteractiveChannelMessage(database,input,
+      timestamp(options),String(inbox.cursor(input.channelRef.channelId))));
     const receipt = reserved.receipt.status === "pending"
-      ? await settlePendingChannelSend(repoRoot, reserved.receipt, options)
-      : reserved.receipt;
+      ? await settlePendingChannelSend(repoRoot, reserved.receipt, options) : reserved.receipt;
     const currentFollow = store.requireFollow(receipt.followToken);
     if (receipt.status === "accepted" && currentFollow.status === "waiting") {
-      store.commitFollow({
-        followToken: currentFollow.followToken,
-        expectedRevision: currentFollow.revision,
-        next: transitionChannelFollow(currentFollow, {
-          status: "active",
-          ...(receipt.observedCursor === undefined
-            ? {} : { currentCursor: receipt.observedCursor }),
-          at: receipt.updatedAt
-        })
-      });
+      store.commitFollow({followToken:currentFollow.followToken,expectedRevision:currentFollow.revision,
+        next:transitionChannelFollow(currentFollow,{status:"active",
+          ...(receipt.observedCursor === undefined ? {} : {currentCursor:receipt.observedCursor}),at:receipt.updatedAt})});
     }
-    return {
-      outcome: reserved.created ? "applied" as const : "unchanged" as const,
-      receipt,
-      follow: store.requireFollow(receipt.followToken)
-    };
-  } finally {
-    store.close();
-  }
+    return {outcome:reserved.created ? "applied" as const : "unchanged" as const,
+      receipt,follow:store.requireFollow(receipt.followToken)};
+  } finally { store.close();runtime.close();database.close(); }
 }
 
 export async function settlePendingChannelSend(
@@ -226,50 +210,18 @@ export async function settlePendingChannelSend(
   const paths = runtimePaths(repoRoot, options.runtimeDirectory);
   const store = new ChannelStore(paths.database);
   try {
-    const current = store.requireSend(receipt.sendId);
+    let current = store.requireSend(receipt.sendId);
     if (current.status !== "pending") return current;
+    if (current.channelRef.kind === "local-chat") return settleLocalChannelSend(repoRoot,current,options);
     let serverDispatchStarted = false;
     try {
+      const binding = store.requireBinding(current.bindingId);
+      if (binding.revision !== current.bindingRevision ||
+        !interactiveChannelBindingAvailableAt(binding, timestamp(options)) || !channelRefAllowed(binding,current.channelRef)) {
+        throw new Error("Interactive Channel binding authority changed before delivery");
+      }
       let accepted: ChannelSendReceipt;
-      if (current.channelRef.kind === "local-chat") {
-        const foundation = new LocalFoundationStore(paths.database);
-        const governance = new TopicGovernanceStore(paths.database);
-        const chat = new LocalChatStore(paths.database);
-        try {
-          const agent = foundation.listAgents().find(
-            ({ principalId }) => principalId === current.senderAgentId
-          );
-          if (agent === undefined || agent.status !== "active") {
-            throw new Error("Bound Agent is not active");
-          }
-          if (!activeTopicParticipant(
-            governance, current.channelRef.channelId, current.senderAgentId
-          )) {
-            throw new Error("Bound Agent is not an active Local Topic participant");
-          }
-          const admission = chat.admitExternalAgentMessage({
-            source: { kind: "handler", externalId: current.transactionId },
-            topicId: current.channelRef.channelId,
-            sender: {
-              principalId: current.senderAgentId,
-              handleSnapshot: agent.handle
-            },
-            body: current.body,
-            activation: { strategyId: "participant-message", turnBudget: 8 },
-            at: current.createdAt
-          });
-          accepted = acceptChannelSend(current, {
-            observedCursor: admission.message.eventId,
-            messageEventId: admission.message.eventId,
-            conversationRootId: admission.message.causality.rootEventId,
-            at: timestamp(options)
-          });
-        } finally {
-          chat.close();
-          governance.close();
-          foundation.close();
-        }
-      } else {
+      {
         const foundation = new LocalFoundationStore(paths.database);
         const inbox = new TopicInboxStore(paths.topicInbox);
         try {
@@ -282,6 +234,10 @@ export async function settlePendingChannelSend(
           if (inbox.participant(current.channelRef.channelId, current.senderAgentId) === undefined) {
             throw new Error("Bound Agent is not enrolled in Server Topic");
           }
+          // Commit intent before network I/O, so response loss/restart never erases
+          // the possibility that the remote side effect already occurred.
+          if (current.deliveryAttempted !== true) current = store.commitSend({sendId:current.sendId,
+            expectedRevision:current.revision,next:markChannelDeliveryAttempted(current,timestamp(options))});
           serverDispatchStarted = true;
           const event = await publishServerTopicMessage(
             repoRoot,
@@ -327,6 +283,68 @@ export async function settlePendingChannelSend(
   }
 }
 
+function settleLocalChannelSend(repoRoot: string, receipt: ChannelSendReceipt, options: ChannelControlOptions) {
+  const database = openRuntimeDatabase(runtimePaths(repoRoot, options.runtimeDirectory).database);
+  const store = new ChannelStore(database, { migrate: false });
+  const runtime = new RuntimeStore(database, { migrate: false });
+  const foundation = new LocalFoundationStore(database, { migrate: false });
+  const governance = new TopicGovernanceStore(database);
+  const chat = new LocalChatStore(database);
+  try {
+    return runtime.withImmediateTransaction(() => {
+      const current = store.requireSend(receipt.sendId);
+      if (current.status !== "pending") return current;
+      // Reconcile an old crash gap by exact canonical source, even after revocation.
+      // This records an existing effect; it never re-sends under revoked authority.
+      const existing = database.prepare(`
+        SELECT event_id FROM events WHERE source_kind = 'handler' AND source_external_id = ?
+      `).get(current.transactionId) as { event_id: string } | undefined;
+      const event = existing === undefined ? undefined : runtime.event(existing.event_id);
+      let message = event?.type === "chat.message" ? event : undefined;
+      if (message !== undefined && (message.topicId !== current.channelRef.channelId ||
+        message.body !== current.body || message.sender.kind !== "agent" ||
+        message.sender.principalId !== current.senderAgentId)) {
+        throw new Error("Channel canonical message identity mismatch");
+      }
+      if (message === undefined) {
+        const binding = store.requireBinding(current.bindingId);
+        const agent = foundation.agent(current.senderAgentId);
+        const participant = activeTopicParticipant(governance, current.channelRef.channelId, current.senderAgentId);
+        const eligible = binding.revision === current.bindingRevision &&
+          interactiveChannelBindingAvailableAt(binding, timestamp(options)) &&
+          channelRefAllowed(binding, current.channelRef) && agent?.status === "active" && participant;
+        if (!eligible) return store.commitSend({
+          sendId: current.sendId, expectedRevision: current.revision,
+          next: failChannelSend(current, participant
+            ? "Channel authority changed before local delivery"
+            : "Agent is not an active Local Topic participant", timestamp(options))
+        });
+        message = chat.admitExternalAgentMessage({
+          source: { kind: "handler", externalId: current.transactionId },
+          topicId: current.channelRef.channelId,
+          sender: { principalId: current.senderAgentId, handleSnapshot: agent!.handle },
+          body: current.body, activation: { strategyId: "participant-message", turnBudget: 8 },
+          at: current.createdAt
+        }).message;
+      }
+      return store.commitSend({
+        sendId: current.sendId, expectedRevision: current.revision,
+        next: acceptChannelSend(current, {
+          observedCursor: message.eventId, messageEventId: message.eventId,
+          conversationRootId: message.causality.rootEventId, at: timestamp(options)
+        })
+      });
+    });
+  } finally {
+    chat.close();
+    governance.close();
+    foundation.close();
+    runtime.close();
+    store.close();
+    database.close();
+  }
+}
+
 function definitiveServerRejection(error: unknown): boolean {
   if (!(error instanceof Error) || !("status" in error) ||
     typeof error.status !== "number") return false;
@@ -338,7 +356,8 @@ function activeTopicParticipant(
   topicId: string,
   agentId: string
 ): boolean {
-  return store.require(topicId).participants.some(
+  const topic = store.require(topicId);
+  return topic.status === "active" && topic.participants.some(
     (participant) => participant.agentId === agentId && participant.status === "active"
   );
 }
@@ -351,6 +370,14 @@ export function stopInteractiveChannelFollow(
 ) {
   const store = new ChannelStore(runtimePaths(repoRoot, options.runtimeDirectory).database);
   try {
+    return stopInteractiveChannelFollowInTransaction(store,followToken,expectedRevision,timestamp(options));
+  } finally {
+    store.close();
+  }
+}
+
+export function stopInteractiveChannelFollowInTransaction(store: ChannelStore,followToken: string,
+  expectedRevision: number,at: string) {
     const current = store.requireFollow(followToken);
     if (current.revision !== expectedRevision) return { outcome: "conflict" as const, follow: current };
     if (["quiet", "terminal", "failed", "expired", "stopped"].includes(current.status)) {
@@ -359,12 +386,9 @@ export function stopInteractiveChannelFollow(
     const follow = store.commitFollow({
       followToken,
       expectedRevision,
-      next: transitionChannelFollow(current, { status: "stopped", at: timestamp(options) })
+      next: transitionChannelFollow(current, { status: "stopped", at })
     });
     return { outcome: "applied" as const, follow };
-  } finally {
-    store.close();
-  }
 }
 
 function timestamp(options: LocalControlOptions): string {

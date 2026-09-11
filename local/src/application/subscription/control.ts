@@ -1,3 +1,7 @@
+import type { DatabaseSync } from "node:sqlite";
+import { openRuntimeDatabase } from "../../infrastructure/sqlite/database.js";
+import { controlStateToken, requireControlState } from "../control-state.js";
+import { ContinuousSubscriptionStore } from "../../capabilities/subscription/continuous-store.js";
 import { createHash } from "node:crypto";
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
@@ -27,7 +31,6 @@ import {
   type SubscriptionInspection
 } from "./query.js";
 import {
-  controlContinuousSubscriptionView,
   setContinuousSubscriptionArchivedView
 } from "./continuous.js";
 export {
@@ -108,24 +111,43 @@ export function controlSubscriptionView(
   action: "pause" | "resume" | "cancel",
   runtimeDirectory?: string
 ): SubscriptionConsoleView {
-  const continuous = controlContinuousSubscriptionView(
-    repoRoot,
-    subscriptionId,
-    action,
-    runtimeDirectory
-  );
-  if (continuous !== undefined) return continuous;
-  const store = new SubscriptionStore(runtimePaths(repoRoot, runtimeDirectory).database);
+  const database = openRuntimeDatabase(runtimePaths(repoRoot, runtimeDirectory).database);
+  const runtime = new RuntimeStore(database);
   try {
-    const current = store.require(subscriptionId);
-    if (action === "resume" && current.definitionSchema === "SubscriptionDefinition@3") {
+    runtime.withImmediateTransaction(() => controlSubscriptionInTransaction(database, subscriptionId, action));
+  } finally { runtime.close(); database.close(); }
+  return inspectSubscriptionView(repoRoot, subscriptionId, runtimeDirectory);
+}
+
+function withSubscription<T>(database: DatabaseSync, subscriptionId: string,
+  apply: (current: ReturnType<SubscriptionStore["require"]> | ReturnType<ContinuousSubscriptionStore["require"]>,
+    store: SubscriptionStore | ContinuousSubscriptionStore) => T): T {
+  const continuous = new ContinuousSubscriptionStore(database, {migrate:false});
+  const single = new SubscriptionStore(database, {migrate:false});
+  try {
+    const current = continuous.get(subscriptionId);
+    return current === undefined ? apply(single.require(subscriptionId), single) : apply(current, continuous);
+  } finally { continuous.close(); single.close(); }
+}
+
+export function subscriptionControlSnapshot(database: DatabaseSync, subscriptionId: string) {
+  return withSubscription(database, subscriptionId, current => ({
+    subscriptionId, stateToken: controlStateToken(current), status: current.status
+  }));
+}
+
+/** Source policy and state comparison share the caller's immediate transaction. */
+export function controlSubscriptionInTransaction(database: DatabaseSync, subscriptionId: string,
+  action: "pause" | "resume" | "cancel", expectedState?: string, at = new Date().toISOString()) {
+  return withSubscription(database, subscriptionId, (current, store) => {
+    requireControlState(current, expectedState);
+    const schema = "definition" in current ? current.definition.schemaVersion : current.definitionSchema;
+    if (action === "resume" && ["SubscriptionDefinition@3", "ContinuousSubscriptionDefinition@1"].includes(schema)) {
       throw new Error("legacy_trigger_execution_closed: migrate this Subscription to a bound Run");
     }
-    store.setStatus(subscriptionId, action);
-  } finally {
-    store.close();
-  }
-  return inspectSubscriptionView(repoRoot, subscriptionId, runtimeDirectory);
+    store.setStatus(subscriptionId, action, at);
+    return subscriptionControlSnapshot(database, subscriptionId);
+  });
 }
 
 export function setSubscriptionArchivedView(

@@ -26,10 +26,28 @@ import {
   planAgentRunContinuation,
   type AgentRunProjection
 } from "../src/modules/steward/state-machine.js";
-import { parseAgentRunDecisionReceipt, parseCallerOrchestratorBinding } from
+import { parseAgentRunDecisionReceipt, parseCallerOrchestratorBinding, parseRunDecision } from
   "../src/modules/steward/caller-contract.js";
 
 const DIGEST = `sha256:${"a".repeat(64)}`;
+
+test("RunDecision@4 accepts bounded terminal outputs while V3 remains strict", () => {
+  const output = { id: "report", title: "Report", contentType: "application/json",
+    schemaVersion: "Example@1", value: { ok: true } };
+  const decision = {
+    schemaVersion: "RunDecision@4", action: "finish", expectedRunVersion: 1,
+    rationale: "done", checkedAcceptance: [],
+    state: { schemaVersion: "OrchestratorState@1", goal: "report", tasks: [],
+      acceptedEvidence: [], unresolvedQuestions: [] },
+    finish: { scope: "run", outcome: "succeeded", summary: "done", outputs: [output] }
+  };
+  assert.deepEqual(parseRunDecision(decision), decision);
+  assert.throws(() => parseRunDecision({ ...decision, schemaVersion: "RunDecision@3" }), /unknown field/);
+  for (const outputs of [[output, output], [{ ...output, value: "x".repeat(32_768) }],
+    [{ ...output, contentType: "text/plain" }], [{ ...output, extra: true }]]) {
+    assert.throws(() => parseRunDecision({ ...decision, finish: { ...decision.finish, outputs } }));
+  }
+});
 
 test("v0.5.5 Run admission contracts fail closed and keep a stable intent digest", () => {
   const intent = {

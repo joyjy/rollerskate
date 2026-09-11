@@ -3,10 +3,11 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { temporaryDirectory } from "./support/temp-directory.js";
 
 import type { AgentInputEvent, ChatDispatchEvent } from "../src/core/event/model.js";
-import { chatReadToolGrant } from
-  "../src/application/chat/read-tool-policy.js";
+import { chatToolGrant } from
+  "../src/application/chat/tool-policy.js";
 import { AgentInvocationError } from "../src/core/runtime/agent-invocation.js";
 import {
   PI_CHAT_TOOL_CONTEXT_ENV,
@@ -158,7 +159,7 @@ test("pi keeps JSON events and loads the bounded Rollerskate read tools in Chat"
     projectRoot: fixture.workspace,
     environment: {},
     timeoutMilliseconds: 3_000,
-    chatReadToolGrant: chatReadToolGrant(),
+    chatToolGrant: chatToolGrant(),
     resolveChatToolContext: () => context
   });
 
@@ -497,7 +498,7 @@ function piFixture(options: {
   readonly invocation: string;
   readonly settlementMarker: string;
 } {
-  const workspace = mkdtempSync(join(tmpdir(), "rollerskate-pi-runtime-"));
+  const workspace = temporaryDirectory("rollerskate-pi-runtime-");
   const executable = join(workspace, "pi-fixture");
   const invocation = join(workspace, "invocation.json");
   const settlementMarker = join(workspace, "settlement-order.txt");

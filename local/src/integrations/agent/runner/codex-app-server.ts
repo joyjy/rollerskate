@@ -20,6 +20,10 @@ import {
   runnerTimeoutMilliseconds
 } from "./protocol.js";
 
+// Wire records can contain tool results or turn snapshots, independently of the
+// assistant text budget. This is a transport bound, not a model context budget.
+const MAX_PROTOCOL_RECORD_BYTES = 16 * 1_048_576;
+
 export interface CodexAppServerRunnerOptions {
   readonly adapterId: string;
   readonly executable: string;
@@ -28,6 +32,7 @@ export interface CodexAppServerRunnerOptions {
   readonly meaningfulOutputTimeoutMilliseconds: number;
   readonly maxOutputBytes: number;
   readonly threadParameters: Readonly<Record<string, unknown>>;
+  readonly turnSandboxPolicy?: Readonly<Record<string, unknown>>;
 }
 
 export class CodexAppServerRunner implements AgentRunner {
@@ -184,10 +189,10 @@ export class CodexAppServerRunner implements AgentRunner {
       };
 
       const decoder = new JsonLineResponseDecoder({
-        maxLineBytes: this.#options.maxOutputBytes,
+        maxLineBytes: MAX_PROTOCOL_RECORD_BYTES,
         onDiscardedLine: () => {
           terminate("protocol_error",
-            `Codex app-server record exceeds ${this.#options.maxOutputBytes} bytes`
+            `Codex app-server protocol record exceeds ${MAX_PROTOCOL_RECORD_BYTES} bytes`
           );
         },
         onMessage: (value): boolean => {
@@ -213,7 +218,12 @@ export class CodexAppServerRunner implements AgentRunner {
               method: request.sessionId === undefined ? "thread/start" : "thread/resume",
               params: {
                 ...this.#options.threadParameters,
-                ...(request.sessionId === undefined ? {} : { threadId: request.sessionId })
+                ...(request.sessionId === undefined ? {} : {
+                  threadId: request.sessionId,
+                  // Restore the model's context without returning its full transcript
+                  // to this client, which consumes only the new turn's events.
+                  excludeTurns: true
+                })
               }
             });
             return true;
@@ -249,6 +259,7 @@ export class CodexAppServerRunner implements AgentRunner {
               method: "turn/start",
               params: {
                 threadId,
+                ...(this.#options.turnSandboxPolicy === undefined ? {} : {sandboxPolicy: this.#options.turnSandboxPolicy}),
                 input: [{ type: "text", text: request.prompt }]
               }
             });
@@ -386,7 +397,7 @@ export class CodexAppServerRunner implements AgentRunner {
         id: 0,
         method: "initialize",
         params: {
-          clientInfo: { name: "rollerskate-local", version: "0.5.7" },
+          clientInfo: { name: "rollerskate-local", version: "0.6.0" },
           capabilities: {}
         }
       });

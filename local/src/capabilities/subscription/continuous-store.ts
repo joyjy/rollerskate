@@ -1,3 +1,6 @@
+import { parseFileEventSource, type FileListenerState } from "./file-source.js";
+import type { FileContinuousSubscriptionDefinition } from "./continuous-model.js";
+import type { ExternalWorkflowExecutionRuntime } from "../../modules/proactive/target.js";
 import type { DatabaseSync } from "node:sqlite";
 
 import { localId, requireLocalId } from "../../core/id.js";
@@ -40,6 +43,8 @@ import {
 } from "./run-binding.js";
 
 interface Row {
+  readonly file_source_json: string | null;
+  readonly file_listener_json: string | null;
   readonly subscription_id: string;
   readonly title: string;
   readonly owner_agent_id: string | null;
@@ -52,7 +57,7 @@ interface Row {
   readonly interval_ms: number;
   readonly poll_count: number;
   readonly status: ContinuousSubscription["status"];
-  readonly next_poll_at: string;
+  readonly next_poll_at: string | null;
   readonly checkpoint_occurrence_key: string | null;
   readonly checkpoint_observation_json: string | null;
   readonly pending_occurrence_key: string | null;
@@ -75,6 +80,7 @@ export class ContinuousSubscriptionStore {
   readonly #runtime: RuntimeStore;
   readonly #ownsDatabase: boolean;
   readonly #runBinding: SubscriptionRunBindingAdapter | undefined;
+  readonly #workflows: ExternalWorkflowExecutionRuntime | undefined;
   readonly #actions: DeterministicApplicationActionRuntime | undefined;
 
   public constructor(
@@ -82,6 +88,7 @@ export class ContinuousSubscriptionStore {
     options: {
       readonly migrate?: boolean;
       readonly runBinding?: SubscriptionRunBindingAdapter;
+      readonly externalWorkflows?: ExternalWorkflowExecutionRuntime;
       readonly applicationActions?: DeterministicApplicationActionRuntime;
     } = {}
   ) {
@@ -94,6 +101,7 @@ export class ContinuousSubscriptionStore {
     this.#runtime = new RuntimeStore(this.#database, nestedOptions);
     this.#runBinding = options.runBinding;
     this.#actions = options.applicationActions;
+    this.#workflows = options.externalWorkflows;
   }
 
   public create(
@@ -224,11 +232,108 @@ export class ContinuousSubscriptionStore {
     return this.require(input.subscriptionId);
   }
 
+  public createFileInTransaction(
+    input: FileContinuousSubscriptionDefinition & { readonly subscriptionId: string },
+    at = new Date().toISOString()
+  ): ContinuousSubscription {
+    if (!this.#database.isTransaction) throw new Error("file subscription admission requires a transaction");
+    requireLocalId(input.subscriptionId, "sub", "subscriptionId");
+    if (input.schemaVersion !== "ContinuousSubscriptionDefinition@4" || !Number.isInteger(input.revision) || input.revision < 1) throw new Error("invalid file subscription revision");
+    const definition: FileContinuousSubscriptionDefinition = {
+      schemaVersion: "ContinuousSubscriptionDefinition@4", revision: input.revision,
+      title: text(input.title, "title", 120).trim(), source: parseFileEventSource(input.source),
+      target: parseProactiveTarget(input.target, {
+        kind: "continuous_subscription", id: input.subscriptionId,
+        definitionRevision: `ContinuousSubscriptionDefinition@4:${input.revision}`
+      })
+    };
+    const binding = proactiveTargetRunBinding(definition.target);
+    if (binding !== undefined && binding.occurrencePolicy !== "recurring") throw new Error("file source Run target must be recurring");
+    const existing = this.get(input.subscriptionId);
+    if (existing !== undefined) {
+      if (stableJson(existing.definition) === stableJson(definition)) return existing;
+      throw new Error("Subscription ID already belongs to another definition");
+    }
+    if (binding !== undefined && this.boundForRun(binding.runId) !== undefined) {
+      throw new Error("Agent Run is already bound to another Continuous Subscription");
+    }
+    const count = this.#database.prepare("SELECT count(*) AS count FROM continuous_subscriptions WHERE definition_schema = 'ContinuousSubscriptionDefinition@4' AND status != 'cancelled'").get() as { count: number };
+    if (count.count >= 100) throw new Error("file subscriptions exceed 100 active registrations");
+    this.#database.prepare(`INSERT INTO continuous_subscriptions (
+      subscription_id, title, current_revision, definition_schema, file_source_json,
+      target_json, agent_run_id, status, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`).run(
+      input.subscriptionId, definition.title, definition.revision, definition.schemaVersion,
+      boundedJson(definition.source, "file source"), boundedJson(definition.target, "target"),
+      binding?.runId ?? null, iso(at), iso(at));
+    return this.require(input.subscriptionId);
+  }
+
+  public fileSubscriptions(): ContinuousSubscription[] {
+    return this.#mapRows(this.#database.prepare(`SELECT * FROM continuous_subscriptions
+      WHERE definition_schema = 'ContinuousSubscriptionDefinition@4' AND status != 'cancelled'
+      ORDER BY subscription_id LIMIT 100`).all() as unknown as Row[]);
+  }
+
+  public recordFileListener(subscriptionId: string, state: FileListenerState): void {
+    this.#database.prepare(`UPDATE continuous_subscriptions SET file_listener_json = ?
+      WHERE subscription_id = ? AND definition_schema = 'ContinuousSubscriptionDefinition@4'`)
+      .run(boundedJson(state, "file listener"), subscriptionId);
+  }
+
+  public applyFileRecoveryInTransaction(subscriptionId: string, occurrenceKey: string,
+    outcome: "queued" | "succeeded" | "failed", at = new Date().toISOString()): void {
+    if (!this.#database.isTransaction) throw new Error("file recovery requires an owning transaction");
+    const current = this.require(subscriptionId);
+    if (current.definition.schemaVersion !== "ContinuousSubscriptionDefinition@4" ||
+      current.definition.target.kind !== "external_workflow" || current.status !== "blocked" ||
+      current.pendingOccurrenceKey !== occurrenceKey) throw new Error("file recovery source conflict");
+    this.#database.prepare(`UPDATE continuous_subscriptions SET status = ?, latest_error = ?, updated_at = ?
+      WHERE subscription_id = ?`).run(outcome === "failed" ? "blocked" : "active",
+        outcome === "failed" ? "external-workflow-failed" : null, iso(at), subscriptionId);
+    if (outcome === "succeeded") {
+      this.#checkpointFileOccurrence(subscriptionId, occurrenceKey, at);
+    }
+  }
+
+  public reconcileExternalWorkflows(at = new Date().toISOString()): string[] {
+    const workflows = this.#workflows;
+    if (workflows === undefined) return [];
+    // Serialize readback with Owner recovery so a stale failure cannot re-block a queued retry.
+    return withImmediateTransaction(this.#database, () => {
+      const changed: string[] = [];
+      for (const current of this.fileSubscriptions()) {
+        if (current.pendingOccurrenceKey === undefined ||
+          current.definition.schemaVersion !== "ContinuousSubscriptionDefinition@4" ||
+          current.definition.target.kind !== "external_workflow") continue;
+        const execution = workflows.execution({ kind: "continuous_subscription",
+          id: current.subscriptionId, definitionRevision: `${current.definition.schemaVersion}:${current.definition.revision}`
+        }, current.pendingOccurrenceKey);
+        if (execution === undefined || !["succeeded", "failed", "unknown"].includes(execution.status)) continue;
+        if (execution.status === "succeeded") {
+          this.#checkpointFileOccurrence(current.subscriptionId, current.pendingOccurrenceKey, at);
+        } else if (current.status !== "blocked") {
+          this.#database.prepare("UPDATE continuous_subscriptions SET status = 'blocked', latest_error = ?, updated_at = ? WHERE subscription_id = ?")
+            .run(`external-workflow-${execution.status}`, iso(at), current.subscriptionId);
+        } else continue;
+        changed.push(current.subscriptionId);
+      }
+      return changed;
+    });
+  }
+
+  #checkpointFileOccurrence(subscriptionId: string, occurrenceKey: string, at: string): void {
+    this.#database.prepare(`UPDATE continuous_subscriptions SET
+      checkpoint_occurrence_key = pending_occurrence_key, checkpoint_observation_json = pending_observation_json,
+      pending_occurrence_key = NULL, pending_observation_json = NULL, latest_error = NULL, updated_at = ?
+      WHERE subscription_id = ? AND pending_occurrence_key = ?`).run(iso(at), subscriptionId, occurrenceKey);
+  }
+
   public boundForRun(runId: string): ContinuousSubscription | undefined {
     const row = this.#database.prepare(`
       SELECT * FROM continuous_subscriptions
       WHERE definition_schema IN (
-        'ContinuousSubscriptionDefinition@2', 'ContinuousSubscriptionDefinition@3'
+        'ContinuousSubscriptionDefinition@2', 'ContinuousSubscriptionDefinition@3', 'ContinuousSubscriptionDefinition@4'
       )
         AND agent_run_id = ?
     `).get(runId) as Row | undefined;
@@ -397,10 +502,17 @@ export class ContinuousSubscriptionStore {
         };
         if (current.definition.schemaVersion === "ContinuousSubscriptionDefinition@2") {
           activateRunTarget(current.definition.sourceBinding);
-        } else if (current.definition.schemaVersion === "ContinuousSubscriptionDefinition@3" &&
+        } else if ((current.definition.schemaVersion === "ContinuousSubscriptionDefinition@3" || current.definition.schemaVersion === "ContinuousSubscriptionDefinition@4") &&
           current.definition.target.kind === "steward_run") {
           activateRunTarget(current.definition.target.sourceBinding);
-        } else if (current.definition.schemaVersion === "ContinuousSubscriptionDefinition@3" &&
+        } else if (current.definition.schemaVersion === "ContinuousSubscriptionDefinition@4" &&
+          current.definition.target.kind === "external_workflow") {
+          if (this.#workflows === undefined) throw new Error("external workflow adapter unavailable");
+          this.#workflows.enqueueInTransaction({ target: current.definition.target,
+            source: { kind: "continuous_subscription", id: subscriptionId,
+              definitionRevision: `${current.definition.schemaVersion}:${current.definition.revision}` },
+            occurrenceKey, observation, at: timestamp });
+        } else if ((current.definition.schemaVersion === "ContinuousSubscriptionDefinition@3" || current.definition.schemaVersion === "ContinuousSubscriptionDefinition@4") &&
           current.definition.target.kind === "application_action") {
           if (this.#actions === undefined) {
             throw new Error(
@@ -414,7 +526,7 @@ export class ContinuousSubscriptionStore {
               kind: "continuous_subscription",
               id: subscriptionId,
               definitionRevision:
-                `ContinuousSubscriptionDefinition@3:${current.definition.revision}`
+                `${current.definition.schemaVersion}:${current.definition.revision}`
             },
             occurrenceKey,
             observation,
@@ -517,7 +629,7 @@ export class ContinuousSubscriptionStore {
       FROM continuous_subscriptions AS subscription
       LEFT JOIN agent_runs AS run ON run.run_id = subscription.agent_run_id
       WHERE subscription.definition_schema IN (
-        'ContinuousSubscriptionDefinition@2', 'ContinuousSubscriptionDefinition@3'
+        'ContinuousSubscriptionDefinition@2', 'ContinuousSubscriptionDefinition@3', 'ContinuousSubscriptionDefinition@4'
       ) AND subscription.agent_run_id IS NOT NULL
         AND (
           (subscription.pending_cycle_id IS NOT NULL AND subscription.status = 'active')
@@ -532,7 +644,7 @@ export class ContinuousSubscriptionStore {
       const definition = subscription.definition;
       const binding = definition.schemaVersion === "ContinuousSubscriptionDefinition@2"
         ? definition.sourceBinding
-        : definition.schemaVersion === "ContinuousSubscriptionDefinition@3" &&
+        : (definition.schemaVersion === "ContinuousSubscriptionDefinition@3" || definition.schemaVersion === "ContinuousSubscriptionDefinition@4") &&
             definition.target.kind === "steward_run"
           ? definition.target.sourceBinding
           : undefined;
@@ -620,6 +732,9 @@ export class ContinuousSubscriptionStore {
     action: "pause" | "resume" | "cancel",
     at = new Date().toISOString()
   ): ContinuousSubscription {
+    if (!this.#database.isTransaction) {
+      return withImmediateTransaction(this.#database, () => this.setStatus(subscriptionId, action, at));
+    }
     const current = this.require(subscriptionId);
     const target = action === "pause" ? "paused" : action === "resume" ? "active" : "cancelled";
     const allowed = action === "pause"
@@ -632,37 +747,35 @@ export class ContinuousSubscriptionStore {
       throw new Error(`Continuous Subscription cannot ${action} from ${current.status}`);
     }
     const timestamp = iso(at);
-    withImmediateTransaction(this.#database, () => {
-      if (action === "cancel" && current.pendingOccurrenceKey !== undefined) {
-        const eventIds = this.#database.prepare(`
-          SELECT event_id FROM proactive_callback_occurrences
-          WHERE owner_kind = 'continuous_subscription' AND owner_id = ?
-            AND trigger_occurrence_key = ? AND event_id IS NOT NULL
-        `).all(subscriptionId, current.pendingOccurrenceKey) as unknown as
-          Array<{ event_id: string }>;
-        this.#runtime.failExecutionsForEventsInTransaction(
-          eventIds.map(({ event_id }) => event_id),
-          "subscription_cancelled",
-          timestamp
-        );
-        this.#database.prepare(`
-          UPDATE proactive_callback_occurrences
-          SET status = 'unknown', last_error = 'subscription_cancelled',
-            completed_at = ?, updated_at = ?
-          WHERE owner_kind = 'continuous_subscription' AND owner_id = ?
-            AND trigger_occurrence_key = ? AND status IN ('pending', 'started')
-        `).run(timestamp, timestamp, subscriptionId, current.pendingOccurrenceKey);
-      }
-      this.#database.prepare(`
-        UPDATE continuous_subscriptions SET status = ?, next_poll_at = ?, updated_at = ?
-        WHERE subscription_id = ?
-      `).run(
-        target,
-        action === "resume" ? timestamp : current.nextPollAt,
-        timestamp,
-        subscriptionId
+    if (action === "cancel" && current.pendingOccurrenceKey !== undefined) {
+      const eventIds = this.#database.prepare(`
+        SELECT event_id FROM proactive_callback_occurrences
+        WHERE owner_kind = 'continuous_subscription' AND owner_id = ?
+          AND trigger_occurrence_key = ? AND event_id IS NOT NULL
+      `).all(subscriptionId, current.pendingOccurrenceKey) as unknown as
+        Array<{ event_id: string }>;
+      this.#runtime.failExecutionsForEventsInTransaction(
+        eventIds.map(({ event_id }) => event_id),
+        "subscription_cancelled",
+        timestamp
       );
-    });
+      this.#database.prepare(`
+        UPDATE proactive_callback_occurrences
+        SET status = 'unknown', last_error = 'subscription_cancelled',
+          completed_at = ?, updated_at = ?
+        WHERE owner_kind = 'continuous_subscription' AND owner_id = ?
+          AND trigger_occurrence_key = ? AND status IN ('pending', 'started')
+      `).run(timestamp, timestamp, subscriptionId, current.pendingOccurrenceKey);
+    }
+    this.#database.prepare(`
+      UPDATE continuous_subscriptions SET status = ?, next_poll_at = ?, updated_at = ?
+      WHERE subscription_id = ?
+    `).run(
+      target,
+      current.definition.schemaVersion === "ContinuousSubscriptionDefinition@4" ? null : action === "resume" ? timestamp : current.nextPollAt,
+      timestamp,
+      subscriptionId
+    );
     return this.require(subscriptionId);
   }
 
@@ -702,15 +815,17 @@ export class ContinuousSubscriptionStore {
           kind: "continuous_subscription",
           id: row.subscription_id,
           definitionRevision:
-            `ContinuousSubscriptionDefinition@3:${row.current_revision}`
+            `${row.definition_schema}:${row.current_revision}`
         });
     const pendingAdmissionReceipt = row.pending_admission_receipt_json === null
       ? undefined
       : parseSubscriptionOccurrenceAdmissionReceipt(
           JSON.parse(row.pending_admission_receipt_json) as unknown
         );
-    const definition: ContinuousSubscriptionDefinition = row.definition_schema ===
-      "ContinuousSubscriptionDefinition@1"
+    const definition: ContinuousSubscriptionDefinition = row.definition_schema === "ContinuousSubscriptionDefinition@4"
+      ? { schemaVersion: "ContinuousSubscriptionDefinition@4", revision: row.current_revision,
+          title: row.title, source: parseFileEventSource(JSON.parse(row.file_source_json!)), target: target! }
+      : row.definition_schema === "ContinuousSubscriptionDefinition@1"
       ? {
           schemaVersion: "ContinuousSubscriptionDefinition@1",
           revision: row.current_revision,
@@ -766,6 +881,11 @@ export class ContinuousSubscriptionStore {
           };
     const result: ContinuousSubscription = {
       subscriptionId: row.subscription_id,
+      ...(row.file_listener_json === null ? {} : { fileListener: JSON.parse(row.file_listener_json) as FileListenerState }),
+      ...(definition.schemaVersion !== "ContinuousSubscriptionDefinition@4" || definition.target.kind !== "external_workflow" || this.#workflows === undefined || (row.pending_occurrence_key ?? row.checkpoint_occurrence_key) === null ? {} : {
+        externalWorkflowExecution: this.#workflows.execution({kind: "continuous_subscription", id: row.subscription_id,
+          definitionRevision: `${definition.schemaVersion}:${definition.revision}`}, (row.pending_occurrence_key ?? row.checkpoint_occurrence_key)!)!
+      }),
       definition,
       status: row.status,
       ...(row.archived_at === null ? {} : { archivedAt: row.archived_at }),
@@ -790,7 +910,7 @@ export class ContinuousSubscriptionStore {
       createdAt: row.created_at,
       updatedAt: row.updated_at
     };
-    if (definition.schemaVersion !== "ContinuousSubscriptionDefinition@3" ||
+    if ((definition.schemaVersion !== "ContinuousSubscriptionDefinition@3" && definition.schemaVersion !== "ContinuousSubscriptionDefinition@4") ||
       definition.target.kind !== "application_action" || this.#actions === undefined) {
       return result;
     }
@@ -799,7 +919,7 @@ export class ContinuousSubscriptionStore {
     const receipt = this.#actions.receipt({
       kind: "continuous_subscription",
       id: result.subscriptionId,
-      definitionRevision: `ContinuousSubscriptionDefinition@3:${definition.revision}`
+      definitionRevision: `${definition.schemaVersion}:${definition.revision}`
     }, occurrenceKey);
     return receipt === undefined ? result : { ...result, latestActionReceipt: receipt };
   }
@@ -872,7 +992,7 @@ function validateTargetedDefinition(
     kind: "continuous_subscription",
     id: definition.subscriptionId,
     definitionRevision:
-      `ContinuousSubscriptionDefinition@3:${definition.revision}`
+      `${definition.schemaVersion}:${definition.revision}`
   });
   const binding = proactiveTargetRunBinding(target);
   if (binding !== undefined && binding.occurrencePolicy !== "recurring") {
@@ -880,7 +1000,7 @@ function validateTargetedDefinition(
   }
 }
 
-function validateDefinitionBase(definition: ContinuousSubscriptionDefinition): void {
+function validateDefinitionBase(definition: Exclude<ContinuousSubscriptionDefinition, FileContinuousSubscriptionDefinition>): void {
   if (!Number.isInteger(definition.revision) || definition.revision < 1) {
     throw new Error("continuous subscription revision must be positive");
   }
@@ -896,7 +1016,8 @@ function validateDefinitionBase(definition: ContinuousSubscriptionDefinition): v
   }
 }
 
-function nextPoll(subscription: ContinuousSubscription, at: string): string {
+function nextPoll(subscription: ContinuousSubscription, at: string): string | null {
+  if (subscription.definition.schemaVersion === "ContinuousSubscriptionDefinition@4") return null;
   return new Date(Date.parse(at) + subscription.definition.intervalMilliseconds).toISOString();
 }
 

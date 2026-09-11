@@ -183,13 +183,15 @@ export type ChatActivationReason =
   | "manual"
   | "scheduled"
   | "participant_message"
-  | "resumed";
+  | "resumed"
+  | "work_result";
 
 export type ChatActivationStrategy =
   | "starter"
   | "manual"
   | "scheduled"
-  | "participant-message";
+  | "participant-message"
+  | "work-result";
 
 export interface ChatActivationEvent extends EventBase {
   readonly type: "chat.activation";

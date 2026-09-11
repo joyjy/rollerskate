@@ -5,7 +5,7 @@ import {
   inspectAgent,
   isAgentClient,
   listAgents,
-  localRuntimeSnapshot,
+  readLocalRuntimeSnapshot,
   renameLocalAgent,
   resumeLocalAgent,
   suspendLocalAgent,
@@ -136,7 +136,7 @@ export function requireLocalAgent(
   handle: string,
   options: { readonly runtimeDirectory?: string }
 ): LocalAgent {
-  const agent = localRuntimeSnapshot(repoRoot, options).agents.find(
+  const agent = readLocalRuntimeSnapshot(repoRoot, options).agents.find(
     (candidate) => candidate.handle.toLocaleLowerCase("und") === handle.toLocaleLowerCase("und")
   );
   if (agent === undefined) throw new Error(`Local Agent not found: ${handle}`);

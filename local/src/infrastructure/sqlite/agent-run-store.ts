@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
 import { openInitializedRuntimeDatabase } from "./database.js";
@@ -666,6 +667,40 @@ export class AgentRunStore {
     return this.requireProjection(input.runId);
   }
 
+  public waitForHumanInTransaction(runId: string, expectedVersion: number, at: string): AgentRunProjection {
+    const changed = this.#database.prepare(`UPDATE agent_runs SET status = 'awaiting_orchestrator', active_execution_id = NULL,
+      version = version + 1, updated_at = ? WHERE run_id = ? AND version = ? AND orchestration_mode = 'caller'
+      AND status IN ('active','awaiting_orchestrator')`).run(iso(at),requireAgentRunId(runId),expectedVersion);
+    if (changed.changes !== 1) throw new Error("Run human question CAS failed");
+    return this.requireProjection(runId);
+  }
+
+  public resumeNetworkCapabilityInTransaction(runId: string, expectedVersion: number, requestEventId: string, at: string): AgentRunProjection {
+    const run = this.requireProjection(runId);
+    const binding = run.orchestratorBinding;
+    if (binding?.schemaVersion !== "OrchestratorBinding@3" || run.workspaceGrant?.access !== "read" ||
+      run.workspaceGrant.networkAccess || binding.authority.workspace === undefined) throw new Error("Invalid network capability transition");
+    const grant = {...run.workspaceGrant, networkAccess: true};
+    const authority = {...binding.authority, workspace: {...binding.authority.workspace, networkAccess: true}};
+    const admissionDigest = `sha256:${createHash("sha256").update(JSON.stringify({
+      priorAdmissionDigest: binding.admissionDigest, requestEventId, expectedVersion, authority
+    })).digest("hex")}`;
+    const nextBinding = {...binding, admissionDigest, ownerNetworkAuthorized: true, authority};
+    const changed = this.#database.prepare(`UPDATE agent_runs SET workspace_grant_json = ?, orchestrator_binding_json = ?,
+      version = version + 1, updated_at = ? WHERE run_id = ? AND version = ? AND status = 'awaiting_orchestrator' AND active_execution_id IS NULL`)
+      .run(JSON.stringify(grant), JSON.stringify(nextBinding), iso(at), requireAgentRunId(runId), expectedVersion);
+    if (changed.changes !== 1) throw new Error("Capability adjustment CAS failed");
+    return this.requireProjection(runId);
+  }
+
+  public resumeHumanAnswerInTransaction(runId: string, expectedVersion: number, at: string): AgentRunProjection {
+    const changed = this.#database.prepare(`UPDATE agent_runs SET version = version + 1, updated_at = ?
+      WHERE run_id = ? AND version = ? AND status = 'awaiting_orchestrator' AND active_execution_id IS NULL`)
+      .run(iso(at),requireAgentRunId(runId),expectedVersion);
+    if (changed.changes !== 1) throw new Error("Run human answer CAS failed");
+    return this.requireProjection(runId);
+  }
+
   public advanceCallerInTransaction(input: {
     readonly runId: string;
     readonly expectedVersion: number;
@@ -1119,9 +1154,6 @@ function parseWorkspaceGrant(value: string): ExternalWorkspaceGrant {
   }
   if (parsed.networkAccess !== undefined && typeof parsed.networkAccess !== "boolean") {
     throw new Error("Agent Run workspaceGrant networkAccess is unsupported");
-  }
-  if (parsed.networkAccess === true && parsed.access !== "write") {
-    throw new Error("Agent Run workspaceGrant networkAccess requires write access");
   }
   if (parsed.effect !== undefined && parsed.effect !== "must_change" &&
     parsed.effect !== "may_remain_unchanged") {

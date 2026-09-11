@@ -1,3 +1,5 @@
+import { DeterministicApplicationActionRegistry } from "../proactive/action-registry.js";
+import { ExternalWorkflowStore } from "../../infrastructure/proactive/external-workflow-store.js";
 import { realpathSync, statSync } from "node:fs";
 
 import type {
@@ -8,6 +10,9 @@ import { ContinuousSubscriptionStore } from "../../capabilities/subscription/con
 import type { ProactiveCallbackOccurrence } from "../../modules/callback/proactive-model.js";
 import { LocalFoundationStore } from "../../infrastructure/sqlite/foundation-store.js";
 import { runtimePaths } from "../../infrastructure/runtime/config.js";
+
+import { openRuntimeDatabase, openRuntimeDatabaseReadOnly } from "../../infrastructure/sqlite/database.js";
+import { assertCurrentLocalSchema } from "../../infrastructure/sqlite/schema/index.js";
 
 export type { ContinuousSubscriptionDefinition, LegacyContinuousSubscriptionDefinition };
 
@@ -24,8 +29,10 @@ export interface ContinuousSubscriptionView {
   readonly definition: ContinuousSubscriptionDefinition;
   readonly probe: {
     readonly plugin: { readonly id: string; readonly path: string; readonly schemaVersion: 1 };
-    readonly policy: ContinuousSubscriptionDefinition["probe"]["policy"];
-  };
+    readonly policy: LegacyContinuousSubscriptionDefinition["probe"]["policy"];
+  } | null;
+  readonly fileListener?: ReturnType<ContinuousSubscriptionStore["require"]>["fileListener"];
+  readonly externalWorkflowExecution?: ReturnType<ContinuousSubscriptionStore["require"]>["externalWorkflowExecution"];
   readonly callbacks: readonly ProactiveCallbackOccurrence[];
   readonly callbackOccurrenceKey: string | null;
   readonly callbackSummary: {
@@ -36,7 +43,7 @@ export interface ContinuousSubscriptionView {
     readonly unknown: number;
   };
   readonly pollCount: number;
-  readonly nextPollAt: string;
+  readonly nextPollAt: string | null;
   readonly checkpointOccurrenceKey: string | null;
   readonly checkpointObservation: unknown;
   readonly pendingOccurrenceKey: string | null;
@@ -121,7 +128,7 @@ export function listContinuousSubscriptionViews(
   repoRoot: string,
   runtimeDirectory?: string
 ): ContinuousSubscriptionView[] {
-  return withResources(repoRoot, runtimeDirectory, ({ store, foundation }) => {
+  return withResources(repoRoot, runtimeDirectory, false, ({ store, foundation }) => {
     const subscriptions = store.list(100);
     const callbacks = store.visibleCallbacks(
       subscriptions.map(({ subscriptionId }) => subscriptionId)
@@ -142,7 +149,7 @@ export function inspectContinuousSubscriptionView(
   subscriptionId: string,
   runtimeDirectory?: string
 ): ContinuousSubscriptionView | undefined {
-  return withResources(repoRoot, runtimeDirectory, ({ store, foundation }) => {
+  return withResources(repoRoot, runtimeDirectory, false, ({ store, foundation }) => {
     const subscription = store.get(subscriptionId);
     if (subscription === undefined) return undefined;
     const owner = continuousOwner(subscription, foundation);
@@ -160,7 +167,7 @@ export function inspectContinuousSubscriptionViews(
   runtimeDirectory?: string
 ): ReadonlyMap<string, ContinuousSubscriptionView> {
   if (subscriptionIds.length > 100) throw new Error("subscriptionIds exceeds 100 items");
-  return withResources(repoRoot, runtimeDirectory, ({ store, foundation }) => {
+  return withResources(repoRoot, runtimeDirectory, false, ({ store, foundation }) => {
     const subscriptions = subscriptionIds.flatMap((subscriptionId) => {
       const subscription = store.get(subscriptionId);
       return subscription === undefined ? [] : [subscription];
@@ -179,32 +186,6 @@ export function inspectContinuousSubscriptionViews(
   });
 }
 
-export function controlContinuousSubscriptionView(
-  repoRoot: string,
-  subscriptionId: string,
-  action: "pause" | "resume" | "cancel",
-  runtimeDirectory?: string,
-  at = new Date().toISOString()
-): ContinuousSubscriptionView | undefined {
-  return withResources(repoRoot, runtimeDirectory, ({ store, foundation }) => {
-    const current = store.get(subscriptionId);
-    if (current === undefined) return undefined;
-    if (action === "resume" &&
-      current.definition.schemaVersion === "ContinuousSubscriptionDefinition@1") {
-      throw new Error(
-        "legacy_trigger_execution_closed: migrate this Continuous Subscription to a bound Run"
-      );
-    }
-    const subscription = store.setStatus(subscriptionId, action, at);
-    const owner = continuousOwner(subscription, foundation);
-    return view(
-      subscription,
-      owner,
-      store.visibleCallbacks([subscriptionId]).get(subscriptionId) ?? []
-    );
-  });
-}
-
 export function setContinuousSubscriptionArchivedView(
   repoRoot: string,
   subscriptionId: string,
@@ -212,7 +193,7 @@ export function setContinuousSubscriptionArchivedView(
   runtimeDirectory?: string,
   at = new Date().toISOString()
 ): ContinuousSubscriptionView | undefined {
-  return withResources(repoRoot, runtimeDirectory, ({ store, foundation }) => {
+  return withResources(repoRoot, runtimeDirectory, true, ({ store, foundation }) => {
     if (store.get(subscriptionId) === undefined) return undefined;
     const subscription = store.setArchived(subscriptionId, archived, at);
     const owner = continuousOwner(subscription, foundation);
@@ -249,7 +230,7 @@ function view(
         ? null
         : { agentId: owner.principalId, handle: owner.handle, client: owner.client },
       definition: subscription.definition,
-      probe: {
+      probe: subscription.definition.schemaVersion === "ContinuousSubscriptionDefinition@4" ? null : {
         plugin: {
           id: subscription.definition.probe.plugin.id,
           path: subscription.definition.probe.plugin.path,
@@ -257,6 +238,8 @@ function view(
         },
         policy: subscription.definition.probe.policy
       },
+      ...(subscription.fileListener === undefined ? {} : { fileListener: subscription.fileListener }),
+      ...(subscription.externalWorkflowExecution === undefined ? {} : { externalWorkflowExecution: subscription.externalWorkflowExecution }),
       callbacks,
       callbackOccurrenceKey: visibleOccurrenceKey ?? null,
       callbackSummary,
@@ -293,18 +276,21 @@ function continuousOwner(
 function withResources<T>(
   repoRoot: string,
   runtimeDirectory: string | undefined,
+  migrate: boolean,
   callback: (resources: {
     readonly store: ContinuousSubscriptionStore;
     readonly foundation: LocalFoundationStore;
   }) => T
 ): T {
-  const database = runtimePaths(repoRoot, runtimeDirectory).database;
-  const store = new ContinuousSubscriptionStore(database);
-  const foundation = new LocalFoundationStore(database);
+  const path = runtimePaths(repoRoot, runtimeDirectory).database;
+  const database = migrate ? openRuntimeDatabase(path) : openRuntimeDatabaseReadOnly(path);
   try {
+    if (!migrate) assertCurrentLocalSchema(database);
+    const options = { migrate };
+    const store = new ContinuousSubscriptionStore(database, { ...options, applicationActions: new DeterministicApplicationActionRegistry(database), externalWorkflows: new ExternalWorkflowStore(database) });
+    const foundation = new LocalFoundationStore(database, options);
     return callback({ store, foundation });
   } finally {
-    foundation.close();
-    store.close();
+    database.close();
   }
 }

@@ -51,13 +51,14 @@ export interface PiRuntimeAgentOptions {
   readonly resolveChatToolContext?: (
     input: Pick<PiRequest, "event" | "providerSessionId">
   ) => PiChatToolContext | undefined;
-  readonly chatReadToolGrant?: {
+  readonly chatToolGrant?: {
     readonly tools: readonly string[];
     readonly manifestDigest: string;
   };
 }
 
 export interface PiChatToolContext {
+  readonly dispatchEventId?: string;
   readonly repoRoot?: string;
   readonly runtimeDirectory: string;
   readonly topicId: string;
@@ -84,19 +85,19 @@ export class PiRuntimeAgent implements RuntimeAgentAdapter {
   readonly #launchArgs: readonly string[];
   readonly #processOptions: Omit<PiRuntimeAgentOptions, "resolveChatToolContext">;
   readonly #resolveChatToolContext: PiRuntimeAgentOptions["resolveChatToolContext"];
-  readonly #chatReadToolNames: readonly string[];
-  readonly #chatReadToolManifestDigest: string;
+  readonly #chatToolNames: readonly string[];
+  readonly #chatToolManifestDigest: string;
 
   public constructor(options: PiRuntimeAgentOptions) {
     this.workspace = workspace(options.projectRoot);
     this.#launchArgs = [...(options.launchArgs ?? [])];
     this.#resolveChatToolContext = options.resolveChatToolContext;
-    const grant = validatedChatReadToolGrant(options.chatReadToolGrant);
-    this.#chatReadToolNames = grant.tools;
-    this.#chatReadToolManifestDigest = grant.manifestDigest;
+    const grant = validatedChatToolGrant(options.chatToolGrant);
+    this.#chatToolNames = grant.tools;
+    this.#chatToolManifestDigest = grant.manifestDigest;
     const resources = piPolicyResources(
-      this.#chatReadToolNames,
-      this.#chatReadToolManifestDigest
+      this.#chatToolNames,
+      this.#chatToolManifestDigest
     );
     this.providerPolicy = providerPolicyObservationFromArgv(
       "pi",
@@ -127,8 +128,8 @@ export class PiRuntimeAgent implements RuntimeAgentAdapter {
       this.#processOptions.meaningfulOutputTimeoutMilliseconds ??
       this.#processOptions.timeoutMilliseconds;
     const resources = piPolicyResources(
-      this.#chatReadToolNames,
-      this.#chatReadToolManifestDigest
+      this.#chatToolNames,
+      this.#chatToolManifestDigest
     );
     const currentBasePolicy = providerPolicyObservationFromArgv(
       "pi",
@@ -141,7 +142,7 @@ export class PiRuntimeAgent implements RuntimeAgentAdapter {
     }
     providerPolicyObservationFromArgv(
       "pi",
-      piArgs(request, this.#launchArgs, this.#chatReadToolNames),
+      piArgs(request, this.#launchArgs, this.#chatToolNames),
       piPolicyHelperSource,
       resources,
       access
@@ -149,7 +150,7 @@ export class PiRuntimeAgent implements RuntimeAgentAdapter {
     const process = new PiRpcRunner({
       adapterId: this.adapterId,
       executable: this.#processOptions.executable,
-      args: piArgs(request, this.#launchArgs, this.#chatReadToolNames),
+      args: piArgs(request, this.#launchArgs, this.#chatToolNames),
       environment: {
         ...this.#processOptions.environment,
         [PI_GIT_WORKSPACE_ENV]: this.workspace,
@@ -203,22 +204,22 @@ export class PiRuntimeAgent implements RuntimeAgentAdapter {
 function piArgs(
   request: PiRequest,
   launchArgs: readonly string[],
-  chatReadToolNames: readonly string[] = []
+  chatToolNames: readonly string[] = []
 ): string[] {
   const access = piWorkspaceAccess(request.event);
-  const chatToolNames = request.chatToolContext === undefined
+  const invocationToolNames = request.chatToolContext === undefined
     ? []
     : [
         ...(request.chatToolContext.sourceMessageEventId === undefined
           ? []
           : ["read_chat_history"]),
-        ...chatReadToolNames
+        ...chatToolNames
       ];
   return [
     ...piOptions(
       access,
       launchArgs,
-      chatToolNames
+      invocationToolNames
     ),
     "--session-id", request.providerSessionId
   ];
@@ -296,14 +297,14 @@ function piResponse(receipt: RunnerTurnReceipt): PiDecodedResponse {
 const piPolicyHelperSource = [
   piArgs.toString(),
   piOptions.toString(),
-  validatedChatReadToolGrant.toString(),
+  validatedChatToolGrant.toString(),
   rejectPiResourceLaunchArgs.toString(),
   piWorkspaceAccess.toString()
 ].join("\n");
 
 function piPolicyResources(
-  chatReadToolNames: readonly string[] = [],
-  chatReadToolManifestDigest = ""
+  chatToolNames: readonly string[] = [],
+  chatToolManifestDigest = ""
 ):
 Readonly<Record<string, string>> {
   return {
@@ -311,20 +312,20 @@ Readonly<Record<string, string>> {
     piReadonlyGitExtensionSource: readFileSync(piReadonlyGitExtension, "utf8"),
     piChatHistoryExtensionPath: piChatHistoryExtension,
     piChatHistoryExtensionSource: readFileSync(piChatHistoryExtension, "utf8"),
-    piChatReadToolNames: chatReadToolNames.join(","),
-    piChatReadToolManifestDigest: chatReadToolManifestDigest
+    piChatToolNames: chatToolNames.join(","),
+    piChatToolManifestDigest: chatToolManifestDigest
   };
 }
 
-function validatedChatReadToolGrant(
-  grant: PiRuntimeAgentOptions["chatReadToolGrant"]
+function validatedChatToolGrant(
+  grant: PiRuntimeAgentOptions["chatToolGrant"]
 ): { readonly tools: readonly string[]; readonly manifestDigest: string } {
   if (grant === undefined) return { tools: [], manifestDigest: "" };
   const tools = [...grant.tools];
   if (!/^[a-f0-9]{64}$/u.test(grant.manifestDigest) ||
     tools.length === 0 || new Set(tools).size !== tools.length ||
     tools.some((name) => !/^[a-z][a-z0-9_]{1,63}$/u.test(name))) {
-    throw new Error("Pi Chat read tool grant is malformed");
+    throw new Error("Pi Chat tool grant is malformed");
   }
   return { tools, manifestDigest: grant.manifestDigest };
 }

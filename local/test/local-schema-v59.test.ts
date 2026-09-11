@@ -11,7 +11,7 @@ import { dropChatProjectionObjects } from
 
 const AT = "2026-08-14T08:00:00.000Z";
 
-test("schema v72 extends the public agent_client check and preserves referencing tables", () => {
+test("schema v74 extends the agent_client check and preserves referencing tables", () => {
   const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v59-agent-check-"));
   const databasePath = join(directory, "runtime.db");
   try {
@@ -65,7 +65,7 @@ test("schema v72 extends the public agent_client check and preserves referencing
     }
 
     const diagnostics = initializeRuntimeSchema(databasePath);
-    assert.equal(diagnostics.schemaVersion, 72);
+    assert.equal(diagnostics.schemaVersion, 75);
 
     const migrated = new DatabaseSync(databasePath);
     try {

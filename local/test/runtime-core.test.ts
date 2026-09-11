@@ -1,6 +1,5 @@
+import { temporaryDirectory } from "./support/temp-directory.js";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -361,19 +360,42 @@ test("RuntimeCycle poll claims later independent work while an invocation is run
   }
 });
 
-test("AgentHandler serializes concurrent invocations in the same Agent workspace lane", async () => {
+test("RuntimeCycle shortens the fallback wait to the next durable due time", () => {
+  const store = runtimeStore();
+  try {
+    const at = "2026-09-07T00:00:00.000Z";
+    store.appendEvent({
+      type: "agent.request",
+      source: { kind: "cli" },
+      agentId: "agent-1",
+      prompt: "run when due",
+      createdAt: "2026-09-07T00:00:00.250Z"
+    });
+    const cycle = runtimeCycle(store, {
+      async invoke() {
+        return { providerSessionId: "unused", outcome: { kind: "silent" } };
+      }
+    });
+    assert.equal(cycle.nextWaitMilliseconds(1_000, at), 250);
+    assert.equal(cycle.nextWaitMilliseconds(100, at), 100);
+  } finally {
+    store.close();
+  }
+});
+
+test("RuntimeCycle admits two independent cold Sessions for the same Agent", async () => {
   const store = runtimeStore();
   try {
     let active = 0;
     let maximum = 0;
     const cycle = runtimeCycle(store, {
-      async invoke() {
+      async invoke(input) {
         active += 1;
         maximum = Math.max(maximum, active);
         await new Promise((resolve) => setTimeout(resolve, 20));
         active -= 1;
         return {
-          providerSessionId: `provider-${Date.now()}`,
+          providerSessionId: `provider-${input.event.eventId}`,
           outcome: { kind: "message", body: "done" }
         };
       }
@@ -385,9 +407,9 @@ test("AgentHandler serializes concurrent invocations in the same Agent workspace
       type: "agent.request", source: { kind: "cli" }, agentId: "agent-1", prompt: "second"
     });
 
-    await cycle.run();
+    assert.deepEqual((await cycle.run()).failures, []);
 
-    assert.equal(maximum, 1);
+    assert.equal(maximum, 2);
   } finally {
     store.close();
   }
@@ -611,7 +633,7 @@ test("runtime recovery terminalizes interrupted Agent invocation as unknown with
 });
 
 function runtimeStore(): RuntimeStore {
-  const directory = mkdtempSync(join(tmpdir(), "rollerskate-runtime-core-"));
+  const directory = temporaryDirectory("rollerskate-runtime-core-");
   return new RuntimeStore(join(directory, "runtime.db"));
 }
 

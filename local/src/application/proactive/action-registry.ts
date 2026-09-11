@@ -178,6 +178,12 @@ implements DeterministicApplicationActionRuntime {
     return this.#existing(source, occurrenceKey);
   }
 
+  public receiptById(receiptId: string): DeterministicApplicationActionReceipt | undefined {
+    const row = this.#database.prepare("SELECT receipt_json FROM deterministic_action_receipts WHERE receipt_id = ?")
+      .get(receiptId) as ReceiptRow | undefined;
+    return row === undefined ? undefined : parseDeterministicApplicationActionReceipt(JSON.parse(row.receipt_json) as unknown);
+  }
+
   #existing(
     source: TriggerSourceRef,
     occurrenceKey: string

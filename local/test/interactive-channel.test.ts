@@ -1,3 +1,5 @@
+import { openRuntimeDatabase } from "../src/infrastructure/sqlite/database.js";
+import { ChannelStore } from "../src/infrastructure/sqlite/channel-store.js";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -8,6 +10,7 @@ import { addLocalAgent, localRuntimeSnapshot } from
   "../src/application/agent/control.js";
 import { suspendLocalAgent } from "../src/application/agent/control.js";
 import {
+  revokeInteractiveChannel,
   bindInteractiveChannel,
   sendInteractiveChannelMessage
 } from "../src/application/channel/control.js";
@@ -237,6 +240,78 @@ test("Local first_reply ignores unrelated concurrent conversation roots", async 
   }
 });
 
+for (const condition of ["first_reply", "quiet"] as const) {
+  test(`Channel ${condition} reaches a reply beyond 200 excluded messages`, async () => {
+    const fixture = runtimeFixture(`filtered-page-${condition}`);
+    try {
+      const alice = addLocalAgent(fixture.repo, "alice", "codex", fixture.optionsAt(AT));
+      const bob = addLocalAgent(fixture.repo, "bob", "codex", fixture.optionsAt(AT));
+      const topicId = localRuntimeSnapshot(fixture.repo, fixture.options).foundation.topicId;
+      const binding = bindInteractiveChannel(fixture.repo, {
+        agentId: alice.principalId,
+        allowedChannelRefs: [{ kind: "local-chat", channelId: topicId }],
+        expiresAt: "2026-08-04T00:00:00.000Z"
+      }, fixture.optionsAt(AT));
+      const sent = await sendInteractiveChannelMessage(fixture.repo, {
+        bindingId: binding.bindingId,
+        channelRef: { kind: "local-chat", channelId: topicId },
+        idempotencyKey: "filtered-page",
+        body: "Please reply.",
+        followCondition: condition,
+        quietWindowMilliseconds: 1_000
+      }, fixture.optionsAt("2026-08-03T00:01:00.000Z"));
+      const chat = new LocalChatStore(join(fixture.runtime, "runtime.db"));
+      const runtime = new RuntimeStore(join(fixture.runtime, "runtime.db"));
+      try {
+        const sourceExecution = runtime.claimDueExecutions(1, "2026-08-03T00:01:00.000Z")[0]!;
+        runtime.admitChatAttention(sourceExecution.executionId, [{
+          plan: {
+            agentId: bob.principalId, handle: bob.handle, outcome: "dispatch", reason: "available",
+            presenceSnapshot: {
+              global: { scope: "global", mode: "available", wakeKeywords: [] },
+              topic: { scope: "topic", mode: "available", wakeKeywords: [] }
+            }
+          },
+          prompt: "Reply to Alice."
+        }], "2026-08-03T00:01:00.100Z");
+        const dispatch = runtime.claimDueExecutions(1, "2026-08-03T00:01:00.100Z")[0]!;
+        for (let index = 0; index < 200; index += 1) {
+          chat.admitExternalAgentMessage({
+            topicId, source: { kind: "server", externalId: `excluded-${index}` },
+            sender: { principalId: alice.principalId, handleSnapshot: alice.handle },
+            body: "Sender's own message.",
+            at: new Date(Date.parse("2026-08-03T00:01:01.000Z") + index).toISOString()
+          });
+        }
+        const reply = runtime.completeExecution(dispatch.executionId, {
+          adapterId: "fake", workspace: fixture.repo, providerSessionId: "bob-reply",
+          chatDecision: {
+            schema: "ChatDecision@1", speech: { action: "reply", body: "Here is the reply." },
+            presence: { scope: "global", mode: "available", wakeKeywords: [] }
+          },
+          chatReplyRoute: { continueAttention: false }
+        }, "2026-08-03T00:01:02.000Z");
+        assert.equal(reply?.type, "chat.message");
+        assert.equal(reply?.causality.rootEventId, sent.receipt.conversationRootId);
+        const observedAt = "2026-08-03T00:01:03.000Z";
+        const result = await followInteractiveChannel(
+          fixture.repo, sent.receipt.followToken, 0, fixture.optionsAt(observedAt)
+        );
+        assert.equal(result.follow.status, condition === "first_reply" ? "terminal" : "active");
+        assert.equal(result.follow.currentCursor, reply?.eventId);
+        assert.equal(result.follow.lastObservedAt, observedAt);
+        const recovered = new InteractiveChannelRuntime(fixture.repo, fixture.options);
+        try {
+          await recovered.runCycle("2026-08-03T00:01:04.000Z");
+          assert.equal(inspectInteractiveChannelFollow(
+            fixture.repo, sent.receipt.followToken, fixture.runtime
+          ).follow.status, condition === "first_reply" ? "terminal" : "quiet");
+        } finally { recovered.close(); }
+      } finally { runtime.close(); chat.close(); }
+    } finally { fixture.close(); }
+  });
+}
+
 test("bounded Channel delta resumes from the last returned cursor without gaps", async () => {
   const fixture = runtimeFixture("delta-cursor");
   try {
@@ -435,7 +510,8 @@ test("Channel CLI binds, sends, inspects and revokes exact Local authority", asy
   }
 });
 
-test("Server Channel send uses exact enrollment and stable transaction without reply attribution", async () => {
+for (const recovery of ["replay","revoke"] as const) {
+test(`Server Channel response loss and ${recovery} preserve unknown effect evidence`, async () => {
   const fixture = runtimeFixture("server");
   try {
     const agent = addLocalAgent(fixture.repo, "alice", "codex", fixture.optionsAt(AT));
@@ -549,6 +625,19 @@ test("Server Channel send uses exact enrollment and stable transaction without r
       followCondition: "quiet",
       quietWindowMilliseconds: 0
     }, { ...fixture.optionsAt("2026-08-03T00:01:00.000Z"), fetch: fakeFetch });
+    const pending=inspectInteractiveChannelFollow(fixture.repo,sent.receipt.followToken,fixture.runtime);
+    assert.equal(pending.deliveryOutcome,"unknown");
+    assert.equal(pending.receipt.deliveryAttempted,true);
+    if(recovery==="revoke") {
+      revokeInteractiveChannel(fixture.repo,binding.bindingId,binding.revision,fixture.optionsAt("2026-08-03T00:01:01.000Z"));
+      const recovered=new InteractiveChannelRuntime(fixture.repo,{...fixture.options,fetch:fakeFetch});
+      try {await recovered.runCycle("2026-08-03T00:01:02.000Z");} finally {recovered.close();}
+      const after=inspectInteractiveChannelFollow(fixture.repo,sent.receipt.followToken,fixture.runtime);
+      assert.equal(after.receipt.status,"failed");
+      assert.equal(after.deliveryOutcome,"unknown");
+      assert.equal(calls,1); // no new network effect after grant revocation
+      return;
+    }
     const replay = await sendInteractiveChannelMessage(fixture.repo, {
       bindingId: binding.bindingId,
       channelRef: { kind: "server-topic", channelId: topicId },
@@ -575,6 +664,38 @@ test("Server Channel send uses exact enrollment and stable transaction without r
   } finally {
     fixture.close();
   }
+});
+
+}
+
+test("Local Channel message and receipt commit atomically and reconcile an old crash gap",async()=>{
+  const fixture=runtimeFixture("atomic-local");
+  const agent=addLocalAgent(fixture.repo,"alice","codex",fixture.optionsAt(AT));
+  const topicId=localRuntimeSnapshot(fixture.repo,fixture.options).foundation.topicId;
+  const binding=bindInteractiveChannel(fixture.repo,{agentId:agent.principalId,allowedChannelRefs:[{kind:"local-chat",channelId:topicId}],expiresAt:"2026-08-04T00:00:00.000Z"},fixture.optionsAt(AT));
+  const database=openRuntimeDatabase(runtimePaths(fixture.repo,fixture.runtime).database);
+  const store=new ChannelStore(database,{migrate:false});
+  const chat=new LocalChatStore(database);
+  try {
+    database.exec(`CREATE TRIGGER fail_channel_receipt BEFORE UPDATE ON channel_send_receipts
+      WHEN json_extract(NEW.receipt_json,'$.status')='accepted'
+      BEGIN SELECT RAISE(ABORT,'fixture receipt crash'); END;`);
+    await assert.rejects(()=>sendInteractiveChannelMessage(fixture.repo,{bindingId:binding.bindingId,
+      channelRef:{kind:"local-chat",channelId:topicId},idempotencyKey:"atomic",body:"atomic message"},fixture.optionsAt(AT)),/fixture receipt crash/);
+    assert.equal(chat.events(topicId).filter(event=>event.type==="chat.message").length,0);
+    const follow=store.followsForBinding(binding.bindingId)[0]!;
+    const pending=store.requireSend(follow.sendId);
+    assert.equal(pending.status,"pending");
+    database.exec("DROP TRIGGER fail_channel_receipt");
+    // Simulate a persisted pre-S4 message/receipt crash gap, then revoke authority.
+    chat.admitExternalAgentMessage({source:{kind:"handler",externalId:pending.transactionId},topicId,
+      sender:{principalId:agent.principalId,handleSnapshot:agent.handle},body:pending.body,at:AT});
+    revokeInteractiveChannel(fixture.repo,binding.bindingId,binding.revision,fixture.optionsAt(AT));
+    const recovered=new InteractiveChannelRuntime(fixture.repo,fixture.options);
+    try {await recovered.runCycle(AT);} finally {recovered.close();}
+    assert.equal(store.requireSend(pending.sendId).status,"accepted");
+    assert.equal(chat.events(topicId).filter(event=>event.type==="chat.message").length,1);
+  } finally {chat.close();store.close();database.close();fixture.close();}
 });
 
 const AT = "2026-08-03T00:00:00.000Z";

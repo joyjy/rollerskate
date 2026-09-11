@@ -57,7 +57,7 @@ const canCancel = computed(() => ["active", "paused"].includes(props.subscriptio
       <dt>Local Session</dt>
       <dd>{{ subscription.kind === "free" ? subscription.definition.callbackPhaseStatus : (subscription.pendingOccurrenceKey ?? "checkpointed") }}</dd>
       <dt>Plugin</dt>
-      <dd>{{ subscription.probe.plugin.id }}</dd>
+      <dd>{{ subscription.probe?.plugin.id ?? "File events" }}</dd>
       <dt>Updated</dt>
       <dd>{{ formatDateTime(subscription.updatedAt) }}</dd>
     </dl>

@@ -1,6 +1,6 @@
+import { temporaryDirectory } from "./support/temp-directory.js";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -197,8 +197,9 @@ test("Kimi Code stalls when ACP emits only non-meaningful updates", async () => 
     executable: fixture.executable,
     projectRoot: fixture.workspace,
     environment: {},
-    timeoutMilliseconds: 1_500,
-    meaningfulOutputTimeoutMilliseconds: 500
+    // Allow the fixture process to establish a Session before exercising its stall.
+    timeoutMilliseconds: 5_000,
+    meaningfulOutputTimeoutMilliseconds: 2_000
   });
 
   await assert.rejects(agent.invoke({ event: runEvent() }), (error: unknown) => {
@@ -354,7 +355,7 @@ test("Kimi ACP policy rejects bundled prompts that omit the raw-result first-cha
 });
 
 test("Kimi ACP launch args reject controls other than model selection", () => {
-  const workspace = mkdtempSync(join(tmpdir(), "rollerskate-kimi-acp-policy-"));
+  const workspace = temporaryDirectory("rollerskate-kimi-acp-policy-");
   assert.throws(() => new KimiCodeRuntimeAgent({
     executable: "/absolute/kimi",
     projectRoot: workspace,
@@ -374,7 +375,7 @@ function kimiFixture(options: {
   readonly cancelled?: boolean;
   readonly exitBeforeSettlement?: boolean;
 }): { readonly workspace: string; readonly executable: string; readonly invocation: string } {
-  const workspace = mkdtempSync(join(tmpdir(), "rollerskate-kimi-acp-"));
+  const workspace = temporaryDirectory("rollerskate-kimi-acp-");
   const executable = join(workspace, "kimi-fixture");
   const invocationPath = join(workspace, "invocation.json");
   writeFileSync(executable, `#!${process.execPath}

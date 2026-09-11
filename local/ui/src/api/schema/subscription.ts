@@ -160,6 +160,14 @@ const continuousSubscriptionSchema = v.object({
       schemaVersion: v.literal("ContinuousSubscriptionDefinition@1"),
       revision: v.number()
     }),
+    v.object({
+      schemaVersion: v.literal("ContinuousSubscriptionDefinition@4"),
+      revision: v.number(), title: v.string(), target: v.unknown(),
+      source: v.object({ kind: v.literal("file"), root: v.string(), recursive: v.boolean(),
+        suffixes: v.array(v.string()), exclude: v.array(v.string()),
+        debounceMilliseconds: v.number(), maxDelayMilliseconds: v.number() })
+    }),
+    v.looseObject({ schemaVersion: v.literal("ContinuousSubscriptionDefinition@3"), revision: v.number(), target: v.unknown() }),
     v.looseObject({
       schemaVersion: v.literal("ContinuousSubscriptionDefinition@2"),
       revision: v.number(),
@@ -175,9 +183,11 @@ const continuousSubscriptionSchema = v.object({
     terminal: v.number(),
     unknown: v.number()
   }),
-  probe: subscriptionProbeSchema,
+  probe: v.nullable(subscriptionProbeSchema),
+  fileListener: v.optional(v.object({ status: v.union([v.literal("watching"), v.literal("degraded"), v.literal("stopped")]), observedAt: v.string(), error: v.optional(v.string()) })),
+  externalWorkflowExecution: v.optional(v.unknown()),
   pollCount: v.number(),
-  nextPollAt: v.string(),
+  nextPollAt: nullableString,
   checkpointOccurrenceKey: nullableString,
   checkpointObservation: v.unknown(),
   pendingOccurrenceKey: nullableString,

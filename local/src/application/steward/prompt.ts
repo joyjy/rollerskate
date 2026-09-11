@@ -1,3 +1,4 @@
+import type { AcceptanceContract } from "../../modules/steward/acceptance.js";
 import type { WorkspaceEffect } from "../../core/runtime/model.js";
 
 export interface StewardDelegateTarget {
@@ -171,20 +172,24 @@ export function stewardOrchestratorPrompt(input: {
   readonly participants: readonly StewardDelegateTarget[];
   readonly taskUrl?: string;
   readonly workspaceEffect?: WorkspaceEffect;
-  readonly contractVersion?: 2 | 3;
+  readonly contractVersion?: 2 | 3 | 4 | 5 | 6;
+  readonly acceptanceContract?: AcceptanceContract;
+  readonly currentNetworkAccess?: boolean;
   readonly triggerKinds?: readonly string[];
   readonly sourceEnvelope?: unknown;
 }): string {
   const decisionVersion = input.contractVersion ?? 2;
-  const state = input.priorState ?? {
+  const exampleState = {
     schemaVersion: "OrchestratorState@1",
-    goal: input.objective,
+    goal: "concise business goal",
     tasks: [],
     acceptedEvidence: [],
     unresolvedQuestions: []
   };
   return [
     "You are the Steward Orchestrator for this Run. You own decomposition, Agent selection, handoff, and stopping; Workers do not.",
+    `Your response envelope is RunDecision@${decisionVersion}. The business request below defines the goal and deliverables, not a different response envelope.`,
+    ...(decisionVersion >= 4 ? ["If the business request describes AgentTurnResult@1.outputs, map that outputs array to finish.outputs, preserving each output's id, contentType, schemaVersion and value. A requested report JSON belongs in an output's value. Do not return AgentTurnResult@1 or put outputs at the RunDecision top level."] : []),
     "",
     `Goal: ${input.objective}`,
     `Current Run version: ${input.runVersion}`,
@@ -197,8 +202,8 @@ export function stewardOrchestratorPrompt(input: {
     input.checkpoint === undefined
       ? "First decompose the goal into a bounded task state, then select the first Worker. Keep stable taskIds; do not copy raw transcripts."
       : "Update the bounded task state from the newest Worker checkpoint. Keep stable taskIds and preserve accepted conclusions; do not copy raw transcripts.",
-    "Choose next_step only when another bounded step can materially change completion. Use an exact admitted agentId. Finish only when the goal is actually satisfied; otherwise use needs_human when authority or information is missing.",
-    ...(decisionVersion === 3
+    "Choose next_step only when another bounded step can materially change completion. Use an exact admitted agentId. Finish only when the goal is actually satisfied; otherwise use the human-input decision described below when blocked.",
+    ...(decisionVersion >= 3
       ? [
           input.sourceEnvelope === undefined
             ? "Use await_source only to bind this standalone Run to one admitted trigger."
@@ -211,8 +216,20 @@ export function stewardOrchestratorPrompt(input: {
           "finish must declare scope=cycle or scope=run. A source occurrence may finish its cycle and await the next occurrence, or close the whole Run."
         ]
       : []),
+    ...(decisionVersion >= 4 ? ["finish.outputs may contain up to 20 generic outputs with unique URL-safe id, title, contentType (application/json, text/markdown, text/plain), optional schemaVersion, and value; the entire outputs array must fit within 32768 bytes. Return structured deliverables here; checkedAcceptance and state.acceptedEvidence are reasoning, not canonical outputs. Workers return AgentStepResult@1; pass report content through their bounded summary/artifactRefs and assemble final outputs yourself."] : []),
+    ...(decisionVersion >= 5 ? [
+      "When one concrete Owner answer can unblock this Run within its existing authority, choose action=ask_human with question (one concise question, at most 4096 characters), rationale, checkedAcceptance and state; omit nextStep, awaitSource and finish. This suspends the Run while preserving the checkpoint and accepted evidence. Use needs_human only when no safe continuation is known, including unknown external effects. An answer does not expand workspace, network, participants, budget or authority. Never use a question as a substitute for obtaining missing execution permission."
+    ] : []),
     "The next Worker receives only nextStep.mandate, not the checkpoint, prior task state, or decision history. Put every bounded fact and reference needed for the handoff into that mandate.",
     "The Runtime will validate this decision against the current Run version, roster, deadline, and budget. Never expand them.",
+    ...(decisionVersion >= 6 ? [
+      `Current effective network access: ${input.currentNetworkAccess === true ? "enabled" : "disabled"}. This overrides historical admission text in the objective.`,
+      "Immutable original acceptance contract (higher priority than dispatch notes, task decomposition or worker claims):",
+      JSON.stringify(input.acceptanceContract),
+      "checkedAcceptance is an array of {id,status:pass|fail|unknown,evidenceRefs:string[]}. At success every original ID must occur exactly once, pass with evidence, and state.unresolvedQuestions must be empty. Missing or stale required evidence is unknown, never pass. A report listing gaps does not satisfy the underlying requirements.",
+      "Before work and again before finish, compare original acceptance with admitted capabilities. If network is needed but unavailable, return action=request_capability with capability={kind:network,acceptanceIds:[original IDs],targets:[exact URLs or hosts],reason:why needed}, plus expectedRunVersion,rationale,checkedAcceptance,state. Omit finish/nextStep/question. Runtime suspends and checks Owner authorization; a request grants nothing. Do not replace this with ask_human or reduce acceptance. Preserve useful evidence in state; after continuation do not repeat completed work."
+    ] : ["checkedAcceptance must be an array of plain strings."]),
+    "state.acceptedEvidence and state.unresolvedQuestions are arrays of plain strings.",
     ...(input.workspaceEffect === "must_change"
       ? ["Runtime will reject finish.outcome=succeeded until it independently observes a workspace revision change."]
       : []),
@@ -220,8 +237,9 @@ export function stewardOrchestratorPrompt(input: {
     "Admitted participants:",
     JSON.stringify(input.participants, null, 2),
     "",
-    "Prior OrchestratorState@1:",
-    JSON.stringify(state, null, 2),
+    "Prior OrchestratorState@1 (null means no accepted state yet):",
+    JSON.stringify(input.priorState ?? null, null, 2),
+    "Keep state.goal a concise description of the business goal; do not copy the full request, output schemas or transcripts into state. The full goal and original acceptance above remain authoritative.",
     "Every state.tasks item must use exactly this shape; assignedAgentId and summary are optional, and no other task fields are allowed:",
     JSON.stringify({
       taskId: "stable-task-id",
@@ -242,6 +260,7 @@ export function stewardOrchestratorPrompt(input: {
       : ["Current TriggerOccurrenceEnvelope@1:", JSON.stringify(input.sourceEnvelope, null, 2)]),
     "",
     `Return exactly one RunDecision@${decisionVersion} JSON object with no code fence or extra text.`,
+    "The following examples show the response structure only. Replace example state with the updated task state, and fill checkedAcceptance from actual evidence. Produce complete valid JSON: escape quotes, backslashes and newlines inside strings; close every object and array. Keep rationale, state and report content concise rather than repeating the same evidence.",
     "For next_step use:",
     JSON.stringify({
       schemaVersion: `RunDecision@${decisionVersion}`,
@@ -249,24 +268,24 @@ export function stewardOrchestratorPrompt(input: {
       expectedRunVersion: input.runVersion,
       rationale: "why another bounded step is needed",
       checkedAcceptance: [],
-      state,
+      state: exampleState,
       nextStep: {
         target: { kind: "agent", agentId: "exact admitted agentId" },
         mandate: { kind: "objective", objective: "bounded next objective" }
       }
     }, null, 2),
-    ...(decisionVersion === 3
+    ...(decisionVersion >= 3
       ? [
           ...(input.sourceEnvelope === undefined
             ? [
                 "For await_source use:",
                 JSON.stringify({
-                  schemaVersion: "RunDecision@3",
+                  schemaVersion: `RunDecision@${decisionVersion}`,
                   action: "await_source",
                   expectedRunVersion: input.runVersion,
                   rationale: "why the Run should wait for one admitted source",
                   checkedAcceptance: [],
-                  state,
+                  state: exampleState,
                   awaitSource: {
                     sourceKind: "schedule | subscription | continuous_subscription",
                     templateId: "exact admitted template id",
@@ -277,16 +296,22 @@ export function stewardOrchestratorPrompt(input: {
             : []),
           "For finish use:",
           JSON.stringify({
-            schemaVersion: "RunDecision@3",
+            schemaVersion: `RunDecision@${decisionVersion}`,
             action: "finish",
             expectedRunVersion: input.runVersion,
             rationale: "why this scope is complete",
             checkedAcceptance: [],
-            state,
+            state: exampleState,
             finish: {
-              scope: "cycle | run",
-              outcome: "succeeded | failed",
-              summary: "bounded terminal summary"
+              scope: "run",
+              outcome: "succeeded",
+              summary: "bounded terminal summary",
+              ...(decisionVersion >= 4 ? { outputs: [{
+                id: "report",
+                title: "Requested report",
+                contentType: "application/json",
+                value: { result: "replace with the requested deliverable" }
+              }] } : {})
             }
           }, null, 2),
           "For needs_human omit nextStep/awaitSource/finish. Always include the updated state."

@@ -1,3 +1,6 @@
+import { migrateV74Schema } from "./v74-migration.js";
+import { migrateV73Schema } from "./v73-migration.js";
+import { migrateV72Schema } from "./v72-migration.js";
 import type { DatabaseSync } from "node:sqlite";
 
 import { createSchema } from "./definition.js";
@@ -61,7 +64,7 @@ import { assertV70SchemaShape, migrateV70Schema } from "./v70-migration.js";
 import { assertV71SchemaShape, migrateV71Schema } from "./v71-migration.js";
 import { assertNoLiveRuntimeSchemaUpgrade } from "./upgrade-guard.js";
 
-export const LOCAL_SCHEMA_VERSION = 72;
+export const LOCAL_SCHEMA_VERSION = 75;
 
 export function assertCurrentLocalSchema(database: DatabaseSync): void {
   const declaredVersion = schemaVersion(database);
@@ -101,9 +104,27 @@ export function migrateLocalDatabase(database: DatabaseSync): void {
     migrateCurrentRuntimeData(database);
     return;
   }
+  if (declaredVersion === 74) {
+    migrateV74Schema(database, LOCAL_SCHEMA_VERSION);
+    migrateCurrentRuntimeData(database);
+    return;
+  }
+  if (declaredVersion === 73) {
+    migrateV73Schema(database, LOCAL_SCHEMA_VERSION);
+    migrateCurrentRuntimeData(database);
+    return;
+  }
+  if (declaredVersion === 72) {
+    migrateV72Schema(database, 73);
+    migrateV73Schema(database, LOCAL_SCHEMA_VERSION);
+    migrateCurrentRuntimeData(database);
+    return;
+  }
   if (declaredVersion === 71) {
     assertV71SchemaShape(database);
-    migrateV71Schema(database, LOCAL_SCHEMA_VERSION);
+    migrateV71Schema(database, 72);
+    migrateV72Schema(database, 73);
+    migrateV73Schema(database, LOCAL_SCHEMA_VERSION);
     backfillScheduleCallbacks(database);
     migrateCurrentRuntimeData(database);
     return;
@@ -112,7 +133,9 @@ export function migrateLocalDatabase(database: DatabaseSync): void {
     assertV70SchemaShape(database);
     migrateV70Schema(database, 71);
     assertV71SchemaShape(database);
-    migrateV71Schema(database, LOCAL_SCHEMA_VERSION);
+    migrateV71Schema(database, 72);
+    migrateV72Schema(database, 73);
+    migrateV73Schema(database, LOCAL_SCHEMA_VERSION);
     backfillScheduleCallbacks(database);
     migrateCurrentRuntimeData(database);
     return;
@@ -123,7 +146,9 @@ export function migrateLocalDatabase(database: DatabaseSync): void {
     assertV70SchemaShape(database);
     migrateV70Schema(database, 71);
     assertV71SchemaShape(database);
-    migrateV71Schema(database, LOCAL_SCHEMA_VERSION);
+    migrateV71Schema(database, 72);
+    migrateV72Schema(database, 73);
+    migrateV73Schema(database, LOCAL_SCHEMA_VERSION);
     backfillScheduleCallbacks(database);
     migrateCurrentRuntimeData(database);
     return;
@@ -136,7 +161,9 @@ export function migrateLocalDatabase(database: DatabaseSync): void {
     assertV70SchemaShape(database);
     migrateV70Schema(database, 71);
     assertV71SchemaShape(database);
-    migrateV71Schema(database, LOCAL_SCHEMA_VERSION);
+    migrateV71Schema(database, 72);
+    migrateV72Schema(database, 73);
+    migrateV73Schema(database, LOCAL_SCHEMA_VERSION);
     backfillScheduleCallbacks(database);
     migrateCurrentRuntimeData(database);
     return;
@@ -313,6 +340,7 @@ export function migrateLocalDatabase(database: DatabaseSync): void {
 }
 
 function migrateCurrentRuntimeData(database: DatabaseSync): void {
+  migrateV74Schema(database, LOCAL_SCHEMA_VERSION);
   database.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS subscriptions_bound_run
       ON subscriptions(agent_run_id) WHERE agent_run_id IS NOT NULL;
@@ -445,7 +473,7 @@ function isCurrentSchema(database: DatabaseSync): boolean {
     ) && ["source_binding_json", "target_json", "agent_run_id", "cycle_id",
       "admission_receipt_json"].every(
       (column) => tableColumns(database, "subscriptions").includes(column)
-    ) && ["definition_schema", "source_binding_json", "target_json", "agent_run_id",
+    ) && ["file_source_json", "file_listener_json", "definition_schema", "source_binding_json", "target_json", "agent_run_id",
       "pending_cycle_id", "pending_admission_receipt_json"].every(
       (column) => tableColumns(database, "continuous_subscriptions").includes(column)
     ) &&
@@ -484,5 +512,7 @@ function upgradeFromV67(database: DatabaseSync): void {
   assertV70SchemaShape(database);
   migrateV70Schema(database, 71);
   assertV71SchemaShape(database);
-  migrateV71Schema(database, LOCAL_SCHEMA_VERSION);
+  migrateV71Schema(database, 72);
+  migrateV72Schema(database, 73);
+    migrateV73Schema(database, LOCAL_SCHEMA_VERSION);
 }

@@ -440,7 +440,7 @@ test("Kimi Chat can use the provider-neutral safe read request fallback", async 
         }
       };
       assert.equal(input.providerSessionId, "kimi-read-tools-session");
-      assert.match(input.event.prompt, /ChatReadCapabilities@1/);
+      assert.match(input.event.prompt, /ChatCapabilities@1/);
       assert.match(input.event.prompt, /mutationAllowed/);
       return {
         providerSessionId: "kimi-read-tools-session",
@@ -461,7 +461,10 @@ test("Kimi Chat can use the provider-neutral safe read request fallback", async 
     clientHistory: () => {
       throw new Error("Client history was not requested");
     },
-    chatReadTools: () => createChatReadToolContext({ repoRoot: "/repo" })
+    chatTools: (event) => {
+      assert.equal(event.eventId, eventId);
+      return createChatReadToolContext({ repoRoot: "/repo", dispatchEventId: event.eventId });
+    }
   });
   const eventId = "evt_019f92c9-0000-7000-8000-000000000005";
   const result = await adapter.invoke({
@@ -483,3 +486,33 @@ test("Kimi Chat can use the provider-neutral safe read request fallback", async 
   assert.equal(calls, 2);
   assert.equal(result.providerSessionId, "kimi-read-tools-session");
 });
+
+for (const scenario of ["tool-error","shared-budget","crossed-session"] as const) {
+  test(`Kimi continuation ${scenario} preserves the turn boundary`,async()=>{
+    let calls=0;
+    const request=(tool:string,args:unknown)=>JSON.stringify({schema:"ChatToolRequest@1",tool,arguments:args});
+    const adapter=withChatHistoryContinuation({adapterId:"kimi-s4",workspace:"/workspace",providerPolicy:KIMI_POLICY_OBSERVATION,
+      async invoke(input){
+        calls++;
+        let body:string;
+        if(calls===1 && scenario==="shared-budget") body=JSON.stringify({schema:"ClientHistoryRequest@1",action:"search",query:"history",limit:1});
+        else if(calls===1) body=request("control_schedule",{});
+        else if(calls===2 && scenario==="shared-budget") body=request("start_chat_run",{desiredEffect:"none"});
+        else {
+          assert.match(input.event.prompt,/tool_error/);
+          assert.match(input.event.prompt,scenario==="shared-budget" ? /budget/ : /malformed/);
+          body=JSON.stringify({schema:"ChatDecision@1",speech:{action:"silent",reason:"blocked tool"},presence:{scope:"topic",mode:"available",wakeKeywords:[]}});
+        }
+        return {providerSessionId:scenario==="crossed-session" && calls===2 ? "wrong-session" : "exact-session",outcome:{kind:"message" as const,body}};
+      }
+    },{chatHistory:()=>{throw new Error("unexpected history");},
+      clientHistory:()=>({schema:"ClientHistoryResult@1",client:"kimi-code",action:"search",items:[{reference:"kimi-code:aaaaaaaaaaaaaaaaaaaaaaaa",occurredAt:AT,content:"x".repeat(800000)}],truncated:false}),
+      // Nonexistent runtime proves budget/argument rejection occurs before opening a writer.
+      chatTools:()=>createChatReadToolContext({repoRoot:"/missing-s4-runtime"})});
+    const eventId="evt_019f92c9-0000-7000-8000-000000000099";
+    const input={event:{eventId,type:"chat.dispatch" as const,source:{kind:"handler" as const},agentId:"prn_kimi",topicId:"topic-local",sourceAttentionEventId:eventId,targetHandleSnapshot:"kimi",promptResourceId:"rollerskate.chat.free-turn.v1",prompt:"respond",destinationIds:[],causality:{rootEventId:eventId,hop:1},createdAt:AT}};
+    if(scenario==="crossed-session") await assert.rejects(()=>adapter.invoke(input),/Session identity/);
+    else {const result=await adapter.invoke(input);assert.equal(result.providerSessionId,"exact-session");}
+    assert.equal(calls,scenario==="shared-budget" ? 3 : 2);
+  });
+}

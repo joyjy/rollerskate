@@ -49,6 +49,7 @@ export interface RuntimePaths {
   readonly deviceCredential: string;
   readonly deviceBinding: string;
   readonly agentConfig: string;
+  readonly stewardPolicy: string;
   readonly agentCredentials: string;
   readonly database: string;
   readonly workspace: string;
@@ -98,6 +99,7 @@ export function runtimePaths(repoRoot: string, configuredRuntimeDirectory?: stri
     deviceCredential: join(runtimeDirectory, "device-credential.json"),
     deviceBinding: join(runtimeDirectory, "device-binding.json"),
     agentConfig: join(runtimeDirectory, "agent-config.json"),
+    stewardPolicy: join(runtimeDirectory, "steward-policy.json"),
     agentCredentials: join(runtimeDirectory, "agent-credentials"),
     database: join(runtimeDirectory, "runtime.db"),
     workspace: join(runtimeDirectory, "workspace"),

@@ -10,7 +10,6 @@ import {
   unlinkSync,
   writeFileSync
 } from "node:fs";
-import { setTimeout as delay } from "node:timers/promises";
 
 export interface LoopState {
   readonly schemaVersion: 1;
@@ -53,6 +52,8 @@ export interface LoopOptions {
   readonly phases: readonly LoopPhase[];
   readonly paused: () => boolean;
   readonly pollMilliseconds?: number;
+  readonly wakeSignal?: LoopWakeSignal;
+  readonly nextWaitMilliseconds?: (maximumWaitMilliseconds: number) => number;
   readonly output?: { readonly write: (text: string) => void };
 }
 
@@ -61,11 +62,50 @@ export interface LoopResult {
   readonly stopped: true;
 }
 
+export class LoopWakeSignal {
+  #generation = 0;
+  readonly #waiters = new Set<() => void>();
+
+  public snapshot(): number {
+    return this.#generation;
+  }
+
+  public wake(): void {
+    this.#generation += 1;
+    for (const waiter of [...this.#waiters]) waiter();
+  }
+
+  public waitAfter(
+    generation: number,
+    milliseconds: number,
+    signal: AbortSignal
+  ): Promise<void> {
+    if (signal.aborted || generation !== this.#generation || milliseconds === 0) {
+      return Promise.resolve();
+    }
+    return new Promise((resolveWait) => {
+      let settled = false;
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal.removeEventListener("abort", finish);
+        this.#waiters.delete(finish);
+        resolveWait();
+      };
+      const timer = setTimeout(finish, milliseconds);
+      this.#waiters.add(finish);
+      signal.addEventListener("abort", finish, { once: true });
+      if (signal.aborted || generation !== this.#generation) finish();
+    });
+  }
+}
+
 export async function runLoop(
   options: LoopOptions,
   signal: AbortSignal
 ): Promise<LoopResult> {
-  const pollMilliseconds = bounded(options.pollMilliseconds ?? 1_000, 50, 60_000, "poll");
+  const pollMilliseconds = bounded(options.pollMilliseconds ?? 250, 50, 60_000, "poll");
   const startedAt = new Date().toISOString();
   let cycles = 0;
   let lastCycleStartAt: string | undefined;
@@ -89,6 +129,7 @@ export async function runLoop(
         await waitForNextCycle(pollMilliseconds, signal);
         continue;
       }
+      const wakeGeneration = options.wakeSignal?.snapshot();
       const cycleStartedAt = new Date().toISOString();
       for (const phase of options.phases) {
         if (signal.aborted) break main;
@@ -123,7 +164,18 @@ export async function runLoop(
         lastCycleEndAt,
         lastCycleDurationMs
       }));
-      await waitForNextCycle(pollMilliseconds, signal);
+      const waitMilliseconds = bounded(
+        options.nextWaitMilliseconds?.(pollMilliseconds) ?? pollMilliseconds,
+        0,
+        pollMilliseconds,
+        "next wait"
+      );
+      await waitForNextCycle(
+        waitMilliseconds,
+        signal,
+        options.wakeSignal,
+        wakeGeneration
+      );
     }
     writeState(options.statePath, {
       ...state(options, startedAt, cycles, options.paused(), {
@@ -204,14 +256,24 @@ function state(
 
 async function waitForNextCycle(
   pollMilliseconds: number,
-  signal: AbortSignal
+  signal: AbortSignal,
+  wakeSignal?: LoopWakeSignal,
+  wakeGeneration?: number
 ): Promise<void> {
   if (signal.aborted) return;
-  try {
-    await delay(pollMilliseconds, undefined, { signal });
-  } catch (error) {
-    if (!signal.aborted) throw error;
+  if (wakeSignal !== undefined && wakeGeneration !== undefined) {
+    await wakeSignal.waitAfter(wakeGeneration, pollMilliseconds, signal);
+    return;
   }
+  await new Promise<void>((resolveWait) => {
+    const finish = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", finish);
+      resolveWait();
+    };
+    const timer = setTimeout(finish, pollMilliseconds);
+    signal.addEventListener("abort", finish, { once: true });
+  });
 }
 
 function claimLoop(path: string, initialState: LoopState): () => void {

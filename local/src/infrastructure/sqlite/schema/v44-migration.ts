@@ -48,6 +48,7 @@ export const TARGET_TABLES = [
   "agent_run_decisions",
   "deterministic_action_receipts",
   "external_workflow_executions",
+  "external_workflow_recovery_receipts",
   "legacy_trigger_migration_receipts",
   "proactive_source_migration_receipts"
 ] as const;
@@ -89,6 +90,7 @@ export function assertSupportedSchemaShape(
     "agent_run_decisions",
     "deterministic_action_receipts",
     "external_workflow_executions",
+    "external_workflow_recovery_receipts",
     "legacy_trigger_migration_receipts",
     "proactive_source_migration_receipts"
   ];

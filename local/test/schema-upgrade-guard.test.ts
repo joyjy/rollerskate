@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import {
+  existsSync,
   mkdtempSync,
   rmSync,
   writeFileSync
@@ -32,20 +33,20 @@ test("new CLI cannot upgrade the database while an older Runtime owns the loop",
       () => runLocalApp(repo, [
         "--runtime", runtime, "start", "--no-open", "--ui-port", "4300"
       ]),
-      /Cannot upgrade Local database schema 59 to 72 while Runtime pid \d+ is running/
+      /Cannot upgrade Local database schema 59 to 75 while Runtime pid \d+ is running/
     );
     await assert.rejects(
       () => runLocalApp(repo, ["--runtime", runtime, "run", "list"]),
-      /Cannot upgrade Local database schema 59 to 72 while Runtime pid \d+ is running/
+      /Cannot upgrade Local database schema 59 to 75 while Runtime pid \d+ is running/
     );
     assert.equal(readSchemaVersion(databasePath), 59);
     assert.throws(
       () => runMigration([databasePath]),
-      /Cannot upgrade Local database schema 59 to 72 while Runtime pid \d+ is running/
+      /Cannot upgrade Local database schema 59 to 75 while Runtime pid \d+ is running/
     );
     assert.equal(readSchemaVersion(databasePath), 59);
 
-    setSchemaVersion(databasePath, 72);
+    setSchemaVersion(databasePath, 75);
     let sameVersionOutput = "";
     assert.equal(await runLocalApp(repo, [
       "--runtime", runtime, "run", "list"
@@ -54,10 +55,12 @@ test("new CLI cannot upgrade the database while an older Runtime owns the loop",
 
     setSchemaVersion(databasePath, 59);
     rmSync(loopLock);
-    await assert.rejects(
-      () => runLocalApp(repo, ["--runtime", runtime, "run", "list"]),
-      /read-only queries do not migrate schema.*scripts\/rs start/
-    );
+    for (const command of [["run", "list"], ["agent", "list"], ["subscription", "list"], ["notice", "list"]]) {
+      await assert.rejects(
+        () => runLocalApp(repo, ["--runtime", runtime, ...command]),
+        /read-only queries do not migrate schema.*scripts\/rs start/
+      );
+    }
     assert.equal(readSchemaVersion(databasePath), 59);
     runMigration([databasePath]);
     let output = "";
@@ -65,7 +68,7 @@ test("new CLI cannot upgrade the database while an older Runtime owns the loop",
       "--runtime", runtime, "run", "list"
     ], {}, { write(text) { output += text; } }), 0);
     assert.deepEqual(JSON.parse(output), []);
-    assert.equal(readSchemaVersion(databasePath), 72);
+    assert.equal(readSchemaVersion(databasePath), 75);
   } finally {
     rmSync(repo, { recursive: true, force: true });
     rmSync(runtime, { recursive: true, force: true });
@@ -111,3 +114,16 @@ function readSchemaVersion(databasePath: string): number {
     database.close();
   }
 }
+
+test("diagnostic queries never create a missing Runtime", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "rollerskate-query-missing-"));
+  const runtime = join(repo, "missing-runtime");
+  try {
+    for (const command of [["agent", "list"], ["subscription", "list"], ["notice", "list"], ["chat", "history"]]) {
+      await assert.rejects(() => runLocalApp(repo, ["--runtime", runtime, ...command]));
+      assert.equal(existsSync(runtime), false);
+    }
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});

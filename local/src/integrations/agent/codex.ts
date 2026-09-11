@@ -59,14 +59,14 @@ export class CodexRuntimeAgent implements RuntimeAgentAdapter {
   public readonly providerPolicy;
   public readonly workspace: string;
   readonly #options: CodexRuntimeAgentOptions;
-  readonly #model: string | undefined;
+  readonly #selection: { readonly model?: string; readonly reasoningEffort?: string };
 
   public constructor(options: CodexRuntimeAgentOptions) {
     this.workspace = workspace(options.projectRoot);
     this.#options = options;
-    this.#model = codexModel(options.launchArgs ?? []);
+    this.#selection = codexSelection(options.launchArgs ?? []);
     this.providerPolicy = codexAppServerPolicyObservation(
-      codexThreadParameters("read", false, this.workspace, [], this.#model),
+      codexThreadParameters("read", false, this.workspace, [], this.#selection),
       codexPolicyHelperSource,
       "read"
     );
@@ -94,7 +94,7 @@ export class CodexRuntimeAgent implements RuntimeAgentAdapter {
       networkAccess,
       this.workspace,
       mcpServers,
-      this.#model
+      this.#selection
     );
     const policyObservation = codexAppServerPolicyObservation(
       threadParameters,
@@ -114,7 +114,8 @@ export class CodexRuntimeAgent implements RuntimeAgentAdapter {
       workingDirectory: this.workspace,
       meaningfulOutputTimeoutMilliseconds,
       maxOutputBytes: this.#options.maxOutputBytes ?? 1_048_576,
-      threadParameters
+      threadParameters,
+      ...(access === "read" ? {turnSandboxPolicy: codexReadSandboxPolicy(networkAccess)} : {})
     });
     let receipt: RunnerTurnReceipt;
     try {
@@ -166,7 +167,7 @@ function codexThreadParameters(
   networkAccess: boolean,
   projectRoot: string,
   servers: readonly CodexMcpServer[],
-  model: string | undefined
+  selection: { readonly model?: string; readonly reasoningEffort?: string }
 ): Readonly<Record<string, unknown>> {
   const mcpServers = Object.fromEntries(servers.map((server) => {
     validateStdioMcpServer(server);
@@ -182,8 +183,9 @@ function codexThreadParameters(
     cwd: projectRoot,
     approvalPolicy: "never",
     sandbox: access === "write" ? "workspace-write" : "read-only",
-    ...(model === undefined ? {} : { model }),
+    ...(selection.model === undefined ? {} : { model: selection.model }),
     config: {
+      ...(selection.reasoningEffort === undefined ? {} : { model_reasoning_effort: selection.reasoningEffort }),
       shell_environment_policy: { exclude: [CODEX_CLIENT_HISTORY_POLICY_ENV] },
       ...(networkAccess
         ? { sandbox_workspace_write: { network_access: true } }
@@ -223,13 +225,23 @@ function codexResponse(receipt: RunnerTurnReceipt): {
   };
 }
 
-function codexModel(launchArgs: readonly string[]): string | undefined {
-  if (launchArgs.length === 0) return undefined;
-  if (launchArgs.length !== 2 || launchArgs[0] !== "--model" ||
-    launchArgs[1] === undefined || launchArgs[1].trim() === "") {
-    throw new Error("Codex app-server launch args only support --model <model>");
+function codexSelection(launchArgs: readonly string[]): { model?: string; reasoningEffort?: string } {
+  const values = new Map<string, string>();
+  for (let index = 0; index < launchArgs.length; index += 2) {
+    const option = launchArgs[index]!;
+    const value = launchArgs[index + 1];
+    if (!["--model", "--reasoning-effort"].includes(option) || values.has(option) ||
+      value === undefined || value.trim() === "" || value.startsWith("--")) {
+      throw new Error("Codex app-server launch args only support --model <model> and --reasoning-effort <effort>, each once");
+    }
+    values.set(option, value);
   }
-  return launchArgs[1];
+  const model = values.get("--model");
+  const reasoningEffort = values.get("--reasoning-effort");
+  if (reasoningEffort !== undefined && !["none", "minimal", "low", "medium", "high", "xhigh", "max"].includes(reasoningEffort)) {
+    throw new Error("Unsupported Codex reasoning effort");
+  }
+  return { ...(model === undefined ? {} : { model }), ...(reasoningEffort === undefined ? {} : { reasoningEffort }) };
 }
 
 function codexEnvironment(
@@ -266,7 +278,12 @@ function codexNetworkAccess(event: AgentInputEvent | ChatDispatchEvent): boolean
   return event.type === "subscription.fire" && event.invocation?.networkAccess === true;
 }
 
+function codexReadSandboxPolicy(networkAccess: boolean) {
+  return {type: "readOnly", networkAccess};
+}
+
 const codexPolicyHelperSource = [
+  codexReadSandboxPolicy.toString(),
   codexThreadParameters.toString(),
   codexWorkspaceAccess.toString(),
   codexNetworkAccess.toString()

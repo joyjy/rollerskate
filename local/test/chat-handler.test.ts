@@ -9,8 +9,8 @@ import {
   loadChatMentionPromptResource,
   loadChatPromptResource
 } from "../src/application/chat/prompt.js";
-import { chatReadToolCapability } from
-  "../src/application/chat/read-tool-policy.js";
+import { chatToolCapability } from
+  "../src/application/chat/tool-policy.js";
 import { addLocalAgent, localRuntimeSnapshot } from "../src/application/agent/control.js";
 import {
   localChatView,
@@ -385,7 +385,7 @@ test("ChatHandler isolates optional client-history failure to one Agent dispatch
       const aliceExecution = agentExecutions.find((candidate) =>
         runtime.event(candidate.eventId)?.agentId === alice.principalId
       )!;
-      let piExecution = agentExecutions.find((candidate) =>
+      const piExecution = agentExecutions.find((candidate) =>
         runtime.event(candidate.eventId)?.agentId === pi.principalId
       )!;
       runtime.completeExecution(aliceExecution.executionId, {
@@ -403,20 +403,7 @@ test("ChatHandler isolates optional client-history failure to one Agent dispatch
         at,
         1
       );
-      piExecution = runtime.claimDueExecutions(1, "2099-07-25T12:00:01.000Z")[0]!;
-      runtime.failExecution(
-        piExecution.executionId,
-        "pi executable was not found in PATH",
-        "2099-07-25T12:00:01.000Z",
-        1
-      );
-      piExecution = runtime.claimDueExecutions(1, "2099-07-25T12:00:02.000Z")[0]!;
-      runtime.failExecution(
-        piExecution.executionId,
-        "pi executable was not found in PATH",
-        "2099-07-25T12:00:02.000Z",
-        1
-      );
+      assert.equal(runtime.claimDueExecutions(1, "2099-07-25T12:00:02.000Z").length, 0);
 
       assert.deepEqual(
         localChatView(repo, options).messages.items.find(
@@ -736,7 +723,7 @@ test("bundled Chat prompt is a separately loaded resource", () => {
       createdAt: "2026-07-25T12:00:00.000Z"
     },
     history: { items: [], hasEarlier: false },
-    readTools: chatReadToolCapability("tools"),
+    tools: chatToolCapability("tools"),
     now: "2026-07-25T12:00:00.000Z"
   });
   assert.equal(resource.resourceId, chatPromptResourceId);
@@ -781,7 +768,7 @@ test("direct mention uses a speech-only prompt resource", () => {
       createdAt: "2026-07-25T12:00:00.000Z"
     },
     history: { items: [], hasEarlier: false },
-    readTools: chatReadToolCapability("tools"),
+    tools: chatToolCapability("tools"),
     now: "2026-07-25T12:00:00.000Z"
   });
   assert.equal(resource.resourceId, chatMentionPromptResourceId);

@@ -1,3 +1,7 @@
+import type { StewardRunDecisionV6 } from "../../modules/steward/run-contract-v6.js";
+import type { StewardRunDecisionV5 } from "../../modules/steward/run-contract-v5.js";
+import type { StewardRunDecisionV4 } from "../../modules/steward/run-contract-v4.js";
+import { stewardDecisionVersion } from "../../modules/steward/caller-contract.js";
 import type {
   AgentInputEvent,
   AgentRequestEvent,
@@ -64,7 +68,7 @@ import {
 } from "./result-recovery.js";
 import {
   queueStewardOrchestratorRetryInTransaction,
-  stewardOrchestratorRetryPrompt
+  stewardOrchestratorContinuationPrompt
 } from "./orchestrator-retry.js";
 
 export interface RuntimeApplicationModule {
@@ -82,8 +86,7 @@ export class StewardModule implements
   readonly #runtime: RuntimeStore;
   readonly #recoveryContinuations: readonly RuntimeAgentResultContinuation[];
   readonly #callerContinuation: CallerAgentStepContinuation;
-  readonly #orchestratorContinuation: StewardDecisionContinuation;
-  readonly #orchestratorContinuationV3: StewardDecisionContinuation;
+  readonly #orchestratorContinuations: readonly StewardDecisionContinuation[];
 
   public constructor(options: {
     readonly runs: AgentRunStore;
@@ -98,14 +101,8 @@ export class StewardModule implements
         this.handleAgentResult(execution, result, request, at)
     });
     this.#callerContinuation = new CallerAgentStepContinuation(options);
-    this.#orchestratorContinuation = new StewardDecisionContinuation(
-      options,
-      "run-decision@2"
-    );
-    this.#orchestratorContinuationV3 = new StewardDecisionContinuation(
-      options,
-      "run-decision@3"
-    );
+    this.#orchestratorContinuations = (["run-decision@2", "run-decision@3", "run-decision@4", "run-decision@5", "run-decision@6"] as const)
+      .map((contract) => new StewardDecisionContinuation(options, contract));
   }
 
   public manifest(): RuntimeApplicationModule {
@@ -115,8 +112,7 @@ export class StewardModule implements
         this,
         ...this.#recoveryContinuations,
         this.#callerContinuation,
-        this.#orchestratorContinuation,
-        this.#orchestratorContinuationV3
+        ...this.#orchestratorContinuations
       ],
       executionGuards: [this]
     };
@@ -537,10 +533,12 @@ class CallerAgentStepContinuation implements RuntimeAgentResultContinuation {
             runVersion: checkpointed.version,
             maxSteps: checkpointed.maxSteps,
             completedWorkerSteps: checkpointed.stepCount,
+            currentNetworkAccess: checkpointed.workspaceGrant?.networkAccess ?? false,
             checkpoint,
             ...(priorState === undefined ? {} : { priorState }),
             participants: this.#runs.activeParticipantTargets(participantIds),
-            contractVersion: binding.schemaVersion === "OrchestratorBinding@3" ? 3 : 2,
+            contractVersion: stewardDecisionVersion(binding),
+            ...(binding.schemaVersion !== "OrchestratorBinding@3" ? {} : {acceptanceContract: binding.acceptanceContract}),
             ...(binding.schemaVersion !== "OrchestratorBinding@3" ||
               binding.authority.trigger === undefined
               ? {}
@@ -613,7 +611,7 @@ class CallerAgentStepContinuation implements RuntimeAgentResultContinuation {
 }
 
 class StewardDecisionContinuation implements RuntimeAgentResultContinuation {
-  public readonly resultContractId: "run-decision@2" | "run-decision@3";
+  public readonly resultContractId: "run-decision@2" | "run-decision@3" | "run-decision@4" | "run-decision@5" | "run-decision@6";
   readonly #runs: AgentRunStore;
   readonly #runtime: RuntimeStore;
   readonly #bindSource: StewardSourceBindingRegistrar | undefined;
@@ -622,7 +620,7 @@ class StewardDecisionContinuation implements RuntimeAgentResultContinuation {
     readonly runs: AgentRunStore;
     readonly runtime: RuntimeStore;
     readonly bindSource?: StewardSourceBindingRegistrar;
-  }, resultContractId: "run-decision@2" | "run-decision@3") {
+  }, resultContractId: "run-decision@2" | "run-decision@3" | "run-decision@4" | "run-decision@5" | "run-decision@6") {
     this.#runs = options.runs;
     this.#runtime = options.runtime;
     this.#bindSource = options.bindSource;
@@ -692,7 +690,7 @@ class StewardDecisionContinuation implements RuntimeAgentResultContinuation {
         );
         return;
       }
-      let decision: StewardRunDecision | StewardRunDecisionV3;
+      let decision: StewardRunDecision | StewardRunDecisionV3 | StewardRunDecisionV4 | StewardRunDecisionV5 | StewardRunDecisionV6;
       try {
         const parsed = parseRunDecision(JSON.parse(result.output ?? "") as unknown, {
           allowHistorical: this.resultContractId === "run-decision@2"
@@ -726,7 +724,8 @@ class StewardDecisionContinuation implements RuntimeAgentResultContinuation {
         return;
       }
       const sourceStepId = run.checkpoint?.stepId ?? context.stepId;
-      const requestId = `orchestrator:${sourceStepId}`;
+      const requestId = (decision.schemaVersion === "RunDecision@5" || decision.schemaVersion === "RunDecision@6")
+        ? `orchestrator:${sourceStepId}:${request.eventId}` : `orchestrator:${sourceStepId}`;
       try {
         const plan = planCallerRunDecision({ run, decision, now: at });
         assertWorkspaceEffectSatisfied(run, plan);
@@ -739,6 +738,8 @@ class StewardDecisionContinuation implements RuntimeAgentResultContinuation {
         }
       } catch (error) {
         const rejection = `${this.resultContractId} rejected: ${errorMessage(error)}`;
+        if (decision.schemaVersion === "RunDecision@6" && errorMessage(error).startsWith("acceptance_incomplete") &&
+          this.#queueAcceptanceRetry(execution, result, request, run, rejection, at)) return;
         if (firstInitialDecision && this.#queueInitialRetry(
           execution,
           result,
@@ -777,6 +778,27 @@ class StewardDecisionContinuation implements RuntimeAgentResultContinuation {
       });
       this.#runtime.completeResultExecutionInTransaction(execution.executionId, at);
     });
+    return true;
+  }
+
+  #queueAcceptanceRetry(execution: RuntimeExecution, result: AgentResultEvent, request: AgentRequestEvent,
+    run: AgentRunProjection, error: string, at: string): boolean {
+    const externalId = `agent-run:${run.runId}:acceptance-retry:${request.runContext!.stepId}`;
+    if (run.workspaceGrant?.access === "write" || (run.deadlineAt !== undefined && Date.parse(at) >= Date.parse(run.deadlineAt)) ||
+      this.#runtime.eventsForRoot(run.rootEventId).some(event => event.source.externalId === externalId)) return false;
+    const agentExecution = this.#runtime.executionForEvent(request.eventId);
+    if (agentExecution === undefined) return false;
+    const retryRun = run.status === "active" ? this.#runs.awaitInitialStewardDecisionInTransaction({
+      runId: run.runId, expectedVersion: run.version, expectedStepId: request.runContext!.stepId,
+      expectedExecutionId: agentExecution.executionId, updatedAt: at
+    }) : run;
+    const retry = queueStewardOrchestratorRetryInTransaction({runtime: this.#runtime, request, result, agentExecution,
+      source: {kind: "handler", externalId}, at,
+      prompt: `${stewardOrchestratorContinuationPrompt(this.#runs, retryRun)}\nRuntime rejected the success claim: ${error}. Preserve useful output, correct the checks, and continue or request the missing capability. This correction is attempted once per step.`});
+    this.#runtime.recordExecutionReceiptInTransaction(execution.executionId, {schema: "StewardOrchestratorDecisionReceipt@1",
+      runId: run.runId, stepId: request.runContext!.stepId, outcome: "retry_queued", error,
+      retryEventId: retry.eventId, retryExecutionId: retry.executionId, resumedSession: retry.resumedSession});
+    this.#runtime.completeResultExecutionInTransaction(execution.executionId, at);
     return true;
   }
 
@@ -819,7 +841,7 @@ class StewardDecisionContinuation implements RuntimeAgentResultContinuation {
           ? `agent-run:${run.runId}:occurrence-retry:${request.runContext!.stepId}:1`
           : `agent-run:${run.runId}:root-retry:${request.runContext!.stepId}:1`
       },
-      prompt: stewardOrchestratorRetryPrompt(this.#runs, retryRun),
+      prompt: stewardOrchestratorContinuationPrompt(this.#runs, retryRun),
       at
     });
     this.#runtime.recordExecutionReceiptInTransaction(execution.executionId, {

@@ -148,6 +148,12 @@ export class RuntimeChatStore {
       if (candidateAgentIds.length === 0 || candidateAgentIds.length > 64) {
         throw new Error("candidateAgentIds must contain between 1 and 64 Agents");
       }
+      if (input.sessionId !== undefined) {
+        const session = this.#query.session(input.sessionId);
+        if (session === undefined || candidateAgentIds.length !== 1 || session.agentId !== candidateAgentIds[0] || session.runId !== undefined) {
+          throw new Error("Session-bound Chat activation requires one matching Chat Agent Session");
+        }
+      }
       const strategyRevision = bounded(
         input.strategyRevision ?? 1, 1, 1_000_000, "strategyRevision"
       );
@@ -174,8 +180,8 @@ export class RuntimeChatStore {
           destination_snapshots_json, root_event_id, parent_event_id, causal_hop,
           created_at
         ) VALUES (?, 'chat.activation', 'handler', ?, NULL, NULL, NULL, NULL, NULL,
-          ?, NULL, '[]', '[]', ?, NULL, 0, ?)
-      `).run(eventId, externalId, JSON.stringify(payload), eventId, timestamp);
+          ?, ?, '[]', '[]', ?, NULL, 0, ?)
+      `).run(eventId, externalId, JSON.stringify(payload), input.sessionId ?? null, eventId, timestamp);
       this.#database.prepare(`
         INSERT INTO executions (
           execution_id, event_id, handler, status, attempt_count, max_attempts,
@@ -282,7 +288,7 @@ export class RuntimeChatStore {
           admission.plan.agentId,
           prompt,
           JSON.stringify(payload),
-          current?.sessionId ?? null,
+          (source.type === "chat.activation" ? source.sessionId : undefined) ?? current?.sessionId ?? null,
           source.causality.rootEventId,
           source.eventId,
           source.causality.hop + 1,
@@ -292,7 +298,7 @@ export class RuntimeChatStore {
           INSERT INTO executions (
             execution_id, event_id, handler, status, attempt_count, max_attempts,
             next_attempt_at, created_at, updated_at
-          ) VALUES (?, ?, 'agent', 'queued', 0, 3, ?, ?, ?)
+          ) VALUES (?, ?, 'agent', 'queued', 0, 1, ?, ?, ?)
         `).run(dispatchExecutionId, dispatchEventId, timestamp, timestamp, timestamp);
         dispatchedTurns += 1;
         attentionReceipts.push(chatAttentionReceipt(

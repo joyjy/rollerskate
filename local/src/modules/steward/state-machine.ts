@@ -1,3 +1,4 @@
+import { assertAcceptanceSatisfied } from "./acceptance.js";
 import { randomBytes } from "node:crypto";
 import type {
   AgentRunCheckpoint,
@@ -216,6 +217,8 @@ export function planAgentRunContinuation(input: {
 }
 
 export type CallerRunDecisionPlan =
+  | { readonly kind: "request_capability" }
+  | { readonly kind: "ask_human"; readonly question: string }
   | {
       readonly kind: "next_step";
       readonly targetAgentId: string;
@@ -258,8 +261,31 @@ export function planCallerRunDecision(input: {
       `RunDecision expected version ${decision.expectedRunVersion} but current is ${run.version}`
     );
   }
+  if (run.orchestratorBinding.schemaVersion === "OrchestratorBinding@3" && run.orchestratorBinding.acceptanceContract !== undefined &&
+    decision.action === "finish" && decision.finish.outcome === "succeeded" && decision.schemaVersion !== "RunDecision@6") {
+    throw new Error("Original acceptance cannot be bypassed through an older decision contract");
+  }
+  if (decision.schemaVersion === "RunDecision@6") {
+    const contract = run.orchestratorBinding.schemaVersion === "OrchestratorBinding@3"
+      ? run.orchestratorBinding.acceptanceContract : undefined;
+    if (contract === undefined) throw new Error("RunDecision@6 requires immutable original acceptance");
+    if (decision.checkedAcceptance.some(check => !contract.items.some(item => item.id === check.id))) throw new Error("Unknown acceptance ID");
+    if (decision.action === "finish" && decision.finish.outcome === "succeeded") {
+      assertAcceptanceSatisfied(contract, decision.checkedAcceptance, decision.state.unresolvedQuestions);
+    }
+    if (decision.action === "request_capability") {
+      if (run.workspaceGrant?.access !== "read" || run.workspaceGrant.networkAccess || run.sourceBinding !== undefined || run.activeCycleId !== undefined) throw new Error("Network adjustment requires a standalone read-only offline Run");
+      if (run.deadlineAt !== undefined && Date.parse(input.now) >= Date.parse(run.deadlineAt)) throw new Error("Agent Run deadline exhausted");
+      if (decision.capability.acceptanceIds.some(id => !contract.items.some(item => item.id === id))) throw new Error("Capability request has unknown acceptance ID");
+      return {kind: "request_capability"};
+    }
+  }
+  if (decision.action === "ask_human") {
+    if (run.deadlineAt !== undefined && Date.parse(input.now) >= Date.parse(run.deadlineAt)) throw new Error("Agent Run deadline exhausted");
+    return {kind:"ask_human",question:decision.question};
+  }
   if (decision.action === "finish") {
-    const scope = decision.schemaVersion === "RunDecision@3"
+    const scope = (decision.schemaVersion === "RunDecision@3" || decision.schemaVersion === "RunDecision@4" || decision.schemaVersion === "RunDecision@5" || decision.schemaVersion === "RunDecision@6")
       ? decision.finish.scope
       : run.activeCycleId === undefined ? "run" : "cycle";
     if (scope === "cycle" &&

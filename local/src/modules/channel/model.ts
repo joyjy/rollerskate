@@ -40,6 +40,7 @@ export interface ChannelSendReceipt {
   readonly body: string;
   readonly transactionId: string;
   readonly status: ChannelSendStatus;
+  readonly deliveryAttempted?: boolean; // Absent on legacy receipts: effect is unknown.
   readonly observedCursor?: string;
   readonly followToken: string;
   readonly messageEventId?: string;
@@ -269,6 +270,7 @@ export function createPendingChannelSend(input: {
     body: input.body,
     transactionId: `channel-send:${sendId}`,
     status: "pending",
+    deliveryAttempted: false,
     ...(input.observedCursor === undefined ? {} : { observedCursor: input.observedCursor }),
     followToken: newChannelFollowToken(),
     revision: 1,
@@ -319,10 +321,23 @@ export function failChannelSend(
   });
 }
 
+export function channelSendDeliveryOutcome(receipt: ChannelSendReceipt): "confirmed" | "not_started" | "unknown" {
+  if (receipt.status === "accepted") return "confirmed";
+  return receipt.deliveryAttempted === false ? "not_started" : "unknown";
+}
+
+export function markChannelDeliveryAttempted(current: ChannelSendReceipt, at: string): ChannelSendReceipt {
+  if (current.status !== "pending") throw new Error("Only pending Channel sends can attempt delivery");
+  return parseChannelSendReceipt({...current,deliveryAttempted:true,revision:current.revision+1,updatedAt:at});
+}
+
 export function parseChannelSendReceipt(value: unknown): ChannelSendReceipt {
   const record = object(value, "ChannelSendReceipt");
   if (record.schema !== "ChannelSendReceipt@1") {
     throw new Error("Channel send receipt schema is unsupported");
+  }
+  if (record.deliveryAttempted !== undefined && typeof record.deliveryAttempted !== "boolean") {
+    throw new Error("Channel deliveryAttempted must be Boolean");
   }
   const status = oneOf(record.status, ["pending", "accepted", "failed"] as const, "status");
   const channelRef = parseChannelRef(record.channelRef);
@@ -358,6 +373,7 @@ export function parseChannelSendReceipt(value: unknown): ChannelSendReceipt {
     body: text(record.body, "body", 16_384),
     transactionId: text(record.transactionId, "transactionId", 256),
     status,
+    ...(record.deliveryAttempted === undefined ? {} : {deliveryAttempted:record.deliveryAttempted as boolean}),
     ...(observedCursor === undefined ? {} : { observedCursor }),
     followToken: requireChannelFollowToken(text(record.followToken, "followToken", 64)),
     ...(messageEventId === undefined ? {} : { messageEventId }),

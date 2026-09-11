@@ -1,3 +1,5 @@
+import { isAgentInputEvent } from "../event/model.js";
+import { ExecutionScheduler, type SchedulingEntry } from "./scheduling.js";
 import {
   DeliveryHandler,
   type RuntimeEventHandler
@@ -21,16 +23,19 @@ export class RuntimeCycle {
   readonly #deliveryHandler: Pick<DeliveryHandler, "handle">;
   readonly #handlers: ReadonlyMap<RuntimeEventHandler["kind"], RuntimeEventHandler>;
   readonly #store: RuntimeStore;
+  readonly #scheduler = new ExecutionScheduler();
   readonly #activeExecutions = new Map<string, Promise<void>>();
   readonly #activeDeliveries = new Map<string, Promise<void>>();
   readonly #completedExecutions: string[] = [];
   readonly #completedDeliveries: string[] = [];
   readonly #completedFailures: RuntimeCycleFailure[] = [];
+  readonly #onWorkStateChanged: () => void;
 
   public constructor(options: {
     readonly store: RuntimeStore;
     readonly handlers: ReadonlyMap<RuntimeEventHandler["kind"], RuntimeEventHandler>;
     readonly deliveryHandler: Pick<DeliveryHandler, "handle">;
+    readonly onWorkStateChanged?: () => void;
   }) {
     this.#store = options.store;
     this.#handlers = options.handlers;
@@ -38,6 +43,7 @@ export class RuntimeCycle {
       if (handler.kind !== kind) throw new Error(`Handler registry key mismatch: ${kind}`);
     }
     this.#deliveryHandler = options.deliveryHandler;
+    this.#onWorkStateChanged = options.onWorkStateChanged ?? (() => undefined);
   }
 
   public async run(at?: string): Promise<RuntimeCycleResult> {
@@ -49,7 +55,8 @@ export class RuntimeCycle {
     while (remainingExecutions > 0) {
       const claimed = this.#store.claimDueExecutions(
         Math.min(20, remainingExecutions),
-        at ?? new Date().toISOString()
+        at ?? new Date().toISOString(),
+        snapshot => this.#select(snapshot, Math.min(20, remainingExecutions))
       );
       if (claimed.length === 0) break;
       remainingExecutions -= claimed.length;
@@ -73,13 +80,8 @@ export class RuntimeCycle {
 
   public poll(at?: string): RuntimeCycleResult {
     const completed = this.#takeCompleted();
-    const executionCapacity = Math.max(0, 100 - this.#activeExecutions.size);
-    const executions = executionCapacity === 0
-      ? []
-      : this.#store.claimDueExecutions(
-          Math.min(20, executionCapacity),
-          at ?? new Date().toISOString()
-        );
+    const executions = this.#store.claimDueExecutions(7, at ?? new Date().toISOString(),
+      snapshot => this.#select(snapshot, 7));
     for (const execution of executions) {
       const task = this.#handleExecution(execution.executionId, at).then((outcome) => {
         this.#activeExecutions.delete(execution.executionId);
@@ -88,6 +90,7 @@ export class RuntimeCycle {
         } else {
           this.#completedFailures.push(outcome.failure);
         }
+        this.#onWorkStateChanged();
       });
       this.#activeExecutions.set(execution.executionId, task);
     }
@@ -106,10 +109,57 @@ export class RuntimeCycle {
         } else {
           this.#completedFailures.push(outcome.failure);
         }
+        this.#onWorkStateChanged();
       });
       this.#activeDeliveries.set(delivery.deliveryId, task);
     }
     return completed;
+  }
+
+  public nextWaitMilliseconds(
+    maximumWaitMilliseconds: number,
+    at = new Date().toISOString()
+  ): number {
+    if (!Number.isInteger(maximumWaitMilliseconds) || maximumWaitMilliseconds < 0) {
+      throw new Error("maximumWaitMilliseconds must be a non-negative integer");
+    }
+    const candidates = [
+      ...(this.#select(this.#store.executionSchedulingSnapshot(at), 1, false).length > 0
+        ? [at] : [this.#store.nextFutureExecutionAt(at)]),
+      ...(this.#activeDeliveries.size < 100
+        ? [this.#store.nextDueDeliveryAt()]
+        : [])
+    ].filter((value): value is string => value !== undefined);
+    if (candidates.length === 0) return maximumWaitMilliseconds;
+    const nextDue = Math.min(...candidates.map((candidate) => Date.parse(candidate)));
+    return Math.min(
+      maximumWaitMilliseconds,
+      Math.max(0, Math.ceil(nextDue - Date.parse(at)))
+    );
+  }
+
+  #select(snapshot: ReturnType<RuntimeStore["executionSchedulingSnapshot"]>, limit: number, advance = true) {
+    const describe = (execution: import("./model.js").RuntimeExecution): SchedulingEntry => {
+      const event = snapshot.events.get(execution.eventId);
+      let source = event;
+      if (event?.type === "agent.result" && event.causality.parentEventId !== undefined) {
+        source = snapshot.events.get(event.causality.parentEventId);
+      }
+      if (source !== undefined && isAgentInputEvent(source)) {
+        try {
+          const resources = this.#handlers.get("agent")?.resources?.(source) ?? {
+            agentId: source.agentId, lanes: [source.sessionId ? `session:${source.sessionId}` : `request:${source.eventId}`]
+          };
+          return { execution, resources: execution.handler === "result" ? { ...resources, lanes: [] } : resources };
+        } catch {
+          // Invalid/suspended adapter inputs must reach their Handler's normal terminal failure path.
+          return { execution, resources: { agentId: source.agentId, lanes: [`request:${source.eventId}`] } };
+        }
+      }
+      return { execution, resources: { lanes: [] } };
+    };
+    return this.#scheduler.select(snapshot.due.map(describe), snapshot.running.map(describe),
+      snapshot.resultBarriers.map(describe), limit, advance);
   }
 
   public async settle(): Promise<RuntimeCycleResult> {

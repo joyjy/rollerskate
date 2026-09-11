@@ -1,8 +1,8 @@
 import type { DatabaseSync } from "node:sqlite";
 import { withImmediateTransaction } from "./transaction.js";
 
-import { openInitializedRuntimeDatabase } from "./database.js";
-import { migrateLocalDatabase } from "./schema/index.js";
+import { openInitializedRuntimeDatabase, openRuntimeDatabaseReadOnly } from "./database.js";
+import { migrateLocalDatabase, assertCurrentLocalSchema } from "./schema/index.js";
 
 export type NoticeDeliveryStatus =
   | "pending"
@@ -117,7 +117,13 @@ const PROJECT_ALL = `${PROJECT_BASE}${PROJECT_UPSERT}`;
 export class NoticeStore {
   readonly #database: DatabaseSync;
 
-  public constructor(databasePath: string) {
+  public constructor(databasePath: string, options: { readonly readOnly?: boolean } = {}) {
+    if (options.readOnly) {
+      this.#database = openRuntimeDatabaseReadOnly(databasePath);
+      try { assertCurrentLocalSchema(this.#database); }
+      catch (error) { this.#database.close(); throw error; }
+      return;
+    }
     let needsBackfill = false;
     this.#database = openInitializedRuntimeDatabase(databasePath, (database) => {
       needsBackfill = database.prepare(`

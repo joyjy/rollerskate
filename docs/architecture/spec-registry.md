@@ -38,16 +38,16 @@ Canonical grammar 固定为 `spec:rollerskate/<name>@<major>`，由 `SpecRef@1` 
 `specRegistryInventory()` 从 registry 本身生成 readback；focused test 逐项证明 ref 唯一、token 无碰撞、owner/parser/source 非空。首个闭环包含：
 
 - intake/compiler：`RunIntent@1`、`StewardRunRequest@2`、`RunAuthorityEnvelope@1`；
-- orchestration：`OrchestratorBinding@3`、`RunDecision@3`、`AgentStepResult@1`、`AgentRunCheckpoint@1`；
+- orchestration：`OrchestratorBinding@3`、`RunDecision@5`、`AgentStepResult@1`、`AgentRunCheckpoint@1`；
 - source/target binding：`RunSourceBinding@1`、`ProactiveTarget@1`、`ScheduleRevision@3`、`SubscriptionDefinition@5`、`ContinuousSubscriptionDefinition@3`、`TriggerOccurrenceEnvelope@1`、`DeterministicApplicationActionReceipt@1`；
 - source templates：`schedule.once@1`、`schedule.cron@1`、`subscription.until@1`、`subscription.continuous@1`；
 - workflows：`review@1`、`mr-readiness@1`、`forum@1`、`continuous-observation-monitor@1`，四者是 file-backed artifact 并绑定 digest；
-- result contracts：`agent-turn-result@1`、`agent-step-result@1`、`run-decision@3`、`agent-turn-adjudication@1`、`agent-turn-retry-result@1`；
+- result contracts：`agent-turn-result@1`、`agent-step-result@1`、`run-decision@5`、`agent-turn-adjudication@1`、`agent-turn-retry-result@1`；
 - bundled capabilities：`scheduled-task@1`、`subscription@1`。template entry 显式指向 owning capability。
 
 ## Migration status
 
-- `active`：上述 Run 主链、四份 workflow、四个 source template、两个 bundled capability、当前 `AgentRunDecisionReceipt@2`，以及仍由 manual Owner control 使用的 `OrchestratorBinding@1` / `RunDecision@1`。active 不等于 public 默认入口；public intake 仍只选择 `OrchestratorBinding@3` / `RunDecision@3`。
+- `active`：上述 Run 主链、四份 workflow、四个 source template、两个 bundled capability、当前 `AgentRunDecisionReceipt@2` 和可恢复问题的 `AgentRunDecisionReceipt@3`，以及仍由 manual Owner control 使用的 `OrchestratorBinding@1` / `RunDecision@1`。`RunDecision@3` / `RunDecision@4` 保留为已有 binding 的 active 兼容读取/恢复契约；active 不等于 public 默认入口；public intake 仍只选择 `OrchestratorBinding@3` / `RunDecision@5`。
 - `historical`：旧 Steward `OrchestratorBinding@2` / `RunDecision@2`、`AgentRunDecisionReceipt@1`、`ScheduleRevision@1`、`SubscriptionDefinition@3` 与 `ContinuousSubscriptionDefinition@1`。它们只服务 persisted Run、decision audit 和 legacy source read/reconcile，不能成为新的通用输入。
 - `unmigrated, out of this slice`：其余 versioned token 不自动进入 registry，也不批量改写。Local core/Event/Session/Delivery token 继续由 `local/src/core/` owner；Chat/Foundation/application view token 由对应 `local/src/modules/` 与 `application/` owner；callback/integration token 由对应 capability/integration owner；Local/Server wire token 由 `packages/protocol/src/` owner。新增 Run 跨边界引用前必须先登记，不得另建 parser/registry。
 
@@ -57,3 +57,5 @@ Canonical grammar 固定为 `spec:rollerskate/<name>@<major>`，由 `SpecRef@1` 
 - 新 file-backed workflow 修改内容后必须同步 registry digest；digest drift 测试应先失败，再更新登记值。
 - 只有可定位的持久化记录和 reader 才能保留 historical token；外部输入版本变化必须显式升级 producer/consumer，不能走历史兼容 adapter。
 - registry 只保存 identity 与追溯 metadata。payload shape、resource instance lifecycle、artifact storage 和业务状态仍归原领域 owner。
+
+Owner steward 分流配置为 `spec:rollerskate/steward-policy@1`（`StewardPolicy@1`），parser 与权重选择由 `modules/steward/steward-policy.ts` 拥有。

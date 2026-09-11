@@ -53,6 +53,7 @@ export interface ChatAttentionReceipt {
 }
 
 export interface ChatDecisionReceipt {
+  readonly sessionId?: string;
   readonly dispatchEventId: string;
   readonly speechAction: ChatTurnDecision["speech"]["action"];
   readonly silenceReason?: string;

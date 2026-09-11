@@ -375,13 +375,13 @@ export class SubscriptionStore {
         const exhausted = subscription.attemptCount >= subscription.maxAttempts ||
           Date.parse(timestamp) >= Date.parse(subscription.deadlineAt);
         this.#database.prepare(`
-          UPDATE subscriptions SET status = ?, next_poll_at = ?, updated_at = ?
+          UPDATE subscriptions SET next_poll_at = ?, updated_at = ?
           WHERE subscription_id = ? AND status = 'active'
         `).run(
-          exhausted ? "expired" : "active",
           new Date(Date.parse(timestamp) + subscription.intervalMilliseconds).toISOString(),
           timestamp, subscriptionId
         );
+        if (exhausted) this.#expireInTransaction(subscription, timestamp);
       } else {
         const terminalKey = terminalOccurrenceKey(subscriptionId);
         const observationJson = terminalObservationJson(observation, terminalKey);
@@ -417,34 +417,7 @@ export class SubscriptionStore {
           );
         } else if (subscription.definitionSchema === "SubscriptionDefinition@5" &&
           subscription.target?.kind === "application_action") {
-          if (this.#actions === undefined) {
-            throw new Error("Subscription application action target adapter is unavailable");
-          }
-          const receipt = this.#actions.executeInTransaction({
-            target: subscription.target,
-            source: {
-              kind: "subscription",
-              id: subscriptionId,
-              definitionRevision: `SubscriptionDefinition@5:${subscription.definitionRevision}`
-            },
-            occurrenceKey: terminalKey,
-            observation: JSON.parse(observationJson) as unknown,
-            at: timestamp
-          });
-          this.#database.prepare(`
-            UPDATE subscriptions SET status = ?, terminal_key = ?,
-              terminal_observation_json = ?, callback_phase_status = ?,
-              latest_error = ?, updated_at = ?
-            WHERE subscription_id = ? AND status = 'active' AND terminal_key IS NULL
-          `).run(
-            receipt.status === "failed" ? "blocked" : "completed",
-            terminalKey,
-            observationJson,
-            receipt.status === "failed" ? "completed_with_errors" : "completed",
-            receipt.error ?? null,
-            timestamp,
-            subscriptionId
-          );
+          this.#completeActionInTransaction(subscription, observationJson, terminalKey, timestamp, "completed");
         } else {
           const owner = { kind: "subscription" as const, id: subscriptionId, revision: 1 };
           const count = this.#callbacks.definitions(owner).length;
@@ -470,19 +443,20 @@ export class SubscriptionStore {
     error: string,
     at = new Date().toISOString()
   ): FreeSubscription {
-    const subscription = this.require(subscriptionId);
-    const timestamp = iso(at);
-    const exhausted = subscription.attemptCount >= subscription.maxAttempts ||
-      Date.parse(timestamp) >= Date.parse(subscription.deadlineAt);
-    this.#database.prepare(`
-      UPDATE subscriptions SET status = ?, latest_error = ?, next_poll_at = ?, updated_at = ?
-      WHERE subscription_id = ? AND status = 'active'
-    `).run(
-      exhausted ? "expired" : "active", error.slice(0, 4_096),
-      new Date(Date.parse(timestamp) + subscription.intervalMilliseconds).toISOString(),
-      timestamp, subscriptionId
-    );
-    return this.require(subscriptionId);
+    return withImmediateTransaction(this.#database, () => {
+      const subscription = this.require(subscriptionId);
+      if (subscription.status !== "active") return subscription;
+      const timestamp = iso(at);
+      const exhausted = subscription.attemptCount >= subscription.maxAttempts ||
+        Date.parse(timestamp) >= Date.parse(subscription.deadlineAt);
+      this.#database.prepare(`
+        UPDATE subscriptions SET latest_error = ?, next_poll_at = ?, updated_at = ?
+        WHERE subscription_id = ? AND status = 'active'
+      `).run(error.slice(0, 4_096),
+        new Date(Date.parse(timestamp) + subscription.intervalMilliseconds).toISOString(), timestamp, subscriptionId);
+      if (exhausted) this.#expireInTransaction(this.require(subscriptionId), timestamp);
+      return this.require(subscriptionId);
+    });
   }
 
   public blockExternalRefTrigger(
@@ -643,13 +617,63 @@ export class SubscriptionStore {
     if (this.#ownsDatabase) this.#database.close();
   }
 
-  #expireExhausted(at: string): void {
+  #completeActionInTransaction(subscription: FreeSubscription, observationJson: string, terminalKey: string, timestamp: string, status: "completed" | "expired"): void {
+    if (subscription.target?.kind !== "application_action") throw new Error("Application action target required");
+    const subscriptionId = subscription.subscriptionId;
+    if (this.#actions === undefined) {
+      throw new Error("Subscription application action target adapter is unavailable");
+    }
+    const receipt = this.#actions.executeInTransaction({
+      target: subscription.target,
+      source: {
+        kind: "subscription",
+        id: subscriptionId,
+        definitionRevision: `SubscriptionDefinition@5:${subscription.definitionRevision}`
+      },
+      occurrenceKey: terminalKey,
+      observation: JSON.parse(observationJson) as unknown,
+      at: timestamp
+    });
     this.#database.prepare(`
-      UPDATE subscriptions SET status = 'expired', updated_at = ?
-      WHERE status = 'active' AND (
+      UPDATE subscriptions SET status = ?, terminal_key = ?,
+        terminal_observation_json = ?, callback_phase_status = ?,
+        latest_error = ?, updated_at = ?
+      WHERE subscription_id = ? AND status = 'active' AND terminal_key IS NULL
+    `).run(
+      receipt.status === "failed" ? "blocked" : status,
+      terminalKey,
+      observationJson,
+      receipt.status === "failed" ? "completed_with_errors" : "completed",
+      receipt.error ?? (status === "expired" ? subscription.latestError : undefined) ?? null,
+      timestamp,
+      subscriptionId
+    );
+  }
+
+  #expireInTransaction(subscription: FreeSubscription, timestamp: string): void {
+    if (subscription.target?.kind === "application_action") {
+      const terminalKey = terminalOccurrenceKey(subscription.subscriptionId);
+      const observationJson = terminalObservationJson({
+        version: "SubscriptionExpiry@1", terminal: "failure",
+        summary: "Subscription wait budget exhausted",
+        facts: { status: "expired", reason: Date.parse(timestamp) >= Date.parse(subscription.deadlineAt)
+          ? "deadline" : "max_attempts", attemptCount: subscription.attemptCount,
+          ...(subscription.latestError === undefined ? {} : { latestError: subscription.latestError }) }
+      }, terminalKey);
+      this.#completeActionInTransaction(subscription, observationJson, terminalKey, timestamp, "expired");
+    } else {
+      this.#database.prepare("UPDATE subscriptions SET status = 'expired', updated_at = ? WHERE subscription_id = ? AND status = 'active'")
+        .run(timestamp, subscription.subscriptionId);
+    }
+  }
+
+  #expireExhausted(at: string): void {
+    withImmediateTransaction(this.#database, () => {
+      const rows = this.#database.prepare(`SELECT * FROM subscriptions WHERE status = 'active' AND (
         julianday(deadline_at) <= julianday(?) OR attempt_count >= max_attempts
-      )
-    `).run(at, at);
+      ) ORDER BY deadline_at, subscription_id LIMIT 100`).all(at) as unknown as SubscriptionRow[];
+      for (const row of rows) this.#expireInTransaction(this.#map(row), at);
+    });
   }
 
   #map(row: SubscriptionRow): FreeSubscription {

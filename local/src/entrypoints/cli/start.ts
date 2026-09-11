@@ -35,6 +35,7 @@ export async function runStartForeground(
   output: AppOutput,
   startOptions: StartOptions
 ): Promise<number> {
+  const codexDesktopSocketPath = environment.ROLLERSKATE_CODEX_IPC_SOCKET?.trim() || undefined;
   const codexExecutable = environment.ROLLERSKATE_CODEX_EXECUTABLE?.trim() ||
     findExecutable("codex", environment.PATH);
   const claudeCodeExecutable = environment.ROLLERSKATE_CLAUDE_CODE_EXECUTABLE?.trim() ||
@@ -103,6 +104,7 @@ export async function runStartForeground(
       repoRoot,
       ...(runtimeDirectory === undefined ? {} : { runtimeDirectory }),
       ...(codexExecutable === undefined ? {} : { codexExecutable }),
+      ...(codexDesktopSocketPath === undefined ? {} : { codexDesktopSocketPath }),
       ...(claudeCodeExecutable === undefined ? {} : { claudeCodeExecutable }),
       ...(kimiCodeExecutable === undefined ? {} : { kimiCodeExecutable }),
       ...(piExecutable === undefined ? {} : { piExecutable }),

@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import {
   chmodSync,
-  mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   writeFileSync
 } from "node:fs";
@@ -14,18 +14,14 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import type { AgentSummary, DeviceSummary } from "../src/protocol.js";
 import { runtimePaths } from "../src/infrastructure/runtime/config.js";
-import { AgentCredentialStore } from "../src/infrastructure/files/agent-credential-store.js";
-import {
-  bootstrapLocalFoundation,
-  LocalFoundationStore
-} from "../src/infrastructure/sqlite/foundation-store.js";
-import { LocalDeviceStore } from "../src/infrastructure/files/device-binding-store.js";
+import { LocalFoundationStore } from "../src/infrastructure/sqlite/foundation-store.js";
 import { runtimeStatus } from "../src/application/runtime/control.js";
 import { startRuntime } from "../src/bootstrap/runtime.js";
 import { runLocalApp } from "../src/entrypoints/cli/main.js";
 import { RuntimeStore } from "../src/core/runtime/store.js";
+import { LoopWakeSignal, runLoop } from "../src/core/loop.js";
+import { subscribeRuntimeWork } from "../src/core/runtime/wake.js";
 import { startUiServer } from "../src/entrypoints/console/launcher.js";
 import { addLocalAgent } from "../src/application/agent/control.js";
 import { enqueueAgentRequest } from "../src/application/agent/server-control.js";
@@ -36,57 +32,132 @@ import {
 } from "../src/application/chat/control.js";
 
 const now = "2026-07-20T00:00:00.000Z";
-const roomId = "room-1";
-const head = `r1.${Buffer.from(JSON.stringify([roomId, 1])).toString("base64url")}`;
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
-test.skip("v0.4 Server Agent workspace does not block Local-first startup", async () => {
-  const repo = mkdtempSync(join(tmpdir(), "rollerskate-stale-agent-repo-"));
-  const runtime = mkdtempSync(join(tmpdir(), "rollerskate-stale-agent-runtime-"));
+test("core loop does not lose a wake raised before it begins waiting", async () => {
+  const runtime = mkdtempSync(join(tmpdir(), "rollerskate-loop-wake-"));
+  const controller = new AbortController();
+  const wakeSignal = new LoopWakeSignal();
+  let phaseRuns = 0;
+  const timeout = setTimeout(() => controller.abort(), 500);
+  try {
+    const result = await runLoop({
+      statePath: join(runtime, "loop.json"),
+      runtimeDirectory: runtime,
+      runtimeRevision: "test-revision",
+      agentNames: [],
+      routeIds: [],
+      phases: [{
+        scope: "wake-test",
+        async run() {
+          phaseRuns += 1;
+          if (phaseRuns === 1) wakeSignal.wake();
+          else controller.abort();
+          return undefined;
+        }
+      }],
+      paused: () => false,
+      pollMilliseconds: 60_000,
+      wakeSignal
+    }, controller.signal);
+    assert.equal(phaseRuns, 2);
+    assert.equal(result.cycles, 2);
+  } finally {
+    clearTimeout(timeout);
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("RuntimeStore publishes newly persisted work to the in-process loop", () => {
+  const runtime = mkdtempSync(join(tmpdir(), "rollerskate-runtime-wake-"));
+  const databasePath = join(runtime, "runtime.db");
+  const initialized = new RuntimeStore(databasePath);
+  initialized.close();
+  const database = new DatabaseSync(databasePath);
+  const store = new RuntimeStore(database);
+  let wakes = 0;
+  const unsubscribe = subscribeRuntimeWork(databasePath, () => {
+    wakes += 1;
+  });
+  try {
+    store.appendEvent({
+      type: "agent.request",
+      source: { kind: "cli", externalId: "wake-once" },
+      agentId: "agent-1",
+      prompt: "wake the loop"
+    });
+    store.appendEvent({
+      type: "agent.request",
+      source: { kind: "cli", externalId: "wake-once" },
+      agentId: "agent-1",
+      prompt: "wake the loop"
+    });
+    assert.equal(wakes, 1);
+  } finally {
+    unsubscribe();
+    store.close();
+    database.close();
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("Local startup restores a missing workspace and executes there without Server", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "rollerskate-workspace-repo-"));
+  const runtime = mkdtempSync(join(tmpdir(), "rollerskate-workspace-runtime-"));
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(), 5_000);
   try {
     const paths = runtimePaths(repo, runtime);
-    bootstrapLocalFoundation(paths, now);
-    const agents = new LocalFoundationStore(paths.database);
-    agents.addAgent("alice", "codex", now);
-    agents.close();
+    addLocalAgent(repo, "alice", "codex", { runtimeDirectory: runtime });
+    const executable = join(runtime, "codex-fixture");
+    const cwdReceipt = join(runtime, "invocation-cwd.txt");
+    writeFileSync(executable, codexFixtureSource(
+      "workspace-provider-session",
+      "workspace restored",
+      `fs.writeFileSync(${JSON.stringify(cwdReceipt)}, process.cwd());`
+    ));
+    chmodSync(executable, 0o700);
+    const eventId = enqueueAgentRequest(repo, "alice", "check workspace", {
+      runtimeDirectory: runtime
+    }).event.eventId;
+    renameSync(paths.workspace, join(runtime, "previous-workspace"));
 
-    const controller = new AbortController();
     let output = "";
-    let consoleView: {
-      workspaceRoot: string;
-      failures: readonly {
-        owner: string;
-        reason: string;
-        action: { readonly consoleRoute?: string };
-      }[];
-    } | undefined;
+    let serverRequests = 0;
     await startRuntime({
       repoRoot: repo,
       runtimeDirectory: runtime,
-      codexExecutable: process.execPath,
+      codexExecutable: executable,
       environment: { HOME: repo },
       pollMilliseconds: 50,
+      fetch: async () => {
+        serverRequests += 1;
+        throw new Error("Local startup must not contact Server");
+      },
       output: { write(text) {
         output += text;
-        if (text.includes("Runtime loop ready:")) {
-          consoleView = runtimeOperationsView(
-            projectRoot,
-            runtime,
-            "localhost:4300"
-          ) as typeof consoleView;
-          controller.abort();
-        }
+        if (text.includes('"type":"runtime.cycle"')) controller.abort();
       } }
     }, controller.signal);
 
-    assert.match(output, /"type":"runtime\.adapter_unavailable"/);
-    assert.match(output, /deleted-workspace/);
-    assert.match(output, /Runtime loop ready: 0 Agent\(s\), 1 Route\(s\)/);
-    assert.equal(consoleView?.workspaceRoot, join(realpathSync(runtime), "workspace"));
-    assert.equal(consoleView?.failures[0]?.owner, "agent");
-    assert.match(consoleView?.failures[0]?.reason ?? "", /No active local Agent/);
-    assert.equal(consoleView?.failures[0]?.action.consoleRoute, "/console/agents");
+    const workspace = join(realpathSync(runtime), "workspace");
+    assert.equal(serverRequests, 0);
+    assert.equal(readFileSync(cwdReceipt, "utf8"), workspace);
+    assert.doesNotMatch(output, /runtime\.adapter_unavailable/);
+    assert.match(output, /Runtime loop ready: 1 Agent\(s\), 1 Route\(s\)/);
+    const store = new RuntimeStore(paths.database);
+    try {
+      assert.equal(store.executionForEvent(eventId)?.status, "succeeded");
+      assert.equal(store.sessions()[0]?.workspace, workspace);
+      assert.equal(store.sessions()[0]?.providerSessionId, "workspace-provider-session");
+    } finally {
+      store.close();
+    }
+    assert.equal(runtimeOperationsView(projectRoot, runtime, "localhost:4300")
+      .workspaceRoot, workspace);
   } finally {
+    clearTimeout(deadline);
+    controller.abort();
     rmSync(repo, { recursive: true, force: true });
     rmSync(runtime, { recursive: true, force: true });
   }
@@ -172,7 +243,7 @@ test("offline agent request enters SQLite and is handled without Device, Room or
       try {
         assert.equal((schemaVersion.prepare(`
           SELECT value FROM schema_meta WHERE key = 'schema_version'
-        `).get() as { value: string }).value, "72");
+        `).get() as { value: string }).value, "75");
       } finally {
         schemaVersion.close();
       }
@@ -232,160 +303,54 @@ test("offline agent request enters SQLite and is handled without Device, Room or
   }
 });
 
-test.skip("v0.4 Matrix loop runs the complete Handler without replay", async () => {
-  const repo = mkdtempSync(join(tmpdir(), "rollerskate-local-loop-repo-"));
-  const runtime = mkdtempSync(join(tmpdir(), "rollerskate-local-loop-runtime-"));
+test("an in-process enqueue wakes the idle Runtime before its fallback scan", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "rollerskate-wake-request-repo-"));
+  const runtime = mkdtempSync(join(tmpdir(), "rollerskate-wake-request-runtime-"));
+  const controller = new AbortController();
+  let running: Promise<{ readonly cycles: number; readonly stopped: true }> | undefined;
   try {
-    const fixture = seedRuntime(repo, runtime);
-    const fetchImplementation = serverFetch(fixture.deviceId);
-    const firstController = new AbortController();
-    let output = "";
-    const first = await startRuntime({
+    addLocalAgent(repo, "alice", "codex", { runtimeDirectory: runtime });
+    const executable = join(runtime, "codex-fixture");
+    writeFileSync(executable, codexFixtureSource(
+      "wake-provider-session",
+      "woken before fallback"
+    ));
+    chmodSync(executable, 0o700);
+    running = startRuntime({
       repoRoot: repo,
       runtimeDirectory: runtime,
-      codexExecutable: fixture.executable,
+      codexExecutable: executable,
       environment: { HOME: repo },
-      pollMilliseconds: 50,
-      fetch: fetchImplementation,
-      output: { write(text) {
-        output += text;
-        if (text.includes('"type":"runtime.cycle"')) firstController.abort();
-      } }
-    }, firstController.signal);
-    assert.equal(first.cycles, 1);
-    assert.match(output, /"type":"matrix\.ingress_cycle"/);
-    assert.equal(readFileSync(fixture.invocations, "utf8").trim().split("\n").length, 1);
-    const stopped = runtimeStatus(repo, runtime);
-    assert.equal(stopped.state?.status, "stopped");
-    assert.equal(stopped.state?.phase, "idle");
-    assert.equal(typeof stopped.state?.lastCycleStartAt, "string");
-    assert.equal(typeof stopped.state?.lastCycleEndAt, "string");
-    assert.equal(typeof stopped.state?.lastCycleDurationMs, "number");
-    const audit = new RuntimeStore(runtimePaths(repo, runtime).database);
+      pollMilliseconds: 60_000
+    }, controller.signal);
+    await waitUntil(() => {
+      const state = runtimeStatus(repo, runtime).state;
+      return state?.phase === "idle" && state.cycles >= 1;
+    }, 2_000);
+
+    const request = enqueueAgentRequest(repo, "alice", "wake while idle", {
+      runtimeDirectory: runtime
+    });
+    const audit = new RuntimeStore(runtimePaths(repo, runtime).database, { migrate: false });
     try {
-      const resultEvent = audit.events().find((event) => event.type === "agent.result");
-      assert.equal(resultEvent?.outcome, "succeeded");
-      assert.equal(audit.sessions().length, 1);
-      assert.equal(audit.deliveriesForResultEvent(resultEvent!.eventId)[0]?.status, "delivered");
+      await waitUntil(
+        () => {
+          const requestAudit = audit.audit(request.event.eventId);
+          return requestAudit?.resultEvent?.output === "woken before fallback" &&
+            requestAudit.resultExecution?.status === "succeeded";
+        },
+        2_000
+      );
     } finally {
       audit.close();
     }
-
-    const secondController = new AbortController();
-    const timer = setTimeout(() => secondController.abort(), 120);
-    try {
-      const second = await startRuntime({
-        repoRoot: repo,
-        runtimeDirectory: runtime,
-        codexExecutable: fixture.executable,
-        environment: { HOME: repo },
-        pollMilliseconds: 50,
-        fetch: fetchImplementation
-      }, secondController.signal);
-      assert.ok(second.cycles >= 1);
-    } finally {
-      clearTimeout(timer);
-    }
-    assert.equal(readFileSync(fixture.invocations, "utf8").trim().split("\n").length, 1);
   } finally {
+    controller.abort();
+    await running;
     rmSync(repo, { recursive: true, force: true });
     rmSync(runtime, { recursive: true, force: true });
   }
 });
-
-test.skip("v0.4 Matrix loop isolates a Room sync timeout", async () => {
-  const repo = mkdtempSync(join(tmpdir(), "rollerskate-room-timeout-repo-"));
-  const runtime = mkdtempSync(join(tmpdir(), "rollerskate-room-timeout-runtime-"));
-  try {
-    const fixture = seedRuntime(repo, runtime);
-    const delegate = serverFetch(fixture.deviceId);
-    let headAttempts = 0;
-    const fetchImplementation: typeof fetch = async (input, init) => {
-      const url = new URL(String(input));
-      if (url.pathname.endsWith("/head") && ++headAttempts === 1) {
-        throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
-      }
-      return delegate(input, init);
-    };
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 1_000);
-    let output = "";
-    try {
-      const result = await startRuntime({
-        repoRoot: repo,
-        runtimeDirectory: runtime,
-        codexExecutable: fixture.executable,
-        environment: { HOME: repo },
-        pollMilliseconds: 50,
-        fetch: fetchImplementation,
-        output: { write(text) {
-          output += text;
-          if (text.includes('"type":"runtime.cycle"')) controller.abort();
-        } }
-      }, controller.signal);
-      assert.ok(result.cycles >= 2);
-    } finally {
-      clearTimeout(timer);
-    }
-    assert.equal(headAttempts, 2);
-    assert.match(output, /"type":"runtime\.cycle_failed","scope":"matrix"/);
-    assert.match(output, /The operation was aborted due to timeout/);
-    assert.match(output, /"type":"matrix\.ingress_cycle"/);
-    assert.equal(runtimeStatus(repo, runtime).state?.status, "stopped");
-  } finally {
-    rmSync(repo, { recursive: true, force: true });
-    rmSync(runtime, { recursive: true, force: true });
-  }
-});
-
-function seedRuntime(
-  repo: string,
-  runtime: string
-): {
-  readonly executable: string;
-  readonly invocations: string;
-  readonly deviceId: string;
-  readonly workspace: string;
-} {
-  const paths = runtimePaths(repo, runtime);
-  mkdirSync(paths.agentCredentials, { recursive: true, mode: 0o700 });
-  const foundation = bootstrapLocalFoundation(paths, now);
-  const devices = new LocalDeviceStore(paths.deviceBinding, {
-    deviceId: foundation.deviceId,
-    deviceName: foundation.deviceName
-  });
-  const pairing = devices.beginPairing("http://localhost:3000", "Test Device");
-  devices.activate("device-credential-1", deviceSummary(pairing.deviceId), now);
-  devices.close();
-
-  const workspace = join(runtime, "workspace", "alice");
-  mkdirSync(workspace, { recursive: true, mode: 0o700 });
-  const agents = new LocalFoundationStore(paths.database);
-  agents.addAgent("alice", "codex", now);
-  agents.close();
-  new AgentCredentialStore(paths.agentCredentials).save({
-    state: "active",
-    serverUrl: "http://localhost:3000",
-    deviceId: pairing.deviceId,
-    name: "alice",
-    verifier: "verifier",
-    agentId: "agent-1",
-    placementId: "placement-1",
-    enrollmentId: "enrollment-1",
-    credentialId: "agent-credential-1",
-    credential: "agent-secret"
-  });
-
-  const executable = join(runtime, "agent-fixture");
-  const invocations = join(runtime, "invocations.txt");
-  writeFileSync(executable, codexFixtureSource(
-    "session-one",
-    JSON.stringify({ action: { type: "reply", body: "hello from alice" } }),
-    `fs.appendFileSync(${JSON.stringify(invocations)}, "invoked\\n");`
-  ));
-  chmodSync(executable, 0o700);
-  return { executable, invocations, deviceId: pairing.deviceId, workspace };
-}
 
 function codexFixtureSource(
   sessionId: string,
@@ -419,82 +384,10 @@ rl.on("line", (line) => {
 `;
 }
 
-function serverFetch(deviceId: string): typeof fetch {
-  return async (input, init) => {
-    const url = new URL(String(input));
-    if (url.pathname === "/api/agent-principals/agent-1") {
-      return Response.json(agentSummary(deviceId));
-    }
-    if (url.pathname === "/api/agent-principals/agent-1/rooms") {
-      return Response.json([{
-        id: "binding-1",
-        agentId: "agent-1",
-        roomId,
-        wakeMode: "mention_only",
-        status: "active",
-        createdAt: now,
-        createdByHumanId: "human-1",
-        updatedAt: now
-      }]);
-    }
-    if (url.pathname === "/pipeline") {
-      return Response.json({ id: 42, status: "success" });
-    }
-    if (url.pathname.endsWith("/head")) return Response.json({ roomId, head });
-    if (url.pathname.endsWith("/events")) {
-      return Response.json({
-        roomId,
-        through: head,
-        events: [{
-          roomId,
-          position: head,
-          event: {
-            protocolVersion: 1,
-            eventId: "$human-message",
-            type: "m.chat.message",
-            occurredAt: now,
-            source: { kind: "human", id: "human-1" },
-            payload: { body: "@alice please reply" }
-          }
-        }],
-        complete: true
-      });
-    }
-    if (url.pathname.endsWith("/messages") && init?.method === "POST") {
-      const body = JSON.parse(String(init.body)) as { transactionId: string };
-      return Response.json({ eventId: "$agent-reply", transactionId: body.transactionId });
-    }
-    return Response.json({ error: "not_found" }, { status: 404 });
-  };
-}
-
-function deviceSummary(deviceId: string): DeviceSummary {
-  return {
-    id: deviceId,
-    name: "Test Device",
-    status: "active",
-    createdAt: now,
-    human: { id: "human-1", displayName: "Owner", isAdmin: true }
-  };
-}
-
-function agentSummary(deviceId: string): AgentSummary {
-  const human = { id: "human-1", displayName: "Owner", isAdmin: true };
-  return {
-    id: "agent-1",
-    name: "alice",
-    status: "active",
-    createdAt: now,
-    owner: human,
-    operator: human,
-    placement: {
-      id: "placement-1",
-      deviceId,
-      state: "active",
-      generation: 1,
-      createdAt: now,
-      activatedAt: now
-    },
-    credentialStatus: "active"
-  };
+async function waitUntil(predicate: () => boolean, timeoutMilliseconds: number): Promise<void> {
+  const deadline = Date.now() + timeoutMilliseconds;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for Runtime state");
+    await new Promise((resolveWait) => setTimeout(resolveWait, 5));
+  }
 }

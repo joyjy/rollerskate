@@ -173,6 +173,14 @@ defineExpose({ scrollToBottom, scrollToMessage });
           <div v-if="item.message.targets" class="target-chip">
             to {{ item.message.targets.map((target) => `@${target.handleSnapshot}`).join(", ") }}
           </div>
+          <section v-for="work in item.message.works ?? []" :key="work.runId" class="chat-work" aria-live="polite">
+            <strong>{{ work.humanQuestion?.status === "pending" ? "Waiting for your answer" : work.humanQuestion?.status === "expired" ? "Question expired" : work.state === "needs_human" ? "Run needs human" : `Run ${work.status.replaceAll('_', ' ')}` }}</strong>
+            <p>{{ work.label }}</p>
+            <p v-if="work.attentionReason">{{ work.attentionReason }}</p>
+            <p v-if="work.terminalSummary">{{ work.terminalSummary }}</p>
+            <ul aria-label="Run outputs"><li v-for="output in work.outputs ?? []" :key="output.outputId">{{ output.title }}</li></ul>
+            <button type="button" @click="emit('openRun', work.runId)">Open Run</button>
+          </section>
           <ChatRunProposalCard
             v-for="proposal in item.message.runProposals ?? []"
             :key="proposal.proposalId"
@@ -197,6 +205,8 @@ defineExpose({ scrollToBottom, scrollToMessage });
 </template>
 
 <style scoped>
+.chat-work { margin-top: 12px; padding: 12px; border: 1px solid var(--border); border-radius: 8px; overflow-wrap: anywhere; }
+.chat-work p { margin: 6px 0; }
 .chat-header {
   padding: 16px 20px;
   border-bottom: 1px solid var(--border);

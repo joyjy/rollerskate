@@ -72,17 +72,19 @@ test("Steward Run persists explicit network authority in its workspace grant", (
     } finally {
       runtime.close();
     }
-    assert.throws(() => startStewardRun(fixture.repo, {
-      requestId: "invalid-network-authority-run",
+    const readNetwork = startStewardRun(fixture.repo, {
+      requestId: "read-network-authority-run",
       steward: "a",
-      objective: "Invalid read-only network request",
+      objective: "Read-only network request",
       workspace: {
         root: fixture.workspace,
         access: "read",
         networkAccess: true
       },
       maxDepth: 0
-    }, fixture.runtimeDirectory), /requires workspace\.access=write/);
+    }, fixture.runtimeDirectory);
+    assert.equal(readNetwork.run.workspaceGrant?.access, "read");
+    assert.equal(readNetwork.run.workspaceGrant?.networkAccess, true);
     assert.throws(() => startStewardRun(fixture.repo, {
       requestId: "delegating-network-authority-run",
       steward: "a",

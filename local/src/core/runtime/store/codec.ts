@@ -126,8 +126,6 @@ function validateAgentRunContext(context: AgentRunContext): void {
         context.workspaceGrant.effect !== "must_change" &&
         context.workspaceGrant.effect !== "may_remain_unchanged") ||
       (context.workspaceGrant.effect !== undefined &&
-        context.workspaceGrant.access !== "write") ||
-      (context.workspaceGrant.networkAccess === true &&
         context.workspaceGrant.access !== "write")) {
       throw new Error("runContext workspace grant is malformed");
     }
@@ -224,7 +222,9 @@ export function parseChatDecisionReceipt(value: string | null): ChatDecisionRece
   const parsed = parseJsonObject(value, "Execution receipt");
   if (parsed.schema !== "ChatDecisionReceipt@1" &&
     parsed.schema !== "ChatDecisionReceipt@2") return undefined;
-  if (typeof parsed.dispatchEventId !== "string" ||
+  if ((parsed.sessionId !== undefined &&
+      (typeof parsed.sessionId !== "string" || !/^ses_[A-Za-z0-9_-]+$/u.test(parsed.sessionId))) ||
+    typeof parsed.dispatchEventId !== "string" ||
     (parsed.speechAction !== "reply" && parsed.speechAction !== "silent" &&
       parsed.speechAction !== "propose_run") ||
     (parsed.speechAction === "propose_run" && parsed.schema !== "ChatDecisionReceipt@2") ||
@@ -254,6 +254,7 @@ export function parseChatDecisionReceipt(value: string | null): ChatDecisionRece
   }
   return {
     dispatchEventId: parsed.dispatchEventId,
+    ...(typeof parsed.sessionId === "string" ? { sessionId: parsed.sessionId } : {}),
     speechAction: parsed.speechAction,
     ...(parsed.speechAction === "silent" && typeof parsed.silenceReason === "string"
       ? { silenceReason: parsed.silenceReason as string }
@@ -510,7 +511,7 @@ export function parseDestinationSnapshots(
     if (!isRecord(entry) ||
       typeof entry.destinationId !== "string" ||
       (entry.kind !== "matrix" && entry.kind !== "macos-notification" &&
-        entry.kind !== "server-topic" && entry.kind !== "vikunja-task") ||
+        entry.kind !== "server-topic" && entry.kind !== "vikunja-task" && entry.kind !== "codex-desktop") ||
       !isStringRecord(entry.address) ||
       typeof entry.createdAt !== "string" ||
       typeof entry.updatedAt !== "string") {

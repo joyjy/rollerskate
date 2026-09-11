@@ -10,7 +10,7 @@ timestamp: 2026-07-26
 
 [返回 architecture index](./index.md)
 
-Steward 是一次显式启动、可查询和可取消的本机 Agent 协作领域；它的 durable aggregate 使用 `agent_runs`、`agent_run_decisions`、`runId` 和 `AgentRunContext@1`。Control surface 提供 autonomous、manual caller 和 steward 三种启动语义；持久层只需要 `autonomous | caller` 两种 mode。public `RunIntent@1` 由 Owner compiler 解析为 canonical spec，并建立 `OrchestratorBinding@3`。autonomous Agent 用 `AgentTurnResult@1` 完成或委派 child；manual caller 由 Worker 交付 checkpoint、Owner 提交 `RunDecision@1`；default steward 由 admission 时固定的 Codex Orchestrator 返回严格 `RunDecision@3`，可以继续 Worker、结束当前 cycle/Run 或绑定一个已准入 source。三条路径最终都经过同一个 Store transition authority。Steward 是 application domain，不是 Agent 类型，也不是 Capability。
+Steward 是一次显式启动、可查询和可取消的本机 Agent 协作领域；它的 durable aggregate 使用 `agent_runs`、`agent_run_decisions`、`runId` 和 `AgentRunContext@1`。Control surface 提供 autonomous、manual caller 和 steward 三种启动语义；持久层只需要 `autonomous | caller` 两种 mode。public `RunIntent@1` 由 Owner compiler 解析为 canonical spec，并建立 `OrchestratorBinding@3`。autonomous Agent 用 `AgentTurnResult@1` 完成或委派 child；manual caller 由 Worker 交付 checkpoint、Owner 提交 `RunDecision@1`；default steward 由 admission 时固定的 Orchestrator 返回严格 `RunDecision@6`，可以继续 Worker、结束当前 cycle/Run 或绑定一个已准入 source。三条路径最终都经过同一个 Store transition authority。Steward 是 application domain，不是 Agent 类型，也不是 Capability。
 
 Review 与 Forum 分别是 `review@1`、`forum@1` versioned workflow resource。它们向 Steward 说明目标、输入、允许的能力、结果格式和 Agent 间如何交接，但不拥有 Handler、Store、loop 或固定角色状态机。其他 workflow 复用同一个 Steward engine。
 
@@ -22,14 +22,14 @@ Run 产物仍以 canonical Agent result 为唯一事实源，不建立 artifact 
 
 ## Run admission
 
-Run 只通过显式 `run start` 创建；autonomous Run 后续通过 Agent 的 typed delegate 推进，caller/steward Run 后续只通过 typed decision 推进。未显式指定 steward 时，`run start` 选择当前 active、client 为 `codex`、handle 为 `codex` 的 Local Agent 作为 Orchestrator；显式 legacy steward 仍可启动 autonomous Run。首次 admission 固定：
+Run 只通过显式 `run start` 创建；autonomous Run 后续通过 Agent 的 typed delegate 推进，caller/steward Run 后续只通过 typed decision 推进。公共 intent 准入在配置 Owner `StewardPolicy@1` 时按 request ID 的 SHA-256 稳定分桶选择 active Codex/Kimi/Pi Agent；未配置时选择 active `codex` Agent；显式 legacy steward 仍可启动 autonomous Run。首次 admission 固定：
 
 - `runId`、Owner request ID、Steward Agent 和独立 run-scoped Session；
 - bounded `RunMandateSnapshot@1`，来源可以是内联 objective，也可以是 `workflowRef + inputs` 渲染后的 versioned workflow；
 - 可选 `ExternalWorkspaceGrant@1`，由 Owner 指定 canonical root 和 `read | write`；write grant 还必须选择 `must_change | may_remain_unchanged` effect，workflow 与 Agent 都不能自行扩大；
 - deadline、max steps、max depth 和其他 bounded execution budget。
 
-manual caller Run 固定 `OrchestratorBinding@1`、active Local participant roster 与 `maxDepth = 0`；binding 只接受 Owner principal、`run-decision@1` 和 `deliveryPolicy = manual`。公共 intent compiler 创建的 steward Run 固定 `OrchestratorBinding@3`、Codex Orchestrator exact Agent snapshot、canonical `run-decision@3` result contract、完整 `RunAuthorityEnvelope@1`、participant roster 与可选 result destination。`OrchestratorBinding@2` / `run-decision@2` 只为已持久化的旧 Steward Run 保留 exact historical read/continuation，不是新 external input 或 public admission。Worker 不能委派、结束 Run 或扩大 participant、budget、deadline、workspace 与 network authority；Orchestrator 也只能选择 admission roster 中当前仍 active 的 Agent 和 trigger/template。
+manual caller Run 固定 `OrchestratorBinding@1`、active Local participant roster 与 `maxDepth = 0`；binding 只接受 Owner principal、`run-decision@1` 和 `deliveryPolicy = manual`。公共 intent compiler 创建的 steward Run 固定 `OrchestratorBinding@3`、Orchestrator exact Agent snapshot、canonical `run-decision@6` result contract、完整 `RunAuthorityEnvelope@1`、participant roster 与可选 result destination。`OrchestratorBinding@2` / `run-decision@2` 只为已持久化的旧 Steward Run 保留 exact historical read/continuation，不是新 external input 或 public admission。Worker 不能委派、结束 Run 或扩大 participant、budget、deadline、workspace 与 network authority；Orchestrator 也只能选择 admission roster 中当前仍 active 的 Agent 和 trigger/template。
 
 autonomous Run 默认在每个 turn 使用当时 active Local Agent roster。caller/steward Run 在 admission 时冻结 exact participant IDs；后续 prompt 与 decision admission 只能使用该 roster，不能因新 Agent 上线或 Agent 猜测 ID 而扩大 authority。相同 Owner request ID 的重试只有在完整 binding、mandate、workspace grant 与 budget 相同才返回原 Run，否则 fail closed。
 
@@ -62,18 +62,28 @@ Run R1 / Agent A Session A1
 
 ## Caller/Steward checkpoint 与 decision
 
-manual caller Run 从首个 Worker 开始；default steward Run 则先以 `stepCount = 0` 向固定 Codex Orchestrator 请求初始 `RunDecision@3`。初始 decision 建立 bounded `OrchestratorState@1`、拆分任务并选择首个 Worker，只有随后真正的 Worker 才消耗 step budget。每个 Worker `agent.request` 使用 `AgentStepResult@1`；结果严格包含 `outcome`、bounded summary、artifact references，以及可选 acceptance evidence、unresolved questions 和 observed workspace revision，不包含 delegate 或 terminal authority。Runtime 将结果和 request/result/Execution identity 固定成 `AgentRunCheckpoint@1`，原子写入 `agent_runs.checkpoint_json`，并把 Run 转为 `awaiting_orchestrator`。
+manual caller Run 从首个 Worker 开始；default steward Run 则先以 `stepCount = 0` 向固定 Codex Orchestrator 请求初始 `RunDecision@6`。初始 decision 建立 bounded `OrchestratorState@1`、拆分任务并选择首个 Worker，只有随后真正的 Worker 才消耗 step budget。每个 Worker `agent.request` 使用 `AgentStepResult@1`；结果严格包含 `outcome`、bounded summary、artifact references，以及可选 acceptance evidence、unresolved questions 和 observed workspace revision，不包含 delegate 或 terminal authority。Runtime 将结果和 request/result/Execution identity 固定成 `AgentRunCheckpoint@1`，原子写入 `agent_runs.checkpoint_json`，并把 Run 转为 `awaiting_orchestrator`。
 
-manual Owner 读取当前 checkpoint 与 Run version 后提交 strict `RunDecision@1`。steward mode 用 Orchestrator 的 run-scoped Session 建立 `agent.request`：首轮 prompt 包含 objective、remaining budget、fixed participant roster 和 admitted trigger authority，后续再加入 current checkpoint、source envelope 与从 immutable decisions/receipts 重建的 `OrchestratorState@1`；最多保留 32 个结构化 task，不复制完整 transcript 或隐藏推理。Orchestrator 返回 strict `RunDecision@3`：
+manual Owner 读取当前 checkpoint 与 Run version 后提交 strict `RunDecision@1`。steward mode 用 Orchestrator 的 run-scoped Session 建立 `agent.request`：首轮 prompt 包含 objective、remaining budget、fixed participant roster 和 admitted trigger authority，后续再加入 current checkpoint、source envelope 与从 immutable decisions/receipts 重建的 `OrchestratorState@1`；最多保留 32 个结构化 task，不复制完整 transcript 或隐藏推理。Orchestrator 返回 strict `RunDecision@6`：
 
 - `next_step`：目标是产生 checkpoint 的 `self` Agent，或 admission roster 中另一个 exact Agent；mandate 是 bounded objective 或 versioned workflow invocation；
 - `await_source`：只能选择 registry 中登记且与 admitted trigger kind/capability 一致的 Schedule/Subscription template，由 source owner 产生 `RunSourceBinding@1`；
 - `finish`：以 `succeeded | failed` 和 bounded summary 结束当前 cycle 或整个 Run；
 - `needs_human`：以 decision rationale 结束为 `needs_human`。
+- `ask_human`：暂停并等待既有权限内的业务选择或信息。
+- `request_capability`：暂停并请求关联原始验收的网络能力，由 Owner 准入决定续行。
 
-decision 必须携带 `expectedRunVersion`、rationale、checked acceptance 和独立 request ID；`RunDecision@3` 还携带完整、bounded 的当前 task state。Store 在一个 transaction 中校验 orchestration mode、current decision source/checkpoint producer、Run version、admitted participant、目标 Agent 当前 active、deadline、step budget 与 source authority，写入 immutable `agent_run_decisions` receipt，再建立唯一的下一步 Event/Execution、source binding 或 terminal state。相同 request ID 只返回原 receipt；不同 request 不能越过 CAS。Orchestrator malformed/stale/越权 decision 不会被自动改写；后续 checkpoint 保持可由 manual Owner `RunDecision@1` 收口，首轮失败则保留 `stepCount = 0` 的 decision source 进入同一人工接管入口。
+decision 必须携带 `expectedRunVersion`、rationale、checked acceptance 和独立 request ID；`RunDecision@6` 还携带完整、bounded 的当前 task state。Store 在一个 transaction 中校验 orchestration mode、current decision source/checkpoint producer、Run version、admitted participant、目标 Agent 当前 active、deadline、step budget 与 source authority，写入 immutable `agent_run_decisions` receipt，再建立唯一的下一步 Event/Execution、source binding 或 terminal state。相同 request ID 只返回原 receipt；不同 request 不能越过 CAS。Orchestrator malformed/stale/越权 decision 不会被自动改写；后续 checkpoint 保留人工处理入口，但带固定验收的新 Run 不能用 `RunDecision@1` 宣告成功，首轮失败则保留 `stepCount = 0` 的 decision source 进入同一人工接管入口。
 
 steward Run terminal 时，可选 Vikunja Task destination 通过普通 Core Delivery 写回一个包含 Run ID、terminal status、summary 和稳定隐藏 marker 的 comment。adapter 写前查询、写后 readback；transport ambiguous 或 restart 重试先按 delivery ID marker 查重，因此同一个 terminal delivery 至多追加一次。Vikunja token 绑定 operator 配置的 endpoint origin，用户输入的 Task URL 不同源时在读取 token 前失败。Delivery 成败不改变已经 terminal 的 Run。
+
+`RunDecision@4` 在 V3 action grammar 上增加可选 `finish.outputs`，复用 `AgentTurnResult@1` 的输出 envelope（id、title、contentType、schemaVersion、value），最多 20 项、整个数组最多 32 KiB。旧 Run 的 `OrchestratorBinding@3.decisionContractId=run-decision@3` 保留严格 V3 解析及恢复，新 public admission 固定选择 `run-decision@6`；旧 Run 保留其已绑定的版本，不自动迁移。
+
+`agent_run_decisions` 是被接受决策的 immutable 事实源；query 从其 `finish.outputs` 生成 canonical `outputFolders`，以 decision request ID 与 output id 形成稳定 outputId，并按 receipt 的 cycleId 分组。未接受的 Agent 原始输出、checkedAcceptance 和 acceptedEvidence 不产生 canonical output。输出 schema 属于调用方领域，Steward 不解析具体报告业务格式。
+
+Orchestrator prompt 区分业务产物与本次响应契约：目标中沿用的 `AgentTurnResult@1.outputs` 要求映射到 `RunDecision.finish.outputs`，不改变业务 schema 或验收。完整目标与 prior state 各出现一次，响应示例只展示紧凑结构，并实际展示 `finish.outputs` 的嵌套位置；避免在每个示例中重复完整目标、报告 schema 和历史证据。顶层 `outputs` 仍被拒绝，诊断指向正确位置；JSON 语法错误不补括号、不搬字段，也不因此自动重跑或改变模型分流。
+
+`run inspect.intervention` 是即时 read model，不新增表或 Run 状态。当当前 cycle 最新 Orchestrator request 的 result continuation 已 settled 且 receipt 为 `rejected_manual_fallback` 时，投影 `RunIntervention@1`（kind=manual_fallback、runId/runVersion、requestEventId、resultExecutionId、reason、allowedActions）。重试排队、后续决策或终态会使旧 fallback 消失。allowedActions 仅在符合初始只读、未过期恢复条件时包含 retry_orchestrator，另列 decide/cancel；调用时仍由 control 重新检查。跨系统 owner 可以据此执行自己的有界恢复/取消策略，RS 不替它决定业务失败。
 
 ## Lifecycle、cancel 与恢复
 
@@ -120,3 +130,25 @@ Vikunja Task URL 只是 Host 在 start 时传入的普通 destination snapshot�
 - 新 orchestration producer 必须通过当前 binding 声明的 RunDecision contract 和 current Run version 推进 Run，不能直接改 Run、checkpoint 或建立下一步 Event。
 - 新 reply destination 属于 Destination/Delivery 边界，只报告 checkpoint/terminal receipt；delivery 成败不能隐式推进 Run。
 - 新 workspace authority 由 Owner admission 固定，不能由 workflow prompt、Agent output 或 provider Session 自行扩大。
+
+## Steward 分流与比较
+
+`<runtime>/steward-policy.json` 是 Owner policy 的唯一配置源，经 `run steward-policy <file>` 校验 active Agent identity、客户端和总计 100 的正整数权重后原子保存。新 Run 的桶为 `SHA256("steward-policy@1:" + requestId)` 前四字节无符号大端值模 100，按 entries 顺序累计权重选择；比例是长期样本期望，不保证每十个 Run 恰好一次。配置只在新准入时读取，选中 Agent 不可用时明确失败，不悄悄回落到 Codex。既有 workspace/network guard 保持有效。
+
+`StewardRunRequest@2.stewardSelection` 与 `OrchestratorBinding@3.selection` 固定 agentId、policyDigest、bucket，参与 admission digest；重复 request ID、后续 decision 和恢复使用既有 Run identity。可选字段用于读取已持久化的无 policy Run，不建立第二份分流状态或迁移已有 Run。回退到全 Codex 通过提交该 Agent 权重 100 的新 policy 完成，只影响未来准入。
+
+`run steward-stats` 从 Run、decision 和 Execution receipt 只读聚合，按实际 stewardAgentId 与准入 policyDigest 分组。成功率分母为 succeeded/failed/cancelled，needs_human 与进行中另列；fallback 率表示曾出现 rejected_manual_fallback 的 Run 比例，恢复成功后仍计入。耗时仅统计具有 finish receipt 或 cancellation 时间的 terminal Run，包含排队时间；durationSamples 明示样本量，不使用会被归档更新的 updatedAt。历史无 policy 的 Run 单独成组，比较策略应按 digest 过滤。
+
+## 可恢复的 Owner 问答
+
+`RunDecision@5` 保留 v4 的 source/finish.outputs 语法，并增加 `ask_human`：在既有权限内只缺一个用户选择或信息时，返回 bounded `question`、rationale、checkedAcceptance 和 state。`needs_human` 仍是不能证明安全续行的终态，不因用户回答自动恢复；已有 v3/v4 binding 继续使用其原契约，不升级历史 Run。
+
+等待由 Run aggregate 拥有：同一事务保留 checkpoint、step count、workspace/authority，转为或保持 `awaiting_orchestrator`，递增 version，并将问题保存为 immutable decision + `AgentRunDecisionReceipt@3`。questionId 是提问的 canonical `agent.result` ID。current question 由最新决策、Run version/状态、answer Event 和 deadline 派生，不建立平行 mutable pending state。等待期沿用 Run deadline，无 deadline 时为问题创建后 24 小时；取消、过期或 superseded 问题不能续行。
+
+Chat 的 `control_chat_run(action=answer)` 在 Host-bound 原负责 Session 内复检 Owner source message、exact Run/question/version、有效 Agent 与原 Run Orchestrator Session。回答正文只取 Owner 原消息，不接受模型替写。一个 immediate transaction 创建带 question/Owner source identity 的 canonical `agent.request`，递增 Run version；同一问题已有 answer Event 时直接返回 already_answered，重复回复不增加执行。新请求沿用原 Run/cycle/grant、原编排 Session、checkpoint 和 latest state，`maxAttempts=1`；已完成 Worker 不会因回答被重新 admission。Session 丢失或忙碌时保留问题，不猜测新 Session；provider 的未知失败继续用原有限恢复边界。
+
+问题和后续终态沿用 Chat work-return；Agent、Chat 卡片和 Run detail 共用 `humanQuestion` 查询事实。独立 Run 的 Owner 仍可使用已有 Caller decision 控制；本轮的自然语言回答入口限于具有准确 Chat 工作归属的 Run，不声称给全部旧 Run 增加了新恢复能力。
+
+## 原始验收与能力调整
+
+新公共 Run 按 `RunDecision@6` 执行，完整验收条目固定在准入 binding，dispatchNotes 与任务分解不能改写。成功转换按稳定 ID 核验逐项 pass/evidence 与无未决问题；完整文档不能替代未知的必需事实。`request_capability` 独立于 `ask_human`：前者请求具体 network 能力并关联验收和目标，后者只获取既有权限内的选择或信息。网络调整由 Owner CLI 或本次已存的 Owner 预授权准入，默认暂停；恢复保留原验收、state/checkpoint，并以明确的 Codex turn sandbox policy 应用有效权限。初版仅处理 standalone read-only Codex Run 的网络调整，其他能力保持未获准。命令和权限边界见 CLI Reference，持久化与幂等边界见 Database Reference。

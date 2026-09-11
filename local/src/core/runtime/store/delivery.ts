@@ -124,7 +124,7 @@ export class RuntimeDeliveryStore {
       input.kind,
       JSON.stringify(input.address),
       payloadJson,
-      bounded(input.maxAttempts ?? (input.kind === "macos-notification" ? 1 : 5),
+      bounded(input.kind === "codex-desktop" ? 1 : input.maxAttempts ?? (input.kind === "macos-notification" ? 1 : 5),
         1, 30, "maxAttempts"),
       timestamp,
       timestamp,
@@ -160,6 +160,9 @@ export class RuntimeDeliveryStore {
     return withImmediateTransaction(this.#database, () => {
       const delivery = this.#requireDelivery(deliveryId);
       if (delivery.status !== "failed") return delivery;
+      if (this.#query.destination(delivery.destinationId)?.kind === "codex-desktop") {
+        throw new Error("Codex Desktop Delivery cannot be retried; inspect the target task before a new request");
+      }
       if (delivery.attemptCount >= 30) {
         throw new Error(`delivery retry limit reached: ${deliveryId}`);
       }

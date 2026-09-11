@@ -1,6 +1,6 @@
+import { temporaryDirectory } from "./support/temp-directory.js";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -8,7 +8,7 @@ import type { AgentInputEvent } from "../src/core/event/model.js";
 import { ClaudeCodeRuntimeAgent } from "../src/integrations/agent/claude-code.js";
 
 test("Claude Code receives Agent launch args and resumes the exact provider Session", async () => {
-  const workspace = mkdtempSync(join(tmpdir(), "rollerskate-claude-code-runtime-"));
+  const workspace = temporaryDirectory("rollerskate-claude-code-runtime-");
   const executable = join(workspace, "claude-fixture");
   const invocation = join(workspace, "invocation.json");
   writeFileSync(executable, `#!${process.execPath}
@@ -26,7 +26,7 @@ process.stdin.on("end", () => {
     subtype: "success",
     is_error: false,
     result: "direct Claude result",
-    session_id: "claude-provider-session",
+    session_id: "claude-existing-session",
     usage: { input_tokens: 9, output_tokens: 3 },
     num_turns: 2,
     total_cost_usd: 0.01
@@ -77,7 +77,7 @@ process.stdin.on("end", () => {
   ]);
   assert.ok(!request.args.includes("claude"));
   assert.match(request.input, /Prompt:\nrespond directly/);
-  assert.equal(result.providerSessionId, "claude-provider-session");
+  assert.equal(result.providerSessionId, "claude-existing-session");
   assert.deepEqual(result.outcome, { kind: "message", body: "direct Claude result" });
   assert.deepEqual(result.invocation?.tokenUsage, {
     inputTokens: 9,

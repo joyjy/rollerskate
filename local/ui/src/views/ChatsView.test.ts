@@ -49,6 +49,28 @@ describe("ChatsView", () => {
     });
   });
 
+  it("limits quick mentions to active participants", async () => {
+    const agent = localAgent();
+    const outsider = { ...agent, principalId: "prn_outside", handle: "codex-sol" };
+    mockedRequestJson.mockImplementation(async (path) => {
+      const control = controlResponse(path, [agent.principalId]);
+      if (control !== undefined) return control;
+      if (path === "/api/network/topics") return [];
+      if (path === "/api/network") return networkView(false, false);
+      if (path === "/api/chat/presence") return { topicId: "local_1", agents: [] };
+      return {
+        chat: { topicId: "local_1", handle: "local" },
+        agents: [agent, outsider], events: [],
+        messages: { topicId: "local_1", items: [], hasEarlier: false }, sessions: []
+      };
+    });
+    const wrapper = mount(ChatsView);
+    await flushPromises();
+    expect(wrapper.get(".mention-row").text()).toContain(`@${agent.handle}`);
+    expect(wrapper.get(".mention-row").text()).not.toContain("@codex-sol");
+    wrapper.unmount();
+  });
+
   it("shows a Human composer without inventing a Human Topic membership", async () => {
     const wrapper = mount(ChatsView);
     await flushPromises();

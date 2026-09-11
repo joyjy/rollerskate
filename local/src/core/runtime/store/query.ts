@@ -39,6 +39,7 @@ import type {
 
 export class RuntimeStoreQuery {
   readonly #database: DatabaseSync;
+  readonly #schedulingEvents = new Map<string, Event>();
   readonly #destinationCache: Map<string, RuntimeDestination>;
 
   public constructor(
@@ -47,6 +48,51 @@ export class RuntimeStoreQuery {
   ) {
     this.#database = database;
     this.#destinationCache = destinationCache;
+  }
+
+  public executionSchedulingSnapshot(at = new Date().toISOString()) {
+    const timestamp = at;
+    const rows = this.#database.prepare(`
+      SELECT * FROM executions
+      WHERE status = 'running' OR (status IN ('queued', 'retry_wait') AND
+        (julianday(next_attempt_at) <= julianday(?) OR handler = 'result'))
+      ORDER BY next_attempt_at, created_at, execution_id
+    `).all(timestamp) as unknown as ExecutionRow[];
+    const entries = rows.map(mapExecution);
+    // Canonical Events are immutable. Cache only current scheduling inputs, with a hard bound.
+    const required = new Set(entries.map(item => item.eventId));
+    const load = (ids: string[]) => {
+      if (ids.length === 0) return;
+      for (const row of this.#database.prepare("SELECT * FROM events WHERE event_id IN (SELECT value FROM json_each(?))")
+        .all(JSON.stringify(ids)) as unknown as EventRow[]) events.set(row.event_id, mapEvent(row));
+    };
+    const events = new Map([...this.#schedulingEvents].filter(([id]) => required.has(id)));
+    load([...required].filter(id => !events.has(id)));
+    for (const event of events.values()) if (event.type === "agent.result" && event.causality.parentEventId !== undefined) {
+      const id = event.causality.parentEventId;
+      required.add(id);
+      const cached = this.#schedulingEvents.get(id);
+      if (cached !== undefined) events.set(id, cached);
+    }
+    load([...required].filter(id => !events.has(id)));
+    this.#schedulingEvents.clear();
+    for (const [id, event] of events) {
+      if (this.#schedulingEvents.size >= 1_000) break;
+      this.#schedulingEvents.set(id, event);
+    }
+    return {
+      events,
+      due: entries.filter(item => item.status !== "running" && Date.parse(item.nextAttemptAt) <= Date.parse(timestamp)),
+      running: entries.filter(item => item.status === "running"),
+      resultBarriers: entries.filter(item => item.handler === "result" && item.status !== "running")
+    };
+  }
+
+  public nextFutureExecutionAt(at: string): string | undefined {
+    const row = this.#database.prepare(`SELECT next_attempt_at FROM executions
+      WHERE status IN ('queued', 'retry_wait') AND julianday(next_attempt_at) > julianday(?)
+      ORDER BY next_attempt_at, execution_id LIMIT 1`).get(at) as { next_attempt_at: string } | undefined;
+    return row?.next_attempt_at;
   }
 
   public event(eventId: string): Event | undefined {
@@ -181,6 +227,16 @@ export class RuntimeStoreQuery {
     return row?.receipt_json ?? null;
   }
 
+  public nextDueExecutionAt(): string | undefined {
+    const row = this.#database.prepare(`
+      SELECT next_attempt_at FROM executions
+      WHERE status IN ('queued', 'retry_wait')
+      ORDER BY next_attempt_at, execution_id
+      LIMIT 1
+    `).get() as { next_attempt_at: string } | undefined;
+    return row?.next_attempt_at;
+  }
+
   public session(sessionId: string): RuntimeSession | undefined {
     const row = this.#database.prepare("SELECT * FROM agent_sessions WHERE session_id = ?")
       .get(sessionId) as SessionRow | undefined;
@@ -293,6 +349,23 @@ export class RuntimeStoreQuery {
     const row = this.#database.prepare("SELECT * FROM deliveries WHERE delivery_id = ?")
       .get(deliveryId) as DeliveryRow | undefined;
     return row === undefined ? undefined : mapDelivery(row);
+  }
+
+  public deliveriesForHostOrigin(originId: string): RuntimeDelivery[] {
+    return (this.#database.prepare(`
+      SELECT * FROM deliveries WHERE origin_kind = 'host' AND origin_id = ?
+      ORDER BY created_at, delivery_id
+    `).all(originId) as unknown as DeliveryRow[]).map(mapDelivery);
+  }
+
+  public nextDueDeliveryAt(): string | undefined {
+    const row = this.#database.prepare(`
+      SELECT next_attempt_at FROM deliveries
+      WHERE status IN ('pending', 'retry_wait') AND attempt_count < max_attempts
+      ORDER BY next_attempt_at, delivery_id
+      LIMIT 1
+    `).get() as { next_attempt_at: string } | undefined;
+    return row?.next_attempt_at;
   }
 
   public deliveriesForDestinationKind(

@@ -131,7 +131,7 @@ function eventTraceView(
     deliveries: audit.deliveries.map(({ delivery, destination }) => ({
       delivery: {
         ...delivery,
-        source: "agent.result",
+        source: delivery.origin.kind === "event" ? "agent.result" : audit.event.type,
         attemptedAt: delivery.attemptCount === 0 ? null : delivery.updatedAt,
         deliveredAt: delivery.status === "delivered" ? delivery.updatedAt : null,
         boundedError: delivery.lastError === undefined ? undefined : bounded(delivery.lastError, 512)

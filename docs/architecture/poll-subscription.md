@@ -29,9 +29,23 @@ Steward await_source registers SubscriptionDefinition@5
 
 Continuous Subscription uses a separate parent and checkpoint state machine. `ContinuousSubscriptionDefinition@3` turns each new stable occurrence key into either one cycle on the same bound Run or one registered application action；only a succeeded cycle or succeeded/skipped action receipt advances its checkpoint。V3/V1 callback and V4/V2 Run-bound definitions remain readable as persisted compatibility。
 
+## 原生 file event source
+
+`ContinuousSubscriptionDefinition@4` 将 `source.kind=file` 与既有 `ProactiveTarget@1` 组合，复用 Continuous Subscription 的 status、pending observation 和成功 checkpoint；polling V1/V2/V3 保持原样。V4 不保存 probe 或 interval，`nextPollAt=null`，不通过 Plugin 注册监听，也不创建 canonical 文件 Event。
+
+Owner 使用 `subscription register-file` 登记固定目录、递归开关、字面 suffixes、相对 exclude 路径、debounce 和最大合并延迟，以及已注册 external workflow ref。源码内 Owner action compiler 也可绑定既有 application action；Run target 必须持有既有 recurring Run binding，文件输入不自行授予 Agent 权限。目录必须是 canonical path，监听不跟随 symlink 路径；最多保留 100 个未取消的 file Subscription。
+
+原生目录监听先于启动补齐，父目录监听负责发现根目录替换。通知只表示“指定范围需要重新读取”，不提供逐文件事件日志、文件正文或完整变更清单。`FileSourceObservation@1` 的 facts 只含 root 和 reconcile 标记；创建、删除、原子替换、无 filename 或可能影响子目录的 rename 均可引发保守补齐，因此 suffix 不是每次触发都存在匹配文件的证明。接收方自行读取当前范围并判断业务变化。停止期间已创建又消失的瞬时状态不在投影收敛保证内。
+
+唯一 core loop 驱动现有 Continuous Subscription phase；原生通知复用 core wake，合并 deadline 纳入同一等待计算。一个 source 最多一个 pending occurrence，在途期间的新通知继续合并，旧 occurrence 成功不会清掉这些通知。每次监听重建都生成启动补齐，覆盖进程崩溃前未持久化的通知；监听错误按 1 秒退避重挂，不能静默切换为目录定时扫描。底层静默漏通知仍是原生文件监听的限制，不声称持久事件流语义。
+
+External workflow 的 enqueue 与 pending 写入同事务，只有 succeeded 才推进 checkpoint；failed/unknown 保留 pending 并 block。继续复用 workflow 的 pre-effect retry 和 post-effect unknown 边界，不自动重放可能有副作用的命令。pause/cancel 停止新 source 准入，不撤销已经入队或执行中的 target；执行结果保留在 external workflow receipt。Runtime shutdown 先关闭监听，再执行既有 target settle。
+
+`inspect/list` 与 Console 共用 source definition、fileListener（status、observedAt、error）、pending/checkpoint 和最近 externalWorkflowExecution。监听状态是带时间的最近观察，需结合 Runtime health 判断当前是否运行；它不构成第二份 Runtime heartbeat。日常查询不迁移数据库。
+
 ## Fixed contract
 
-Current one-shot registration uses `SubscriptionDefinition@5`. The definition fixes:
+Current one-shot polling registration uses `SubscriptionDefinition@5`. The definition fixes:
 
 - required title and exact `ProactiveTarget@1`；its Run branch contains `RunSourceBinding@1`，action branch contains versioned action ref、registration digest 与 bounded input；
 - probe Plugin/config, canonical artifact revision/digest and bounded execution policy;
@@ -48,7 +62,7 @@ A terminal observation is durable Subscription state, not a parent Event. The so
 
 ## Recovery and isolation
 
-Polling resumes from durable `nextPollAt`; cancellation, deadline expiry or attempt exhaustion stops further probes. Poll failures only update the Subscription and loop log.
+Polling resumes from durable `nextPollAt`; cancellation, deadline expiry or attempt exhaustion stops further probes. Poll failures update the Subscription and loop log. For `application_action` one-shot targets, deadline or attempt exhaustion atomically records a `SubscriptionExpiry@1` failure observation and executes the action once; successful enqueue retains source status `expired`, while an action failure blocks the source. Legacy callback and Steward-bound expiry behavior is unchanged.
 
 带 ExternalRef binding 的 one-shot/Continuous Subscription 在每次 due probe 前重读 current Integration binding 并做最多 16 KiB 的 exact Connector read。inactive、stale、profile/placement/ownership mismatch 会把 parent 持久标成 `blocked`，不执行 probe、不 materialize callback，也不建立 Run 或外写；transport/read 异常仍走既有 poll failure/retry。相同 terminal/blocked parent 重启后不再次触发。无 binding definition 保持原行为。
 
@@ -70,3 +84,14 @@ Console shows definition/probe identity、显式 target、terminal/pending obser
 - External commands are executed once by their owner and publish a durable receipt; the Subscription probe only observes that receipt.
 - New callback kinds must use the shared host callback kernel or Core admission boundary and define exact grants plus crash semantics.
 - Poll attempts and observations remain Capability state; do not turn them into generic Events.
+
+
+File external workflow 的 failed/unknown 通过 Owner `subscription recover-file` 显式恢复，契约见 [CLI Reference](../runbook/cli-reference.md)。恢复绑定当前 blocked source、definition revision、pending execution 和 attempt；unknown 先确认实际结果，failed 只有明确确认 retry 安全后才追加一次执行预算。execution/occurrence identity 与 target 不变，原 terminal/unknown receipt 存入不可变 recovery 记录；确认成功或重试成功才推进 checkpoint。source 生命周期与 execution 恢复在同一事务提交，重复请求不重复产生副作用。
+
+## Desktop observation delivery
+
+统一 `run start` 在启动调用者侧进程前固定内置 completion probe 与可选 Desktop action。内部准入只接收源码拥有的 probe authority；观察已有来源时从 Owner registry 解析，调用方不能覆盖 executable authority。命令回执与崩溃边界见 [Database Reference](db-reference.md#本地长命令的文件状态)；Runtime 只检查回执，不启动或重试原命令。
+
+The Run compiler composes a registered probe and `action:codex-desktop.push@1` through the existing application-action target. The action only enqueues Core Delivery in the source transaction; it performs no IPC and invokes no Agent. One-shot terminal observations and continuous new occurrences share the same adapter. Action receipt output is the immutable destination/body binding, and Delivery is the transport oracle; continuous checkpoint advancement means durable enqueue, not Desktop consumption. [Desktop push runbook](../runbook/codex-desktop-push.md) owns failure handling and target lifecycle limits; the CLI reference owns Run submission.
+
+普通确定性观察和长命令通过统一 `run preflight/start` 准入，Subscription definition 由内部 compiler 装配；公共调用方不再拼装 Desktop registration JSON。预检与实际 probe 复用 `probe-validation.ts` 的工具参数、allowlist 和 workspace 检查。无回传目标使用固定 observe-only action，有目标复用 Desktop action/Delivery。详见 [统一 Run](unified-run.md)。

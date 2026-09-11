@@ -191,8 +191,9 @@ describe("ChatTimeline", () => {
           linkedRun: {
             runId: "run_1",
             state: "needs_human" as const,
-            status: "needs_human" as const,
-            terminalSummary: "Owner must choose the target branch.",
+            status: "awaiting_orchestrator" as const,
+            terminal: false,
+            attentionReason: "Owner must choose the target branch.",
             updatedAt: "2026-09-02T04:02:00.000Z"
           }
         }]
@@ -215,6 +216,9 @@ describe("ChatTimeline", () => {
             state: "terminal" as const,
             status: "succeeded" as const,
             terminalSummary: "Regression traced to the checkout cache.",
+            terminal: true,
+            outputs: [{ outputId: "out_report", stepId: "step_report", title: "Investigation report",
+              kind: "output" as const, contentType: "text/markdown" }],
             updatedAt: "2026-09-02T04:03:00.000Z"
           }
         }]
@@ -222,6 +226,7 @@ describe("ChatTimeline", () => {
     });
     expect(wrapper.text()).toContain("Run succeeded");
     expect(wrapper.text()).toContain("Regression traced to the checkout cache.");
+    expect(wrapper.text()).toContain("Investigation report");
   });
 
   it("renders each Agent proposal as an independently actionable card", async () => {
@@ -292,4 +297,18 @@ describe("ChatTimeline", () => {
     expect(wrapper.emitted("declineProposal")?.[0]?.[0]).toEqual(proposals[1]);
     expect(wrapper.find("button.handoff-action").exists()).toBe(false);
   });
+  it("shows native tool work without requiring a proposal and opens its exact Run", async () => {
+    const wrapper = mount(ChatTimeline,{props:{
+      chat:{id:"local",kind:"local",handle:"#local",name:"Local",status:"active",unreadCount:0},
+      messages:[{eventId:"evt_tool",createdAt:"2026-09-10T00:00:00Z",sender:{kind:"owner",principalId:"prn_owner",handleSnapshot:"owner"},body:"研究会话边界",
+        works:[{runId:"run_tool",label:"研究会话边界",state:"terminal",status:"cancelled",terminal:true,terminalSummary:"Owner cancelled",outputs:[],updatedAt:"2026-09-10T00:00:01Z"}]}],
+      activeAgents:[]
+    }});
+    expect(wrapper.text()).toContain("Run cancelled");
+    expect(wrapper.text()).toContain("Owner cancelled");
+    expect(wrapper.find(".run-proposal").exists()).toBe(false);
+    await wrapper.get(".chat-work button").trigger("click");
+    expect(wrapper.emitted("openRun")?.[0]).toEqual(["run_tool"]);
+  });
+
 });

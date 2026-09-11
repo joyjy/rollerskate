@@ -134,7 +134,12 @@ function resolvePluginPath(ref: string, repoRoot: string): string {
   const input = ref.startsWith("project:")
     ? projectPath(repoRoot, ref.slice("project:".length))
     : filePath(ref, "pluginPath");
-  return canonicalFile(input, "pluginPath");
+  const canonical = canonicalFile(input, "pluginPath");
+  if (ref.startsWith("project:")) {
+    const nested = relative(realpathSync(repoRoot), canonical);
+    if (nested === ".." || nested.startsWith("../") || isAbsolute(nested)) throw new Error("project pluginPath symlink escapes the project root");
+  }
+  return canonical;
 }
 
 function resolveWorkspace(ref: string, repoRoot: string, localWorkspace: string): string {
@@ -237,4 +242,23 @@ function stringList(value: unknown, field: string, maximum: number): readonly st
 
 function unique(values: readonly string[], field: string): void {
   if (new Set(values).size !== values.length) throw new Error(`${field} must be unique`);
+}
+
+export function registeredSubscriptionProbe(plugin: RegisteredSubscriptionPlugin, config: unknown) {
+  return {
+    plugin: {
+    path: plugin.path,
+    id: plugin.id,
+    schemaVersion: 1 as const,
+    config: config
+    },
+    policy: {
+    workspaceRoot: plugin.workspaceRoot,
+    allowedHttpOrigins: plugin.allowedHttpOrigins,
+    allowedExecutables: plugin.allowedExecutables,
+    allowedEnvironment: [] as string[],
+    timeoutMilliseconds: 30_000,
+    maxOutputBytes: 65_536
+    }
+  };
 }

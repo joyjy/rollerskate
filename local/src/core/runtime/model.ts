@@ -114,7 +114,7 @@ export interface AgentRunContext {
 
 export interface RuntimeDestination {
   readonly destinationId: string;
-  readonly kind: "matrix" | "macos-notification" | "server-topic" | "vikunja-task";
+  readonly kind: "matrix" | "macos-notification" | "server-topic" | "vikunja-task" | "codex-desktop";
   readonly address: Readonly<Record<string, string>>;
   readonly createdAt: string;
   readonly updatedAt: string;

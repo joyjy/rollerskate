@@ -9,7 +9,7 @@ import { RuntimeStore } from "../src/core/runtime/store.js";
 import { LocalFoundationStore } from "../src/infrastructure/sqlite/foundation-store.js";
 import { initializeRuntimeSchema } from "../src/infrastructure/sqlite/schema.js";
 
-test("schema v72 drops v44 SubscriptionDefinition@2 data and legacy Review", () => {
+test("schema v74 drops v44 SubscriptionDefinition@2 data and legacy Review", () => {
   const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v52-from-v44-"));
   const databasePath = join(directory, "runtime.db");
   const legacySubscriptionId = "sub_019f0000-0000-7000-8000-000000000044";
@@ -122,8 +122,8 @@ test("schema v72 drops v44 SubscriptionDefinition@2 data and legacy Review", () 
     legacy.close();
 
     const diagnostics = initializeRuntimeSchema(databasePath);
-    assert.equal(diagnostics.schemaVersion, 72);
-    assert.equal(diagnostics.tables.length, 32);
+    assert.equal(diagnostics.schemaVersion, 75);
+    assert.equal(diagnostics.tables.length, 33);
     assert.ok(!diagnostics.tables.includes("reviews"));
 
     const migrated = new DatabaseSync(databasePath, { readOnly: true });

@@ -1,6 +1,6 @@
 {
   "name": "rollerskate",
-  "version": "0.5.7",
+  "version": "0.6.0",
   "private": true,
   "type": "module",
   "workspaces": [
@@ -14,10 +14,11 @@
     "dev:init": "node dev/init-secrets.mjs",
     "dev:up": "docker compose --env-file dev/.env -f dev/compose.yaml up --build",
     "dev:down": "docker compose --env-file dev/.env -f dev/compose.yaml down",
-    "test": "$HOME/.ai/scripts/node-test-kit run",
+    "test": "npm run build && npm test --workspaces",
     "test:ui": "npm --prefix local/ui test",
-    "test:coverage": "$HOME/.ai/scripts/node-test-kit coverage",
-    "verify": "npm test && npm run test:ui"
+    "test:coverage": "npm run build && (cd packages/protocol && node --experimental-test-coverage --test dist/test/*.test.js) && (cd local && node --experimental-test-coverage --test --test-concurrency=4 dist/test/*.test.js) && (cd server && node --experimental-test-coverage --test dist/test/*.test.js)",
+    "verify": "npm test && npm run test:ui",
+    "benchmark:scheduler": "node scripts/scheduler-benchmark/run.mjs"
   },
   "engines": {
     "node": ">=24.0.0"

@@ -226,6 +226,14 @@ describe("AgentRunOverview", () => {
     expect(wrapper.get(".source-card .trace-link").attributes("href"))
       .toContain("/console/subscriptions?subscriptionId=sub_bound");
   });
+  it("shows the pending question and routes the Owner back to Chat",async()=>{
+    const router=createConsoleRouter(createMemoryHistory());await router.push("/console/steward");
+    const wrapper=mount(AgentRunOverview,{global:{plugins:[router]},props:{run:{...baseRun(),
+      humanQuestion:{questionId:"evt_question",question:"选择 A 还是 B？",runVersion:4,status:"pending",expiresAt:"2026-09-11T00:00:00Z"}}}});
+    expect(wrapper.text()).toContain("Waiting for your answer");expect(wrapper.text()).toContain("选择 A 还是 B？");
+    expect(wrapper.find('a[href="/console/chats"]').exists()).toBe(true);
+  });
+
 });
 
 function baseRun(overrides: { steps?: AgentRunStepOutput[] } = {}): AgentRunDetailViewOutput {

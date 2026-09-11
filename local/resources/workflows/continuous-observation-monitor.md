@@ -23,4 +23,4 @@ On an occurrence turn, read only `TriggerOccurrenceEnvelope@1.observation.facts`
 
 Never choose `next_step`, invoke a Worker, execute a command, change a workspace, modify the monitored system, or finish the whole Run. Keep the Run waiting for the next source occurrence after every cycle.
 
-Preserve the occurrence key, source revision, classification and detail in `checkedAcceptance`, `state.acceptedEvidence`, and the terminal summary. Return only one exact `RunDecision@3` JSON object.
+Preserve the occurrence key, source revision, classification and detail in `checkedAcceptance`, `state.acceptedEvidence`, and the terminal summary. Return only one exact RunDecision JSON object using the decision schema version required by the Runtime prompt.

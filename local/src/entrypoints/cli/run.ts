@@ -1,3 +1,8 @@
+import { compileRunIntentWithOwnerPolicy } from "../../application/steward/admission.js";
+import { authorizeRunNetwork } from "../../application/steward/capability.js";
+import { startStewardRunFromOwnerIntent } from "../../application/steward/intent-control.js";
+import { stewardStatsView } from "../../application/steward/stats-query.js";
+import { configureStewardPolicy, stewardPolicyView } from "../../application/steward/policy-control.js";
 import { readFileSync, realpathSync } from "node:fs";
 
 import {
@@ -32,6 +37,32 @@ export function runStewardCommand(
   runtimeDirectory?: string
 ): number {
   const [command, ...rest] = arguments_;
+  if (command === "steward-policy") {
+    if (rest.length > 1) throw new Error("run steward-policy accepts at most one policy JSON file");
+    write(output, rest.length === 0 ? stewardPolicyView(repoRoot, runtimeDirectory)
+      : configureStewardPolicy(repoRoot, parseJsonFile(rest[0]!, "StewardPolicy@1"), runtimeDirectory));
+    return 0;
+  }
+  if (command === "steward-stats") {
+    if (rest.length !== 0 && (rest.length !== 2 || rest[0] !== "--policy-digest")) {
+      throw new Error("run steward-stats accepts [--policy-digest <sha256:digest>]");
+    }
+    write(output, stewardStatsView(repoRoot, runtimeDirectory, rest[1]));
+    return 0;
+  }
+  if (command === "authorize-network") {
+    if (rest.length !== 5 || rest[1] !== "--request-event" || rest[3] !== "--expected-version") throw new Error("run authorize-network requires <run-id> --request-event <event-id> --expected-version <version>");
+    write(output, authorizeRunNetwork(repoRoot, rest[0]!, rest[2]!, integer(rest[4], "expectedVersion", 1, Number.MAX_SAFE_INTEGER), runtimeDirectory));
+    return 0;
+  }
+  if (command === "preflight" && rest.length === 2 && rest[1] === "--authorize-network") {
+    write(output, compileRunIntentWithOwnerPolicy(repoRoot, parseRunIntentFile(rest[0]!), {authorizeNetwork: true}, runtimeDirectory));
+    return 0;
+  }
+  if (command === "start" && rest.length === 2 && rest[1] === "--authorize-network") {
+    write(output, startStewardRunFromOwnerIntent(repoRoot, parseRunIntentFile(rest[0]!), {authorizeNetwork: true}, runtimeDirectory));
+    return 0;
+  }
   if (command === "start") {
     requireCount(rest, 1, "run start requires one RunIntent@1 JSON file");
     write(output, startStewardRunFromIntent(
@@ -149,7 +180,7 @@ export function runStewardCommand(
   throw new Error(
     "run requires preflight, start, list, legacy-inventory, legacy-migration-plan, " +
     "legacy-migrate, inspect, trace, decide, retry-orchestrator, " +
-    "close, cancel, archive or unarchive"
+    "authorize-network, close, cancel, archive or unarchive"
   );
 }
 

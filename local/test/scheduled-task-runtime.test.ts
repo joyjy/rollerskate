@@ -6,6 +6,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { temporaryDirectory } from "./support/temp-directory.js";
 
 import { LocalFoundationStore } from "../src/infrastructure/sqlite/foundation-store.js";
 import { addLocalAgent } from "../src/application/agent/control.js";
@@ -414,7 +415,7 @@ function setup(
   readonly scheduler: ScheduledTaskRuntime;
   readonly close: () => void;
 } {
-  const root = mkdtempSync(join(tmpdir(), "rollerskate-schedule-runtime-"));
+  const root = temporaryDirectory("rollerskate-schedule-runtime-");
   const database = join(root, "runtime.sqlite");
   const runtime = new RuntimeStore(database);
   const foundation = new LocalFoundationStore(database);

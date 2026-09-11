@@ -24,7 +24,7 @@ Optional remote control
   -> Server BFF -> Matrix -> Local Runtime admission
 ```
 
-最近 release baseline 是 [v0.5.7 verification](../verification/v0.5.7.md)；Chat-to-Run foundation、Subscription history、安全只读 Chat tools、统一 proactive target 与 Owner-registered durable external workflow 已通过集成门禁和默认 Runtime 验证。未发布的 v0.5.3 Project/effect 候选已经降级：Project policy/effect 硬集成退出当前架构，保留 read-only Connector、Integration binding、普通 Vikunja Task writeback 与通用 Steward Orchestrator。其余未实现工作只从 [Active plan](../plan/index.md) 进入。
+当前版本为 v0.6.0：持续会话与 RS 工具、Run 委派和准确返回、可恢复人工回答、统一 Run 准入与 Desktop 回传。
 
 ## 默认阅读路径
 
@@ -41,11 +41,13 @@ ADR、Source map 和 Event Reference 都是按需材料，不是理解系统的�
 
 - [Local Runtime](./local-runtime.md)：Local-first 基础设施、模块边界、canonical Event、Route/Handler、Session、审计与单进程 loop。
 - [Event and Handler flow](./event-and-chat-flow.md)：Event、Execution、Handler、result、Destination 与 Local Chat 主链。
+- [Provider 能力与恢复边界](./provider-capabilities.md)：当前 adapter 的 Session、工具、预算、进度及降级矩阵。
 - [State and recovery](./state-and-recovery.md)：SQLite、lease、outbox、Agent invocation、crash 与恢复语义。
 - [Source of truth](./source-of-truth.md)：身份、消息、配置、运行状态、远端 working set 与本地数据的权威归属。
 
 ### Capability 与产品 vertical
 
+- [统一 Run 准入与确定性执行](unified-run.md)：公共工作入口、执行前校验、命令/观察与既有 Agent 编排的 ownership。
 - [Subscription](./poll-subscription.md)：one-shot/Continuous 轮询、受限 probe Plugin、ordered callback 与控制面。
 - [Local Scheduled Task](./scheduled-task.md)：Schedule revision、cron/timezone、misfire/overlap、Session policy 与 unknown recovery。
 - Topic scheduled activation：`TopicActivationSchedule` 属于 Topic application vertical，只调度 conversation intent 与 candidate policy，不接受 arbitrary prompt/callback；运行时复用 canonical Chat activation。
@@ -82,7 +84,7 @@ Source map 只在修改 source root、ownership、共享 contract、生成关系
 ## 跨域不变量
 
 - 每台电脑最多运行一个 Local Runtime；本机 workspace、授权、执行状态与停止权始终由 Local/Owner 掌握。
-- 所有 ingress 先成为 canonical Event，再按 `Event.type` 进入唯一 Handler；transport adapter 不拥有产品处理语义。
+- 进入 Agent/Handler 主链的消息 ingress 先成为 canonical Event，再按 `Event.type` 进入唯一 Handler；确定性 Run 复用 source-owned action/receipt，不创建 Agent Execution。transport adapter 不拥有产品处理语义。
 - `core/loop.ts` 拥有唯一长期运行 loop；Capability 和 integration 不能建立平行 daemon 或 execution core。
 - application vertical 通过 control/query、纯状态机和低频 manifest registration 接入；业务语义不得随 vertical 数量扩散进 core、ResultHandler 或 Agent adapter。
 - Local 只保存本机执行、恢复和 bounded working set 所需事实，不复制 Server、Matrix 或 provider 的完整信息。

@@ -44,7 +44,7 @@ function agentResultBadge(callback: {
     <div class="panel-title">{{ subscription.title }}</div>
     <div class="panel-subtitle">
       {{ subscription.id }} ·
-      {{ subscription.probe.plugin.id }}@{{ subscription.probe.plugin.schemaVersion }} ·
+      {{ subscription.probe ? `${subscription.probe.plugin.id}@${subscription.probe.plugin.schemaVersion}` : "File events" }} ·
       <StatusBadge :status="subscription.status" />
     </div>
 
@@ -102,8 +102,14 @@ function agentResultBadge(callback: {
     <template v-else>
       <div class="section-title">Continuous checkpoint</div>
       <dl class="kv">
-        <dt>Poll count</dt><dd>{{ subscription.pollCount }}</dd>
-        <dt>Next poll</dt><dd>{{ formatDateTime(subscription.nextPollAt) }}</dd>
+        <template v-if="subscription.probe">
+          <dt>Poll count</dt><dd>{{ subscription.pollCount }}</dd>
+          <dt>Next poll</dt><dd>{{ formatDateTime(subscription.nextPollAt) }}</dd>
+        </template>
+        <template v-else>
+          <dt>Listener</dt><dd>{{ subscription.fileListener?.status ?? "awaiting runtime" }}</dd>
+          <dt>Observed at</dt><dd>{{ formatDateTime(subscription.fileListener?.observedAt) }}</dd>
+        </template>
         <dt>Checkpoint</dt><dd class="mono">{{ subscription.checkpointOccurrenceKey ?? "none" }}</dd>
         <dt>Pending</dt><dd class="mono">{{ subscription.pendingOccurrenceKey ?? "none" }}</dd>
         <dt>Visible callback occurrence</dt><dd class="mono">{{ subscription.callbackOccurrenceKey ?? "none" }}</dd>
@@ -124,6 +130,12 @@ function agentResultBadge(callback: {
           <dt>Pending admission</dt><dd>{{ subscription.pendingAdmissionReceipt ? "durable" : "none" }}</dd>
         </dl>
         <pre v-if="subscription.pendingAdmissionReceipt">{{ JSON.stringify(subscription.pendingAdmissionReceipt, null, 2) }}</pre>
+      </template>
+      <template v-else-if="subscription.definition.schemaVersion === 'ContinuousSubscriptionDefinition@4' || subscription.definition.schemaVersion === 'ContinuousSubscriptionDefinition@3'">
+        <div class="section-title registration-title">Subscription target</div>
+        <pre>{{ JSON.stringify(subscription.definition, null, 2) }}</pre>
+        <pre v-if="subscription.externalWorkflowExecution">{{ JSON.stringify(subscription.externalWorkflowExecution, null, 2) }}</pre>
+        <div v-if="subscription.fileListener?.error" class="error-card">{{ subscription.fileListener.error }}</div>
       </template>
       <div v-else class="fire-card registration-title">Legacy callbacks · non-public</div>
       <div v-if="subscription.latestError" class="error-card">{{ subscription.latestError }}</div>

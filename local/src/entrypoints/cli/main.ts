@@ -13,6 +13,8 @@ import {
 import { doctorLocalRuntime } from "../../application/runtime/doctor.js";
 import { runtimeOperationsView } from "../../application/runtime/query.js";
 import { runAgentCommand, runWorkspaceCommand } from "./agent.js";
+import { runCodexPushCommand } from "./codex-push.js";
+import { runCommandCommand } from "./command.js";
 import { runChatCommand } from "./chat.js";
 import { runChannelCommand } from "./channel.js";
 import { runDeviceCommand } from "./device.js";
@@ -24,7 +26,7 @@ import {
   runWorkloadCommand
 } from "./operations.js";
 import { runAdminCommand, runRoomCommand } from "./room.js";
-import { runStewardCommand } from "./run.js";
+import { runWorkCommand } from "./work-run.js";
 import { runScheduleCommand } from "./schedule.js";
 import { collectSetupInput } from "./setup.js";
 import type { AppOutput, LocalAppDependencies } from "./shared.js";
@@ -56,6 +58,8 @@ const HELP = [
   "Usage:",
   "  scripts/rs [--runtime <absolute-path>] [command]",
   "  scripts/rs --help",
+  "  scripts/rs codex-push --thread <UUID> [--socket <path>] [--timeout <seconds>] send",
+  "  scripts/rs run preflight|start|inspect ...  submit Agent work, commands or observations",
   "  scripts/rs start [--foreground] [--no-open] [--ui-port <port>]  start Local Runtime + Console",
   "  scripts/rs restart [--foreground] [--no-open] [--ui-port <port>]  restart on current sources",
   "  scripts/rs stop          stop Local Runtime daemon gracefully",
@@ -82,7 +86,7 @@ const HELP = [
   "  scripts/rs topic profile update <topic-id> <json-file>",
   "  scripts/rs topic join <topic-id> <agent-handle>",
   "  scripts/rs topic publish <topic-id> <agent-handle> <transaction-id> <message...>",
-  "  scripts/rs chat post <message...>",
+  "  scripts/rs chat post [--codex-thread <task UUID> --] <message...>",
   "  scripts/rs chat history [--before <event-id>] [--limit <1-200>]",
   "  scripts/rs chat status",
   "  scripts/rs chat governance",
@@ -95,10 +99,11 @@ const HELP = [
   "  scripts/rs notice inspect <notice-id>",
   "  scripts/rs notice mark-read|ack <notice-id>",
   "  scripts/rs notice rebuild",
+  "  scripts/rs subscription deliveries <subscription-id>",
   "  scripts/rs subscription history <subscription-id> --json",
   "  scripts/rs subscription list|inspect|pause|resume|cancel ...",
   "  scripts/rs schedule list|inspect|pause|resume|cancel|run-now|migrate-workflow|occurrences|runs|trace|resolve ...",
-  "  scripts/rs run preflight|start|list|legacy-inventory|legacy-migration-plan|legacy-migrate|inspect|trace|decide|retry-orchestrator|close|cancel|archive|unarchive ...",
+  "  scripts/rs run steward-policy|steward-stats|preflight|start|list|legacy-inventory|legacy-migration-plan|legacy-migrate|inspect|trace|decide|retry-orchestrator|close|cancel|archive|unarchive ...",
   "  scripts/rs work-request inspect|accept|reject|await-owner ...",
   "",
   "Runtime: ~/.rollerskate, or the path selected with --runtime"
@@ -108,7 +113,7 @@ const RUNTIME_COMMANDS = new Set([
   "setup", "doctor", "status", "trace", "event", "workload", "failure",
   "recover", "pause", "resume", "device", "workspace", "agent", "activity",
   "topic", "notice", "chat", "channel", "subscription", "schedule", "run",
-  "work-request", "room", "admin"
+  "work-request", "room", "admin", "command"
 ]);
 
 export async function runLocalApp(
@@ -128,6 +133,7 @@ export async function runLocalApp(
     output.write(`${HELP}\n`);
     return 0;
   }
+  if (command === "codex-push") return runCodexPushCommand(rest, output);
   if (command === "start") {
     const options = parseStartOptions(rest);
     assertRuntimeSchemaUpgradeAllowed(repoRoot, global.runtimeDirectory);
@@ -178,6 +184,8 @@ export async function runLocalApp(
   }
   assertRuntimeSchemaUpgradeAllowed(repoRoot, global.runtimeDirectory);
   switch (command) {
+    case "command":
+      return runCommandCommand(repoRoot, rest, output, global.runtimeDirectory);
     case "setup": {
       rejectArguments(rest);
       const input = await collectSetupInput(repoRoot, environment);
@@ -298,7 +306,7 @@ export async function runLocalApp(
     case "schedule":
       return runScheduleCommand(repoRoot, rest, output, global.runtimeDirectory);
     case "run":
-      return runStewardCommand(repoRoot, rest, output, global.runtimeDirectory);
+      return runWorkCommand(repoRoot, rest, output, global.runtimeDirectory);
     case "work-request":
       return runWorkRequestCommand(
         repoRoot, rest, output, global.runtimeDirectory, dependencies

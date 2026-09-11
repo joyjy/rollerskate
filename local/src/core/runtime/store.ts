@@ -50,6 +50,7 @@ import { RuntimeChatStore } from "./store/chat.js";
 import { RuntimeDeliveryStore } from "./store/delivery.js";
 import { RuntimeEventStore } from "./store/event.js";
 import { RuntimeAuditQuery } from "./store/audit.js";
+import { notifyRuntimeWork } from "./wake.js";
 import type {
   AdmitChatAttention,
   AppendRuntimeEventReceipt,
@@ -79,11 +80,15 @@ export class RuntimeStore {
   readonly #delivery: RuntimeDeliveryStore;
   readonly #eventStore: RuntimeEventStore;
   readonly #audit: RuntimeAuditQuery;
+  readonly #onWorkAvailable: () => void;
 
   public constructor(
     database: string | DatabaseSync,
     options: { readonly migrate?: boolean } = {}
   ) {
+    const databasePath = typeof database === "string"
+      ? resolve(database)
+      : mainDatabasePath(database);
     if (typeof database === "string") {
       const absolutePath = resolve(database);
       mkdirSync(dirname(absolutePath), { recursive: true });
@@ -97,6 +102,7 @@ export class RuntimeStore {
       this.#ownsDatabase = false;
       if (options.migrate !== false) migrateRuntimeDatabase(this.#database);
     }
+    this.#onWorkAvailable = () => notifyRuntimeWork(databasePath);
     this.#query = new RuntimeStoreQuery(this.#database, this.#destinationCache);
     this.#chat = new RuntimeChatStore(this.#database, this.#query);
     this.#delivery = new RuntimeDeliveryStore(
@@ -113,7 +119,9 @@ export class RuntimeStore {
   }
 
   public appendEventInTransaction(input: CreateEvent): AppendRuntimeEventReceipt {
-    return this.#eventStore.appendInTransaction(input);
+    const receipt = this.#eventStore.appendInTransaction(input);
+    if (receipt.status === "accepted") this.#onWorkAvailable();
+    return receipt;
   }
 
   public withImmediateTransaction<T>(callback: () => T): T {
@@ -173,21 +181,27 @@ export class RuntimeStore {
     admissions: readonly AdmitChatAttention[],
     at = new Date().toISOString()
   ): readonly ChatDispatchEvent[] {
-    return this.#chat.admitAttention(executionId, admissions, at);
+    const dispatches = this.#chat.admitAttention(executionId, admissions, at);
+    if (dispatches.length > 0) this.#onWorkAvailable();
+    return dispatches;
   }
 
   public createChatActivation(
     input: CreateChatActivation,
     at = new Date().toISOString()
   ): AppendRuntimeEventReceipt {
-    return this.#chat.createActivation(input, at);
+    const receipt = this.#chat.createActivation(input, at);
+    if (receipt.status === "accepted") this.#onWorkAvailable();
+    return receipt;
   }
 
   public createChatActivationInTransaction(
     input: CreateChatActivation,
     at = new Date().toISOString()
   ): AppendRuntimeEventReceipt {
-    return this.#chat.createActivationInTransaction(input, at);
+    const receipt = this.#chat.createActivationInTransaction(input, at);
+    if (receipt.status === "accepted") this.#onWorkAvailable();
+    return receipt;
   }
 
   public recordChatRunProposalDeclinedInTransaction(input: {
@@ -222,17 +236,32 @@ export class RuntimeStore {
     return this.#query.executionReceiptJson(executionId);
   }
 
+  public nextDueExecutionAt(): string | undefined {
+    return this.#query.nextDueExecutionAt();
+  }
+
+  public executionSchedulingSnapshot(at = new Date().toISOString()) {
+    return this.#query.executionSchedulingSnapshot(iso(at));
+  }
+
+  public nextFutureExecutionAt(at: string): string | undefined {
+    return this.#query.nextFutureExecutionAt(iso(at));
+  }
+
   public claimDueExecutions(
     limit = 20,
-    now = new Date().toISOString()
+    now = new Date().toISOString(),
+    select?: (snapshot: ReturnType<RuntimeStore["executionSchedulingSnapshot"]>) => readonly RuntimeExecution[]
   ): RuntimeExecution[] {
     const timestamp = iso(now);
+    limit = bounded(limit, 1, 100, "limit");
     return runImmediateTransaction(this.#database, () => {
-      const rows = this.#database.prepare(`
+      const rows = select === undefined ? this.#database.prepare(`
         SELECT execution_id FROM executions
         WHERE status IN ('queued', 'retry_wait') AND julianday(next_attempt_at) <= julianday(?)
         ORDER BY next_attempt_at ASC, created_at ASC, execution_id ASC LIMIT ?
-      `).all(timestamp, bounded(limit, 1, 100, "limit")) as unknown as Array<{ execution_id: string }>;
+      `).all(timestamp, limit) as unknown as Array<{ execution_id: string }>
+        : select(this.executionSchedulingSnapshot(timestamp)).slice(0, limit).map(item => ({ execution_id: item.executionId }));
       const claimed: RuntimeExecution[] = [];
       for (const row of rows) {
         const changed = this.#database.prepare(`
@@ -255,7 +284,7 @@ export class RuntimeStore {
     requireText(receipt.workspace, "workspace");
     requireText(receipt.providerSessionId, "providerSessionId");
     const timestamp = iso(at);
-    return runImmediateTransaction(this.#database, () => {
+    const outcome = runImmediateTransaction(this.#database, () => {
       const execution = this.#requireExecution(executionId);
       if (execution.status !== "running") throw new Error(`execution is not running: ${executionId}`);
       if (execution.handler !== "agent") {
@@ -354,6 +383,7 @@ export class RuntimeStore {
             ? "ChatDecisionReceipt@2"
             : "ChatDecisionReceipt@1",
           dispatchEventId: event.eventId,
+          sessionId: session.sessionId,
           speechAction: decision.speech.action,
           ...(decision.speech.action === "silent"
             ? { silenceReason: decision.speech.reason }
@@ -400,6 +430,8 @@ export class RuntimeStore {
       }
       return resultEvent;
     });
+    this.#onWorkAvailable();
+    return outcome;
   }
 
   public failExecution(
@@ -411,7 +443,7 @@ export class RuntimeStore {
   ): { readonly execution: RuntimeExecution; readonly resultEvent?: AgentResultEvent } {
     const failure = requireText(error, "error").slice(0, 4_096);
     const timestamp = iso(at);
-    return runImmediateTransaction(this.#database, () => {
+    const outcome = runImmediateTransaction(this.#database, () => {
       const execution = this.#requireExecution(executionId);
       if (execution.status !== "running") throw new Error(`execution is not running: ${executionId}`);
       const normalizedTrace = options.trace === undefined
@@ -457,6 +489,8 @@ export class RuntimeStore {
         ...(resultEvent === undefined ? {} : { resultEvent })
       };
     });
+    this.#onWorkAvailable();
+    return outcome;
   }
 
   public completeResultExecution(
@@ -481,8 +515,8 @@ export class RuntimeStore {
     if (resultEvent.type !== "agent.result") {
       throw new Error(`ResultHandler requires agent.result: ${resultEvent.eventId}`);
     }
-    for (const destination of this.#destinationSnapshots(resultEvent.eventId)) {
-      const maxAttempts = destination.kind === "macos-notification" ? 1 : 5;
+    for (const destination of this.destinationSnapshots(resultEvent.eventId)) {
+      const maxAttempts = destination.kind === "macos-notification" || destination.kind === "codex-desktop" ? 1 : 5;
       this.#database.prepare(`
         INSERT INTO deliveries (
           delivery_id, result_event_id, origin_kind, origin_id, destination_id,
@@ -508,7 +542,9 @@ export class RuntimeStore {
       UPDATE executions SET status = 'succeeded', completed_at = ?, updated_at = ?,
         last_error = NULL WHERE execution_id = ?
     `).run(timestamp, timestamp, executionId);
-    return this.deliveriesForResultEvent(resultEvent.eventId);
+    const deliveries = this.deliveriesForResultEvent(resultEvent.eventId);
+    this.#onWorkAvailable();
+    return deliveries;
   }
 
   public cancelQueuedExecutionsForRootInTransaction(
@@ -660,7 +696,7 @@ export class RuntimeStore {
   ): { readonly execution: RuntimeExecution; readonly resultEvent?: AgentResultEvent } {
     const failure = requireText(error, "error").slice(0, 4_096);
     const timestamp = iso(at);
-    return this.withImmediateTransaction(() => {
+    const outcome = this.withImmediateTransaction(() => {
       const execution = this.#requireExecution(executionId);
       if (execution.status !== "running" || execution.handler !== "agent") {
         throw new Error(`agent execution is not running: ${executionId}`);
@@ -685,6 +721,8 @@ export class RuntimeStore {
         ...(resultEvent === undefined ? {} : { resultEvent })
       };
     });
+    this.#onWorkAvailable();
+    return outcome;
   }
 
   public session(sessionId: string): RuntimeSession | undefined {
@@ -788,7 +826,9 @@ export class RuntimeStore {
   public enqueueHostDeliveryInTransaction(
     input: Parameters<RuntimeDeliveryStore["enqueueHostInTransaction"]>[0]
   ): RuntimeDelivery {
-    return this.#delivery.enqueueHostInTransaction(input);
+    const delivery = this.#delivery.enqueueHostInTransaction(input);
+    this.#onWorkAvailable();
+    return delivery;
   }
 
   public claimDueDeliveries(
@@ -810,7 +850,9 @@ export class RuntimeStore {
     deliveryId: string,
     at = new Date().toISOString()
   ): RuntimeDelivery {
-    return this.#delivery.retryFailed(deliveryId, at);
+    const delivery = this.#delivery.retryFailed(deliveryId, at);
+    this.#onWorkAvailable();
+    return delivery;
   }
 
   public deliveryFailed(
@@ -819,11 +861,17 @@ export class RuntimeStore {
     at = new Date().toISOString(),
     retryBaseMilliseconds = 1_000
   ): RuntimeDelivery {
-    return this.#delivery.failed(deliveryId, error, at, retryBaseMilliseconds);
+    const delivery = this.#delivery.failed(deliveryId, error, at, retryBaseMilliseconds);
+    this.#onWorkAvailable();
+    return delivery;
   }
 
   public delivery(deliveryId: string): RuntimeDelivery | undefined {
     return this.#query.delivery(deliveryId);
+  }
+
+  public nextDueDeliveryAt(): string | undefined {
+    return this.#query.nextDueDeliveryAt();
   }
 
   public deliveriesForDestinationKind(
@@ -886,7 +934,7 @@ export class RuntimeStore {
       `).run(timestamp, timestamp).changes;
       const exhaustedDeliveries = this.#database.prepare(`
         UPDATE deliveries SET status = 'failed', next_attempt_at = ?,
-          last_error = 'runtime_interrupted', updated_at = ?
+          last_error = CASE WHEN destination_kind = 'codex-desktop' THEN 'runtime_interrupted_unknown' ELSE 'runtime_interrupted' END, updated_at = ?
         WHERE status = 'delivering' AND attempt_count >= max_attempts
       `).run(timestamp, timestamp).changes;
       const retryableDeliveries = this.#database.prepare(`
@@ -949,8 +997,16 @@ export class RuntimeStore {
     return session;
   }
 
-  #destinationSnapshots(eventId: string) {
+  public destinationSnapshots(eventId: string) {
     return this.#query.destinationSnapshots(eventId);
   }
 
+}
+
+function mainDatabasePath(database: DatabaseSync): string | undefined {
+  const row = (database.prepare("PRAGMA database_list").all() as unknown as Array<{
+    name: string;
+    file: string;
+  }>).find((item) => item.name === "main");
+  return row?.file.trim() ? resolve(row.file) : undefined;
 }

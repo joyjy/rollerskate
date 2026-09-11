@@ -12,6 +12,8 @@ timestamp: 2026-07-26
 
 Local Runtime 使用 Node 内置 SQLite 与 WAL。SQLite 是本机执行事实源；结构化日志提供运行审计，但不替代 durable facts。
 
+Codex adapter 用已保存的 provider Thread ID 调用 `thread/resume`，设置 `excludeTurns: true`，由 app-server 恢复模型上下文，RS 只消费新 Turn 的事件，不回传历史全文。该参数已按本机 Codex 0.153.4 stable schema 核验。JSON 协议单条记录上限为 16 MiB，助手文本输出默认上限仍为 1 MiB；二者与模型 token context window 是不同边界。超限分别报告 protocol record 或 assistant output 错误，不清空 Session 或自动重放有副作用的 Turn。
+
 ## Durable domains
 
 - canonical Event：统一 ID、type/source、Agent、Session/Destination snapshot 与 causality；输入 Event 携带 prompt 与可选 generic run context，`agent.result` 只携带 outcome、Core 不透明处理的 output/error。具体 result contract 由注册的 application continuation 解释。
@@ -20,7 +22,7 @@ Local Runtime 使用 Node 内置 SQLite 与 WAL。SQLite 是本机执行事实�
 - Local Chat：immutable `chat.message`/`chat.dispatch`、Execution 上的 versioned attention/decision receipt、Topic/Global presence、prompt resource ID 与 handle snapshot；`chat_messages` 只提供可删除重建的 Timeline/read-progress projection。
 - Execution：唯一 Event、唯一 Handler、attempt/max attempts、next retry、terminal status和 bounded versioned receipt。
 - Session：Agent、adapter、workspace、provider Session ID 与可选 Run/cycle binding；Chat current Session 与 run/cycle-scoped Session 不共享。
-- Delivery：稳定 delivery ID、immutable Destination kind/address snapshot、attempt、retry 与外部 receipt；当前 kind 为 Matrix 或 macOS notification。
+- Delivery：稳定 delivery ID、immutable Destination kind/address snapshot、attempt、retry 与外部 receipt；当前 kind 为 Matrix、macOS notification、Server Topic、Vikunja Task 或 Codex Desktop。
 - Subscription：固定 definition revision/digest、probe policy、interval/deadline/max attempts 与 terminal/delta observation；V5/V3 保存统一 proactive target 及对应 Run/action receipt，V4/V2 Run binding 与 V3/V1 callback 保持历史兼容。
 - Local Scheduled Task：Schedule current definition/revision/next occurrence，以及按 occurrence 唯一、固定 immutable definition snapshot 的 ScheduleOccurrence；V3 target 原子关联 Steward Run/cycle/admission receipt 或 deterministic action receipt，V2/V1 保持历史兼容。
 - Deterministic application action receipt：Owner registry 编译的 action ref/digest/input 对 exact source occurrence 的 immutable terminal fact；它不是 Event、Execution、callback 或 retry work。
@@ -30,8 +32,8 @@ Local Runtime 使用 Node 内置 SQLite 与 WAL。SQLite 是本机执行事实�
 - Interactive Channel：Agent-scoped binding/allowlist/expiry/callback Session，幂等 Local/Server send receipt、observed cursor、follow token 与 callback pending/admitted 状态。
 - Agent Run：durable coordination object 保存可选 series/active cycle、mandate/workflow snapshot、orchestration mode、current step/checkpoint、budget、external workspace grant、CAS、cancel 与 terminal outcome；series revision cycle 另存 durable child，step transcript 留在 Event/Execution。
 - Notice：derived projection 与 authoritative read/ack 同表；rebuild 只覆盖 derived columns。
-- Server connection/binding 不进入 Local SQLite：Device/Agent credential 与 binding metadata 分别保存在 mode-0600 file store，Server Topic delivery 只进入独立的被动 inbox/cursor file store。
-- Matrix outbound 仍可消费已经 admission 的 Destination snapshot；v0.4 原生 Server Topic ingress 与 legacy Matrix Room ingress 分离，前者只持久化 passive delivery，不建立 Local Event、Handler、Execution 或 Session。
+- Server connection/binding 不进入 Local SQLite：Device/Agent credential 与 binding metadata 分别保存在 mode-0600 file store，Server Topic delivery 与同步 cursor 保存在独立的 inbox/cursor file store；经固定 bridge 准入的消息正文同时属于 Local SQLite 中的 canonical Chat Event。
+- Matrix outbound 仍可消费已经 admission 的 Destination snapshot；原生 Server Topic ingress 与 legacy Matrix Room ingress 分离。默认装配的 ServerTopicRuntimeBridge 将 Human 消息通过 admitExternalOwnerMessage 写入 chat.message 与 queued Chat Execution；Agent 消息仅在匹配本机 active participant 且不是 canonical transaction 回声时准入，是否继续 attention 由其 activation 条件决定。后续 provider Execution/Session 仍受 Topic admission、participant 与 Chat attention 规则控制，不由 delivery 到达直接授权。
 
 旧 Work、lease、generic outbox、RoomChat invocation/turn/outbox 与独立 continuation work 不再是当前 Runtime domain。
 
@@ -52,6 +54,7 @@ Local Runtime 使用 Node 内置 SQLite 与 WAL。SQLite 是本机执行事实�
 - cancel 幂等并阻止 queued work、retry、delegate、child 与 callback；已经 running 的 provider process不强杀，late result 只能留下审计事实。
 - 相同 canonical external workspace 允许多个 read Run，但最多一个 non-terminal write Run；数据库唯一约束不声称隔离外部进程修改，每个 step 必须记录观察到的 revision/drift。
 - Matrix Delivery 使用稳定 delivery ID 作为 transaction ID。
+- Codex Desktop Delivery 固定 `maxAttempts=1`，正常 accepted 保存 Desktop receipt，未知结果以 failed/unknown error 保留；中断的 delivering 在恢复时以 `runtime_interrupted_unknown` 终止，不自动 replay。通用 failure retry 拒绝对该 kind 扩展 budget，并保留原 unknown evidence。Subscription application action 与 Delivery 在 source transaction 内原子入队，origin 绑定 action receipt，重启后待发送项按原预算执行；action 成功不等于 Desktop 接收。具体接收证明与人工处理见 [Desktop push runbook](../runbook/codex-desktop-push.md)。
 - terminal Subscription 与 `subscription.fire` Event/Execution 原子建立；非 terminal poll 不创建 Event。
 - callback 在外部 effect 前持久化 started；正常失败继续下一项，started callback 遇到 crash 后与剩余 pending callback 一并 unknown，并终止对应 Execution，绝不自动 replay。
 - callback `destination.deliver` 先持久化 host-origin Core Delivery；macOS notification 最多尝试一次，其他 adapter 使用 Core retry。Delivery terminal receipt 再投影到 callback occurrence，外发失败不会绕过 Delivery 状态机。
@@ -65,7 +68,9 @@ Local Runtime 使用 Node 内置 SQLite 与 WAL。SQLite 是本机执行事实�
 
 ## Crash and shutdown
 
-Local Runtime loop 串行推进 Subscription、被动 Topic sync、Local Chat、Topic schedule、Interactive Channel、Scheduled Task 与 Runtime cycle，但每个 cycle 和每条 Execution/Delivery 分别隔离异常。单个失败只写结构化 failure log，不能结束主进程。被动 Topic sync 必须先原子持久化并按 Event ID 去重，再提交 Server cursor；它不触发 Agent 执行。
+Owner CLI 长命令由调用者侧的一次性 worker 执行，生命周期独立于 Runtime；Runtime 重启只恢复已准入 Subscription 与待发 Delivery，不恢复或重跑命令。worker/宿主崩溃后缺失终态回执的结果保持未知，观察预算耗尽生成 expiry，不从 PID 消失派生成功。文件预留与准入中断的具体边界见 [命令文件状态](db-reference.md#本地长命令的文件状态)，操作恢复见 [Desktop push runbook](../runbook/codex-desktop-push.md#预计耗时较长的本地命令)。
+
+Local Runtime loop 串行推进 Subscription、被动 Topic sync、Local Chat、Topic schedule、Interactive Channel、Scheduled Task 与 Runtime cycle，但每个 cycle 和每条 Execution/Delivery 分别隔离异常。单个失败只写结构化 failure log，不能结束主进程。Topic sync 先按 (source.kind, source.externalId) 幂等准入 Local Chat，再原子提交 inbox/cursor，最后向 Server acknowledge。三者不是同一事务：若 Local admission 后、inbox commit 或 acknowledge 前崩溃，重放由外部 source identity 去重，不能重复创建 Chat Event/Execution；备份与恢复需要同时考虑 Local SQLite 和 inbox/cursor file store。后续 ChatHandler 决定 attention 与 provider dispatch，规则见 [Local Runtime](./local-runtime.md)。
 
 启动恢复不会把已进入 `running` 的 Agent provider invocation 放回重试。进程无法证明 crash 前是否已经产生 tool/provider side effect，因此这类 Execution 一律终态标为 `runtime_interrupted_unknown`，保存 `AgentInvocationRecoveryReceipt@1`（`replayed=false`），并为非 Chat Agent input 生成 canonical failed `agent.result`，让 Steward、Schedule/Subscription 等既有 continuation 收口。只有未开始的 `queued/retry_wait` Agent work 才继续正常 retry；ResultHandler 等纯本地 transaction handler 和具有独立幂等 receipt 的 retryable Delivery 保留有限重试。External workflow 的 claimed/pre-effect interruption 回到 `retry_wait` 或在 attempt exhausted 后 failed；running/post-effect interruption写 unknown 并保留 no-replay receipt，`rs recover` 也使用同一判断。Subscription probe 遵守剩余 deadline/attempt；callback phase 中未形成 durable Core work 的 started 与剩余 pending callback 收敛为 unknown，已绑定 host Delivery 的 callback 则等待 Core recovery 后按 terminal receipt reconcile。V1 ScheduleOccurrence 已经进入 provider invocation 时转为 `unknown`，对应 Execution 终止，直到用户根据 provider evidence使用 CLI resolve；V2 occurrence 从 durable Run/cycle/receipt 恢复，不能人工 resolve。SIGINT/SIGTERM 停止接收新 cycle，并通过 AbortSignal 取消可取消的 probe 与 external workflow child；后者因已越过 effect boundary 而收敛为 unknown。
 
@@ -84,3 +89,5 @@ schema v72 以 v0.3.11 发布的 v44 为最早升级基线。v44–v70 保留既
 - 新副作用必须定义 stable ID、terminal receipt、retry ownership 与是否允许自动重试。
 - 修改 Event/Execution/Delivery 状态机必须覆盖 duplicate、restart、failure isolation 与 terminal no-replay。
 - 新 durable facts 必须出现在 Console audit 或明确说明为何仅是内部调度状态。
+
+确定性 Run 的 immutable admission 在 source 注册及命令启动前独占预留。启动链跨文件和 SQLite，中断后统一 `run inspect` 显示已知执行/观察/投递事实及缺失阶段；不自动重跑命令，不凭观察超时把仍在运行的进程标为失败。Agent-backed Run 恢复流程保持原样。事实边界见 [统一 Run](unified-run.md)。

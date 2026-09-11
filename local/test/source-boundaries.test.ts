@@ -292,6 +292,9 @@ test("ordinary SQLite stores share one immediate transaction template", () => {
     "infrastructure/sqlite/schema/v69-migration.ts",
     "infrastructure/sqlite/schema/v70-migration.ts",
     "infrastructure/sqlite/schema/v71-migration.ts",
+    "infrastructure/sqlite/schema/v72-migration.ts",
+    "infrastructure/sqlite/schema/v73-migration.ts",
+    "infrastructure/sqlite/schema/v74-migration.ts",
     "infrastructure/sqlite/transaction.ts"
   ]);
 });

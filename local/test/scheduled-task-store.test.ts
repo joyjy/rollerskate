@@ -1,6 +1,5 @@
+import { temporaryDirectory } from "./support/temp-directory.js";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -212,7 +211,7 @@ function setup(): {
   readonly agentId: string;
   readonly close: () => void;
 } {
-  const root = mkdtempSync(join(tmpdir(), "rollerskate-schedule-store-"));
+  const root = temporaryDirectory("rollerskate-schedule-store-");
   const database = join(root, "runtime.sqlite");
   const runtime = new RuntimeStore(database);
   runtime.close();

@@ -1,10 +1,11 @@
 import * as v from "valibot";
 import {
   agentInvocationDiagnosticsSchema,
+  agentTurnOutputSchema,
   agentStepResultSchema,
   agentTurnResultSchema
 } from "./event";
-import { nullableString, optionalString } from "./shared";
+import { nullableString, optionalString, runHumanQuestionSchema } from "./shared";
 
 const agentRunAgentReferenceSchema = v.object({
   principalId: v.string(),
@@ -90,9 +91,9 @@ const runDecisionV2Schema = v.variant("action", [
   })
 ]);
 
-const runDecisionV3Schema = v.variant("action", [
+const runDecisionModernSchema = v.variant("action", [
   v.object({
-    schemaVersion: v.literal("RunDecision@3"),
+    schemaVersion: v.union([v.literal("RunDecision@3"),v.literal("RunDecision@4"),v.literal("RunDecision@5")]),
     ...runDecisionCommonSchema,
     action: v.literal("next_step"),
     nextStep: v.object({
@@ -101,7 +102,7 @@ const runDecisionV3Schema = v.variant("action", [
     })
   }),
   v.object({
-    schemaVersion: v.literal("RunDecision@3"),
+    schemaVersion: v.union([v.literal("RunDecision@3"),v.literal("RunDecision@4"),v.literal("RunDecision@5")]),
     ...runDecisionCommonSchema,
     action: v.literal("await_source"),
     awaitSource: v.object({
@@ -115,24 +116,26 @@ const runDecisionV3Schema = v.variant("action", [
     })
   }),
   v.object({
-    schemaVersion: v.literal("RunDecision@3"),
+    schemaVersion: v.union([v.literal("RunDecision@3"),v.literal("RunDecision@4"),v.literal("RunDecision@5")]),
     ...runDecisionCommonSchema,
     action: v.literal("finish"),
     finish: v.object({
       scope: v.union([v.literal("cycle"), v.literal("run")]),
+      outputs:v.optional(v.array(agentTurnOutputSchema)),
       outcome: v.union([v.literal("succeeded"), v.literal("failed")]),
       summary: v.string()
     })
   }),
   v.object({
-    schemaVersion: v.literal("RunDecision@3"),
+    schemaVersion: v.union([v.literal("RunDecision@3"),v.literal("RunDecision@4"),v.literal("RunDecision@5")]),
     ...runDecisionCommonSchema,
     action: v.literal("needs_human")
   })
 ]);
 
 export const agentRunDecisionSchema = v.union([
-  runDecisionV3Schema,
+  runDecisionModernSchema,
+  v.object({schemaVersion:v.literal("RunDecision@5"),...runDecisionCommonSchema,action:v.literal("ask_human"),question:v.string()}),
   runDecisionV2Schema
 ]);
 
@@ -155,6 +158,7 @@ const agentRunDecisionReceiptCommonSchema = {
 };
 
 export const agentRunDecisionReceiptSchema = v.variant("schemaVersion", [
+  v.object({schemaVersion:v.literal("AgentRunDecisionReceipt@3"),...agentRunDecisionReceiptCommonSchema,action:v.literal("ask_human"),questionId:v.string(),resultingRunStatus:v.literal("awaiting_orchestrator")}),
   v.looseObject({
     schemaVersion: v.literal("AgentRunDecisionReceipt@1"),
     ...agentRunDecisionReceiptCommonSchema,
@@ -240,6 +244,7 @@ export const chatRunHandoffReceiptSchema = v.looseObject({
 });
 
 const agentRunDetailViewInnerSchema = v.object({
+  humanQuestion:v.optional(v.nullable(runHumanQuestionSchema)),
   summary: agentRunSummarySchema,
   projection: v.looseObject({
     runId: v.string(),

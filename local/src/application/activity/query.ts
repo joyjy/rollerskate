@@ -45,16 +45,17 @@ export function queryLocalActivity(
   options: ActivityQueryOptions = {}
 ): ActivityQueryResult {
   const paths = runtimePaths(repoRoot, options.runtimeDirectory);
-  const foundation = new LocalFoundationStore(paths.database);
+  const foundationDatabase = openRuntimeDatabaseReadOnly(paths.database);
   let client: AgentClient;
   try {
+    const foundation = new LocalFoundationStore(foundationDatabase, { migrate: false });
     const agent = foundation.listAgents().find((candidate) => candidate.principalId === agentId);
     if (agent === undefined || agent.status !== "active") {
       throw new Error("Activity query requires an active local Agent");
     }
     client = agent.client;
   } finally {
-    foundation.close();
+    foundationDatabase.close();
   }
   const scope = options.scope ?? "agent";
   if (scope === "owner-wide") {

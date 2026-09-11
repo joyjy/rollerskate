@@ -94,3 +94,7 @@ Run Workspace 是唯一一级执行页面：显示 source definition/revision、
 4. Runtime 重启后沿同一 source/Run receipt 继续，continuous checkpoint 不因失败或 unknown 前移。
 5. 修改 registry 后，既有 Run 的新 source registration fail closed，不扩大 authority。
 6. legacy `command.exec` migration 只在 exact Owner mapping 与 bundled workflow artifact 均匹配时 ready；replacement definition 无 callbacks，未配置 destination 时保持静默，显式 terminal destination 不泄露 observation 正文。
+
+## 确定性观察入口
+
+无需 Agent 判断的 until/continuous 观察与长命令统一使用 `run preflight/start`。调用方只选择已登记 source 和业务参数，或给出原命令 argv/cwd；Run compiler 生成 source 与可选回传绑定，不调用模型。`subscription register-desktop` 不再新建普通工作，已有定义保留。语法和预检结果见 [统一 Run CLI](cli-reference.md#统一-run-提交与预检)，ownership 见 [统一 Run 架构](../architecture/unified-run.md)。

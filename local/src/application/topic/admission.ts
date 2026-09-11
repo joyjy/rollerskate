@@ -28,7 +28,7 @@ export class TopicGovernanceAdmissionPolicy implements RuntimeAgentExecutionGuar
   readonly #listAgents: () => readonly LocalAgent[];
   readonly #runtime: Pick<
     RuntimeStore,
-    "event" | "chatAttentionReceipts" | "chatPresence"
+    "event" | "chatAttentionReceipts" | "chatPresence" | "currentLocalAgentSession"
   >;
 
   public constructor(options: {
@@ -36,7 +36,7 @@ export class TopicGovernanceAdmissionPolicy implements RuntimeAgentExecutionGuar
     readonly listAgents: () => readonly LocalAgent[];
     readonly runtime: Pick<
       RuntimeStore,
-      "event" | "chatAttentionReceipts" | "chatPresence"
+      "event" | "chatAttentionReceipts" | "chatPresence" | "currentLocalAgentSession"
     >;
   }) {
     this.#getGovernance = options.getGovernance;
@@ -57,6 +57,7 @@ export class TopicGovernanceAdmissionPolicy implements RuntimeAgentExecutionGuar
       .filter(({ status }) => status === "active")
       .map((participant) => [participant.agentId, participant] as const));
     const eligible = candidates.filter((agent) =>
+      (source.type !== "chat.activation" || source.sessionId === undefined || this.#runtime.currentLocalAgentSession(agent.principalId)?.sessionId === source.sessionId) &&
       agent.status === "active" && activeParticipants.has(agent.principalId));
     return {
       candidates: eligible,
@@ -80,6 +81,10 @@ export class TopicGovernanceAdmissionPolicy implements RuntimeAgentExecutionGuar
     const source = this.#runtime.event(event.sourceAttentionEventId);
     if (source?.type !== "chat.activation" && source?.type !== "chat.message") {
       return skipDecision("topic-attention-source-unavailable");
+    }
+    if (source.type === "chat.activation" && source.sessionId !== undefined &&
+      (event.sessionId !== source.sessionId || this.#runtime.currentLocalAgentSession(event.agentId)?.sessionId !== source.sessionId)) {
+      return skipDecision("chat-return-session-changed");
     }
     const syntheticRejection = syntheticActivationRejection(source);
     if (syntheticRejection !== undefined) return skipDecision(syntheticRejection);

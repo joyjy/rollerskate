@@ -62,9 +62,9 @@ export function mapEvent(row: EventRow): Event {
     const reason = payload.reason;
     const strategyId = payload.strategyId;
     if ((reason !== "topic_opened" && reason !== "manual" && reason !== "scheduled" &&
-      reason !== "participant_message" && reason !== "resumed") ||
+      reason !== "participant_message" && reason !== "resumed" && reason !== "work_result") ||
       (strategyId !== "starter" && strategyId !== "manual" &&
-        strategyId !== "scheduled" && strategyId !== "participant-message") ||
+        strategyId !== "scheduled" && strategyId !== "participant-message" && strategyId !== "work-result") ||
       !Number.isInteger(payload.strategyRevision) ||
       !Number.isInteger(payload.contextRevision) ||
       !Number.isInteger(payload.turnBudget)) {
@@ -392,9 +392,6 @@ function externalWorkspaceGrant(
       );
   if (effect !== undefined && access !== "write") {
     throw new Error(`External workspace grant effect requires write access: ${eventId}`);
-  }
-  if (networkAccess === true && access !== "write") {
-    throw new Error(`External workspace grant network access requires write access: ${eventId}`);
   }
   return {
     schemaVersion: "ExternalWorkspaceGrant@1",

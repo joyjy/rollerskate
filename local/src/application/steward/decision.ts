@@ -1,3 +1,4 @@
+import { resumeNetworkCapabilityInTransaction } from "./capability.js";
 import type { AgentResultEvent } from "../../core/event/model.js";
 import { RuntimeStore } from "../../core/runtime/store.js";
 import { AgentRunStore } from "../../infrastructure/sqlite/agent-run-store.js";
@@ -5,6 +6,7 @@ import { workspaceRevision } from "../../infrastructure/workspace/revision.js";
 import { terminalRunResultDelivery } from "./result-destination.js";
 import {
   isStewardOrchestrated,
+  stewardDecisionVersion,
   type AgentRunDecisionReceipt,
   type AnyRunDecision
 } from "../../modules/steward/caller-contract.js";
@@ -12,8 +14,6 @@ import {
   parseRunSourceBinding,
   type RunSourceBinding
 } from "../../modules/steward/source-contract.js";
-import type { StewardAwaitSourceRunDecisionV3 } from
-  "../../modules/steward/run-contract-v3.js";
 import { runAuthorityDigest } from
   "../../modules/steward/admission-contract.js";
 import {
@@ -33,7 +33,7 @@ export interface AppliedRunDecision {
 export interface StewardSourceBindingRegistrar {
   (input: {
     readonly run: AgentRunProjection;
-    readonly decision: StewardAwaitSourceRunDecisionV3;
+    readonly decision: Extract<AnyRunDecision, {readonly action:"await_source"}>;
     readonly at: string;
   }): RunSourceBinding;
 }
@@ -56,8 +56,7 @@ export function applyRunDecisionInTransaction(input: {
   if (input.sourceKind === "handler" && !isStewardOrchestrated(run.orchestratorBinding)) {
     throw new Error("Internal Steward Orchestrator requires a Steward binding");
   }
-  const expectedInternalDecision = run.orchestratorBinding?.schemaVersion ===
-    "OrchestratorBinding@3" ? "RunDecision@3" : "RunDecision@2";
+  const expectedInternalDecision = `RunDecision@${stewardDecisionVersion(run.orchestratorBinding)}`;
   if (input.sourceKind === "handler" && decision.schemaVersion !== expectedInternalDecision) {
     throw new Error(`Internal Steward Orchestrator must submit ${expectedInternalDecision}`);
   }
@@ -68,6 +67,28 @@ export function applyRunDecisionInTransaction(input: {
   }
   const plan = planCallerRunDecision({ run, decision, now: at });
   assertWorkspaceEffectSatisfied(run, plan);
+  if (plan.kind === "request_capability") {
+    if (input.parentResult === undefined || decision.action !== "request_capability") throw new Error("Capability request requires the Orchestrator result");
+    const waiting = runs.waitForHumanInTransaction(run.runId, run.version, at);
+    const receipt: AgentRunDecisionReceipt = {schemaVersion: "AgentRunDecisionReceipt@3", runId: run.runId, requestId,
+      expectedRunVersion: run.version, resultingRunVersion: waiting.version, sourceStepId, action: "request_capability",
+      questionId: input.parentResult.eventId, resultingRunStatus: "awaiting_orchestrator", acceptedAt: at};
+    runs.recordDecisionInTransaction({runId: run.runId, requestId, decision, receipt});
+    if (run.orchestratorBinding?.schemaVersion === "OrchestratorBinding@3" && run.orchestratorBinding.ownerNetworkAuthorized === true) {
+      resumeNetworkCapabilityInTransaction({runtime, runs, run: waiting, result: input.parentResult,
+        expectedVersion: waiting.version, at, authorization: "preauthorized"});
+    }
+    return {status: "accepted", run: runs.requireProjection(run.runId), decision: receipt};
+  }
+  if (plan.kind === "ask_human") {
+    if (input.parentResult === undefined) throw new Error("Human question requires the settled Orchestrator result");
+    const waiting = runs.waitForHumanInTransaction(run.runId,run.version,at);
+    const receipt: AgentRunDecisionReceipt = {schemaVersion:"AgentRunDecisionReceipt@3",runId:run.runId,requestId,
+      expectedRunVersion:run.version,resultingRunVersion:waiting.version,sourceStepId,action:"ask_human",
+      questionId:input.parentResult.eventId,resultingRunStatus:"awaiting_orchestrator",acceptedAt:at};
+    runs.recordDecisionInTransaction({runId:run.runId,requestId,decision,receipt});
+    return {status:"accepted",run:waiting,decision:receipt};
+  }
   if (plan.kind === "await_source") {
     if (decision.action !== "await_source" || input.bindSource === undefined) {
       throw new Error("RunDecision await_source requires a source owner registrar");
@@ -100,6 +121,7 @@ export function applyRunDecisionInTransaction(input: {
     return { status: "accepted", run: awaiting, decision: receipt };
   }
   if (plan.kind === "terminal") {
+    if (decision.action !== "finish" && decision.action !== "needs_human") throw new Error("Terminal plan requires a terminal decision");
     const terminal = runs.terminalizeInTransaction({
       runId: run.runId,
       expectedVersion: run.version,
@@ -108,7 +130,7 @@ export function applyRunDecisionInTransaction(input: {
       scope: plan.scope,
       updatedAt: at
     });
-    const receipt: AgentRunDecisionReceipt = decision.schemaVersion === "RunDecision@3" ? {
+    const receipt: AgentRunDecisionReceipt = (decision.schemaVersion === "RunDecision@3" || decision.schemaVersion === "RunDecision@4" || decision.schemaVersion === "RunDecision@5" || decision.schemaVersion === "RunDecision@6") ? {
       schemaVersion: "AgentRunDecisionReceipt@2",
       runId: run.runId,
       requestId,
@@ -231,7 +253,7 @@ export function applyRunDecisionInTransaction(input: {
         stepCount: plan.nextStepCount,
         updatedAt: at
       });
-  const receipt: AgentRunDecisionReceipt = decision.schemaVersion === "RunDecision@3" ? {
+  const receipt: AgentRunDecisionReceipt = (decision.schemaVersion === "RunDecision@3" || decision.schemaVersion === "RunDecision@4" || decision.schemaVersion === "RunDecision@5" || decision.schemaVersion === "RunDecision@6") ? {
     schemaVersion: "AgentRunDecisionReceipt@2",
     runId: run.runId,
     requestId,

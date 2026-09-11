@@ -1,3 +1,5 @@
+import type { DatabaseSync } from "node:sqlite";
+import { controlStateToken, requireControlState } from "../control-state.js";
 import { statSync } from "node:fs";
 
 import { LocalFoundationStore } from "../../infrastructure/sqlite/foundation-store.js";
@@ -142,12 +144,39 @@ export function controlSchedule(
   at = new Date().toISOString()
 ): ScheduleInspection {
   return withStores(repoRoot, runtimeDirectory, (stores) => {
-    const current = stores.schedules.require(scheduleId);
-    if (action === "resume" && current.revision.schemaVersion === "ScheduleRevision@1") {
-      throw new Error("legacy_trigger_execution_closed: migrate this Schedule to a bound Run");
-    }
-    return inspection(stores.schedules.setStatus(scheduleId, action, at), stores);
+    return stores.runtime.withImmediateTransaction(() => inspection(
+      controlScheduleInTransaction(stores.schedules, scheduleId, action, at), stores
+    ));
   });
+}
+
+/** Also used by Chat inside its Owner admission transaction. */
+export function controlScheduleInTransaction(
+  store: ScheduledTaskStore, scheduleId: string, action: "pause" | "resume" | "cancel",
+  at: string, expectedState?: string
+): Schedule {
+  const current = store.require(scheduleId);
+  requireControlState(current, expectedState);
+  if (action === "resume" && current.revision.schemaVersion === "ScheduleRevision@1") {
+    throw new Error("legacy_trigger_execution_closed: migrate this Schedule to a bound Run");
+  }
+  return store.setStatus(scheduleId, action, at);
+}
+
+export function scheduleControlSnapshot(database: DatabaseSync, scheduleId: string) {
+  const store = new ScheduledTaskStore(database, {migrate:false});
+  try {
+    const current = store.require(scheduleId);
+    return {stateToken: controlStateToken(current), scheduleId, status: current.definition.status};
+  } finally { store.close(); }
+}
+
+export function controlScheduleWithDatabase(database: DatabaseSync, scheduleId: string,
+  action: "pause" | "resume" | "cancel", expectedState: string, at: string) {
+  const store = new ScheduledTaskStore(database, {migrate:false});
+  try { controlScheduleInTransaction(store, scheduleId, action, at, expectedState);
+    return scheduleControlSnapshot(database, scheduleId);
+  } finally { store.close(); }
 }
 
 export function setScheduleArchived(

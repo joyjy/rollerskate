@@ -1,3 +1,5 @@
+import type { FileContinuousSubscriptionDefinition } from "../../capabilities/subscription/continuous-model.js";
+import { assertFileRoot } from "../../capabilities/subscription/file-source.js";
 import type { DatabaseSync } from "node:sqlite";
 
 import type {
@@ -28,6 +30,9 @@ export interface OwnerApplicationActionIntent {
 }
 
 export type OwnerProactiveSourceIntent =
+  | { readonly kind: "file_subscription";
+      readonly source: Omit<FileContinuousSubscriptionDefinition, "target"> & { readonly subscriptionId: string };
+      readonly action: OwnerApplicationActionIntent }
   | {
       readonly kind: "schedule";
       readonly source: Omit<CreateTargetedScheduleInput, "target">;
@@ -49,6 +54,7 @@ export type OwnerProactiveSourceIntent =
     };
 
 export type CompiledOwnerProactiveSource =
+  | { readonly kind: "file_subscription"; readonly source: ContinuousSubscription }
   | { readonly kind: "schedule"; readonly source: Schedule }
   | { readonly kind: "subscription"; readonly source: FreeSubscription }
   | { readonly kind: "continuous_subscription"; readonly source: ContinuousSubscription };
@@ -94,6 +100,10 @@ export class OwnerProactiveSourceCompiler {
       throw new Error("Owner proactive source compilation requires an owning transaction");
     }
     const target = this.#actions.compileTarget(intent.action.actionRef, intent.action.input);
+    if (intent.kind === "file_subscription") {
+      assertFileRoot(intent.source.source);
+      return { kind: intent.kind, source: this.#continuous.createFileInTransaction({ ...intent.source, target }, at) };
+    }
     if (intent.kind === "schedule") {
       return {
         kind: intent.kind,

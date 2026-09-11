@@ -47,7 +47,7 @@ test("Chat read tool policy exposes bounded read-only evidence without raw autho
     };
     assert.equal(capabilities.mutationAllowed, false);
     assert.deepEqual(capabilities.tools.map(({ name }) => name), [
-      "describe_capabilities", "subscription_history", "get_run", "event_trace"
+      "describe_capabilities", "subscription_history", "list_chat_work", "get_run", "event_trace"
     ]);
     assert.ok(chatReadToolDefinitions.every((definition) =>
       definition.annotations.readOnlyHint && !definition.annotations.destructiveHint

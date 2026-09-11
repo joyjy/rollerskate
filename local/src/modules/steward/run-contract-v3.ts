@@ -1,3 +1,5 @@
+import { parseAcceptanceContract, type AcceptanceContract } from "./acceptance.js";
+import { parseStewardSelection, type StewardSelection } from "./steward-policy.js";
 import type {
   OrchestratorState,
   OrchestratorTask,
@@ -22,10 +24,13 @@ import { assertSpecCompatibility } from "../spec/registry.js";
 
 export interface StewardOrchestratorBindingV3 {
   readonly schemaVersion: "OrchestratorBinding@3";
+  readonly selection?: StewardSelection;
+  readonly acceptanceContract?: AcceptanceContract;
+  readonly ownerNetworkAuthorized?: boolean;
   readonly mode: "caller";
   readonly callerRef: { readonly kind: "owner"; readonly principalId: string };
   readonly orchestratorRef: { readonly kind: "agent"; readonly agentId: string };
-  readonly decisionContractId: "run-decision@3";
+  readonly decisionContractId: "run-decision@3" | "run-decision@4" | "run-decision@5" | "run-decision@6";
   readonly deliveryPolicy: "internal-with-manual-fallback";
   readonly admissionDigest: string;
   readonly authority: RunAuthorityEnvelope;
@@ -80,6 +85,7 @@ export function parseStewardOrchestratorBindingV3(
   value: unknown
 ): StewardOrchestratorBindingV3 {
   const input = contractRecord(value, "OrchestratorBinding@3");
+  if (input.ownerNetworkAuthorized !== undefined && typeof input.ownerNetworkAuthorized !== "boolean") throw new Error("ownerNetworkAuthorized must be boolean");
   assertSpecCompatibility(
     "spec:rollerskate/orchestrator-binding@3",
     input.schemaVersion,
@@ -87,25 +93,33 @@ export function parseStewardOrchestratorBindingV3(
   );
   exactContractKeys(input, [
     "schemaVersion", "mode", "callerRef", "orchestratorRef", "decisionContractId",
-    "deliveryPolicy", "admissionDigest", "authority", "resultDestination"
-  ], "OrchestratorBinding@3", ["resultDestination"]);
+    "deliveryPolicy", "admissionDigest", "authority", "resultDestination", "selection", "acceptanceContract", "ownerNetworkAuthorized"
+  ], "OrchestratorBinding@3", ["resultDestination", "selection", "acceptanceContract", "ownerNetworkAuthorized"]);
   const caller = contractRecord(input.callerRef, "callerRef");
   exactContractKeys(caller, ["kind", "principalId"], "callerRef");
   const orchestrator = contractRecord(input.orchestratorRef, "orchestratorRef");
   exactContractKeys(orchestrator, ["kind", "agentId"], "orchestratorRef");
   if (input.schemaVersion !== "OrchestratorBinding@3" || input.mode !== "caller" ||
     caller.kind !== "owner" || orchestrator.kind !== "agent" ||
-    input.decisionContractId !== "run-decision@3" ||
+    (input.decisionContractId !== "run-decision@3" && input.decisionContractId !== "run-decision@4" && input.decisionContractId !== "run-decision@5" && input.decisionContractId !== "run-decision@6") ||
     input.deliveryPolicy !== "internal-with-manual-fallback") {
     throw new Error("OrchestratorBinding@3 is unsupported");
   }
   assertSpecCompatibility(
-    "spec:rollerskate/run-decision@3",
+    input.decisionContractId,
     input.decisionContractId,
     { kind: "result-contract" }
   );
+  if (input.decisionContractId === "run-decision@6" && input.acceptanceContract === undefined) throw new Error("RunDecision@6 requires original acceptance");
+  const selection = input.selection === undefined ? undefined : parseStewardSelection(input.selection);
+  if (selection !== undefined && selection.agentId !== orchestrator.agentId) {
+    throw new Error("Steward selection must match the admitted orchestrator");
+  }
   return {
     schemaVersion: "OrchestratorBinding@3",
+    ...(input.acceptanceContract === undefined ? {} : {acceptanceContract: parseAcceptanceContract(input.acceptanceContract)}),
+    ...(input.ownerNetworkAuthorized === true ? {ownerNetworkAuthorized: true} : {}),
+    ...(selection === undefined ? {} : { selection }),
     mode: "caller",
     callerRef: {
       kind: "owner",
@@ -115,7 +129,7 @@ export function parseStewardOrchestratorBindingV3(
       kind: "agent",
       agentId: contractText(orchestrator.agentId, "orchestratorRef.agentId", 256)
     },
-    decisionContractId: "run-decision@3",
+    decisionContractId: input.decisionContractId,
     deliveryPolicy: "internal-with-manual-fallback",
     admissionDigest: digest(input.admissionDigest, "admissionDigest"),
     authority: parseRunAuthorityEnvelope(input.authority),

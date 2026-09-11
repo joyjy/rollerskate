@@ -1,3 +1,4 @@
+import { stewardDecisionVersion } from "../../modules/steward/caller-contract.js";
 import type {
   AgentRequestEvent,
   AgentResultEvent,
@@ -82,7 +83,7 @@ export function queueStewardOrchestratorRetryInTransaction(input: {
   };
 }
 
-export function stewardOrchestratorRetryPrompt(
+export function stewardOrchestratorContinuationPrompt(
   runs: AgentRunStore,
   run: AgentRunProjection
 ): string {
@@ -105,8 +106,11 @@ export function stewardOrchestratorRetryPrompt(
     runVersion: run.version,
     maxSteps: run.maxSteps,
     completedWorkerSteps: run.stepCount,
+    currentNetworkAccess: run.workspaceGrant?.networkAccess ?? false,
+    ...(run.checkpoint === undefined ? {} : {checkpoint:run.checkpoint}),
     participants: runs.activeParticipantTargets(participantIds),
-    contractVersion: binding.schemaVersion === "OrchestratorBinding@3" ? 3 : 2,
+    contractVersion: stewardDecisionVersion(binding),
+    ...(binding.schemaVersion !== "OrchestratorBinding@3" ? {} : {acceptanceContract: binding.acceptanceContract}),
     ...(priorState === undefined ? {} : { priorState }),
     ...(binding.schemaVersion !== "OrchestratorBinding@3" ||
       binding.authority.trigger === undefined

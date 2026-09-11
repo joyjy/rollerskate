@@ -196,5 +196,5 @@ function openStore(
   repoRoot: string,
   runtimeDirectory?: string
 ): NoticeStore {
-  return new NoticeStore(runtimePaths(repoRoot, runtimeDirectory).database);
+  return new NoticeStore(runtimePaths(repoRoot, runtimeDirectory).database, { readOnly: true });
 }

@@ -1,3 +1,5 @@
+import type { FileEventSource, FileListenerState } from "./file-source.js";
+import type { ExternalWorkflowExecution } from "../../modules/proactive/target.js";
 import type { ProactiveCallbackDefinition } from "../../modules/callback/proactive-model.js";
 import type { ExternalRefTriggerBinding } from
   "../../modules/external-resource/trigger-binding.js";
@@ -48,18 +50,29 @@ export interface TargetedContinuousSubscriptionDefinition extends Omit<
   readonly target: ProactiveTarget;
 }
 
+export interface FileContinuousSubscriptionDefinition {
+  readonly schemaVersion: "ContinuousSubscriptionDefinition@4";
+  readonly revision: number;
+  readonly title: string;
+  readonly source: FileEventSource;
+  readonly target: ProactiveTarget;
+}
+
 export type ContinuousSubscriptionDefinition =
   | LegacyContinuousSubscriptionDefinition
   | BoundContinuousSubscriptionDefinition
-  | TargetedContinuousSubscriptionDefinition;
+  | TargetedContinuousSubscriptionDefinition
+  | FileContinuousSubscriptionDefinition;
 
 export interface ContinuousSubscription {
   readonly subscriptionId: string;
   readonly definition: ContinuousSubscriptionDefinition;
   readonly status: "active" | "paused" | "blocked" | "cancelled";
   readonly archivedAt?: string;
+  readonly fileListener?: FileListenerState;
+  readonly externalWorkflowExecution?: ExternalWorkflowExecution;
   readonly pollCount: number;
-  readonly nextPollAt: string;
+  readonly nextPollAt: string | null;
   readonly checkpointOccurrenceKey?: string;
   readonly checkpointObservation?: PollObservation;
   readonly pendingOccurrenceKey?: string;

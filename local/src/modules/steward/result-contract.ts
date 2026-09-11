@@ -100,7 +100,7 @@ export function parseAgentTurnResult(input: string): AgentTurnResult {
       outcome: parsed.outcome,
       ...(parsed.outputs === undefined
         ? {}
-        : { outputs: outputList(parsed.outputs) })
+        : { outputs: parseRunOutputs(parsed.outputs) })
     };
   }
   if (parsed.action !== "delegate") {
@@ -133,7 +133,7 @@ function boundedValue(value: unknown, field: string): unknown {
   return JSON.parse(encoded) as unknown;
 }
 
-function outputList(value: unknown): AgentTurnOutput[] {
+export function parseRunOutputs(value: unknown): AgentTurnOutput[] {
   if (!Array.isArray(value) || value.length > MAX_OUTPUTS) {
     throw new Error(`outputs must be an array of at most ${MAX_OUTPUTS} items`);
   }

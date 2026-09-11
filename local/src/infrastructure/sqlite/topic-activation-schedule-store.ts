@@ -28,12 +28,12 @@ export class TopicActivationScheduleStore {
   readonly #database: DatabaseSync;
   readonly #ownsDatabase: boolean;
 
-  public constructor(database: string | DatabaseSync) {
+  public constructor(database: string | DatabaseSync, options: { readonly migrate?: boolean } = {}) {
     this.#database = typeof database === "string"
       ? openInitializedRuntimeDatabase(database, migrateLocalDatabase)
       : database;
     this.#ownsDatabase = typeof database === "string";
-    if (!this.#ownsDatabase) migrateLocalDatabase(this.#database);
+    if (!this.#ownsDatabase && options.migrate !== false) migrateLocalDatabase(this.#database);
   }
 
   public close(): void {

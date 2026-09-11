@@ -1,3 +1,4 @@
+import { type ExecutionResources } from "./scheduling.js";
 import {
   isAgentInputEvent,
   isAgentResultEvent,
@@ -27,7 +28,7 @@ import type {
   AgentAdapterInvocation,
   ProviderPolicyObservationSnapshot
 } from "./agent-invocation.js";
-import { AgentInvocationError } from "./agent-invocation.js";
+import { AgentInvocationError, assertProviderSessionIdentity } from "./agent-invocation.js";
 import type { ChatReplyRoute } from "./store/types.js";
 
 export interface RuntimeAgentAdapter {
@@ -109,6 +110,11 @@ export class AgentHandler {
     if (!isAgentInputEvent(event)) {
       throw new Error(`AgentHandler requires an Agent input Event: ${event.eventId}`);
     }
+    // Legacy queued retries must not replay a Chat turn that may have used tools.
+    if (event.type === "chat.dispatch" && execution.attemptCount > 1) {
+      this.#store.cancelRunningAgentExecution(execution.executionId,"chat_retry_requires_new_instruction",at ?? new Date().toISOString());
+      return undefined;
+    }
     const invocationAt = at ?? new Date().toISOString();
     let invocationAdapter: RuntimeAgentAdapter | undefined;
     const blocked = this.#blocked(event, invocationAt);
@@ -129,21 +135,7 @@ export class AgentHandler {
       return undefined;
     }
     try {
-      const sessionId = event.sessionId ??
-        (event.type === "chat.dispatch"
-          ? this.#store.currentLocalAgentSession(event.agentId)?.sessionId
-          : undefined);
-      const session = sessionId === undefined ? undefined : this.#session(sessionId);
-      const controlledWorkspace = event.type === "agent.request"
-        ? event.runContext?.workspaceGrant?.root
-        : event.type === "subscription.fire"
-          ? event.invocation?.workspaceGrant.root
-          : undefined;
-      const adapter = this.#adapterForAgent(
-        event.agentId,
-        controlledWorkspace ?? session?.workspace
-      );
-      if (adapter === undefined) throw new Error(`Agent adapter not available: ${event.agentId}`);
+      const { session, adapter } = this.#invocationTarget(event);
       invocationAdapter = adapter;
       const workspaceAccess = invocationWorkspaceAccess(event);
       if (session !== undefined && (session.agentId !== event.agentId ||
@@ -156,18 +148,21 @@ export class AgentHandler {
         );
       }
       const receipt = await this.#invokeInLane(
-        session === undefined
-          ? `agent:${event.agentId}:workspace:${adapter.workspace}`
-          : `session:${session.sessionId}`,
-        () => adapter.invoke({
-          event,
-          ...(session === undefined ? {} : { providerSessionId: session.providerSessionId }),
-          reportProgress: (progress) => this.#store.recordAgentInvocationProgress(
-            execution.executionId,
-            assertInvocationIdentity(progress, adapter, workspaceAccess)
-          )
-        })
+        this.resources(event).lanes[0]!,
+        () => {
+          const blocked = this.#blocked(event, at ?? new Date().toISOString());
+          if (blocked !== undefined) throw new Error(blocked);
+          return adapter.invoke({
+            event,
+            ...(session === undefined ? {} : { providerSessionId: session.providerSessionId }),
+            reportProgress: (progress) => this.#store.recordAgentInvocationProgress(
+              execution.executionId,
+              assertInvocationIdentity(progress, adapter, workspaceAccess)
+            )
+          });
+        }
       );
+      assertProviderSessionIdentity(session?.providerSessionId, receipt.providerSessionId);
       const completedAt = at ?? new Date().toISOString();
       const chatDecision = event.type === "chat.dispatch"
         ? receipt.outcome.kind === "message"
@@ -211,7 +206,8 @@ export class AgentHandler {
             execution.executionId,
             "Agent invocation failure identity does not match the selected adapter",
             at ?? new Date().toISOString(),
-            this.#retryBaseMilliseconds
+            this.#retryBaseMilliseconds,
+            {retry:event.type === "chat.dispatch" ? "never" : "default"}
           ).resultEvent;
         }
         return this.#store.failExecution(
@@ -221,7 +217,7 @@ export class AgentHandler {
           this.#retryBaseMilliseconds,
           {
             trace: error.failure,
-            retry: event.type === "agent.request" ||
+            retry: event.type === "agent.request" || event.type === "chat.dispatch" ||
               error.failure.recovery === "unknown_outcome_no_replay"
               ? "never"
               : "default"
@@ -232,9 +228,39 @@ export class AgentHandler {
         execution.executionId,
         message(error),
         at ?? new Date().toISOString(),
-        this.#retryBaseMilliseconds
+        this.#retryBaseMilliseconds,
+        {retry:event.type === "chat.dispatch" ? "never" : "default"}
       ).resultEvent;
     }
+  }
+
+  public resources(event: Event): ExecutionResources {
+    if (!isAgentInputEvent(event)) throw new Error("Agent scheduling requires Agent input");
+    const sessionId = event.sessionId ?? (event.type === "chat.dispatch"
+      ? this.#store.currentLocalAgentSession(event.agentId)?.sessionId : undefined);
+    const session = sessionId === undefined ? undefined : this.#store.session(sessionId);
+    const grant = event.type === "agent.request" ? event.runContext?.workspaceGrant
+      : event.type === "subscription.fire" ? event.invocation?.workspaceGrant : undefined;
+    // Durable grants/sessions remain authoritative even when the adapter is suspended.
+    const workspace = grant?.root ?? session?.workspace ?? this.#adapterForAgent(event.agentId)?.workspace;
+    const context = event.type === "agent.request" ? event.runContext : undefined;
+    const sessionLane = sessionId === undefined ? undefined : `session:${sessionId}`;
+    const lane = event.type === "chat.dispatch" ? `chat-agent:${event.agentId}`
+      : sessionLane ?? (context === undefined ? `request:${event.eventId}`
+        : `run:${context.runId}:cycle:${context.cycleId ?? "none"}:agent:${event.agentId}`);
+    return { agentId: event.agentId, lanes: [...new Set([lane, ...(sessionLane ? [sessionLane] : [])])],
+      ...(workspace === undefined ? {} : { workspace: { root: workspace, access: invocationWorkspaceAccess(event) } }) };
+  }
+
+  #invocationTarget(event: AgentInputEvent | ChatDispatchEvent) {
+    const sessionId = event.sessionId ?? (event.type === "chat.dispatch"
+      ? this.#store.currentLocalAgentSession(event.agentId)?.sessionId : undefined);
+    const session = sessionId === undefined ? undefined : this.#session(sessionId);
+    const workspace = event.type === "agent.request" ? event.runContext?.workspaceGrant?.root
+      : event.type === "subscription.fire" ? event.invocation?.workspaceGrant.root : undefined;
+    const adapter = this.#adapterForAgent(event.agentId, workspace ?? session?.workspace);
+    if (adapter === undefined) throw new Error(`Agent adapter not available: ${event.agentId}`);
+    return { session, adapter };
   }
 
   #blocked(
@@ -363,6 +389,7 @@ export class ResultHandler {
 
 export interface RuntimeEventHandler {
   readonly kind: RuntimeHandlerKind;
+  resources?(event: Event): ExecutionResources;
   handle(execution: RuntimeExecution, at?: string): unknown;
 }
 

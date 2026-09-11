@@ -1,3 +1,7 @@
+import { acceptanceContract } from "../../modules/steward/acceptance.js";
+import { AgentRunStore } from "../../infrastructure/sqlite/agent-run-store.js";
+import { StewardPolicyStore } from "../../infrastructure/files/steward-policy-store.js";
+import { selectSteward, supportsStewardClient } from "../../modules/steward/steward-policy.js";
 import { createHash } from "node:crypto";
 import { realpathSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -5,7 +9,8 @@ import type { DatabaseSync } from "node:sqlite";
 
 import { RuntimeStore } from "../../core/runtime/store.js";
 import { runtimePaths } from "../../infrastructure/runtime/config.js";
-import { openRuntimeDatabase } from "../../infrastructure/sqlite/database.js";
+import { openRuntimeDatabaseReadOnly } from "../../infrastructure/sqlite/database.js";
+import { assertCurrentLocalSchema } from "../../infrastructure/sqlite/schema/index.js";
 import { LocalFoundationStore } from "../../infrastructure/sqlite/foundation-store.js";
 import { workspaceRevision } from "../../infrastructure/workspace/revision.js";
 import { normalizeAgentHandle } from "../../modules/foundation/model.js";
@@ -23,13 +28,15 @@ import { stableContractJson } from "../../modules/steward/contract-codec.js";
 import { registeredPluginsForTrigger } from
   "../subscription/plugin-registry.js";
 
+export class StewardUnavailableError extends Error {}
+
 export function compileRunIntent(
   repoRoot: string,
   input: RunIntent | unknown,
   runtimeDirectory?: string
 ): StewardRunRequest {
   const intent = parseRunIntent(input);
-  const database = openRuntimeDatabase(runtimePaths(repoRoot, runtimeDirectory).database);
+  const database = openRuntimeDatabaseReadOnly(runtimePaths(repoRoot, runtimeDirectory).database);
   try {
     return compileWithDatabase(repoRoot, intent, database, runtimeDirectory, {});
   } finally {
@@ -39,6 +46,7 @@ export function compileRunIntent(
 
 export interface RunIntentOwnerPolicy {
   readonly mandate?: CompiledRunMandate;
+  readonly authorizeNetwork?: boolean;
   readonly maxSteps?: number;
   readonly deadlineAt?: string;
 }
@@ -66,7 +74,7 @@ export function compileRunIntentWithOwnerPolicy(
   runtimeDirectory?: string
 ): StewardRunRequest {
   const intent = parseRunIntent(input);
-  const database = openRuntimeDatabase(runtimePaths(repoRoot, runtimeDirectory).database);
+  const database = openRuntimeDatabaseReadOnly(runtimePaths(repoRoot, runtimeDirectory).database);
   try {
     return compileWithDatabase(repoRoot, intent, database, runtimeDirectory, policy);
   } finally {
@@ -81,13 +89,23 @@ function compileWithDatabase(
   runtimeDirectory: string | undefined,
   policy: RunIntentOwnerPolicy
 ): StewardRunRequest {
-  const foundationStore = new LocalFoundationStore(database);
+  assertCurrentLocalSchema(database);
+  const foundationStore = new LocalFoundationStore(database, { migrate: false });
   const foundation = foundationStore.foundation();
   if (foundation === undefined) throw new Error("Local foundation is not initialized");
   const activeAgents = foundationStore.listAgents().filter(({ status }) => status === "active");
-  const steward = foundationStore.agentByHandle("codex");
-  if (steward === undefined || steward.status !== "active") {
-    throw new Error("Run admission requires one active codex Steward Agent");
+  const prior = new AgentRunStore(database, { migrate: false }).projectionByOwnerRequest(intent.requestId);
+  const configured = prior === undefined
+    ? new StewardPolicyStore(runtimePaths(repoRoot, runtimeDirectory).stewardPolicy).load()
+    : undefined;
+  const selection = prior?.orchestratorBinding?.schemaVersion === "OrchestratorBinding@3"
+    ? prior.orchestratorBinding.selection
+    : prior === undefined && configured !== undefined ? selectSteward(configured, intent.requestId) : undefined;
+  const steward = prior !== undefined
+    ? foundationStore.agent(prior.stewardAgentId)
+    : selection === undefined ? foundationStore.agentByHandle("codex") : foundationStore.agent(selection.agentId);
+  if (steward === undefined || steward.status !== "active" || !supportsStewardClient(steward.client)) {
+    throw new StewardUnavailableError("Run admission requires an active supported Steward Agent; selected Agent is unavailable");
   }
   const participantAgentIds = resolveParticipants(
     intent.requestedParticipantRefs,
@@ -95,7 +113,11 @@ function compileWithDatabase(
     activeAgents
   );
   const workspace = resolveWorkspace(repoRoot, foundation.workspacePath, intent);
-  const runtime = new RuntimeStore(database);
+  if (policy.authorizeNetwork === true && (workspace?.access !== "read" || intent.triggerIntent !== undefined ||
+    activeAgents.filter(a => participantAgentIds.includes(a.principalId)).some(a => a.client !== "codex"))) {
+    throw new Error("Network preauthorization requires a standalone read-only Run with Codex participants");
+  }
+  const runtime = new RuntimeStore(database, { migrate: false });
   const resultDestination = resolveDestination(runtime, intent.resultDestinationRef);
   const trigger = resolveTriggerAuthority(repoRoot, intent, runtimeDirectory);
   const mandate = policy.mandate ?? { kind: "objective" as const, objective: intent.objective };
@@ -114,10 +136,14 @@ function compileWithDatabase(
   });
   const draft = {
     schemaVersion: "StewardRunRequest@2" as const,
+    ...(selection === undefined ? {} : { stewardSelection: selection }),
     requestId: intent.requestId,
     idempotencyKey: intent.requestId,
     intentDigest: runIntentDigest(intent),
     objective: intent.objective,
+    acceptanceContract: acceptanceContract(intent.acceptance, intent.contextRefs),
+    ...(intent.dispatchNotes === undefined ? {} : {dispatchNotes: intent.dispatchNotes}),
+    ...(policy.authorizeNetwork === true ? {ownerNetworkAuthorized: true} : {}),
     acceptance: intent.acceptance,
     contextRefs: intent.contextRefs,
     terminalEvidence: intent.terminalEvidence,

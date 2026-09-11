@@ -6,6 +6,7 @@ export type ChatReadToolName =
   | "describe_capabilities"
   | "subscription_history"
   | "get_run"
+  | "list_chat_work"
   | "event_trace";
 
 export interface ChatReadToolDefinition extends Readonly<Record<string, unknown>> {
@@ -23,6 +24,7 @@ export interface ChatReadToolDefinition extends Readonly<Record<string, unknown>
 export interface ChatReadToolContext {
   readonly repoRoot: string;
   readonly runtimeDirectory?: string;
+  readonly dispatchEventId?: string;
   requests: number;
   returnedBytes: number;
 }
@@ -78,6 +80,18 @@ export const chatReadToolDefinitions: readonly ChatReadToolDefinition[] = [
     annotations
   },
   {
+    name: "list_chat_work",
+    description: "Discover Runs initiated by this Agent in the current Chat Session, including true status, intervention and output references. Scope is fixed by the Host; use the returned cursor for older work. Accepted work and completed work are different states.",
+    inputSchema: {
+      type: "object", additionalProperties: false,
+      properties: {
+        beforeDispatchEventId: { type: "string", pattern: "^evt_[A-Za-z0-9_-]+$" },
+        limit: { type: "integer", minimum: 1, maximum: 20, default: 10 }
+      }
+    },
+    annotations
+  },
+  {
     name: "get_run",
     description: [
       "Read a bounded, redacted status and execution trace for one exact Rollerskate Run ID.",
@@ -116,12 +130,14 @@ const toolNames = new Set(chatReadToolDefinitions.map(({ name }) => name));
 export function createChatReadToolContext(input: {
   readonly repoRoot: string;
   readonly runtimeDirectory?: string;
+  readonly dispatchEventId?: string;
 }): ChatReadToolContext {
   return {
     repoRoot: input.repoRoot,
     ...(input.runtimeDirectory === undefined
       ? {}
       : { runtimeDirectory: input.runtimeDirectory }),
+    ...(input.dispatchEventId === undefined ? {} : { dispatchEventId: input.dispatchEventId }),
     requests: 0,
     returnedBytes: 0
   };
@@ -226,6 +242,16 @@ function execute(
       tool: name,
       subscriptionId,
       limit
+    });
+  }
+  if (name === "list_chat_work") {
+    const input = requireArguments(args, [], ["beforeDispatchEventId", "limit"]);
+    return queryChatReadTool(context, {
+      tool: name,
+      limit: boundedInteger(input.limit, 10, 1, 20, "Chat work limit"),
+      ...(input.beforeDispatchEventId === undefined ? {} : {
+        beforeDispatchEventId: requiredIdentifier(input, "beforeDispatchEventId", "evt_")
+      })
     });
   }
   if (name === "get_run") {

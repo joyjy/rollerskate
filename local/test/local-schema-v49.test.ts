@@ -96,7 +96,7 @@ test("runtime startup reconciliation rotates an incompatible current Agent Sessi
   }
 });
 
-test("schema v72 preserves v48 Delivery state and admits server-topic destinations", () => {
+test("schema v74 preserves v48 Delivery state and admits server-topic destinations", () => {
   const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-v49-"));
   const databasePath = join(directory, "runtime.db");
   try {
@@ -127,7 +127,7 @@ test("schema v72 preserves v48 Delivery state and admits server-topic destinatio
       legacy.close();
     }
 
-    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 72);
+    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 75);
     const migrated = new DatabaseSync(databasePath);
     try {
       assert.deepEqual({ ...migrated.prepare(`

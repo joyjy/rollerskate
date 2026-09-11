@@ -7,7 +7,7 @@ import test from "node:test";
 
 import { initializeRuntimeSchema } from "../src/infrastructure/sqlite/schema.js";
 
-test("schema v72 retires synthetic Chat state exactly once without deleting history", () => {
+test("schema v74 retires synthetic Chat state exactly once without deleting history", () => {
   const directory = mkdtempSync(join(tmpdir(), "rollerskate-free-chat-retirement-"));
   const databasePath = join(directory, "runtime.db");
   try {
@@ -107,7 +107,7 @@ test("schema v72 retires synthetic Chat state exactly once without deleting hist
     database.exec("UPDATE schema_meta SET value = '69' WHERE key = 'schema_version'");
     database.close();
 
-    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 72);
+    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 75);
     const migrated = new DatabaseSync(databasePath);
     try {
       const mode = migrated.prepare(`

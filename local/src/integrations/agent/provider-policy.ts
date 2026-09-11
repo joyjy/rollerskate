@@ -126,12 +126,12 @@ function verifiedControls(
       ? "read,write,edit,bash,grep,find,ls"
       : "read,grep,find,ls,read_git_diff";
     const actualTools = lastValue(argv, "--tools");
-    const configuredReadTools = (resources.piChatReadToolNames ?? "")
+    const configuredChatTools = (resources.piChatToolNames ?? "")
       .split(",").filter((name) => name !== "");
     const expectedChatToolSets = [
       ["read_chat_history"],
-      configuredReadTools,
-      ["read_chat_history", ...configuredReadTools]
+      configuredChatTools,
+      ["read_chat_history", ...configuredChatTools]
     ].filter((names) => names.length > 0)
       .map((names) => `${expected},${names.join(",")}`);
     if (actualTools !== expected && !expectedChatToolSets.includes(actualTools ?? "")) {

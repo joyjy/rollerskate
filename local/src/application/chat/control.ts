@@ -1,5 +1,8 @@
+import { codexChatDestination } from "../../integrations/codex-desktop/chat-destination.js";
+import { chatWorkForMessages } from "./work-query.js";
 import {
   localRuntimeSnapshot,
+  readLocalRuntimeSnapshot,
   type LocalControlOptions
 } from "../agent/control.js";
 import type { LocalAgent } from "../../modules/foundation/model.js";
@@ -13,7 +16,7 @@ import {
   LocalChatStore,
   type ChatMessageAdmission
 } from "../../infrastructure/sqlite/chat-store.js";
-import { openRuntimeDatabase } from "../../infrastructure/sqlite/database.js";
+import { openRuntimeDatabaseReadOnly } from "../../infrastructure/sqlite/database.js";
 import { runtimePaths } from "../../infrastructure/runtime/config.js";
 import {
   chatMessageViewsFromPage,
@@ -80,12 +83,12 @@ export function localChatView(
   options: LocalControlOptions = {},
   timelineOptions: ChatTimelineOptions = {}
 ): LocalChatView {
-  const snapshot = localRuntimeSnapshot(repoRoot, options);
-  const chat = openChat(repoRoot, options);
-  const database = openRuntimeDatabase(
+  const snapshot = readLocalRuntimeSnapshot(repoRoot, options);
+  const database = openRuntimeDatabaseReadOnly(
     runtimePaths(repoRoot, options.runtimeDirectory).database
   );
-  const runtime = new RuntimeStore(database);
+  const chat = new LocalChatStore(database);
+  const runtime = new RuntimeStore(database, { migrate: false });
   try {
     const events = chat.events(snapshot.foundation.topicId);
     const messagePage = chat.messagePage(snapshot.foundation.topicId, timelineOptions);
@@ -106,6 +109,9 @@ export function localChatView(
       messages: proposalMessages,
       agents: snapshot.agents
     });
+    const works = chatWorkForMessages({repoRoot, database,
+      ...(options.runtimeDirectory === undefined ? {} : {runtimeDirectory: options.runtimeDirectory})},
+      messagePage.items.map(message => message.eventId));
     return {
       chat: {
         topicId: snapshot.foundation.topicId,
@@ -118,9 +124,11 @@ export function localChatView(
         ...messages,
         items: messages.items.map((message) => {
           const messageProposals = proposals.get(message.eventId);
-          return messageProposals === undefined
-            ? message
-            : { ...message, runProposals: messageProposals.map(({ view }) => view) };
+          const linkedIds = new Set(messageProposals?.map(({view}) => view.linkedRun?.runId));
+          const messageWorks = works.filter(work => work.sourceMessageEventId === message.eventId && !linkedIds.has(work.runId));
+          return { ...message,
+            ...(messageProposals === undefined ? {} : {runProposals: messageProposals.map(({view}) => view)}),
+            ...(messageWorks.length === 0 ? {} : {works: messageWorks.map(({sourceMessageEventId: _source, dispatchEventId: _dispatch, ...work}) => work)}) };
         })
       },
       sessions: snapshot.agents.map((agent) => {
@@ -145,26 +153,36 @@ export function postLocalChatMessage(
   repoRoot: string,
   body: string,
   options: LocalControlOptions = {},
-  messageOptions: { readonly replyToEventId?: string } = {}
+  messageOptions: { readonly replyToEventId?: string; readonly codexThreadId?: string } = {}
 ): ChatMessageAdmission {
   const snapshot = localRuntimeSnapshot(repoRoot, options);
+  const governance = materializeLocalTopicGovernance(
+    repoRoot, options.runtimeDirectory, now(options)
+  ).governance;
+  const participantIds = new Set(governance.participants
+    .filter(({ status }) => status === "active")
+    .map(({ agentId }) => agentId));
+  const eligible = snapshot.agents.filter((agent) =>
+    agent.status === "active" && participantIds.has(agent.principalId));
   const chat = openChat(repoRoot, options);
   try {
     const replyTo = messageOptions.replyToEventId === undefined
       ? undefined
       : chat.message(messageOptions.replyToEventId);
-    const mentioned = resolveMentions(body, snapshot.agents);
+    const mentioned = resolveMentions(body, eligible);
     const repliedAgent = replyTo?.sender.kind === "agent"
-      ? snapshot.agents.find((agent) =>
-          agent.principalId === replyTo.sender.principalId && agent.status === "active")
+      ? eligible.find((agent) =>
+          agent.principalId === replyTo.sender.principalId)
       : undefined;
-    const targets = mentioned.length > 0
-      ? mentioned
-      : repliedAgent === undefined ? [] : [repliedAgent];
+    const targets = repliedAgent === undefined ? mentioned : [repliedAgent];
+    if (messageOptions.codexThreadId !== undefined && targets.length !== 1) {
+      throw new Error("Codex Desktop push requires exactly one explicit active Agent target");
+    }
     return chat.postOwnerMessage({
       topicId: snapshot.foundation.topicId,
       ownerPrincipalId: snapshot.foundation.owner.principalId,
       body,
+      ...(messageOptions.codexThreadId === undefined ? {} : { replyDestination: codexChatDestination(messageOptions.codexThreadId, targets[0]!.principalId, now(options)) }),
       ...(messageOptions.replyToEventId === undefined
         ? {}
         : { replyToEventId: messageOptions.replyToEventId }),
@@ -225,8 +243,9 @@ export function localChatPresenceView(
   repoRoot: string,
   options: LocalControlOptions = {}
 ): LocalChatPresenceView {
-  const snapshot = localRuntimeSnapshot(repoRoot, options);
-  const runtime = new RuntimeStore(runtimePaths(repoRoot, options.runtimeDirectory).database);
+  const snapshot = readLocalRuntimeSnapshot(repoRoot, options);
+  const database = openRuntimeDatabaseReadOnly(runtimePaths(repoRoot, options.runtimeDirectory).database);
+  const runtime = new RuntimeStore(database, { migrate: false });
   try {
     return {
       topicId: snapshot.foundation.topicId,
@@ -311,6 +330,7 @@ export function localChatPresenceView(
     };
   } finally {
     runtime.close();
+    database.close();
   }
 }
 

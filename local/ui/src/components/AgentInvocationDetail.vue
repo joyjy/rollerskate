@@ -163,7 +163,7 @@ const toolCallsSummary = computed(() => {
           </div>
         </div>
         <div
-          v-else-if="result.schemaVersion === 'RunDecision@2' || result.schemaVersion === 'RunDecision@3'"
+          v-else-if="result.schemaVersion === 'RunDecision@2' || result.schemaVersion === 'RunDecision@3' || result.schemaVersion === 'RunDecision@4' || result.schemaVersion === 'RunDecision@5'"
           class="result-card"
           :class="result.action === 'finish' ? result.finish.outcome : 'delegate'"
         >
@@ -184,7 +184,7 @@ const toolCallsSummary = computed(() => {
             <span class="mono">{{ result.awaitSource.sourceKind }} · {{ result.awaitSource.templateId }}</span>
           </div>
           <div class="result-summary">
-            {{ result.action === 'finish' ? result.finish.summary : result.rationale }}
+            {{ result.action === 'finish' ? result.finish.summary : result.action === 'ask_human' ? result.question : result.rationale }}
           </div>
           <div class="artifact-list">
             <span class="label">State</span>
@@ -192,7 +192,7 @@ const toolCallsSummary = computed(() => {
             <span class="artifact-pill">{{ result.state.acceptedEvidence.length }} evidence</span>
           </div>
         </div>
-        <div v-else class="result-card" :class="result.action === 'complete' ? result.outcome : 'delegate'">
+        <div v-else-if="result.schemaVersion === 'AgentTurnResult@1'" class="result-card" :class="result.action === 'complete' ? result.outcome : 'delegate'">
           <div class="result-action">
             <span class="action-badge">{{ result.action }}</span>
             <span v-if="result.action === 'complete'" class="outcome-badge" :class="result.outcome">

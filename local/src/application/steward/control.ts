@@ -1,3 +1,6 @@
+import type { AcceptanceContract } from "../../modules/steward/acceptance.js";
+import { supportsStewardClient, type StewardSelection } from "../../modules/steward/steward-policy.js";
+import { stewardDecisionVersion } from "../../modules/steward/caller-contract.js";
 import { realpathSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -54,7 +57,7 @@ import {
 import { applyRunDecisionInTransaction } from "./decision.js";
 import {
   queueStewardOrchestratorRetryInTransaction,
-  stewardOrchestratorRetryPrompt,
+  stewardOrchestratorContinuationPrompt,
   type StewardOrchestratorRetryReceipt
 } from "./orchestrator-retry.js";
 
@@ -92,6 +95,9 @@ export interface StartStewardRunInput {
     readonly mode: "autonomous" | "caller" | "steward";
     readonly admission?: {
       readonly digest: string;
+      readonly acceptanceContract?: AcceptanceContract;
+      readonly ownerNetworkAuthorized?: boolean;
+      readonly selection?: StewardSelection;
       readonly authority: RunAuthorityEnvelope;
     };
   };
@@ -188,10 +194,7 @@ function startStewardRunWithDatabase(
     if (local === undefined) throw new Error("Local foundation is not initialized");
     ownerPrincipalId = local.owner.principalId;
     const stewardHandle = input.steward ?? "codex";
-    if (requestedMode === "steward" && stewardHandle !== "codex") {
-      throw new Error("Steward orchestration currently requires the codex handle");
-    }
-    const steward = foundation.agentByHandle(stewardHandle);
+    const steward = foundation.agent(stewardHandle) ?? foundation.agentByHandle(stewardHandle);
     if (steward === undefined) throw new Error(`Local Agent not found: ${stewardHandle}`);
     if (steward.status !== "active") {
       throw new Error(`Local Agent is not active: ${stewardHandle}`);
@@ -221,8 +224,8 @@ function startStewardRunWithDatabase(
           handle: agent.handle,
           client: agent.client
         }));
-    if (requestedMode === "steward" && steward.client !== "codex") {
-      throw new Error("Steward orchestration requires an active Codex Agent");
+    if (requestedMode === "steward" && !supportsStewardClient(steward.client)) {
+      throw new Error("Steward orchestration requires an active Codex, Kimi, or Pi Agent");
     }
     if ((input.taskUrl !== undefined || input.resultDestination !== undefined) &&
       requestedMode !== "steward") {
@@ -274,9 +277,12 @@ function startStewardRunWithDatabase(
               kind: "agent",
               agentId: stewardAgentId
             },
-            decisionContractId: "run-decision@3",
+            decisionContractId: input.orchestration.admission.acceptanceContract === undefined ? "run-decision@5" : "run-decision@6",
+            acceptanceContract: input.orchestration.admission.acceptanceContract,
+            ownerNetworkAuthorized: input.orchestration.admission.ownerNetworkAuthorized,
             deliveryPolicy: "internal-with-manual-fallback",
             admissionDigest: input.orchestration.admission.digest,
+            ...(input.orchestration.admission.selection === undefined ? {} : { selection: input.orchestration.admission.selection }),
             authority: input.orchestration.admission.authority,
             ...(input.taskUrl === undefined && input.resultDestination === undefined
               ? {}
@@ -340,10 +346,10 @@ function startStewardRunWithDatabase(
         runVersion: 1,
         maxSteps: input.maxSteps ?? 20,
         completedWorkerSteps: 0,
+        currentNetworkAccess: workspaceGrant?.networkAccess ?? false,
         participants: participantTargets,
-        contractVersion: orchestratorBinding?.schemaVersion === "OrchestratorBinding@3"
-          ? 3
-          : 2,
+        contractVersion: stewardDecisionVersion(orchestratorBinding),
+        ...(orchestratorBinding?.schemaVersion !== "OrchestratorBinding@3" ? {} : {acceptanceContract: orchestratorBinding.acceptanceContract}),
         ...(orchestratorBinding?.schemaVersion !== "OrchestratorBinding@3" ||
           orchestratorBinding.authority.trigger === undefined
           ? {}
@@ -599,31 +605,35 @@ export function cancelStewardRun(
 ): CancelStewardRunReceipt {
   const database = openRuntimeDatabase(runtimePaths(repoRoot, runtimeDirectory).database);
   const runtime = new RuntimeStore(database);
-  const runs = new AgentRunStore(database);
   try {
-    return runtime.withImmediateTransaction(() => {
-      const cancelled = runs.cancelInTransaction(runId, at);
-      if (!cancelled.changed) {
-        return {
-          run: cancelled.run,
-          status: "already_terminal",
-          cancelledExecutions: 0
-        };
-      }
-      return {
-        run: cancelled.run,
-        status: "cancelled",
-        cancelledExecutions: runtime.cancelQueuedExecutionsForRootInTransaction(
-          cancelled.run.rootEventId,
-          at
-        )
-      };
-    });
+    return runtime.withImmediateTransaction(() => cancelStewardRunInTransaction(database, runId, at));
   } finally {
-    runs.close();
     runtime.close();
     database.close();
   }
+}
+
+export function cancelStewardRunInTransaction(database: DatabaseSync, runId: string, at: string): CancelStewardRunReceipt {
+  const runtime = new RuntimeStore(database);
+  const runs = new AgentRunStore(database);
+  try {
+    const cancelled = runs.cancelInTransaction(runId, at);
+    if (!cancelled.changed) {
+      return {
+        run: cancelled.run,
+        status: "already_terminal",
+        cancelledExecutions: 0
+      };
+    }
+    return {
+      run: cancelled.run,
+      status: "cancelled",
+      cancelledExecutions: runtime.cancelQueuedExecutionsForRootInTransaction(
+        cancelled.run.rootEventId,
+        at
+      )
+    };
+  } finally { runs.close(); runtime.close(); }
 }
 
 export function retryStewardOrchestrator(
@@ -633,89 +643,93 @@ export function retryStewardOrchestrator(
   runtimeDirectory?: string,
   at = new Date().toISOString()
 ): RetryStewardOrchestratorReceipt {
-  const requestId = text(requestIdInput, "requestId", 256);
-  const timestamp = iso(at);
   const database = openRuntimeDatabase(runtimePaths(repoRoot, runtimeDirectory).database);
   const runtime = new RuntimeStore(database);
-  const runs = new AgentRunStore(database);
   try {
-    return runtime.withImmediateTransaction(() => {
-      const run = runs.requireProjection(runId);
-      const binding = run.orchestratorBinding;
-      if (binding?.schemaVersion !== "OrchestratorBinding@3") {
-        throw new Error("Run is not OrchestratorBinding@3 Steward orchestration");
-      }
-      const events = runtime.eventsForRoot(run.rootEventId);
-      const externalId = `agent-run:${run.runId}:manual-orchestrator-retry:${requestId}`;
-      const replayEvent = events.find((event): event is AgentRequestEvent =>
-        event.type === "agent.request" && event.source.externalId === externalId
-      );
-      if (replayEvent !== undefined) {
-        const replayExecution = runtime.executionForEvent(replayEvent.eventId);
-        if (replayExecution === undefined) {
-          throw new Error("Manual Steward retry Execution is missing");
-        }
-        return {
-          status: "duplicate",
-          eventId: replayEvent.eventId,
-          executionId: replayExecution.executionId,
-          resumedSession: replayEvent.sessionId !== undefined,
-          run
-        };
-      }
-      if (run.status !== "awaiting_orchestrator" || run.activeStepId === undefined ||
-        run.stepCount !== 0 ||
-        run.checkpoint !== undefined || run.workspaceGrant?.access === "write") {
-        throw new Error(
-          "Run is not awaiting its initial read-only Steward decision"
-        );
-      }
-      if (run.deadlineAt !== undefined &&
-        Date.parse(timestamp) >= Date.parse(run.deadlineAt)) {
-        throw new Error("Agent Run deadline exhausted");
-      }
-      const requests = events.filter((event): event is AgentRequestEvent =>
-        event.type === "agent.request" &&
-        event.agentId === binding.orchestratorRef.agentId &&
-        event.runContext?.runId === run.runId &&
-        event.runContext?.cycleId === run.activeCycleId &&
-        event.runContext?.stepId === run.activeStepId
-      );
-      const request = requests.at(-1);
-      if (request === undefined) {
-        throw new Error("Active initial Steward request is missing");
-      }
-      const result = events.findLast((event): event is AgentResultEvent =>
-        event.type === "agent.result" &&
-        event.causality.parentEventId === request.eventId
-      );
-      if (result === undefined) {
-        throw new Error("Latest initial Steward request is not terminal");
-      }
-      const agentExecution = runtime.executionForEvent(request.eventId);
-      const resultExecution = runtime.executionForEvent(result.eventId);
-      if (agentExecution === undefined || resultExecution?.status !== "succeeded") {
-        throw new Error("Latest initial Steward result has not settled");
-      }
-      const retry = queueStewardOrchestratorRetryInTransaction({
-        runtime,
-        request,
-        result,
-        agentExecution,
-        source: {
-          kind: "cli",
-          externalId
-        },
-        prompt: stewardOrchestratorRetryPrompt(runs, run),
-        at: timestamp
-      });
-      return { ...retry, run };
-    });
+    return runtime.withImmediateTransaction(() => retryStewardOrchestratorInTransaction(database, runId, requestIdInput, at));
   } finally {
-    runs.close();
     runtime.close();
     database.close();
   }
+}
+
+export function retryStewardOrchestratorInTransaction(database: DatabaseSync, runId: string, requestIdInput: string, at: string): RetryStewardOrchestratorReceipt {
+  const requestId = text(requestIdInput, "requestId", 256);
+  const timestamp = iso(at);
+  const runtime = new RuntimeStore(database);
+  const runs = new AgentRunStore(database);
+  try {
+    const run = runs.requireProjection(runId);
+    const binding = run.orchestratorBinding;
+    if (binding?.schemaVersion !== "OrchestratorBinding@3") {
+      throw new Error("Run is not OrchestratorBinding@3 Steward orchestration");
+    }
+    const events = runtime.eventsForRoot(run.rootEventId);
+    const externalId = `agent-run:${run.runId}:manual-orchestrator-retry:${requestId}`;
+    const replayEvent = events.find((event): event is AgentRequestEvent =>
+      event.type === "agent.request" && event.source.externalId === externalId
+    );
+    if (replayEvent !== undefined) {
+      const replayExecution = runtime.executionForEvent(replayEvent.eventId);
+      if (replayExecution === undefined) {
+        throw new Error("Manual Steward retry Execution is missing");
+      }
+      return {
+        status: "duplicate",
+        eventId: replayEvent.eventId,
+        executionId: replayExecution.executionId,
+        resumedSession: replayEvent.sessionId !== undefined,
+        run
+      };
+    }
+    if (run.status !== "awaiting_orchestrator" || run.activeStepId === undefined ||
+      run.stepCount !== 0 ||
+      run.checkpoint !== undefined || run.workspaceGrant?.access === "write") {
+      throw new Error(
+        "Run is not awaiting its initial read-only Steward decision"
+      );
+    }
+    if (run.deadlineAt !== undefined &&
+      Date.parse(timestamp) >= Date.parse(run.deadlineAt)) {
+      throw new Error("Agent Run deadline exhausted");
+    }
+    const requests = events.filter((event): event is AgentRequestEvent =>
+      event.type === "agent.request" &&
+      event.agentId === binding.orchestratorRef.agentId &&
+      event.runContext?.runId === run.runId &&
+      event.runContext?.cycleId === run.activeCycleId &&
+      event.runContext?.stepId === run.activeStepId
+    );
+    const request = requests.at(-1);
+    if (request === undefined) {
+      throw new Error("Active initial Steward request is missing");
+    }
+    const result = events.findLast((event): event is AgentResultEvent =>
+      event.type === "agent.result" &&
+      event.causality.parentEventId === request.eventId
+    );
+    if (result === undefined) {
+      throw new Error("Latest initial Steward request is not terminal");
+    }
+    const agentExecution = runtime.executionForEvent(request.eventId);
+    const resultExecution = runtime.executionForEvent(result.eventId);
+    if (agentExecution === undefined || resultExecution?.status !== "succeeded") {
+      throw new Error("Latest initial Steward result has not settled");
+    }
+    const retry = queueStewardOrchestratorRetryInTransaction({
+      runtime,
+      request,
+      result,
+      agentExecution,
+      source: {
+        kind: "cli",
+        externalId
+      },
+      prompt: stewardOrchestratorContinuationPrompt(runs, run),
+      at: timestamp
+    });
+    return { ...retry, run };
+  } finally { runs.close(); runtime.close(); }
 }
 
 export function closeStewardRunSeries(
@@ -787,9 +801,6 @@ function externalWorkspaceGrant(input: {
   if (!isAbsolute(input.root)) throw new Error("workspace.root must be absolute");
   const root = realpathSync(input.root);
   if (!statSync(root).isDirectory()) throw new Error("workspace.root must be a directory");
-  if (input.networkAccess === true && input.access !== "write") {
-    throw new Error("workspace.networkAccess requires workspace.access=write");
-  }
   if (input.access === "write" && input.effect !== "must_change" &&
     input.effect !== "may_remain_unchanged") {
     throw new Error("workspace.effect is required for write access");

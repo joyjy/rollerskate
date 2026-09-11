@@ -177,7 +177,7 @@ const agentTurnResultMandateSchema = v.union([
   })
 ]);
 
-const agentTurnOutputSchema = v.object({
+export const agentTurnOutputSchema = v.object({
   id: v.string(),
   title: v.string(),
   contentType: v.union([

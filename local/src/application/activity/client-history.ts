@@ -1,3 +1,4 @@
+import { openRuntimeDatabaseReadOnly } from "../../infrastructure/sqlite/database.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -345,8 +346,9 @@ function agentContext(
   options: ClientHistoryOptions
 ): { readonly client: AgentClient; readonly ownerPrincipalId: string } {
   const paths = runtimePaths(repoRoot, options.runtimeDirectory);
-  const foundation = new LocalFoundationStore(paths.database);
+  const database = openRuntimeDatabaseReadOnly(paths.database);
   try {
+    const foundation = new LocalFoundationStore(database, { migrate: false });
     const agent = foundation.listAgents().find((candidate) => candidate.principalId === agentId);
     if (agent === undefined || agent.status !== "active") {
       throw new Error("Client history access requires an active local Agent");
@@ -358,7 +360,7 @@ function agentContext(
       ownerPrincipalId: local.owner.principalId
     };
   } finally {
-    foundation.close();
+    database.close();
   }
 }
 
