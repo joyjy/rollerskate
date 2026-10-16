@@ -3,7 +3,7 @@ import type { AgentResultEvent } from "../../core/event/model.js";
 import { RuntimeStore } from "../../core/runtime/store.js";
 import { AgentRunStore } from "../../infrastructure/sqlite/agent-run-store.js";
 import { workspaceRevision } from "../../infrastructure/workspace/revision.js";
-import { terminalRunResultDelivery } from "./result-destination.js";
+import { enqueueTerminalRunDelivery } from "./result-destination.js";
 import {
   isStewardOrchestrated,
   stewardDecisionVersion,
@@ -159,24 +159,7 @@ export function applyRunDecisionInTransaction(input: {
       acceptedAt: at
     };
     runs.recordDecisionInTransaction({ runId: run.runId, requestId, decision, receipt });
-    if (isStewardOrchestrated(run.orchestratorBinding) &&
-      run.orchestratorBinding.resultDestination !== undefined) {
-      const destination = run.orchestratorBinding.resultDestination;
-      const delivery = terminalRunResultDelivery(destination, {
-        runId: run.runId,
-        ...(run.activeCycleId === undefined ? {} : { cycleId: run.activeCycleId }),
-        status: plan.status,
-        summary: plan.summary
-      });
-      runtime.enqueueHostDeliveryInTransaction({
-        originId: `steward-run:${run.runId}:${run.activeCycleId ?? "run"}:terminal`,
-        destinationId: destination.destinationId,
-        kind: delivery.kind,
-        address: delivery.address,
-        payload: delivery.payload,
-        at
-      });
-    }
+    enqueueTerminalRunDelivery(runtime, run, plan.status, plan.summary, at);
     return { status: "accepted", run: terminal, decision: receipt };
   }
   if (decision.action !== "next_step") {

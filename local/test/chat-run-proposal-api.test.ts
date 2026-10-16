@@ -1,5 +1,6 @@
+import { workspaceGit } from "../src/application/workspace/discovery.js";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
@@ -120,6 +121,30 @@ test("Console confirms only the current Chat Run proposal revision", async () =>
       assert.ok(proposal);
       assert.equal(proposal.ready, false);
       assert.equal(proposal.blocker?.code, "workspace_required");
+
+      const gitRoot=join(realpathSync(runtimeDirectory),"fork-source");mkdirSync(gitRoot);
+      workspaceGit(gitRoot,["init","-b","default-branch"]);
+      workspaceGit(gitRoot,["config","rollerskate.defaultBranch","default-branch"]);
+      workspaceGit(gitRoot,["-c","user.name=Test","-c","user.email=test@example.invalid","commit","--allow-empty","-m","base"]);
+      const found=await jsonRequest(`${origin}/api/chat/workspaces/find`,{method:"POST",headers:consoleHeaders(),body:JSON.stringify({path:gitRoot})});
+      assert.equal(found.response.status,200);
+      const token=(found.body as {items:Array<{token:string}>}).items[0]!.token;
+      const forkUrl=`${origin}/api/chat/proposals/${source.eventId}/${proposal.dispatchEventId}/fork`;
+      const forkBody={revision:proposal.revision,path:gitRoot,token,purpose:"api-test",requestId:"api-fork"};
+      const rejectedFork=await jsonRequest(forkUrl,{method:"POST",body:JSON.stringify(forkBody)});
+      assert.equal(rejectedFork.response.status,403);
+      const staleFork=await jsonRequest(forkUrl,{method:"POST",headers:consoleHeaders(),body:JSON.stringify({...forkBody,revision:"stale"})});
+      assert.equal(staleFork.response.status,400);
+      const forked=await jsonRequest(forkUrl,{method:"POST",headers:consoleHeaders(),body:JSON.stringify(forkBody)});
+      assert.equal(forked.response.status,200,JSON.stringify(forked.body));
+      const retryFork=await jsonRequest(forkUrl,{method:"POST",headers:consoleHeaders(),body:JSON.stringify(forkBody)});
+      assert.deepEqual(retryFork.body,forked.body);
+      const afterFork=await jsonRequest(`${origin}/api/chat`);
+      const forkProposal=(afterFork.body as {messages:{items:Array<{eventId:string;runProposals?:Array<{linkedRun?:unknown}>}>}}).messages.items.find(item=>item.eventId===source.eventId)!.runProposals![0]!;
+      assert.equal(forkProposal.linkedRun,undefined,"Fork must not start a Run");
+      const forkCheck=await jsonRequest(`${origin}/api/chat/proposals/${source.eventId}/${proposal.dispatchEventId}/preflight`,{
+        method:"POST",headers:consoleHeaders(),body:JSON.stringify({revision:proposal.revision,workspaceKind:"path",workspacePath:(forked.body as {root:string}).root})});
+      assert.equal(forkCheck.response.status,200,JSON.stringify(forkCheck.body));
 
       const checked = await jsonRequest(
         `${origin}/api/chat/proposals/${source.eventId}/${proposal.dispatchEventId}/preflight`,

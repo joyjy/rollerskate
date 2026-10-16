@@ -48,6 +48,12 @@ function agentResultBadge(callback: {
       <StatusBadge :status="subscription.status" />
     </div>
 
+    <template v-if="subscription.chatCallbacks?.length">
+      <div class="section-title">Chat callback</div>
+      <div class="fire-card">回传记录、负责人回合和任务验收是不同状态。blocked 表示原会话或参与资格已失效。</div>
+      <pre>{{ JSON.stringify(subscription.chatCallbacks, null, 2) }}</pre>
+    </template>
+
     <template v-if="subscription.kind === 'free'">
       <div class="section-title">Versioned definition</div>
       <dl class="kv">
@@ -73,6 +79,13 @@ function agentResultBadge(callback: {
           <dt>Admission receipt</dt><dd>{{ subscription.admissionReceipt ? "durable" : "pending" }}</dd>
         </dl>
         <pre v-if="subscription.admissionReceipt">{{ JSON.stringify(subscription.admissionReceipt, null, 2) }}</pre>
+      </template>
+      <template v-else-if="subscription.definition.schema === 'SubscriptionDefinition@5'">
+        <div class="section-title registration-title">Subscription target</div>
+        <pre>{{ JSON.stringify(subscription.definition.target, null, 2) }}</pre>
+        <div class="section-title registration-title">Action receipt</div>
+        <pre v-if="subscription.actionReceipt">{{ JSON.stringify(subscription.actionReceipt, null, 2) }}</pre>
+        <div v-else class="fire-card">No action receipt recorded.</div>
       </template>
       <template v-else>
         <div class="section-title registration-title">Legacy callback grants · non-public</div>

@@ -8,7 +8,7 @@ import {
   runtimeAdapterIdMatches
 } from "../src/modules/agent/client-profile.js";
 
-test("Agent client catalog includes native Claude Code, Kimi Code and Pi adapters", () => {
+test("Agent client catalog includes the four public adapters", () => {
   assert.deepEqual(agentClients, [
     "codex",
     "claude-code",

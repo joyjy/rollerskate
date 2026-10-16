@@ -1,3 +1,4 @@
+import { DeterministicApplicationActionRegistry } from "../proactive/action-registry.js";
 import { registerObservationSource } from "./observation-control.js";
 import { runtimePaths } from "../../infrastructure/runtime/config.js";
 import { openRuntimeDatabaseReadOnly } from "../../infrastructure/sqlite/database.js";
@@ -44,5 +45,18 @@ export function desktopSubscriptionDeliveries(repoRoot: string, subscriptionId: 
     `).all(subscriptionId, CODEX_DESKTOP_PUSH_ACTION) as Array<{ delivery_id: string }>;
     const runtime = new RuntimeStore(database, { migrate: false });
     return rows.map(row => runtime.delivery(row.delivery_id)!);
+  } finally { database.close(); }
+}
+
+/** Exact immutable occurrence lookup, independent of the latest subscription result. */
+export function desktopSubscriptionReceipt(repoRoot: string, receiptId: string, runtimeDirectory?: string) {
+  const database = openRuntimeDatabaseReadOnly(runtimePaths(repoRoot, runtimeDirectory).database);
+  try {
+    assertCurrentLocalSchema(database);
+    const receipt = new DeterministicApplicationActionRegistry(database).receiptById(receiptId);
+    if (!receipt || receipt.actionRef !== CODEX_DESKTOP_PUSH_ACTION ||
+      !["subscription", "continuous_subscription"].includes(receipt.source.kind)) throw new Error("Desktop Subscription receipt not found");
+    const output = contractRecord(receipt.output, "Desktop receipt output");
+    return {receipt, evidence: JSON.parse(contractText(output.body, "Desktop body", 65_536)) as unknown};
   } finally { database.close(); }
 }

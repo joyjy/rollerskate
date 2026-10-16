@@ -38,4 +38,12 @@ Subscription 的 plugin plan 在既有无文件/网络/进程权限的 Node 沙�
 
 `command start` 和 `subscription register-desktop` 不再新建普通工作。已有命令回执继续支持 `command inspect`；旧 source、action、Delivery 保留当前读回/恢复语义，不隐式迁移。文件 workflow 的 Owner 注册/恢复是集成管理面，保留已有真实调用方。
 
-确定性 Run 的公共查询目前是 CLI/application；Console 的 Agent Run Workspace、Chat 的 Agent Run 工具和 progress index 继续由原 Steward 读模型拥有，不能宣称它们已经显示确定性 Run。Desktop 仅复用已经验收的 active/idle transport；目标投递状态仍以发送时 admission 与实际接收为准。
+确定性 Run 的 CLI/application、Chat 工作发现与既有 Console 详情共用 `inspectRun`。Chat `list_chat_work` 与有 Host 的 `get_run` 固定在当前 Agent、Topic 和 Session，返回 `agent | command | observe` 类型、来源、状态及准确详情入口；分页必须原样传回 `beforeDispatchEventId` 与 `beforeRunId`，同一 dispatch 的多个工作不会漏页。命令和观察不投影 Agent version 或人工控制，progress index 仍由原 Steward 读模型拥有。Desktop 仅复用已经验收的 active/idle transport；目标投递状态仍以发送时 admission 与实际接收为准。
+
+## 固定 DAG 执行
+
+`RunIntent@1.graph` 使用 `RunGraph@1` 声明角色、节点、needs 依赖、单一结果节点与预算请求；`modules/steward/graph-contract.ts` 是其纯解析与拓扑校验 owner。图参与现有 intent digest，不创建新的状态或持久化表。`application/run/validation.ts` 提供只读、离线格式校验，CLI `run validate` 只做输入输出转换。规范和样例归 [CLI Reference](../runbook/cli-reference.md#dag-输入与执行)。
+
+格式有效不代表准入通过。Steward compiler 固定参与者 principal、只读权限和节点预算；解析后的 graph 随 `RunMandateSnapshot@1` 保存，属于 immutable admission snapshot。`application/steward/graph.ts` 从 canonical request/result 与 Result Execution 的收件回执派生节点状态，在 start/collect 的同一事务内选择就绪节点并按 maxConcurrency 派发。每个 Worker 复用 `AgentStepResult@1`，独立 Session；最终 checkpoint 仍走既有 Steward acceptance 和 terminal delivery。固定 DAG 不进入 dynamic next_step，不增加 daemon、Handler 或可变节点状态表。
+
+失败后继 blocked，独立分支继续；所有已派发节点收件后形成最终 checkpoint。cancel/deadline 后迟到结果不再推进；restart 复用既有 Execution 恢复规则。schema v77 将 Run/Agent Session 关系从唯一索引改为普通索引，以允许独立 Session；串行流程显式查找最新 Run/Agent Session 后照旧复用。

@@ -37,7 +37,7 @@ test("v72 file source migration preserves an actual polling row and its pending/
     assert.equal(after.file_source_json, null);
     assert.equal(after.file_listener_json, null);
     assert.equal(store.require(id).checkpointOccurrenceKey, "confirmed");
-    assert.equal(LOCAL_SCHEMA_VERSION, 75);
+    assert.equal(LOCAL_SCHEMA_VERSION, 80);
     assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
   } finally { database.close(); }
 });

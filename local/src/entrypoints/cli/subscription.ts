@@ -1,4 +1,8 @@
-import { desktopSubscriptionDeliveries } from "../../application/subscription/desktop-control.js";
+import { readFileSync } from "node:fs";
+import { resumeSubscriptionWithReadback } from "../../application/subscription/control.js";
+import { readSubscriptionResumeOutcome, type SubscriptionResumeReceipt } from "../../application/subscription/resume-query.js";
+import { controlNotifications, inspectNotificationControl } from "../../application/subscription/notification-control.js";
+import { desktopSubscriptionDeliveries, desktopSubscriptionReceipt } from "../../application/subscription/desktop-control.js";
 import { recoverFileSubscription, fileSubscriptionRecoveries } from "../../application/subscription/file-recovery.js";
 import { registerFileSubscription, readFileSubscriptionRegistration } from "../../application/subscription/file-control.js";
 import {
@@ -8,6 +12,11 @@ import {
 } from "../../application/subscription/control.js";
 import { subscriptionHistory } from
   "../../application/subscription/query.js";
+import {
+  inspectRunMonitor,
+  listRunMonitors,
+  runMonitorDeliveries
+} from "../../application/subscription/run-monitor-query.js";
 
 interface Output {
   readonly write: (text: string) => void;
@@ -15,7 +24,11 @@ interface Output {
 
 const HELP = [
   "Usage:",
+  "  scripts/rs subscription run-monitors",
+  "  scripts/rs subscription resume-readback <receipt.json>",
+  "  scripts/rs subscription notifications inspect|mute|resume|close run|codex-thread <id> [--reason <text>]",
   "  scripts/rs subscription list",
+  "  scripts/rs subscription receipt <action-receipt-id>",
   "  scripts/rs subscription deliveries <subscription-id>",
   "  scripts/rs subscription register-file <definition.json>",
   "  scripts/rs subscription recover-file <request.json>",
@@ -36,12 +49,44 @@ export function runSubscriptionCommand(
     output.write(`${HELP}\n`);
     return 0;
   }
+  if(command === 'notifications') {
+    const [action,scope,id,...options] = rest;
+    if(!['inspect','mute','resume','close'].includes(action??'') || !['run','codex-thread'].includes(scope??'') || !id ||
+      (action==='inspect' ? options.length!==0 : options.length!==2 || options[0]!=='--reason'))
+      throw new Error('notifications requires inspect|mute|resume|close run|codex-thread <exact-id>; writes require --reason <text>');
+    const targetScope=scope as 'run'|'codex-thread';
+    const result=action==='inspect'?inspectNotificationControl(repoRoot,targetScope,id,runtimeDirectory):
+      controlNotifications(repoRoot,targetScope,id,action as 'mute'|'resume'|'close',options[1]!,runtimeDirectory);
+    output.write(`${JSON.stringify(result,null,2)}\n`);return 0;
+  }
+  if(command === 'resume-readback') {
+    if(rest.length!==1) throw new Error('resume-readback requires one saved resume receipt JSON');
+    const input=JSON.parse(readFileSync(rest[0]!,'utf8')) as {receipt?:SubscriptionResumeReceipt} & SubscriptionResumeReceipt;
+    output.write(`${JSON.stringify(readSubscriptionResumeOutcome(repoRoot,input.receipt??input,runtimeDirectory),null,2)}\n`);return 0;
+  }
+  if(command === 'resume') {
+    if(rest.length!==1) throw new Error('subscription resume requires exactly one id');
+    output.write(`${JSON.stringify(resumeSubscriptionWithReadback(repoRoot,rest[0]!,runtimeDirectory),null,2)}\n`);return 0;
+  }
   if (command === "register-desktop") {
     throw new Error("subscription registration is internal; use run preflight/start --source <plugin-ref> --input <business-input.json>");
   }
+  if (command === "receipt") {
+    if (rest.length !== 1) throw new Error("subscription receipt requires one exact action receipt id");
+    output.write(`${JSON.stringify(desktopSubscriptionReceipt(repoRoot, rest[0]!, runtimeDirectory), null, 2)}\n`);
+    return 0;
+  }
+  if (command === "run-monitors") {
+    if (rest.length !== 0) throw new Error("subscription run-monitors accepts no arguments");
+    output.write(`${JSON.stringify(listRunMonitors(repoRoot, runtimeDirectory), null, 2)}\n`);
+    return 0;
+  }
   if (command === "deliveries") {
     if (rest.length !== 1) throw new Error("subscription deliveries requires one subscription id");
-    output.write(`${JSON.stringify(desktopSubscriptionDeliveries(repoRoot, rest[0]!, runtimeDirectory), null, 2)}\n`);
+    const result = rest[0]!.startsWith("sub_run_")
+      ? runMonitorDeliveries(repoRoot, rest[0]!, runtimeDirectory)
+      : desktopSubscriptionDeliveries(repoRoot, rest[0]!, runtimeDirectory);
+    output.write(`${JSON.stringify(result, null, 2)}\n`);
     return 0;
   }
   if (command === "register-file") {
@@ -71,6 +116,10 @@ export function runSubscriptionCommand(
   }
   if (command === "inspect") {
     if (rest.length !== 1) throw new Error("subscription inspect requires exactly one id");
+    if (rest[0]!.startsWith("sub_run_")) {
+      output.write(`${JSON.stringify(inspectRunMonitor(repoRoot, rest[0]!, runtimeDirectory), null, 2)}\n`);
+      return 0;
+    }
     output.write(`${JSON.stringify(
       inspectSubscriptionView(repoRoot, rest[0]!, runtimeDirectory),
       null,
@@ -89,7 +138,7 @@ export function runSubscriptionCommand(
     )}\n`);
     return 0;
   }
-  if (command === "pause" || command === "resume" || command === "cancel") {
+  if (command === "pause" || command === "cancel") {
     if (rest.length !== 1) throw new Error(`subscription ${command} requires exactly one id`);
     output.write(`${JSON.stringify(
       controlSubscriptionView(repoRoot, rest[0]!, command, runtimeDirectory),
@@ -98,5 +147,5 @@ export function runSubscriptionCommand(
     )}\n`);
     return 0;
   }
-  throw new Error("subscription requires deliveries, register-file, recover-file, recoveries, list, history, inspect, pause, resume or cancel; create observations with run preflight/start");
+  throw new Error("subscription requires run-monitors, receipt, deliveries, register-file, recover-file, recoveries, list, history, inspect, pause, resume or cancel; create observations with run preflight/start");
 }

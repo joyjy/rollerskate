@@ -1,3 +1,4 @@
+import { parseRunGraph } from "../../modules/steward/graph-contract.js";
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
@@ -638,6 +639,18 @@ export class AgentRunStore {
     return this.requireProjection(input.runId);
   }
 
+  /** Graph node facts remain in Events; this CAS only advances the aggregate. */
+  public advanceGraphInTransaction(run: AgentRunProjection, stepCount: number, at: string, checkpoint?: AgentRunCheckpoint, active?: {stepId: string; executionId: string}): AgentRunProjection {
+    if (run.mandate.kind !== "objective" || run.mandate.graph === undefined) throw new Error("Run has no fixed DAG");
+    const changed = this.#database.prepare(`UPDATE agent_runs SET step_count = ?, active_step_id = ?, active_execution_id = ?,
+      checkpoint_json = ?, status = ?, version = version + 1, updated_at = ?
+      WHERE run_id = ? AND version = ? AND status = 'active' AND orchestration_mode = 'caller'`).run(
+        stepCount, checkpoint?.stepId ?? active?.stepId ?? null, active?.executionId ?? null, checkpoint === undefined ? null : boundedJson(checkpoint, "checkpoint", 65_536),
+        checkpoint === undefined ? "active" : "awaiting_orchestrator", iso(at), run.runId, run.version);
+    if (changed.changes !== 1) throw new Error(`Agent Run graph CAS failed: ${run.runId}`);
+    return this.requireProjection(run.runId);
+  }
+
   public checkpointInTransaction(input: {
     readonly runId: string;
     readonly expectedVersion: number;
@@ -678,7 +691,7 @@ export class AgentRunStore {
   public resumeNetworkCapabilityInTransaction(runId: string, expectedVersion: number, requestEventId: string, at: string): AgentRunProjection {
     const run = this.requireProjection(runId);
     const binding = run.orchestratorBinding;
-    if (binding?.schemaVersion !== "OrchestratorBinding@3" || run.workspaceGrant?.access !== "read" ||
+    if (binding?.schemaVersion !== "OrchestratorBinding@3" || run.workspaceGrant === undefined ||
       run.workspaceGrant.networkAccess || binding.authority.workspace === undefined) throw new Error("Invalid network capability transition");
     const grant = {...run.workspaceGrant, networkAccess: true};
     const authority = {...binding.authority, workspace: {...binding.authority.workspace, networkAccess: true}};
@@ -1041,6 +1054,7 @@ function parseMandate(value: string): RunMandateSnapshot {
       "kind",
       "objective",
       "renderedInstruction",
+      ...(parsed.graph === undefined ? [] : ["graph"]),
       ...(parsed.participantAgentIds === undefined ? [] : ["participantAgentIds"])
     ], "mandate");
     return {
@@ -1052,6 +1066,7 @@ function parseMandate(value: string): RunMandateSnapshot {
         "mandate.renderedInstruction",
         65_536
       ),
+      ...(parsed.graph === undefined ? {} : {graph: parseRunGraph(parsed.graph)}),
       ...participantAgentIds(parsed.participantAgentIds)
     };
   }

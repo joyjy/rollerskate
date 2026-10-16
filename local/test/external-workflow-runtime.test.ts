@@ -17,6 +17,8 @@ import { ExternalWorkflowRuntime } from
   "../src/application/proactive/external-workflow-runtime.js";
 import { migrateLegacyScheduleToExternalWorkflow } from
   "../src/application/proactive/source-migration.js";
+import { registerExternalWorkflowSchedule } from "../src/application/proactive/schedule-registration.js";
+import { runScheduleCommand } from "../src/entrypoints/cli/schedule.js";
 import { resolveUnknownScheduledRun } from
   "../src/application/schedule/control.js";
 import { ScheduledTaskRuntime } from
@@ -115,6 +117,51 @@ test("Owner workflow registry rejects loose permissions and executable drift", (
   } finally {
     fixture.close();
   }
+});
+
+test("Owner CLI registers a paused twice-daily workflow idempotently and rejects drift", async () => {
+  const fixture = setup();
+  try {
+    const scheduleId = newScheduleId();
+    const input = {
+      schemaVersion: "ExternalWorkflowScheduleRegistration@1", scheduleId,
+      ownerAgent: "workflow-owner", workflowRef: "workflow:test/echo@1",
+      kind: "cron", expression: "0 9,18 * * *", timezone: "Asia/Shanghai",
+      misfirePolicy: "skip", overlapPolicy: "skip", misfireGraceMilliseconds: 60_000
+    };
+    const created = registerExternalWorkflowSchedule(fixture.repo, input, fixture.runtimeDirectory, "2026-09-03T00:00:00.000Z");
+    assert.equal(created.status, "registered");
+    assert.equal(created.schedule.definition.status, "paused");
+    assert.equal(created.schedule.definition.nextRunAt, "2026-09-03T01:00:00.000Z");
+    const file = join(fixture.runtimeDirectory, "schedule.json");
+    writeFileSync(file, JSON.stringify(input));
+    let output = "";
+    assert.equal(runScheduleCommand(fixture.repo, ["register-workflow", file], {
+      write(value) { output += value; }
+    }, fixture.runtimeDirectory), 0);
+    assert.equal(JSON.parse(output).status, "duplicate");
+    const schedules = new ScheduledTaskStore(fixture.database);
+    const runtimeStore = new RuntimeStore(fixture.database);
+    const workflows = new ExternalWorkflowStore(fixture.database);
+    const scheduler = new ScheduledTaskRuntime({ store: schedules, runtime: runtimeStore,
+      validateTarget: () => undefined, externalWorkflows: workflows });
+    assert.equal((await scheduler.runCycle("2026-09-03T01:00:00.000Z")).admitted.length, 0);
+    schedules.setStatus(scheduleId, "resume", "2026-09-03T00:30:00.000Z");
+    assert.equal(registerExternalWorkflowSchedule(fixture.repo, input, fixture.runtimeDirectory).schedule.definition.status, "active");
+    assert.equal((await scheduler.runCycle("2026-09-03T01:00:00.000Z")).admitted.length, 1);
+    assert.equal(schedules.require(scheduleId).definition.nextRunAt, "2026-09-03T10:00:00.000Z");
+    assert.equal((await scheduler.runCycle("2026-09-03T01:00:00.000Z")).admitted.length, 0);
+    for (const override of [
+      { expression: "0 10 * * *" }, { timezone: "Not/AZone" }, { expression: "invalid" },
+      { ownerAgent: "missing" }, { workflowRef: "workflow:missing@1" }, { executable: "/bin/sh" }
+    ]) {
+      assert.throws(() => registerExternalWorkflowSchedule(fixture.repo, { ...input, ...override }, fixture.runtimeDirectory));
+    }
+    writeFileSync(join(fixture.runtimeDirectory, "workflow.sh"), "#!/bin/sh\nexit 0\n");
+    assert.throws(() => registerExternalWorkflowSchedule(fixture.repo, input, fixture.runtimeDirectory), /another definition/);
+    assert.equal(schedules.list().length, 1);
+    assert.equal(schedules.runs(scheduleId).length, 1);
+  } finally { fixture.close(); }
 });
 
 test("pre-effect interruption retries but post-effect interruption becomes manual unknown", () => {

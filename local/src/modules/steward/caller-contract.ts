@@ -1,3 +1,4 @@
+import { parseBoundedJsonObject } from "../agent/result-envelope.js";
 import { parseStewardRunDecisionV6, type StewardRunDecisionV6 } from "./run-contract-v6.js";
 import { parseStewardRunDecisionV5, type StewardRunDecisionV5 } from "./run-contract-v5.js";
 import { parseStewardRunDecisionV4, type StewardRunDecisionV4 } from "./run-contract-v4.js";
@@ -263,6 +264,10 @@ export function parseAgentStepResult(input: string): AgentStepResult {
           )
         })
   };
+}
+
+export function parseRunDecisionOutput(input: string, options: { readonly allowHistorical?: boolean } = {}): AnyRunDecision {
+  return parseRunDecision(parseBoundedJsonObject(input, "Invalid Steward decision JSON object"), options);
 }
 
 export function parseRunDecision(

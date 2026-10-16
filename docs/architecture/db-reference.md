@@ -1,7 +1,7 @@
 ---
 type: Reference
 title: Rollerskate Local Database Reference
-description: Local SQLite 的 Event / index / object 建模规范，以及 schema v75 的 33 张物理表、ownership、authority 与迁移规则。
+description: Local SQLite 的 Event / index / object 建模规范，以及 schema v80 的 36 张物理表、ownership、authority 与迁移规则。
 tags: [rollerskate, local, sqlite, database, schema]
 timestamp: 2026-07-26
 ---
@@ -10,7 +10,7 @@ timestamp: 2026-07-26
 
 [返回 architecture index](./index.md)
 
-`local/src/infrastructure/sqlite/schema/` 是 Local SQLite DDL、组合版本与兼容迁移的唯一事实边界；目录内 `index.ts` 是唯一公开入口，`definition.ts`、各版本 migration 与 `introspection.ts` 分别拥有当前定义、兼容升级和 SQLite metadata helpers。外层 `schema.ts` 只负责打开数据库并调用该入口，各 Store 不再各自创建业务表。schema v75 只有下文登记的 33 张产品表，不包含 SQLite 内部表。
+`local/src/infrastructure/sqlite/schema/` 是 Local SQLite DDL、组合版本与兼容迁移的唯一事实边界；目录内 `index.ts` 是唯一公开入口，`definition.ts`、各版本 migration 与 `introspection.ts` 分别拥有当前定义、兼容升级和 SQLite metadata helpers。外层 `schema.ts` 只负责打开数据库并调用该入口，各 Store 不再各自创建业务表。schema v80 只有下文登记的 36 张产品表，不包含 SQLite 内部表。
 
 ## 物理建模总则：默认聚合，按生命周期拆分
 
@@ -61,15 +61,57 @@ snapshot/receipt 必须满足：
 
 Event type、Route 与 causality 的完整清单由 [Event Reference](./event-reference.md) 维护。本页只登记数据库建模和物理表。
 
+## schema v80：分段观察状态
+
+分段观察属于既有 Subscription durable object。`subscriptions.observation_state_json` 是可选的 `ObservationState@1`，上限 16 KiB。Subscription Store 是唯一写入者，不新增表或 loop。状态保存检查间隔、定义摘要和查询时间。状态也保存来源可查性、业务状态、进度指纹、检查点位置和通知回执引用。原来源仍拥有业务结果，Delivery 仍拥有投递状态。
+
+准入固定总预算和定义摘要。查询状态、检查点位置与通知 action receipt 在同一事务提交。重启从原对象恢复，不延长 deadline，不重放业务命令。进度只保存指纹，不复制日志正文。通知复用原 action 和 Delivery，终态继续使用原 terminal occurrence。
+
+v79→v80 只增加 nullable 列，历史记录保持 NULL，不自动启用分段观察。状态随 Subscription 保留，不单独清理或从业务状态重建。升级前停止 Runtime 并备份完整数据库。验证入口为 `observation-checkpoint.test.ts` 和 `run-preflight.test.ts`。
+
+## schema v79：Owner 通知控制
+
+`notification_controls` 是 Subscription application 拥有的 durable object。按 Run 或 Codex thread 独立拥有 Owner 的通知许可，不复制 Run 生命周期。拆表原因是控制必须在新 Run 注册前存在，且具有独立的修订与审计历史。主键为 `(scope,target_id,revision)`，模式为 enabled、muted、closed。每次控制在 immediate transaction 追加新修订，最新修订是唯一当前 authority。reason 是经脱敏的 1024 字符内原因，created_at 是控制时间。
+
+记录不从 Run 或 Event 重建，不删除历史控制或投递回执。closed 不可恢复，活跃 Run 使用 mute，终态 Run 才允许 close。Run 和会话控制同时存在时，closed 优先于 muted，单独 resume 不能绕过另一层控制。Delivery 发送前使用同一 authority 检查排队消息，监控生成消息前也检查控制。控制回执列出 in-flight Delivery，不能保证撤回已发送请求。
+
+迁移 v78→v79 只添加空控制表，不静音或重放历史任务。数据库升级前停止旧 Runtime，回退使用完整备份。验证入口为 `run-subscription-runtime.test.ts`、schema migration tests。通知内容仍由原 Event/Run/Delivery 保存，本表只保存 Owner 控制。
+
+## schema v78：Run Subscription
+
+`run_subscriptions` 是 Subscription capability 拥有的独立 durable object。拆表原因是监控的观察位置、Runtime 重启身份与通知阻塞状态必须跨进程保存，不能由 Run 当前状态重建；它不拥有第二份 Run lifecycle。主键 `subscription_id` 是 `sub_run_` 加 Run ID 的 SHA-256 前 32 位，`run_id` 唯一且引用 `agent_runs`。新 Agent Run 的 admission 与 Subscription 注册在同一 immediate transaction 完成，重复准入保留同一监控与 checkpoint。
+
+`observed_key` 只拥有已入队通知的观察位置，`runtime_identity` 拥有上次观察进程身份；`status/latest_error` 只表达监控 active、blocked 或 completed。Run 的执行状态、version、原会话和终态摘要仍分别从 Run aggregate、immutable result destination 或 exact Chat dispatch 读取，不复制进本表。注册失败回滚 Run admission；状态观察、Delivery/Chat activation 入队和 checkpoint 原子提交。单条 source 失败只阻塞该 Subscription，不阻断其他 Run 的监控。
+
+Runtime 唯一 loop 内的 `subscription.run-monitor` phase 恢复扫描，只有既存非终态且声明返回来源的 Run 自动补监控；不补发历史终态。缺失目标明确 blocked，不猜最近会话。Runtime identity 只用于诊断。重启继续观察，不为相同状态生成新的恢复消息，不重跑业务。通知复用现有 canonical Delivery 或 Chat activation，沿用稳定 origin 去重；终态沿用 `steward-run:<runId>:<cycle|run>:terminal` 防止与旧 completion path 重复。默认只有 Run 已终态且通知无 pending/failed 才完成监控。Owner 可对终态 Run 显式 close，保留失败回执并完成监控；Desktop unknown 仍保持 blocked，不自动重发。无自动保留期或删除；监控与通知证据随 Run 保留。升级是 additive v77→v78，回退须使用升级前的完整数据库备份。验证入口为 `run-monitor-store.test.ts`、`run-subscription-runtime.test.ts`、`run-monitor-query.test.ts`。
+
+## Agent 网络重试分类
+
+网络退避属于 **既有 Execution object**，不新增表、不改变 schema v76。`status/attempt_count/max_attempts/next_attempt_at` 继续唯一拥有调度状态；failure transaction 在原 receipt 添加 bounded、不可独立修改的 `networkRetry: {failedAttempt}` 决策，只允许匹配的下一次调用。带 trace 的记录仍使用 `AgentInvocationFailureReceipt@1`，没有流式 trace 的明确 provider 拒绝使用 `AgentNetworkRetryReceipt@1`；旧 reader 可继续显示 Execution 状态与错误。`AgentInvocationFailure@1.rejectedBeforeWork` 为可选证据，缺失时不推断重放安全；无回填、无迁移、无平行 retry lifecycle。重建/恢复以 Execution 为准，历史终态失败不因升级重新执行。
+
 ## Chat 工具委派与返回分类
 
-Chat Run admission 继续由 `agent_runs.owner_request_id` 与原 canonical Owner message / dispatch 表达不可变来源，current lifecycle 仍归 Steward。新来源键为 `chat-execute:<messageId>:<dispatchId>`，历史 `chat-work` 只读兼容且不自动回流。负责 Session 从原 dispatch completion receipt 读取，首次调用未结算时保持未知。
+Chat Run admission 继续由 `agent_runs.owner_request_id` 与原 canonical Owner message / dispatch 表达不可变来源，current lifecycle 仍归 Steward。整条消息任务使用 `chat-execute:<messageId>:<dispatchId>`；独立任务使用 `chat-execute:<messageId>:<dispatchId>:task-v1:<start>:<end>`，offset 是原 Owner 正文的 UTF-16 半开区间，由最长 4096 字符且原文唯一出现的 `taskQuote` 校验生成。任务认领属于 **既有 Run aggregate 的 immutable origin**，不新建 claim 表或 lifecycle：同一 immediate transaction 查找同 Owner 消息的重叠任务区间并完成 Run admission；整条消息来源与任意子任务冲突，互不重叠任务独立受理，失败的准入不占用任务。原消息是正文事实源，Run 是已认领事实源；卡片、prompt 和 callback 按来源键投影，不回填历史任务拆分，schema 保持 v76。历史 `chat-work` 只读兼容且不自动回流。负责 Session 从原 dispatch completion receipt 读取，首次调用未结算时保持未知。
+
+Owner 在原生卡片中可明确选择较早的同 Topic / 同 Owner 任务消息并回答原 blockingQuestion；工作区检查、原消息选择和回答都绑定预检 revision，最终确认才授予执行权限。较早消息的候选是只读证据，不自动成为选择或授权。跨消息任务使用 `chat-execute:<currentMessageId>:<dispatchId>:task-source-v1:<taskSourceMessageId>:task-v1:<start>:<end>`：去重基于实际任务消息及重叠 span，回传仍基于原 dispatch / Session。问答进入既有 Run mandate，任务来源进入既有 immutable origin；不改历史 proposal receipt，不增加物理表或 migration。旧 whole-message / task-v1 来源继续可读。
 
 可恢复人工问题分类为 **既有 Run aggregate 状态 + immutable decision receipt**。`agent_runs.status/version/checkpoint_json` 唯一拥有等待和续行条件；`agent_run_decisions` 保存 `RunDecision@5(ask_human)` 与 `AgentRunDecisionReceipt@3`，questionId 引用 canonical 提问结果；回答事实保存在绑定 questionId/Owner message 的 `agent.request`。提问 transition + receipt、回答 Event + version transition 分别原子提交；取消沿用 Run lifecycle，过期由 deadline（缺省 24 小时）派生；没有独立可写 pending row，也不从历史 needs_human 重建问题。重启从以上 source-owned facts 恢复，schema 保持 v74。
 
 Return admission 分类为 **Event-only**：已受理的通知事实由带 source identity 的 `chat.activation` 和对应 Execution 唯一持有；`chat-work-return:<runId>:<version>` 是幂等键，同一 immediate transaction 核验 Run version、Session/roster 并创建 Event/Execution。不存在独立 notification lifecycle 表或可写 work projection；未 admission 的候选从 Run/dispatch 派生，busy 时保留来源等待后续扫描。已 admission 的 expiry/skip/failure 使用原 Execution 结算，不新建后台重试状态。查询游标不持久化，不决定权限或业务状态。Schema 仍为 v74。
 
 S3 的 Subscription/Schedule control token 是 source-owned object 的只读内容指纹，不落表；校验和现有状态转换在同一事务内执行。Channel 工具复用 `channel_send_receipts` / `channel_follows` aggregate，原 Owner message、dispatch 与目标通过 `chat-channel` idempotency key 关联；准确 Chat 返回继续分类为 Event-only，以 `chat-channel-return:<sendId>` 对应 canonical activation/Execution。没有新增表、materialized projection 或第二个 loop，历史 Channel send 不自动生成 Chat 回流。
+
+## Chat Run 恢复方案
+
+恢复方案属于 application/chat 拥有的有界 **durable proposal snapshot**，不是 Run 的 lifecycle 或执行授权。`<runtime>/run-recovery/<runId>.json` 是最多 64 KiB 的 `ChatRunRecovery@1`，保存 runId、原负责 dispatch、准备 dispatch 和已校验的人工 `RunDecision@1`；校验后的负责 Chat Session 工具原子替换此快照。文件内容指纹作为审阅 revision，没有额外 latest 索引、SQLite migration 或 loop。并发准备最后写入的方案成为当前展示；旧确认按指纹拒绝，Run 状态变化由原 expectedRunVersion 拒绝。准备与 Run 不跨资源事务：准备竞态最多留下过期草稿，不能获得执行权限。
+
+Owner 确认以 `chat-recovery:<revision>` 复用原 `agent_run_decisions` 幂等 transition，原事务拥有授权、Run version 与实际执行；确认不接受浏览器上传替代 decision。已接受内容与回执进入原决策记录，草稿不从 Run 反推或自动重新执行，不自动清理历史 Run 的草稿。验证入口为 `chat-run-recovery.test.ts`；文件 adapter 只读写快照，业务校验留在 application/chat。
+
+## Workspace Fork 文件对象
+
+Workspace Fork 属于独立 **durable object/state**，拥有 Git 外部效果与请求去重/中断恢复；不新增 SQLite 表、Event type 或 loop。`<runtime>/workspace-forks/<sha256(authority, requestId)>/` 独占目录保留身份；`request.json` 是 `WorkspaceForkRequest@1`，在 Git 前固定输入、Owner/proposal authority、源路径、默认分支/base SHA、新路径/分支；`result.json` 是不可变 `WorkspaceFork@1`。两者最多 16 KiB，原子发布并校验 schema/身份。application/workspace 是业务 owner，files store 只拥有文件读写。
+
+目录预留、请求持久化、Git worktree add 和回执写入不是跨资源事务。重复请求先读回已有结果，参数不同拒绝；若 Git 已成功但回执丢失，仅当 shared Git directory、HEAD/base SHA、branch 全部匹配时补记原回执；其他情况保持 unknown，禁止自动重放 Git。新路径/分支冲突不会复用未知目录。对象不从 Run 重建、不自动删除，删除工作区与回执需要 Owner 单独决定；保留同一 ID，不能通过清空回执实现重试。验证入口为 `workspace-control.test.ts` 的 dirty、重复、stale、remote HEAD 和缺失回执恢复用例。
 
 ## 本地长命令的文件状态
 
@@ -100,7 +142,23 @@ Notice Center 需要独立物理表，因为 Notice 除了 Delivery/Event 派生
 
 因此 `chat_messages` 可以整表删除重建，而 `notices` 不能丢弃 read/ack 后整表重建。两者都提供独立视图，但只有 Notice 同时拥有不可重建的用户状态。
 
-## schema v75：33 张物理表
+## schema v76：Chat Topic rotation
+
+Chat Topic rotation 是 `application/chat` 拥有的 **durable coordination state**。每个 Topic 只有一份当前可变 state，且 rotation 的 source/dispatch/Owner 关联会随协调而改变，不能从历史 `chat.message` 或 `chat.dispatch` 重放可靠恢复，因此以 `chat_rotations(topic_id)` 独立保存。
+
+- `state_json` 是应用校验的有界 JSON（最大 256 KiB），由 application 唯一写入 `{sourceEventId,state,dispatchEventId?,ownerEventIds[],settled?}`；Event ID 仅为 source fact 引用，不设 foreign key，也不复制 Event 内容或建立第二个 Event authority。
+- rotation state 与 admission/协调 transition 在 application 的同一 SQLite transaction 写入。它不是 `chat_messages` projection：重建 Chat message projection 只能重建 Timeline/read progress，不能清空、回填或覆盖 `chat_rotations`。
+- v75→v76 只创建空表，不回放历史 Chat。phase 只对账当前绑定 dispatch 的 Execution 终态，不从历史消息推定新工作；无自动 retention，已收口的 state 随 Topic Runtime database 生命周期保留。
+- 同一迁移同时重建 Chat progress view/trigger。dispatch status 更新按所有 `attention_json.receipts[].dispatchEventId = NEW.event_id` 的消息关联更新，因此一个 dispatch 可被多个 source receipt 引用；现有 Owner circles receipt 格式不变。
+- 验证入口为 `local/test/local-schema-v76.test.ts`：覆盖 v75 升级、JSON 边界、projection rebuild 保留以及 shared dispatch progress。
+
+## schema v77：独立 Session 与固定 DAG
+
+不新增物理表。`agent_sessions` 的 identity 仍为 session_id，adapter/provider_session_id 保持唯一；Run/Agent、Run/cycle/Agent 改为普通索引，允许一个 Agent 在同一 Run 中创建独立 Session。显式 Session 的执行 lane 仍按 session_id 串行，无 Session 的 Run agent.request 按 run/cycle/step/Agent 独立调度，普通 request 按 Event 独立调度；workspace 读写锁与全局并发预算继续生效。串行 Steward continuation 查询最新 Session 后显式复用，固定 DAG 节点不复用。
+
+DAG 分类为 immutable admission snapshot + Event/receipt 派生 read model：解析后的 `RunGraph@1` 存入既有 mandate_snapshot_json，Steward 独占写入。节点请求通过 root identity 或 `agent-run:<runId>:node:<nodeId>` 绑定；`AgentRunCheckpointReceipt@1` 可选 graphNodeId 确认该 canonical result 已收件，正文只在 agent.result。节点状态从请求、结果、回执重建，blocked 从依赖传播，无节点生命周期表。派发、收件回执、Run version/step count CAS 与最终 checkpoint 同事务提交。activeStep/Execution 保留一个活跃节点的兼容指针；调度不依赖该单指针。
+
+## schema v77：34 张物理表
 
 | Table | Classification / owner | 主键与职责 |
 |---|---|---|
@@ -124,6 +182,7 @@ Notice Center 需要独立物理表，因为 Notice 除了 Delivery/Event 派生
 | `agent_run_decisions` | immutable audit/idempotency child / `application/steward` | `(run_id, request_id)`；保存 Caller 的严格 `RunDecision@1`、原子接受 receipt 与 resulting Run version；不拥有 current Run state。 |
 | `legacy_trigger_migration_receipts` | immutable migration receipt / `application/steward` | `(source_kind, source_id, definition_revision)`；在迁移 transaction 内固定 exact legacy source、proposal/admission digest 与 replacement Run，支持不依赖当前 Agent/plugin/workspace 状态的幂等 replay。 |
 | `chat_messages` | rebuildable projection / `application/chat` | `event_id`；保存 Timeline snapshot、attention denominator 与 Agent Execution-driven read progress，不拥有消息或用户 read state。 |
+| `chat_rotations` | durable coordination state / `application/chat` | `topic_id`；保存 Topic 当前 rotation 的 bounded JSON state，不从历史 Chat 重建。 |
 | `deliveries` | durable work / `core/runtime` | `delivery_id`；保存 Event 或 host origin 发起的一次投递、bounded payload、Destination snapshot、retry 与外部 receipt。 |
 | `chat_presence` | durable policy / `core/chat` | `(agent_id, scope_kind, scope_id)`；保存 scoped available/snoozed 状态。 |
 | `subscriptions` | durable object / Subscription | `subscription_id`；保存严格 V3 legacy callback、V4 Run binding 或 V5 unified target、probe policy、terminal observation、对应 receipt、reconcile summary 与可逆 archive visibility。 |
@@ -191,7 +250,7 @@ definition/grant 使用严格的 `ProactiveCallbackDefinition@1` / `ProactiveCal
 
 receipt 写入必须经过对应 versioned runtime parser，当前列上限为 64 KiB。新增 Handler receipt 需要定义独立 schema，不能复用任意 JSON。
 
-Chat-to-Run proposal 不增加物理表或 schema migration。每个 proposal 的 immutable fact 保存在对应 `chat.dispatch` Agent Execution 的 `ChatDecisionReceipt@2`；Owner 拒绝则追加一个携带 `ChatRunProposalDecision@1` 的 immutable system `chat.message`，以 `chat-run-proposal-decision:<sourceMessageEventId>:<dispatchEventId>` 保证逐 proposal 幂等，且不创建 Chat Execution。`application/chat` 只对 exact Owner source message + dispatch 做可重建投影。Owner 确认后，既有 `agent_runs.owner_request_id='chat-work:' || sourceMessageEventId || ':' || dispatchEventId` 是唯一 association authority；started、needs-human 与 terminal summary 都从该 row 读取，不能复制回 Chat receipt、`chat_messages` 或新的 reconcile state。
+Chat-to-Run proposal 不增加物理表或 schema migration。每个 proposal 的 immutable fact 保存在对应 `chat.dispatch` Agent Execution 的 `ChatDecisionReceipt@2`；Owner 拒绝则追加一个携带 `ChatRunProposalDecision@1` 的 immutable system `chat.message`，以 `chat-run-proposal-decision:<sourceMessageEventId>:<dispatchEventId>` 保证逐 proposal 幂等，且不创建 Chat Execution。`application/chat` 只对 exact Owner source message + dispatch 做可重建投影。Owner 确认后，既有 `agent_runs.owner_request_id` 的 Chat 来源键（格式见前述 Run admission）是唯一 association authority；started、needs-human 与 terminal summary 都从该 row 读取，不能复制回 Chat receipt、`chat_messages` 或新的 reconcile state。
 
 Agent provider 调用的可观测信息使用 `AgentInvocationReceipt@1`，保存 exact effective prompt、调用时间与 provider 实际报告的 token/turn/tool usage；provider 没有报告的字段必须保持 absent，不能伪装成 `0`。Chat 的 Agent Execution 因为同一列已经承载 decision receipt，把同一 `AgentInvocationDiagnostics@1` 嵌入 `ChatDecisionReceipt@1.invocation`。运行中的流式调用以 `AgentInvocationProgressReceipt@1` 覆盖同一 Execution receipt，最多按固定频率保存 Session reference、阶段、最后 meaningful 时间、计数和最后进度种类；失败时由 `AgentInvocationFailureReceipt@1` 取代，追加 termination reason、total/idle budget、协议终止状态与 recovery disposition。两者都禁止保存 raw assistant/thought/tool payload。它们是 bounded execution diagnosis，不是新的 Event fact，也不建立 invocation 表；restart 不从 progress receipt 恢复正在运行的 provider work，仍按 interrupted unknown 语义终止。
 
@@ -219,7 +278,7 @@ Schedule、one-shot Subscription 与 Continuous Subscription 复用同一 visibi
 
 autonomous `agent.request.prompt` 保存该 turn 的 active delegate roster 和 exact `AgentTurnResult@1` shape；caller admission 则把 participant roster 固定在 mandate，Worker prompt 使用 `AgentStepResult@1` 且不提供 delegate authority。Event prompt snapshot 不建立 Agent membership 表。Store 读取 mandate/workspace JSON 时必须重新校验 schemaVersion、exact fields、类型与大小，不能只依赖 `json_valid` 或 TypeScript cast。
 
-Run transcript 不复制到 JSON 或 `agent_run_steps`：所有 request、result 和 callback 都在 `events/executions` 中共享 `runId`，并用 `stepId/parentStepId` 还原调用链。每次 continuation 在同一 transaction 内完成 ResultHandler Execution、更新 Run CAS，并建立最多一个 child/callback Event 与 Execution。deterministic continuation key 保证 retry、duplicate result 和 restart 不重复 admission。
+Run transcript 不复制到 JSON 或 `agent_run_steps`：所有 request、result 和 callback 都在 `events/executions` 中共享 `runId`，并用 `stepId/parentStepId` 还原调用链。每次 continuation 在同一 transaction 内完成 ResultHandler Execution、更新 Run CAS，并建立后继 child/callback Event 与 Execution；固定 DAG 可按 maxConcurrency 一次建立多个就绪节点。deterministic continuation key 保证 retry、duplicate result 和 restart 不重复 admission。
 
 跨 owner transaction 不等于复制 ownership：bootstrap/application unit of work 把同一 `DatabaseSync` transaction 交给 RuntimeStore 与 AgentRunStore；RuntimeStore 仍唯一写 Event/Execution/Session，AgentRunStore 只写 `agent_runs`、`agent_run_decisions` 和 Run-specific constraint。AgentRunStore 不复制 Event mapper、Execution claim/retry 或 child admission SQL，RuntimeStore 也不增加 `agent_runs` column/transition 方法。
 
@@ -343,3 +402,13 @@ v73→v74 在单事务重建 external execution 表以分离当前预算与冻�
 `RunAdmission@1` 是独立 durable object：它在进程启动前拥有 request 幂等身份和不可变授权输入，不是 Event 或 status cache。`RunAdmissionStore` 唯一写 `<runtime>/runs/<run_d_hash>/admission.json`（mode 0600、读取上限 128 KiB、no-follow、schema/identity/digest 校验），内容为 intent、source ID、plan digest 与创建时间；生命周期状态只从 Command receipt、Subscription 和 Delivery 读取，不镜像写回文件，不新增 SQL table 或 schema migration。
 
 独占目录预留防止相同 request 重跑。预留文件和 source SQLite transaction 无法原子提交；中断留下 unknown/incomplete，不自动重建执行或清除预留。重复意图返回原 admission，不同意图拒绝；恢复先核对原 Run/source/命令回执。记录随该本地任务证据保留，本次不增加自动删除或迁移。Agent progress 文件仍是原有投影，两者在 Run 目录下使用不同文件，不能互相重建或覆盖。
+
+## Local Chat 搜索授权（文件状态）
+
+`<runtime>/web-search-access.json` 分类为 Owner 私有 **durable authorization state**，schemaVersion 1；`WebSearchAccessStore` 唯一写入，字段为 Agent principal、Owner principal、active/revoked、updatedAt。它独立于客户端历史授权，不复制既有 history grant，不新增 SQLite table 或 migration。文件 mode 0600、regular-file 与 1 MiB 上限检查、完整 schema/唯一 Agent 校验；同步 read-modify-write 加临时文件原子 rename 在单个 Console control 进程内串行完成。与 roster 不做跨资源事务：每次调用重新核验 source-owned roster/Session/Owner，失效时关闭；授权不从 Event 重建，缺文件默认关闭，移除参与者保留设置，随 Runtime 配置生命周期保留。调用明细使用原 Execution receipt，不新建搜索历史投影。
+
+Chat callback 复用 `deterministic_action_receipts` 保存来源 occurrence 与原始 Chat dispatch 的不可变绑定；canonical `chat.activation` 的 `source_external_id` 是去重依据，子 `chat.dispatch` execution 是负责人回合状态依据。等待/忙碌/失效从当前 Topic membership、Session 和 executions 派生，不维护镜像 queue/table；回传成功不等于业务验收成功。
+
+## Agent 执行过程日志（文件证据）
+
+`AgentInvocationLog@1` 是不可重放的 invocation 诊断证据，不是业务状态或新的 canonical Event。`infrastructure/files/agent-invocation-journal.ts` 唯一写入 JSONL 与有界旁路结果。每次调用独占文件，关闭后封存。Run、Step、Execution 与 provider Session 只作为来源引用；SQLite 原有对象继续持有执行状态与索引，不新增表或 migration。日志失败不触发业务重试。读取、压缩和 Run 整组保留规则见 [执行日志 runbook](../runbook/agent-invocation-logs.md)。

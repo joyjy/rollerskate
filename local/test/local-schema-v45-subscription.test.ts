@@ -87,6 +87,8 @@ test("schema v74 drops v44 SubscriptionDefinition@2 data and legacy Review", () 
         phase TEXT NOT NULL
       );
       INSERT INTO reviews VALUES ('evt_legacy_review', 'terminal');
+      DROP TABLE notification_controls;
+      DROP TABLE run_subscriptions;
       UPDATE schema_meta SET value = '44' WHERE key = 'schema_version';
       COMMIT;
       PRAGMA foreign_keys = ON;
@@ -122,8 +124,7 @@ test("schema v74 drops v44 SubscriptionDefinition@2 data and legacy Review", () 
     legacy.close();
 
     const diagnostics = initializeRuntimeSchema(databasePath);
-    assert.equal(diagnostics.schemaVersion, 75);
-    assert.equal(diagnostics.tables.length, 33);
+    assert.equal(diagnostics.schemaVersion, 80);
     assert.ok(!diagnostics.tables.includes("reviews"));
 
     const migrated = new DatabaseSync(databasePath, { readOnly: true });

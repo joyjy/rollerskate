@@ -122,12 +122,13 @@ test("schema v74 preserves v48 Delivery state and admits server-topic destinatio
         AT,
         AT
       );
+      legacy.exec("DROP TABLE notification_controls; DROP TABLE run_subscriptions");
       legacy.prepare(`UPDATE schema_meta SET value = '48' WHERE key = 'schema_version'`).run();
     } finally {
       legacy.close();
     }
 
-    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 75);
+    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 80);
     const migrated = new DatabaseSync(databasePath);
     try {
       assert.deepEqual({ ...migrated.prepare(`

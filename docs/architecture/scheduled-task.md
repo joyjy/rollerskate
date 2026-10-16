@@ -23,6 +23,8 @@ Steward Run target 只能由 `RunDecision@3(action=await_source)` 的 exact `sch
 
 ## Time contract
 
+Owner CLI 的 `schedule register-workflow` 由 `application/proactive/schedule-registration.ts` 拥有，输入 `ExternalWorkflowScheduleRegistration@1` 只声明 immutable source identity、active owner handle、时间策略与已登记 workflow ref。它通过 registry 编译 exact target，并在同一 source transaction 内调用既有 Schedule store 创建后暂停；不新增表或独立 registration 状态。同 ID 相同 owner/definition 幂等返回且不改状态，差异拒绝。启用与手动验收沿用现有 resume/run-now，不重新开放 legacy create/update。
+
 - `once-rfc3339-v1` 只接受带 `Z` 或明确 offset 的 RFC 3339 instant，持久化为 UTC。
 - `cron-v1` 固定五字段 `minute hour day-of-month month day-of-week`，支持数字、`*`、列表、闭区间与 `/step`；不支持 seconds、名称、macro 或 `L/W/#/?`。day-of-month 与 day-of-week 同时受限时使用传统 cron OR。
 - cron 必须保存 IANA timezone。重复小时只选择较早 offset 对应的 instant；缺失小时形成显式 missing occurrence，再经过 misfire policy。
@@ -63,6 +65,12 @@ next Scheduled Task phase
 ```
 
 Scheduled Task phase 与 Subscription、Matrix、Local Chat、Runtime phase 一样由 `core/loop.ts` 串行驱动。Capability 不拥有 timer loop；loop 的 pause/stop 与顶层异常隔离仍是唯一生命周期。
+
+`application/schedule/readiness.ts` 通过可选 admission gate 为 Agent target 和内置固定文案 Desktop reminder 提供电源、网络传输与 exact Desktop owner 检查。Capability 只消费 ready/defer/skip，等待持久化为既有 queued occurrence 和 decisionReason；probe 不新增状态表或循环。异步 probe 后重新核验 source revision、状态及 occurrence，暂停或取消优先。一次性 definition 已 completed 但尚有未准入 queued occurrence 时，仍可暂停或取消；resume 不生成新的时间 occurrence。
+
+macOS 电源读取由 `integrations/power/readiness.ts` 定义。固定 ioreg 探针通过共享 HostCallbackKernel 执行。Graphics/Audio capability 为正常唤醒，CPU-only 为 DarkWake。无法判定时等待；其他平台不增加电源限制。
+
+`application/proactive/desktop-reminder-registration.ts` 拥有 Owner 的 `DesktopReminderScheduleRegistration@1` 注册，将默认计划时间后 24 小时或显式 expiresAt 冻结到内置 action target，首次创建 paused。`desktop-reminder-action.ts` 在 source transaction 写入 single-attempt host Delivery；准入、执行与发送分别检查有效期。Schedule/action receipt 成功仅表示入队，传输终态仍由 Delivery/IPC receipt 拥有。历史提醒不迁移，发送结果未知不自动重放。使用方式见 [Scheduled Task runbook](../runbook/scheduled-tasks.md)。
 
 带 ExternalRef binding 的 occurrence 在任何 callback materialize 或 Run cycle activation 前，通过当前 Device authority 重读 active Integration binding，并让 placement Connector 做最多 16 KiB 的 exact revision read。authority/revision/profile 不匹配把该 ScheduleOccurrence 持久标成 skipped；guard/read 不可用标成 failed。两者都不创建 callback、cycle、外写或新 Event，进程重启也不会再次处理这个 terminal occurrence。
 

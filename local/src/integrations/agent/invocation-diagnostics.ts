@@ -26,13 +26,14 @@ export interface ProviderInvocationDiagnostics {
 export function invocationDiagnostics(
   event: AgentInputEvent | ChatDispatchEvent,
   receipt: InvocationTimingReceipt,
-  provider: ProviderInvocationDiagnostics = {}
+  provider: ProviderInvocationDiagnostics = {},
+  effectivePrompt = runtimeAgentEventPrompt(event)
 ): AgentInvocationDiagnostics {
   const started = Date.parse(receipt.startedAt);
   const completed = Date.parse(receipt.completedAt);
   return {
     schemaVersion: "AgentInvocationDiagnostics@1",
-    effectivePrompt: bounded(runtimeAgentEventPrompt(event), 32_768),
+    effectivePrompt: bounded(effectivePrompt, 32_768),
     startedAt: receipt.startedAt,
     completedAt: receipt.completedAt,
     durationMilliseconds: Math.max(0, completed - started),
@@ -139,6 +140,7 @@ export function agentInvocationFailure(input: {
   return {
     ...progress,
     schemaVersion: "AgentInvocationFailure@1",
+    ...(input.trace.rejectedBeforeWork === true ? {rejectedBeforeWork: true as const} : {}),
     failedAt: input.trace.failedAt,
     reason: input.trace.reason,
     ...(input.trace.totalTimeoutMilliseconds === undefined

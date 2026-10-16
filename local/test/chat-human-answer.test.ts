@@ -1,3 +1,5 @@
+import { answerStewardRunFromConsole } from "../src/application/chat/human-control.js";
+import { withConsoleStewardApi } from "./helpers/console-steward-api.js";
 import { answerRunHumanInTransaction } from "../src/application/steward/human-input.js";
 import assert from "node:assert/strict";
 import { mkdtempSync,rmSync } from "node:fs";
@@ -19,15 +21,16 @@ import { LocalChatStore } from "../src/infrastructure/sqlite/chat-store.js";
 import { openRuntimeDatabase } from "../src/infrastructure/sqlite/database.js";
 import { chatPromptResourceId } from "../src/core/chat/model.js";
 
-for (const scenario of ["resume","initial","terminal","cancel","expire","suspend","lost-session"] as const) test(`Chat human answer ${scenario} preserves the exact Run checkpoint`,async()=>{
+for (const scenario of ["resume","initial","terminal","cancel","expire","suspend","lost-session","console","console-rollback","console-cancel"] as const) test(`Chat human answer ${scenario} preserves the exact Run checkpoint`,async()=>{
   const repoRoot=resolve(dirname(fileURLToPath(import.meta.url)),"../../..");
   const runtimeDirectory=mkdtempSync(join(tmpdir(),"rs-human-answer-"));
   const options={runtimeDirectory};
   const lead=addLocalAgent(repoRoot,"codex","codex",options);
+  const participants = [lead,...(scenario.startsWith("console") ? [addLocalAgent(repoRoot,"bystander","codex",options)] : [])];
   let database=openRuntimeDatabase(join(runtimeDirectory,"runtime.db"));
   let runtime=new RuntimeStore(database),runs=new AgentRunStore(database),chat=new LocalChatStore(database);
   const now=()=>new Date().toISOString();
-  let chatHandler=new ChatHandler({store:runtime,chat,listAgents:()=>[lead]});
+  let chatHandler=new ChatHandler({store:runtime,chat,listAgents:()=>participants});
   function ownerTurn(body:string) {
     const message=postLocalChatMessage(repoRoot,body,options).message;
     const attention=runtime.claimDueExecutions(100,now()).find(e=>e.eventId===message.eventId)!;
@@ -87,11 +90,90 @@ for (const scenario of ["resume","initial","terminal","cancel","expire","suspend
     chat.close();runs.close();runtime.close();database.close();
     database=openRuntimeDatabase(join(runtimeDirectory,"runtime.db"));
     runtime=new RuntimeStore(database);runs=new AgentRunStore(database);chat=new LocalChatStore(database);
-    chatHandler=new ChatHandler({store:runtime,chat,listAgents:()=>[lead]});
+    chatHandler=new ChatHandler({store:runtime,chat,listAgents:()=>participants});
     manifest=new StewardModule({runtime,runs}).manifest();
     agents=new AgentHandler({store:runtime,adapters:new Map([[lead.principalId,adapter]]),executionGuards:manifest.executionGuards});
     results=new ResultHandler(runtime,manifest.resultContinuations);
     assert.equal(inspectStewardWork(repoRoot,runId,runtimeDirectory).humanQuestion?.questionId,waiting.humanQuestion!.questionId);
+
+    if (scenario.startsWith("console")) {
+      const question = waiting.humanQuestion!;
+      const originalSession = runtime.sessionForRunAgent(runId,lead.principalId)!;
+      const ownerMessages = () => database.prepare("SELECT event_id FROM events WHERE type = 'chat.message' AND json_extract(payload_json, '$.sender.kind') = 'owner'")
+        .all() as {event_id:string}[];
+      const before = ownerMessages();
+      const projectionBefore = runs.requireProjection(runId);
+      const rootEventsBefore = runtime.eventsForRoot(projectionBefore.rootEventId).length;
+      const body = {questionId:question.questionId,expectedVersion:question.runVersion,answer:"选择 A，继续。"};
+      const path = `/api/runs/${runId}`;
+      await withConsoleStewardApi(repoRoot,runtimeDirectory,async post => {
+        const missingMarker = await post(`${path}/answer`,body,"untrusted");
+        assert.equal(missingMarker.status,403);
+        const stale = await post(`${path}/answer`,{...body,expectedVersion:question.runVersion+1});
+        assert.equal(stale.status,400);assert.match(String(stale.body.error),/version changed/);
+        const wrongQuestion = await post(`${path}/answer`,{...body,questionId:"evt_other_question"});
+        assert.equal(wrongQuestion.status,400);assert.match(String(wrongQuestion.body.error),/no longer pending/);
+        assert.deepEqual(ownerMessages(),before);
+        assert.deepEqual(runs.requireProjection(runId),projectionBefore);
+        if (scenario === "console-cancel") {
+          const missingVersion = await post(`${path}/cancel`,{});
+          assert.equal(missingVersion.status,400);assert.match(String(missingVersion.body.error),/expectedVersion/);
+          const staleCancel = await post(`${path}/cancel`,{expectedVersion:question.runVersion+1});
+          assert.equal(staleCancel.status,400);assert.match(String(staleCancel.body.error),/version/i);
+          assert.deepEqual(runs.requireProjection(runId),projectionBefore);
+          assert.equal((await post(`${path}/cancel`,{expectedVersion:question.runVersion})).status,200);
+          assert.equal(runs.requireProjection(runId).status,"cancelled");
+          assert.deepEqual(ownerMessages(),before);
+          return;
+        }
+        if (scenario === "console-rollback") {
+          // A real domain failure occurs after the Console adapter inserts the Owner message.
+          suspendLocalAgent(repoRoot,lead.principalId,options);
+          assert.throws(() => answerStewardRunFromConsole(repoRoot,runId,question.questionId,
+            question.runVersion,body.answer,runtimeDirectory),/not active/);
+          const failed = await post(`${path}/answer`,body);
+          assert.equal(failed.status,400);assert.match(String(failed.body.error),/not active/);
+          assert.deepEqual(ownerMessages(),before,"the Owner message insert must roll back with continuation failure");
+          assert.deepEqual(runs.requireProjection(runId),projectionBefore);
+          assert.equal(runtime.eventsForRoot(projectionBefore.rootEventId).length,rootEventsBefore);
+          assert.equal(inspectStewardWork(repoRoot,runId,runtimeDirectory).humanQuestion?.status,"pending");
+          return;
+        }
+        const accepted = await post(`${path}/answer`,body);
+        assert.equal(accepted.status,200,JSON.stringify(accepted.body));
+        assert.equal(accepted.body.status,"accepted");
+        assert.equal(accepted.body.runId,runId);
+        const continuation = runtime.event(String(accepted.body.eventId));
+        assert.equal(continuation?.type,"agent.request");
+        if (continuation?.type !== "agent.request") throw new Error("Expected Run continuation");
+        assert.equal(continuation.sessionId,originalSession.sessionId);
+        assert.equal(continuation.agentId,lead.principalId);
+        assert.equal(continuation.runContext?.runId,runId);
+        assert.deepEqual(runs.requireProjection(runId).checkpoint,checkpoint);
+        const added = ownerMessages().filter(row=>!before.some(old=>old.event_id===row.event_id));
+        assert.equal(added.length,1);
+        const message = runtime.event(added[0]!.event_id);
+        assert.equal(message?.type,"chat.message");
+        if (message?.type !== "chat.message") throw new Error("Expected Owner answer");
+        assert.equal(message.body,body.answer);
+        assert.equal(message.replyToEventId,first.event.sourceMessageEventId);
+        assert.deepEqual(message.targets,[{principalId:lead.principalId,handleSnapshot:lead.handle}]);
+        assert.match(continuation.prompt,new RegExp(message.eventId));
+        const repeated = await post(`${path}/answer`,body);
+        assert.equal(repeated.status,400);
+        assert.equal(ownerMessages().length,before.length+1,"a stale repeat creates no second Owner answer");
+        await executeRunTurn();
+        assert.equal(runs.requireProjection(runId).status,"succeeded");
+        assert.equal(workerCalls,1);assert.equal(orchestratorCalls,3);
+        const attention = runtime.executionForEvent(message.eventId)!;
+        const dispatchIds = chatHandler.handle(attention,now());
+        assert.equal(dispatchIds.length,1,"the Owner answer does not broadcast to the bystander");
+        const responsibleDispatch = runtime.event(dispatchIds[0]!);
+        assert.equal(responsibleDispatch?.type,"chat.dispatch");
+        if (responsibleDispatch?.type === "chat.dispatch") assert.equal(responsibleDispatch.agentId,lead.principalId);
+      });
+      return;
+    }
 
     const returned=admitChatWorkReturns({repoRoot,runtimeDirectory,database,runtime}).eventIds;
     assert.equal(returned.length,1);

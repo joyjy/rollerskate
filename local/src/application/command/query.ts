@@ -1,4 +1,4 @@
-import { readFileSync, statSync } from "node:fs";
+import { lstatSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { assertCommandId, readCommandReceipt } from "../../infrastructure/command/receipt.js";
 import { runtimePaths } from "../../infrastructure/runtime/config.js";
@@ -6,7 +6,14 @@ import { runtimePaths } from "../../infrastructure/runtime/config.js";
 export function commandCompletion(receiptRoot: string, commandId: string) {
   assertCommandId(commandId);
   const directory = join(receiptRoot, commandId);
+  // Metadata only; unchanged or missing output is not evidence of business failure.
+  let logProgress: {bytes:number;modifiedAt:string} | undefined;
+  try {
+    const info = lstatSync(join(directory, "output.log"));
+    if (info.isFile()) logProgress = {bytes:info.size,modifiedAt:info.mtime.toISOString()};
+  } catch { /* A command may not have produced output yet. */ }
   return { ...readCommandReceipt(directory, commandId),
+    ...(logProgress === undefined ? {} : {logProgress}),
     logPath: join(directory, "output.log"), receiptPath: join(directory, "receipt.json") };
 }
 

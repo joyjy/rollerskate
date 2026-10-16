@@ -9,6 +9,7 @@ const LOCAL_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 test("public work handlers admit only RunIntent-backed Steward Runs", () => {
   const stewardApi = source("src/entrypoints/console/steward-api.ts");
   const chatControl = source("src/application/chat/control.ts");
+  const proposalControl = source("src/application/chat/run-proposal-control.ts");
   const workRequest = source("src/application/work-request/control.ts");
   const scheduleCli = source("src/entrypoints/cli/schedule.ts");
   const subscriptionCli = source("src/entrypoints/cli/subscription.ts");
@@ -16,12 +17,13 @@ test("public work handlers admit only RunIntent-backed Steward Runs", () => {
 
   assert.match(stewardApi, /startStewardRunFromIntent/);
   assert.doesNotMatch(stewardApi, /\bstartStewardRun\s*\(/);
-  assert.match(chatControl, /startStewardRunFromIntent/);
+  assert.doesNotMatch(chatControl, /startStewardRunFromIntent/);
+  assert.match(proposalControl, /startStewardRunFromAdmissionInTransaction/);
   assert.doesNotMatch(chatControl, /\bstartStewardRun\s*\(/);
   assert.match(workRequest, /startStewardRunFromOwnerIntent/);
   assert.doesNotMatch(workRequest, /\bstartStewardRun\s*\(/);
 
-  for (const publicSource of [stewardApi, chatControl, workRequest]) {
+  for (const publicSource of [stewardApi, chatControl, proposalControl, workRequest]) {
     assert.doesNotMatch(publicSource, /ProactiveCallbackRuntime/);
     assert.doesNotMatch(publicSource, /\bcreateSchedule\s*\(/);
     assert.doesNotMatch(publicSource, /\bregisterSubscription\s*\(/);

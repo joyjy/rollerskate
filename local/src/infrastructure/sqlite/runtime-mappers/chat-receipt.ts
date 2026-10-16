@@ -60,6 +60,7 @@ export interface ChatDecisionReceipt {
   readonly proposal?: ChatRunProposalDraft;
   readonly presenceTransition?: ChatPresence;
   readonly replyEventId?: string;
+  readonly replySuppressedReason?: string;
   readonly createdAt: string;
   readonly profileRevisions?: {
     readonly schema: "ChatProfileRevisionReceipt@1";

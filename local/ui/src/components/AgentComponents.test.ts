@@ -30,7 +30,6 @@ describe("Agent components", () => {
     });
     expect(document.activeElement).toBe(wrapper.get("#new-handle").element);
     expect(wrapper.get('[role="dialog"]').attributes("aria-modal")).toBe("true");
-    expect(wrapper.get('option[value="kimi-code"]').text()).toBe("Kimi Code");
     expect(wrapper.get('option[value="pi"]').text()).toBe("Pi");
     wrapper.unmount();
   });

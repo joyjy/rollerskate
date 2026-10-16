@@ -1,13 +1,18 @@
-import { listChatWork } from "./work-query.js";
+import { runtimePaths } from "../../infrastructure/runtime/config.js";
+import { openRuntimeDatabaseReadOnly } from "../../infrastructure/sqlite/database.js";
+import { queryJoinedChatHistory, type ChatHistoryQuery } from "./history-query.js";
+import { readChatCallback, agentRunReturnView } from "./callback-query.js";
+import { listChatWork, deterministicChatWork, requireChatRunOrigin } from "./work-query.js";
 import { stewardWorkView } from "../steward/work-query.js";
 import { eventTrace } from "../event/query.js";
-import { inspectStewardRunView } from "../steward/query.js";
+import { inspectRun } from "../run/query.js";
 import { subscriptionHistoryByReference } from "../subscription/query.js";
 import { redact } from "../../integrations/activity/provider-source.js";
 import type { ChatReadToolContext } from "./read-tool-policy.js";
 
-export type ChatReadQuery =
-  | { readonly tool: "list_chat_work"; readonly beforeDispatchEventId?: string; readonly limit: number }
+export type ChatReadQuery = ChatHistoryQuery
+  | {readonly tool: "get_chat_callback"; readonly receiptId: string}
+  | { readonly tool: "list_chat_work"; readonly beforeDispatchEventId?: string; readonly beforeRunId?: string; readonly limit: number }
   | { readonly tool: "subscription_history"; readonly subscriptionId: string; readonly limit: number }
   | { readonly tool: "get_run"; readonly runId: string }
   | { readonly tool: "event_trace"; readonly eventId: string };
@@ -16,6 +21,8 @@ export function queryChatReadTool(
   context: Pick<ChatReadToolContext, "repoRoot" | "runtimeDirectory" | "dispatchEventId">,
   query: ChatReadQuery
 ): unknown {
+  if (query.tool === "search_chat_history" || query.tool === "get_chat_message") return queryJoinedChatHistory(context,query);
+  if (query.tool === "get_chat_callback") return readChatCallback(context, query.receiptId);
   if (query.tool === "list_chat_work") return listChatWork(context, query);
   if (query.tool === "subscription_history") {
     return subscriptionHistoryView(context, query.subscriptionId, query.limit);
@@ -63,18 +70,37 @@ function subscriptionHistoryView(
 }
 
 function runEvidenceView(
-  context: Pick<ChatReadToolContext, "repoRoot" | "runtimeDirectory">,
+  context: Pick<ChatReadToolContext, "repoRoot" | "runtimeDirectory" | "dispatchEventId">,
   runId: string
 ): unknown {
-  const view = inspectStewardRunView(
-    context.repoRoot,
-    runId,
-    context.runtimeDirectory,
-    { inspectCurrentWorkspaceRevision: false }
-  );
+  const originDispatchId = context.dispatchEventId === undefined ? undefined : requireChatRunOrigin(context, runId);
+  const view = inspectRun(context.repoRoot, runId, context.runtimeDirectory);
+  if ("kind" in view) {
+    const execution = view.execution;
+    const source = view.source;
+    return {
+      schemaVersion: "ChatRunEvidence@1",
+      work: deterministicChatWork(view),
+      summary: {runId:view.runId, kind:view.kind, status:view.status, result:view.result,
+        title:safeText(view.title), createdAt:view.createdAt, updatedAt:view.updatedAt},
+      execution: execution === null ? null : {commandId:execution.commandId, state:execution.state,
+        outcome:execution.outcome ?? null, exitCode:execution.exitCode ?? null, signal:execution.signal ?? null,
+        startedAt:execution.startedAt, completedAt:execution.completedAt ?? null, error:safeText(execution.error ?? null)},
+      source: source === null ? null : {sourceId:view.admission.sourceId, kind:source.kind, status:source.status,
+        updatedAt:source.updatedAt, latestError:safeText(source.latestError)},
+      // Raw command, plugin input, observation payload and filesystem paths stay with their owners.
+      callbacks: (view.chatCallbacks ?? []).slice(0,20).map(callback => ({receiptId:callback.receipt.receiptId,returnState:callback.returnState})),
+      errors: view.errors.length ? ["Some Run evidence is unavailable; inspect the exact Run through the Owner interface."] : []
+    };
+  }
+  const work = stewardWorkView(view);
+  const returnState = originDispatchId === undefined ? undefined : (() => {
+    const database = openRuntimeDatabaseReadOnly(runtimePaths(context.repoRoot,context.runtimeDirectory).database);
+    try {return agentRunReturnView(database,originDispatchId,work);} finally {database.close();}
+  })();
   return {
     schemaVersion: "ChatRunEvidence@1",
-    work: stewardWorkView(view),
+    work: {...work,...(returnState === undefined ? {} : {returnState})},
     summary: {
       runId: view.summary.runId,
       rootEventId: view.summary.rootEventId,

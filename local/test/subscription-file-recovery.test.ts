@@ -6,6 +6,8 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
 import { localId } from "../src/core/id.js";
+import { resumeSubscriptionWithReadback } from "../src/application/subscription/control.js";
+import { readSubscriptionResumeOutcome } from "../src/application/subscription/resume-query.js";
 import { runSubscriptionCommand } from "../src/entrypoints/cli/subscription.js";
 import { ContinuousSubscriptionStore } from "../src/capabilities/subscription/continuous-store.js";
 import { ExternalWorkflowStore } from "../src/infrastructure/proactive/external-workflow-store.js";
@@ -82,6 +84,24 @@ function fixture() {
   return { root, runtime, database, workflows, subscriptions, id, source, executable, cli, observe, run, request, recover, unknown,
     close() { subscriptions.close(); database.close(); rmSync(root, { recursive: true, force: true }); } };
 }
+
+test("resume receipt remains queryable when the next workflow blocks the subscription", async () => {
+  const f = fixture();
+  try {
+    f.subscriptions.setStatus(f.id, "pause");
+    const accepted = resumeSubscriptionWithReadback(f.root, f.id, f.runtime);
+    assert.equal(accepted.receipt.subscriptionId, f.id);
+    assert.equal(accepted.readback.outcome, "currently_active");
+    assert.equal(accepted.readback.final, false);
+
+    f.observe("after-resume");
+    await f.run();
+    const readback = readSubscriptionResumeOutcome(f.root, accepted.receipt, f.runtime);
+    assert.equal(readback.outcome, "blocked");
+    assert.equal(readback.final, true);
+    assert.match(readback.reason ?? "", /failed|exit|workflow/u);
+  } finally { f.close(); }
+});
 
 test("public file recovery retries one exact execution, preserves failed receipt, and is durable/idempotent", async () => {
   const f = fixture();

@@ -1,3 +1,5 @@
+import { guardStewardResultContinuation } from "../src/application/steward/result-failure.js";
+import { resolveStewardRunPush } from "../src/application/steward/result-destination.js";
 import { inspectStewardWork } from "../src/application/steward/work-query.js";
 import { stewardStatsView } from "../src/application/steward/stats-query.js";
 import assert from "node:assert/strict";
@@ -47,7 +49,7 @@ test("RunDecision@6 await_source and source cycle execute through the Runtime lo
     fixture.runtimeDirectory, "2026-08-26T01:00:00.000Z");
   const outputs = [
     JSON.stringify(awaitScheduleDecision(1)),
-    JSON.stringify(finishDecision(3, "cycle"))
+    `\`\`\`json\n${JSON.stringify(finishDecision(3, "cycle"))}\n\`\`\``
   ];
   const prompts: string[] = [];
   let invocation = 0;
@@ -153,6 +155,7 @@ test("standalone read-only Steward retries once and keeps exact Owner recovery",
     fixture.runtimeDirectory, "2026-08-26T01:05:00.000Z");
   let invocation = 0;
   const prompts: string[] = [];
+  const malformed = JSON.stringify(finishDecision(1, "run")).slice(0, -1);
   const database = openRuntimeDatabase(fixture.paths.database);
   const runtime = new RuntimeStore(database);
   const runs = new AgentRunStore(database);
@@ -163,11 +166,18 @@ test("standalone read-only Steward retries once and keeps exact Owner recovery",
     async invoke(input) {
       invocation += 1;
       prompts.push(input.event.prompt);
-      if (invocation === 2) throw new Error(`standalone failure ${invocation}`);
+      if (invocation === 1) return {
+        providerSessionId: "standalone-recovered",
+        outcome: { kind: "message", body: malformed }
+      };
+      if (invocation === 2) return {
+        providerSessionId: "standalone-recovered",
+        outcome: { kind: "message", body: malformed }
+      };
       return {
         providerSessionId: "standalone-recovered",
         outcome: { kind: "message", body: JSON.stringify({
-          ...finishDecision(invocation === 1 ? 999 : 2, "run"),
+          ...finishDecision(2, "run"),
           finish: { ...finishDecision(2, "run").finish, outputs: [{
             id: "report", title: "Report", contentType: "application/json",
             schemaVersion: "ExampleReport@1", value: { finding: "recovered" }
@@ -198,11 +208,13 @@ test("standalone read-only Steward retries once and keeps exact Owner recovery",
     assert.equal(awaiting.version, 2);
     assert.match(prompts[0]!, /Current Run version: 1/);
     assert.match(prompts[1]!, /Current Run version: 2/);
+    assert.match(prompts[1]!, /JSON syntax error at character/);
+    assert.ok(prompts[1]!.includes(JSON.stringify(malformed)));
     const fallback = inspectStewardRunView(fixture.repo, started.run.runId,
       fixture.runtimeDirectory).intervention;
     assert.equal(fallback?.kind, "manual_fallback");
     assert.equal(fallback.runVersion, awaiting.version);
-    assert.match(fallback.reason, /standalone failure 2/);
+    assert.match(fallback.reason, /JSON syntax error at character/);
     assert.deepEqual(fallback.allowedActions, ["retry_orchestrator", "decide", "cancel"]);
 
     const work = inspectStewardWork(fixture.repo, started.run.runId, fixture.runtimeDirectory);
@@ -210,6 +222,8 @@ test("standalone read-only Steward retries once and keeps exact Owner recovery",
     assert.equal(work.terminal, false);
     assert.equal(work.attentionReason, fallback.reason);
 
+    assert.throws(() => retryStewardOrchestrator(fixture.repo, started.run.runId,
+      "stale-recovery", fixture.runtimeDirectory, "2026-08-26T01:06:00.000Z", awaiting.version + 1), /version changed/);
     const recovered = retryStewardOrchestrator(
       fixture.repo,
       started.run.runId,
@@ -233,7 +247,11 @@ test("standalone read-only Steward retries once and keeps exact Owner recovery",
     results.handle(claim(runtime, "result", "2026-08-26T01:06:02.000Z"),
       "2026-08-26T01:06:02.000Z");
     assert.match(prompts[2]!, /Current Run version: 2/);
+    assert.match(prompts[2]!, /Repair syntax only/);
+    assert.ok(prompts[2]!.includes(JSON.stringify(malformed)));
     assert.equal(runs.requireProjection(started.run.runId).status, "succeeded");
+    assert.ok(inspectStewardRunView(fixture.repo, started.run.runId, fixture.runtimeDirectory)
+      .steps.some((step) => step.result?.schemaVersion === "RunDecision@6"));
     const outputs = inspectStewardRunView(fixture.repo, started.run.runId,
       fixture.runtimeDirectory).outputFolders.flatMap((folder) => folder.outputs);
     const report = outputs.filter((output) => output.id === "report");
@@ -262,6 +280,64 @@ test("standalone read-only Steward retries once and keeps exact Owner recovery",
     runtime.close();
     database.close();
     fixture.close();
+  }
+});
+
+test("syntax correction retries preserve the Session and still enforce the decision contract", async () => {
+  for (const invalidContract of [false, true]) {
+    const fixture = setup();
+    const started = startStewardRunFromIntent(fixture.repo, intent("syntax-repair"),
+      fixture.runtimeDirectory, "2026-08-26T01:07:00.000Z");
+    const database = openRuntimeDatabase(fixture.paths.database);
+    const runtime = new RuntimeStore(database);
+    const runs = new AgentRunStore(database);
+    const manifest = new StewardModule({ runs, runtime }).manifest();
+    const report = { id: "report", title: "Report", contentType: "application/json",
+      schemaVersion: "ExampleReport@1", value: { finding: "unchanged" } };
+    const original = { ...finishDecision(1, "run"),
+      finish: { ...finishDecision(1, "run").finish, outputs: [report] } };
+    const malformed = `Decision:\n${JSON.stringify(original).slice(0, -1)}`;
+    let calls = 0;
+    const adapter: RuntimeAgentAdapter = {
+      adapterId: "syntax-repair", workspace: fixture.paths.workspace,
+      async invoke(input) {
+        calls += 1;
+        if (calls === 2) {
+          assert.equal(input.providerSessionId, "syntax-session");
+          assert.match(input.event.prompt, /Repair syntax only/);
+          assert.match(input.event.prompt, /JSON syntax error at character/);
+          assert.ok(input.event.prompt.includes(JSON.stringify(malformed)));
+        }
+        const repaired = { ...original, expectedRunVersion: 2,
+          ...(invalidContract ? { unexpected: true } : {}) };
+        return { providerSessionId: "syntax-session", outcome: { kind: "message",
+          body: calls === 1 ? malformed : JSON.stringify(repaired) } };
+      }
+    };
+    const agents = new AgentHandler({ store: runtime,
+      adapters: new Map([[started.run.stewardAgentId, adapter]]),
+      executionGuards: manifest.executionGuards });
+    const results = new ResultHandler(runtime, manifest.resultContinuations);
+    try {
+      for (const second of [1, 3]) {
+        const agentAt = `2026-08-26T01:07:0${second}.000Z`;
+        const resultAt = `2026-08-26T01:07:0${second + 1}.000Z`;
+        await agents.handle(claim(runtime, "agent", agentAt), agentAt);
+        results.handle(claim(runtime, "result", resultAt), resultAt);
+      }
+      assert.equal(calls, 2);
+      const view = inspectStewardRunView(fixture.repo, started.run.runId, fixture.runtimeDirectory);
+      assert.equal(view.projection.status, invalidContract ? "awaiting_orchestrator" : "succeeded");
+      const outputs = view.outputFolders.flatMap((folder) => folder.outputs);
+      if (invalidContract) {
+        assert.match(view.intervention!.reason, /unknown field/);
+        assert.equal(outputs.length, 0);
+      } else {
+        assert.deepEqual(outputs.find((output) => output.id === "report")?.value, report.value);
+      }
+    } finally {
+      runs.close(); runtime.close(); database.close(); fixture.close();
+    }
   }
 });
 
@@ -841,3 +917,43 @@ function claim(
   }
   return execution;
 }
+
+
+test("source-cycle result exhaustion retains its cycle identity for Desktop delivery", async () => {
+  const fixture = setup(); const database = openRuntimeDatabase(fixture.paths.database);
+  const runtime = new RuntimeStore(database); const runs = new AgentRunStore(database);
+  const at = (minute: number, second = 0) => `2026-08-27T09:0${minute}:${String(second).padStart(2, "0")}.000Z`;
+  try {
+    const destinationId = runtimeId("dst");
+    const address = {threadId: "01a13915-bb1c-7c51-bfd8-ed88bb2ccd67"};
+    runtime.enqueueHostDelivery({originId: "register-desktop-cycle", destinationId, kind: "codex-desktop", address, payload: {body: "fixture"}, at: at(0)});
+    const started = startStewardRunFromIntent(fixture.repo, {...intent("cycle-result-failure"), resultDestinationRef: `destination:${destinationId}`}, fixture.runtimeDirectory, at(0,1));
+    const bound = runtime.withImmediateTransaction(() => applyRunDecisionInTransaction({runtime, runs,
+      run: runs.requireProjection(started.run.runId), decision: awaitScheduleDecision(1), requestId: "bind-cycle-failure",
+      sourceKind: "handler", bindSource: ({run}) => scheduleBinding(run), at: at(0,2)}));
+    const active = runtime.withImmediateTransaction(() => activateRunSourceOccurrenceInTransaction({runtime, runs, runId: started.run.runId,
+      envelope: occurrenceEnvelope(bound.run, "failed-cycle", "revision-failed-cycle", at(1)), at: at(1)}));
+    const request = runtime.event(active.orchestratorEventId)!;
+    if (request.type !== "agent.request") throw new Error("Expected source request");
+    const agents = new AgentHandler({store: runtime, adapters: new Map([[request.agentId, {
+      adapterId: "cycle-failure-test", workspace: fixture.paths.workspace, async invoke() {
+        return {providerSessionId: "cycle-test", outcome: {kind: "message" as const, body: JSON.stringify(finishDecision(active.run.version, "cycle"))}};
+      }
+    }]])});
+    const execution = runtime.claimDueExecutions(20, at(1,1)).find(e => e.executionId === active.orchestratorExecutionId)!;
+    await agents.handle(execution, at(1,1));
+    const resultExecution = runtime.claimDueExecutions(20, at(1,2)).find(e => e.handler === "result")!;
+    const result = runtime.event(resultExecution.eventId)!;
+    if (result.type !== "agent.result") throw new Error("Expected result");
+    const guarded = guardStewardResultContinuation({resultContractId: request.runContext!.resultContractId,
+      handleAgentResult() {throw new Error("cycle continuation unavailable");}}, runs, runtime);
+    assert.throws(() => guarded.handleAgentResult({...resultExecution, attemptCount: resultExecution.maxAttempts}, result, request, at(1,2)), /cycle continuation unavailable/);
+    assert.equal(runs.requireProjection(started.run.runId).status, "awaiting_source");
+    assert.equal(runs.cycle(active.cycle.cycleId)?.status, "failed");
+    const delivery = runtime.deliveriesForDestinationKind("codex-desktop").find(d => d.origin.id.startsWith("steward-run:"))!;
+    assert.equal(delivery.origin.id, `steward-run:${started.run.runId}:${active.cycle.cycleId}:terminal`);
+    const resolved = resolveStewardRunPush(runs, {delivery, destination: runtime.destination(destinationId)!});
+    assert.match(resolved!.body, /cycle continuation unavailable/);
+    assert.equal(resolved!.source.cycleId, active.cycle.cycleId);
+  } finally {runs.close();runtime.close();database.close();fixture.close();}
+});

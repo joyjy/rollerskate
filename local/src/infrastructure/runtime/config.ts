@@ -62,6 +62,7 @@ export interface RuntimePaths {
   readonly matrixPolicy: string;
   readonly activityAccess: string;
   readonly clientHistoryAccess: string;
+  readonly webSearchAccess: string;
   readonly topicInbox: string;
   readonly subscriptionPlugins: string;
   readonly externalWorkflows: string;
@@ -112,6 +113,7 @@ export function runtimePaths(repoRoot: string, configuredRuntimeDirectory?: stri
     matrixPolicy: join(runtimeDirectory, "matrix-policy.json"),
     activityAccess: join(runtimeDirectory, "activity-access.json"),
     clientHistoryAccess: join(runtimeDirectory, "client-history-access.json"),
+    webSearchAccess: join(runtimeDirectory, "web-search-access.json"),
     topicInbox: join(runtimeDirectory, "topic-inbox.json"),
     subscriptionPlugins: join(runtimeDirectory, "subscription-plugins.json"),
     externalWorkflows: join(runtimeDirectory, "external-workflows.json"),

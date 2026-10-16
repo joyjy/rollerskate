@@ -1,9 +1,11 @@
+import { forkWorkspace, type ForkWorkspaceInput } from "../workspace/control.js";
+import { chatTaskSpan } from "./work-origin.js";
+import { existingChatTask } from "./responsibility.js";
 import type { ChatMessageEvent } from "../../core/event/model.js";
 import { RuntimeStore } from "../../core/runtime/store.js";
 import { openRuntimeDatabase } from "../../infrastructure/sqlite/database.js";
 import { LocalFoundationStore } from "../../infrastructure/sqlite/foundation-store.js";
 import { runtimePaths } from "../../infrastructure/runtime/config.js";
-import type { LocalAgent } from "../../modules/foundation/model.js";
 import type { LocalControlOptions } from "../agent/control.js";
 import {
   startStewardRunFromAdmissionInTransaction,
@@ -12,7 +14,7 @@ import {
 import {
   projectChatRunProposal,
   type ChatRunWorkspaceSelection,
-  type ChatRunProposalProjection,
+  type ChatRunProposalResolution,
   type ChatRunProposalView
 } from "./run-proposal.js";
 
@@ -106,7 +108,8 @@ export function preflightLocalChatRunProposal(
   dispatchEventId: string,
   revision: string,
   workspaceSelection: ChatRunWorkspaceSelection,
-  options: LocalControlOptions = {}
+  options: LocalControlOptions = {},
+  resolution?: ChatRunProposalResolution
 ): PreflightLocalChatRunProposalReceipt {
   if (revision.trim() === "") throw new Error("Run proposal revision is required");
   const database = openRuntimeDatabase(
@@ -143,7 +146,8 @@ export function preflightLocalChatRunProposal(
     const selected = projectChatRunProposal({
       ...projectionInput,
       dispatchEventId,
-      workspaceSelection
+      workspaceSelection,
+      ...(resolution === undefined ? {} : {resolution})
     });
     if (selected === undefined) {
       throw new Error("Current Run proposal is not available for this message");
@@ -166,7 +170,8 @@ export function confirmLocalChatRunProposal(
   dispatchEventId: string,
   revision: string,
   options: LocalControlOptions = {},
-  workspaceSelection?: ChatRunWorkspaceSelection
+  workspaceSelection?: ChatRunWorkspaceSelection,
+  resolution?: ChatRunProposalResolution
 ): ConfirmLocalChatRunProposalReceipt {
   if (revision.trim() === "") throw new Error("Run proposal revision is required");
   const database = openRuntimeDatabase(
@@ -188,7 +193,8 @@ export function confirmLocalChatRunProposal(
         message: event,
         agents: foundation.listAgents(),
         dispatchEventId,
-        ...(workspaceSelection === undefined ? {} : { workspaceSelection })
+        ...(workspaceSelection === undefined ? {} : { workspaceSelection }),
+        ...(resolution === undefined ? {} : {resolution})
       });
       if (projection === undefined) {
         throw new Error("Current Run proposal is not available for this message");
@@ -202,6 +208,12 @@ export function confirmLocalChatRunProposal(
       if (projection.admission === undefined ||
         (!projection.view.ready && projection.view.linkedRun === undefined)) {
         throw new Error(projection.view.blocker?.message ?? "Current Run proposal is blocked");
+      }
+      const taskSource = resolution?.taskSourceMessageEventId === undefined ? event
+        : requireProposalSource(runtime, resolution.taskSourceMessageEventId, local.topicId);
+      const existing = existingChatTask(database, taskSource.eventId, chatTaskSpan(taskSource.body, projection.view.finalForm.taskQuote));
+      if (existing && existing.runId !== projection.view.linkedRun?.runId) {
+        throw new Error(`This task already has responsible Run ${existing.runId}; continue that task`);
       }
       const started = startStewardRunFromAdmissionInTransaction(
         projection.admission,
@@ -230,30 +242,15 @@ function requireProposalSource(
   return event;
 }
 
-export function inspectCurrentChatRunProposal(
-  repoRoot: string,
-  message: ChatMessageEvent,
-  agents: readonly LocalAgent[],
-  options: LocalControlOptions = {}
-): ChatRunProposalProjection | undefined {
-  const database = openRuntimeDatabase(
-    runtimePaths(repoRoot, options.runtimeDirectory).database
-  );
-  try {
-    return projectChatRunProposal({
-      repoRoot,
-      ...(options.runtimeDirectory === undefined
-        ? {}
-        : { runtimeDirectory: options.runtimeDirectory }),
-      database,
-      message,
-      agents
-    });
-  } finally {
-    database.close();
-  }
-}
-
 function timestamp(options: LocalControlOptions): string {
   return (options.now ?? (() => new Date()))().toISOString();
+}
+
+export function forkLocalChatRunProposal(
+  repoRoot: string, eventId: string, dispatchEventId: string, revision: string,
+  input: ForkWorkspaceInput, options: LocalControlOptions = {}
+) {
+  // Reuse the exact active Owner proposal admission; Fork itself does not confirm a Run.
+  preflightLocalChatRunProposal(repoRoot,eventId,dispatchEventId,revision,{kind:"path",path:input.path},options);
+  return forkWorkspace(repoRoot,input,`proposal:${eventId}:${dispatchEventId}`,options.runtimeDirectory);
 }

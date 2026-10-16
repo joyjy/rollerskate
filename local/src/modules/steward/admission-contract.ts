@@ -1,3 +1,4 @@
+import { parseRunGraph, type RunGraph } from "./graph-contract.js";
 import { parseAcceptanceContract, type AcceptanceContract } from "./acceptance.js";
 import { parseStewardSelection, type StewardSelection } from "./steward-policy.js";
 import { createHash } from "node:crypto";
@@ -18,6 +19,7 @@ export type RunDesiredEffect = "none" | "read" | "change";
 export type RunTriggerIntent = "once" | "cron" | "until" | "continuous";
 
 export interface RunIntent {
+  readonly graph?: RunGraph;
   readonly schemaVersion: "RunIntent@1";
   readonly requestId: string;
   readonly objective: string;
@@ -28,6 +30,8 @@ export interface RunIntent {
   readonly triggerIntent?: RunTriggerIntent;
   readonly resultDestinationRef?: string;
   readonly requestedParticipantRefs?: readonly string[];
+  readonly stewardRef?: string;
+  readonly workerRef?: string;
   readonly terminalEvidence: readonly string[];
   readonly dispatchNotes?: string;
 }
@@ -36,6 +40,7 @@ export interface RunAuthorityEnvelope {
   readonly schemaVersion: "RunAuthorityEnvelope@1";
   readonly workflowRef?: string;
   readonly participantAgentIds: readonly string[];
+  readonly workerAgentId?: string;
   readonly workspace?: {
     readonly root: string;
     readonly revision: string;
@@ -68,6 +73,7 @@ export type CompiledRunMandate =
     };
 
 export interface StewardRunRequest {
+  readonly graph?: RunGraph;
   readonly acceptanceContract?: AcceptanceContract;
   readonly dispatchNotes?: string;
   readonly ownerNetworkAuthorized?: boolean;
@@ -102,13 +108,19 @@ export function parseRunIntent(value: unknown): RunIntent {
   exactContractKeys(input, [
     "schemaVersion", "requestId", "objective", "acceptance", "contextRefs",
     "workspaceRef", "desiredEffect", "triggerIntent", "resultDestinationRef",
-    "requestedParticipantRefs", "terminalEvidence", "dispatchNotes"
+    "requestedParticipantRefs", "terminalEvidence", "dispatchNotes", "stewardRef", "workerRef", "graph"
   ], "RunIntent@1", [
     "workspaceRef", "desiredEffect", "triggerIntent", "resultDestinationRef",
-    "requestedParticipantRefs", "dispatchNotes"
+    "requestedParticipantRefs", "dispatchNotes", "stewardRef", "workerRef", "graph"
   ]);
   if (input.schemaVersion !== "RunIntent@1") {
     throw new Error("RunIntent@1 schemaVersion is required");
+  }
+  if (input.workerRef !== undefined && input.requestedParticipantRefs !== undefined) {
+    throw new Error("workerRef cannot be combined with requestedParticipantRefs");
+  }
+  if (input.graph !== undefined && (input.workerRef !== undefined || input.requestedParticipantRefs !== undefined)) {
+    throw new Error("graph.participants cannot be combined with workerRef or requestedParticipantRefs");
   }
   const desiredEffect = input.desiredEffect;
   if (desiredEffect !== undefined && desiredEffect !== "none" &&
@@ -123,6 +135,9 @@ export function parseRunIntent(value: unknown): RunIntent {
   }
   return {
     schemaVersion: "RunIntent@1",
+    ...(input.graph === undefined ? {} : {graph: parseRunGraph(input.graph)}),
+    ...(input.stewardRef === undefined ? {} : {stewardRef: contractText(input.stewardRef, "stewardRef", 256)}),
+    ...(input.workerRef === undefined ? {} : {workerRef: contractText(input.workerRef, "workerRef", 256)}),
     ...(input.dispatchNotes === undefined ? {} : {dispatchNotes: contractText(input.dispatchNotes, "dispatchNotes")}),
     requestId: contractText(input.requestId, "requestId", 256),
     objective: contractText(input.objective, "objective"),
@@ -178,17 +193,24 @@ export function parseRunAuthorityEnvelope(value: unknown): RunAuthorityEnvelope 
   );
   exactContractKeys(input, [
     "schemaVersion", "workflowRef", "participantAgentIds", "workspace", "trigger",
-    "destinationIds", "maxSteps", "maxDepth", "deadlineAt"
-  ], "RunAuthorityEnvelope@1", ["workflowRef", "workspace", "trigger", "deadlineAt"]);
+    "destinationIds", "maxSteps", "maxDepth", "deadlineAt", "workerAgentId"
+  ], "RunAuthorityEnvelope@1", ["workflowRef", "workspace", "trigger", "deadlineAt", "workerAgentId"]);
   if (input.schemaVersion !== "RunAuthorityEnvelope@1") {
     throw new Error("RunAuthorityEnvelope@1 schemaVersion is required");
   }
+  const participantAgentIds = uniqueStrings(input.participantAgentIds, "participantAgentIds", 1, 64);
+  const workerAgentId = input.workerAgentId === undefined ? undefined
+    : contractText(input.workerAgentId, "workerAgentId", 256);
+  if (workerAgentId !== undefined && !participantAgentIds.includes(workerAgentId)) {
+    throw new Error("workerAgentId must belong to the admitted participant roster");
+  }
   return {
     schemaVersion: "RunAuthorityEnvelope@1",
+    ...(workerAgentId === undefined ? {} : {workerAgentId}),
     ...(input.workflowRef === undefined
       ? {}
       : { workflowRef: contractText(input.workflowRef, "workflowRef", 256) }),
-    participantAgentIds: uniqueStrings(input.participantAgentIds, "participantAgentIds", 1, 64),
+    participantAgentIds,
     ...(input.workspace === undefined ? {} : { workspace: workspaceAuthority(input.workspace) }),
     ...(input.trigger === undefined ? {} : { trigger: triggerAuthority(input.trigger) }),
     destinationIds: uniqueStrings(input.destinationIds, "destinationIds", 0, 64),
@@ -211,13 +233,14 @@ export function parseStewardRunRequest(value: unknown): StewardRunRequest {
   exactContractKeys(input, [
     "schemaVersion", "requestId", "idempotencyKey", "intentDigest", "objective",
     "acceptance", "contextRefs", "terminalEvidence", "mandate", "authority",
-    "resultDestination", "admissionDigest", "authoritySummary", "stewardSelection", "acceptanceContract", "dispatchNotes", "ownerNetworkAuthorized"
-  ], "StewardRunRequest@2", ["resultDestination", "stewardSelection", "acceptanceContract", "dispatchNotes", "ownerNetworkAuthorized"]);
+    "graph", "resultDestination", "admissionDigest", "authoritySummary", "stewardSelection", "acceptanceContract", "dispatchNotes", "ownerNetworkAuthorized"
+  ], "StewardRunRequest@2", ["graph", "resultDestination", "stewardSelection", "acceptanceContract", "dispatchNotes", "ownerNetworkAuthorized"]);
   if (input.schemaVersion !== "StewardRunRequest@2") {
     throw new Error("StewardRunRequest@2 schemaVersion is required");
   }
   return {
     schemaVersion: "StewardRunRequest@2",
+    ...(input.graph === undefined ? {} : {graph: parseRunGraph(input.graph)}),
     ...(input.acceptanceContract === undefined ? {} : {acceptanceContract: parseAcceptanceContract(input.acceptanceContract)}),
     ...(input.dispatchNotes === undefined ? {} : {dispatchNotes: contractText(input.dispatchNotes, "dispatchNotes")}),
     ...(input.ownerNetworkAuthorized === true ? {ownerNetworkAuthorized: true} : {}),

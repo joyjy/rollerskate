@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import AgentRunRecovery from "./AgentRunRecovery.vue";
+import ChatWorkspacePicker from "./ChatWorkspacePicker.vue";
 import { computed, ref, watch } from "vue";
 import { formatDateTime } from "@/utils/format";
 import type {
@@ -8,19 +10,47 @@ import type {
 
 const props = defineProps<{
   proposal: ChatRunProposal;
+  sourceRevision?: string;
   operation?: "preflight" | "start" | "decline";
   error?: string;
+  recoveryPending?: boolean;
+  replyRuns?: readonly { runId: string; status: string }[];
 }>();
 
 const emit = defineEmits<{
-  preflight: [proposal: ChatRunProposal, selection: ChatRunWorkspaceSelection];
+  preflight: [proposal: ChatRunProposal, selection: ChatRunWorkspaceSelection, resolution?: ChatRunProposal["resolution"]];
   start: [proposal: ChatRunProposal, selection?: ChatRunWorkspaceSelection];
   decline: [proposal: ChatRunProposal];
   openRun: [runId: string];
+  requestRecovery: [runId: string, requestId: string];
+  recoveryChanged: [];
+  clarify: [proposal: ChatRunProposal, workspacePath?: string];
 }>();
 
+const workspaceBusy = ref(false);
+const operation = computed(() => props.operation ?? (workspaceBusy.value ? "workspace" : undefined));
+function selectPath(path:string) {
+  if (selectedKind.value !== "path" && selectedChoice.value?.root === path) return;
+  selectedKind.value="path";customPath.value=path;
+}
+function forked(path:string) { selectPath(path);emit("preflight",props.proposal,{kind:"path",path},resolution.value); }
+
+const clarificationAnswer = ref(props.proposal.resolution?.clarificationAnswer ?? "");
+const taskSourceId = ref(props.proposal.resolution?.taskSourceMessageEventId ?? "");
+const needsTaskSource = computed(() => props.proposal.taskSourceChoices !== undefined &&
+  !props.proposal.taskSourceChoices.some(choice => choice.eventId === props.proposal.sourceMessageEventId));
+const resolution = computed<ChatRunProposal["resolution"]>(() => {
+  const answer = clarificationAnswer.value.trim();
+  return !answer && !taskSourceId.value ? undefined : {
+    ...(answer ? {clarificationAnswer:answer} : {}),
+    ...(taskSourceId.value ? {taskSourceMessageEventId:taskSourceId.value} : {})
+  };
+});
+const resolutionChecked = computed(() => resolution.value?.taskSourceMessageEventId === props.proposal.resolution?.taskSourceMessageEventId &&
+  resolution.value?.clarificationAnswer === props.proposal.resolution?.clarificationAnswer);
+
 const selectedKind = ref<ChatRunWorkspaceSelection["kind"]>(
-  props.proposal.selectedWorkspace?.kind ?? "project"
+  props.proposal.selectedWorkspace?.kind ?? "path"
 );
 const customPath = ref(
   props.proposal.selectedWorkspace?.kind === "path"
@@ -28,10 +58,13 @@ const customPath = ref(
     : ""
 );
 
-watch(() => props.proposal.selectedWorkspace, (selected) => {
-  if (selected === undefined) return;
-  selectedKind.value = selected.kind;
-  if (selected.kind === "path") customPath.value = selected.root;
+watch([
+  () => props.proposal.selectedWorkspace?.kind,
+  () => props.proposal.selectedWorkspace?.root
+], ([kind, root]) => {
+  if (kind === undefined) return;
+  selectedKind.value = kind;
+  if (kind === "path") customPath.value = root ?? "";
 });
 
 const effectLabel = computed(() => {
@@ -70,7 +103,7 @@ const selectedChoice = computed(() => props.proposal.workspaceChoices?.find(
 
 const workspaceAdmitted = computed(() => {
   const selected = props.proposal.selectedWorkspace;
-  if (!props.proposal.ready || selected === undefined || selected.kind !== selectedKind.value) {
+  if ((!props.proposal.ready && selected?.revision === undefined) || selected === undefined || selected.kind !== selectedKind.value) {
     return false;
   }
   return selected.kind !== "path" || customPath.value.trim() === selected.root;
@@ -80,13 +113,13 @@ const canPreflight = computed(() => {
   const selection = workspaceSelection.value;
   return selection !== undefined &&
     (selection.kind !== "path" || selection.path !== "") &&
-    props.operation === undefined;
+    operation.value === undefined;
 });
 
 function preflight() {
   const selection = workspaceSelection.value;
   if (selection !== undefined && canPreflight.value) {
-    emit("preflight", props.proposal, selection);
+    emit("preflight", props.proposal, selection, resolution.value);
   }
 }
 </script>
@@ -105,10 +138,19 @@ function preflight() {
     <header class="proposal-header">
       <div>
         <div class="proposal-eyebrow">Run proposal</div>
-        <strong>{{ runStateLabel }}</strong>
+        <strong>{{ replyRuns?.length ? "Original proposal" : runStateLabel }}</strong>
       </div>
       <span class="effect-chip">{{ effectLabel }}</span>
     </header>
+
+    <div v-if="replyRuns?.length" class="workspace-admitted" aria-label="Work started from replies">
+      <strong>Work started from a reply</strong>
+      <span>Check this work before starting the original proposal again.</span>
+      <button v-for="run in replyRuns" :key="run.runId" type="button"
+        class="secondary-action" @click="emit('openRun', run.runId)">
+        {{ run.runId }} · {{ run.status }} · Open Run
+      </button>
+    </div>
 
     <div
       v-if="proposal.blocker && !proposal.linkedRun && !proposal.decision"
@@ -117,48 +159,35 @@ function preflight() {
     >
       <strong>{{ proposal.blocker.code === "workspace_required" ? "Workspace required" : "Blocked" }}</strong>
       <span>{{ proposal.blocker.message }}</span>
-      <span v-if="proposal.blocker.action === 'reply'" class="blocker-hint">Reply in Chat with the missing decision.</span>
+      <span v-if="proposal.blocker.action === 'reply'" class="blocker-hint">Complete the task source and clarification below, then check the proposal. You can also reply to discuss it.</span>
+      <button v-if="proposal.blocker.action === 'reply'" type="button"
+        class="secondary-action" :disabled="operation !== undefined"
+        @click="emit('clarify', proposal, selectedKind === 'path' ? customPath.trim() || undefined : selectedChoice?.root)">
+        Reply to clarify
+      </button>
       <details v-if="proposal.blocker.detail">
         <summary>Technical details</summary>
         <code>{{ proposal.blocker.detail }}</code>
       </details>
     </div>
 
-    <div v-if="error" class="proposal-error" role="alert">{{ error }}</div>
+    <div v-if="error && !proposal.linkedRun && !proposal.decision" class="proposal-error" role="alert">{{ error }}</div>
 
     <div
       v-if="proposal.workspaceChoices && !proposal.linkedRun && !proposal.decision"
       class="workspace-control"
     >
-      <label>
-        <span class="section-label">Workspace authority</span>
-        <select v-model="selectedKind" :disabled="operation !== undefined">
-          <option
-            v-for="choice in proposal.workspaceChoices"
-            :key="choice.kind"
-            :value="choice.kind"
-          >{{ choice.label }}</option>
-        </select>
-      </label>
-      <label v-if="selectedKind === 'path'">
-        <span class="section-label">Absolute Git workspace path</span>
-        <input
-          v-model="customPath"
-          type="text"
-          autocomplete="off"
-          placeholder="/absolute/path/to/repository"
-          :disabled="operation !== undefined"
-          @keyup.enter="preflight"
-        />
-      </label>
-      <div v-else-if="selectedChoice?.root" class="workspace-candidate">
-        {{ selectedChoice.root }}
-      </div>
-      <div v-if="workspaceAdmitted && proposal.authority?.workspace" class="workspace-admitted">
-        <span>Verified {{ proposal.authority.workspace.access }} authority</span>
-        <strong>{{ proposal.authority.workspace.root }}</strong>
-        <code>{{ proposal.authority.workspace.revision }}</code>
-        <span>Network access off</span>
+      <ChatWorkspacePicker :path="selectedKind === 'path' ? customPath.trim() : selectedChoice?.root ?? ''"
+        :initial-query="proposal.finalForm.goal?.match(/[a-z][a-z0-9]*(?:-[a-z0-9]+)*/i)?.[0]"
+        :source-revision="sourceRevision ?? proposal.revision" :event-id="proposal.sourceMessageEventId"
+        :dispatch-id="proposal.dispatchEventId" :disabled="props.operation !== undefined"
+        @select="selectPath" @forked="forked" @busy="workspaceBusy=$event">
+      <div v-if="workspaceAdmitted" class="workspace-admitted" role="status">
+        <span>Workspace checked</span>
+        <strong>{{ proposal.selectedWorkspace?.root }}</strong>
+        <code>{{ proposal.selectedWorkspace?.revision ?? proposal.authority?.workspace?.revision }}</code>
+        <span v-if="!proposal.ready">{{ needsTaskSource && !taskSourceId ? 'Workspace is ready. Select the original task instruction below, then check the proposal.' : 'Workspace is ready. Resolve the remaining question on this card before starting.' }}</span>
+        <span v-else>Review the proposal, then start the Run.</span>
       </div>
       <button
         v-if="!workspaceAdmitted"
@@ -167,6 +196,22 @@ function preflight() {
         :disabled="!canPreflight"
         @click="preflight"
       >{{ operation === "preflight" ? "Checking…" : "Use workspace" }}</button>
+      </ChatWorkspacePicker>
+    </div>
+
+    <div v-if="!proposal.linkedRun && !proposal.decision && proposal.workspaceChoices && (proposal.finalForm.blockingQuestion || needsTaskSource)" class="workspace-control">
+      <label v-if="needsTaskSource">
+        <span class="section-label">Original task instruction</span>
+        <select v-model="taskSourceId" :disabled="operation !== undefined" aria-label="Original task instruction">
+          <option value="" disabled>Select the Owner message containing this task</option>
+          <option v-for="choice in proposal.taskSourceChoices" :key="choice.eventId" :value="choice.eventId">{{ choice.body }}</option>
+        </select>
+      </label>
+      <label v-if="proposal.finalForm.blockingQuestion">
+        <span class="section-label">{{ proposal.finalForm.blockingQuestion }}</span>
+        <textarea v-model="clarificationAnswer" maxlength="4096" :disabled="operation !== undefined" aria-label="Clarification answer" placeholder="Answer here; for a path question, confirm the workspace selected above." />
+      </label>
+      <button type="button" class="secondary-action" :disabled="!canPreflight || (needsTaskSource && !taskSourceId) || (!!proposal.finalForm.blockingQuestion && !clarificationAnswer.trim())" @click="preflight">{{ operation === 'preflight' ? 'Checking…' : 'Check proposal' }}</button>
     </div>
 
     <div class="proposal-section goal-section">
@@ -218,7 +263,7 @@ function preflight() {
         <span class="section-label">Run</span>
         <strong>{{ proposal.linkedRun.runId }}</strong>
         <p v-if="proposal.linkedRun.terminalSummary">{{ proposal.linkedRun.terminalSummary }}</p>
-        <p v-if="proposal.linkedRun.attentionReason">{{ proposal.linkedRun.attentionReason }}</p>
+        <p v-if="proposal.linkedRun.attentionReason && !proposal.linkedRun.intervention">{{ proposal.linkedRun.attentionReason }}</p>
         <ul v-if="proposal.linkedRun.outputs?.length" aria-label="Run outputs">
           <li v-for="output in proposal.linkedRun.outputs" :key="output.outputId">{{ output.title }}</li>
         </ul>
@@ -228,7 +273,11 @@ function preflight() {
         type="button"
         class="secondary-action"
         @click="emit('openRun', proposal.linkedRun.runId)"
-      >Open Run</button>
+      >查看详情</button>
+      <AgentRunRecovery v-if="proposal.linkedRun.intervention" :key="proposal.linkedRun.runId"
+        :run-id="proposal.linkedRun.runId" :intervention="proposal.linkedRun.intervention"
+        :disabled="!!operation || recoveryPending" @request="(requestId) => emit('requestRecovery', proposal.linkedRun!.runId, requestId)"
+        @changed="emit('recoveryChanged')" />
     </div>
     <div v-else-if="proposal.decision" class="proposal-decision" aria-live="polite">
       <span>Declined by Owner</span>
@@ -238,13 +287,13 @@ function preflight() {
     </div>
     <div v-else class="proposal-action-row">
       <span>
-        {{ proposal.ready && (proposal.workspaceChoices === undefined || workspaceAdmitted)
+        {{ proposal.ready && resolutionChecked && (proposal.workspaceChoices === undefined || workspaceAdmitted)
           ? "Only this revision authorizes the exact effect above."
           : "This proposal has not been authorized." }}
       </span>
       <div class="proposal-actions">
         <button
-          v-if="proposal.ready && (proposal.workspaceChoices === undefined || workspaceAdmitted)"
+          v-if="proposal.ready && resolutionChecked && (proposal.workspaceChoices === undefined || workspaceAdmitted)"
           type="button"
           class="start-action"
           :disabled="operation !== undefined"
@@ -331,7 +380,7 @@ dd { margin: 0; overflow-wrap: anywhere; }
 }
 .workspace-control { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); }
 .workspace-control label { display: grid; gap: 5px; }
-.workspace-control select, .workspace-control input {
+.workspace-control select, .workspace-control input, .workspace-control textarea {
   width: 100%;
   box-sizing: border-box;
   border: 1px solid var(--border);
@@ -355,6 +404,8 @@ dd { margin: 0; overflow-wrap: anywhere; }
   display: flex; justify-content: space-between; gap: 12px; padding-top: 10px;
   border-top: 1px solid var(--border); color: var(--text-dim); font-size: 11px;
 }
+.linked-run { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; }
+.linked-run > .recovery { grid-column: 1 / -1; width: 100%; box-sizing: border-box; }
 .linked-run > div { min-width: 0; display: grid; gap: 2px; }
 .linked-run strong { overflow-wrap: anywhere; }
 .start-action, .secondary-action, .decline-action {
@@ -370,7 +421,7 @@ dd { margin: 0; overflow-wrap: anywhere; }
 .decline-action { border: 1px solid var(--border); background: transparent; color: var(--text-secondary); }
 .start-action:disabled, .secondary-action:disabled, .decline-action:disabled { cursor: wait; opacity: .65; }
 @media (max-width: 720px) {
-  .proposal-columns, .roles { grid-template-columns: 1fr; }
+  .proposal-columns, .roles, .linked-run { grid-template-columns: minmax(0, 1fr); }
   .proposal-header, .proposal-action-row, .linked-run { align-items: flex-start; flex-direction: column; }
   .proposal-actions { width: 100%; flex-direction: column; align-items: stretch; }
   .start-action, .secondary-action, .decline-action { width: 100%; }

@@ -1,3 +1,5 @@
+import { callbackViews } from "../chat/callback-query.js";
+import { openRuntimeDatabaseReadOnly } from "../../infrastructure/sqlite/database.js";
 import { RunAdmissionStore } from "../../infrastructure/files/run-admission-store.js";
 import { runtimePaths } from "../../infrastructure/runtime/config.js";
 import { isDeterministicRunId } from "../../modules/run/intent.js";
@@ -23,17 +25,22 @@ function inspectDeterministicRun(repoRoot: string, runId: string, runtimeDirecto
   const identityMismatch = execution !== null && execution.subscriptionId !== sourceId;
   if (identityMismatch) errors.push("Command request does not match the admitted source identity");
   const deliveries = source ? read("delivery", () => desktopSubscriptionDeliveries(repoRoot, sourceId, runtimeDirectory)) : null;
+  const chatCallbacks = admission.intent.resultDestinationRef?.startsWith("rs-chat:") ? read("Chat callback", () => {
+    const database = openRuntimeDatabaseReadOnly(runtimePaths(repoRoot, runtimeDirectory).database);
+    try {return callbackViews(database, sourceId);} finally {database.close();}
+  }) : null;
   const observation = source?.kind === "free" ? source.terminalObservation as { terminal?: string } | null : null;
   const result = identityMismatch ? "unknown" : admission.intent.work.kind === "command"
     ? execution?.state === "completed" ? execution.outcome! : "unknown"
-    : observation?.terminal ?? "unknown";
+    : source?.status === "expired" ? "unknown" : observation?.terminal ?? "unknown";
   const status = result === "success" ? "succeeded" : result === "failure" ? "failed" : result === "cancelled" ? "cancelled"
     : errors.length || execution?.state === "running" && execution.pid === undefined ? "unknown"
     : source?.status === "expired" || source?.status === "blocked" ? "attention_required"
     : source?.status === "cancelled" ? "cancelled" : "running";
   return { runId, kind: admission.intent.work.kind, requestId: admission.intent.requestId, title: admission.intent.title,
-    createdAt: admission.createdAt, updatedAt: execution?.completedAt ?? source?.updatedAt ?? admission.createdAt, status, result, admission, execution, source, deliveries, errors,
+    createdAt: admission.createdAt, updatedAt: execution?.completedAt ?? source?.updatedAt ?? admission.createdAt, status, result, admission, execution, source, deliveries, chatCallbacks, errors,
     deliveryStatus: admission.intent.resultDestinationRef === undefined ? "not_requested"
+      : admission.intent.resultDestinationRef.startsWith("rs-chat:") ? chatCallbacks?.[0]?.returnState.status ?? "not_recorded"
       : deliveries === null ? "unknown" : deliveries.length ? deliveries[0]!.status : "not_enqueued" };
 }
 

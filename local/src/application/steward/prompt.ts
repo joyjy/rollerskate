@@ -163,10 +163,12 @@ export function callerOrchestratedStepPrompt(
 }
 
 export function stewardOrchestratorPrompt(input: {
+  readonly acceptanceOnly?: boolean;
   readonly objective: string;
   readonly runVersion: number;
   readonly maxSteps: number;
   readonly completedWorkerSteps: number;
+  readonly workerAgentId?: string;
   readonly checkpoint?: unknown;
   readonly priorState?: unknown;
   readonly participants: readonly StewardDelegateTarget[];
@@ -187,13 +189,17 @@ export function stewardOrchestratorPrompt(input: {
     unresolvedQuestions: []
   };
   return [
-    "You are the Steward Orchestrator for this Run. You own decomposition, Agent selection, handoff, and stopping; Workers do not.",
+    input.acceptanceOnly ? "You are the Steward accepting a completed fixed DAG. Only finish(scope=run), needs_human or ask_human are permitted. Evaluate the collected result against original acceptance; do not dispatch more work, change capabilities or bind sources." : "You are the Steward Orchestrator for this Run. You own decomposition, Agent selection, handoff, and stopping; Workers do not.",
     `Your response envelope is RunDecision@${decisionVersion}. The business request below defines the goal and deliverables, not a different response envelope.`,
     ...(decisionVersion >= 4 ? ["If the business request describes AgentTurnResult@1.outputs, map that outputs array to finish.outputs, preserving each output's id, contentType, schemaVersion and value. A requested report JSON belongs in an output's value. Do not return AgentTurnResult@1 or put outputs at the RunDecision top level."] : []),
     "",
     `Goal: ${input.objective}`,
     `Current Run version: ${input.runVersion}`,
     `Worker step budget: ${input.completedWorkerSteps}/${input.maxSteps}`,
+    ...(input.workerAgentId === undefined ? [] : [
+      `Owner-designated Worker: ${input.workerAgentId}. Every next_step must target this exact Agent. Do not substitute yourself or another participant.`,
+      "Before success, obtain a checkpoint from the designated Worker for this Run/cycle. You own planning and final verification; send bounded execution to the Worker. Do not duplicate its full investigation."
+    ]),
     ...(input.taskUrl === undefined ? [] : [`Result destination: ${input.taskUrl}`]),
     ...(input.triggerKinds === undefined
       ? []
@@ -202,8 +208,8 @@ export function stewardOrchestratorPrompt(input: {
     input.checkpoint === undefined
       ? "First decompose the goal into a bounded task state, then select the first Worker. Keep stable taskIds; do not copy raw transcripts."
       : "Update the bounded task state from the newest Worker checkpoint. Keep stable taskIds and preserve accepted conclusions; do not copy raw transcripts.",
-    "Choose next_step only when another bounded step can materially change completion. Use an exact admitted agentId. Finish only when the goal is actually satisfied; otherwise use the human-input decision described below when blocked.",
-    ...(decisionVersion >= 3
+    ...(input.acceptanceOnly ? [] : ["Choose next_step only when another bounded step can materially change completion. Use an exact admitted agentId. Finish only when the goal is actually satisfied; otherwise use the human-input decision described below when blocked."]),
+    ...(decisionVersion >= 3 && !input.acceptanceOnly
       ? [
           input.sourceEnvelope === undefined
             ? "Use await_source only to bind this standalone Run to one admitted trigger."
@@ -220,14 +226,16 @@ export function stewardOrchestratorPrompt(input: {
     ...(decisionVersion >= 5 ? [
       "When one concrete Owner answer can unblock this Run within its existing authority, choose action=ask_human with question (one concise question, at most 4096 characters), rationale, checkedAcceptance and state; omit nextStep, awaitSource and finish. This suspends the Run while preserving the checkpoint and accepted evidence. Use needs_human only when no safe continuation is known, including unknown external effects. An answer does not expand workspace, network, participants, budget or authority. Never use a question as a substitute for obtaining missing execution permission."
     ] : []),
-    "The next Worker receives only nextStep.mandate, not the checkpoint, prior task state, or decision history. Put every bounded fact and reference needed for the handoff into that mandate.",
+    ...(input.acceptanceOnly ? [] : ["For every Worker handoff, put the bounded objective, necessary input facts and references, expected output, admitted workspace and acceptance check in the nextStep.mandate.objective text. For kind=objective, nextStep.mandate has exactly two fields: kind and objective; do not add inputFacts, references, expectedOutput, workspace or acceptance fields. Choose by the step's needs and actual admitted capability, never a permanent client-name role. Integrate and validate the returned evidence yourself; add a separate review step when the change or uncertainty warrants it.",
+    "This Run schedules one Worker at a time. Keep edits inside the admitted workspace and do not launch untracked parallel writers. Preserve completed steps across callbacks; a Worker completion is evidence, not whole-task acceptance.",
+    "The next Worker receives only nextStep.mandate, not the checkpoint, prior task state, or decision history. Put every bounded fact and reference needed for the handoff into that mandate."]),
     "The Runtime will validate this decision against the current Run version, roster, deadline, and budget. Never expand them.",
     ...(decisionVersion >= 6 ? [
       `Current effective network access: ${input.currentNetworkAccess === true ? "enabled" : "disabled"}. This overrides historical admission text in the objective.`,
       "Immutable original acceptance contract (higher priority than dispatch notes, task decomposition or worker claims):",
       JSON.stringify(input.acceptanceContract),
       "checkedAcceptance is an array of {id,status:pass|fail|unknown,evidenceRefs:string[]}. At success every original ID must occur exactly once, pass with evidence, and state.unresolvedQuestions must be empty. Missing or stale required evidence is unknown, never pass. A report listing gaps does not satisfy the underlying requirements.",
-      "Before work and again before finish, compare original acceptance with admitted capabilities. If network is needed but unavailable, return action=request_capability with capability={kind:network,acceptanceIds:[original IDs],targets:[exact URLs or hosts],reason:why needed}, plus expectedRunVersion,rationale,checkedAcceptance,state. Omit finish/nextStep/question. Runtime suspends and checks Owner authorization; a request grants nothing. Do not replace this with ask_human or reduce acceptance. Preserve useful evidence in state; after continuation do not repeat completed work."
+      ...(input.acceptanceOnly ? [] : ["Before work and again before finish, compare original acceptance with admitted capabilities. If network is needed but unavailable, return action=request_capability with capability={kind:network,acceptanceIds:[original IDs],targets:[exact URLs or hosts],reason:why needed}, plus expectedRunVersion,rationale,checkedAcceptance,state. Omit finish/nextStep/question. Runtime suspends and checks Owner authorization; a request grants nothing. Do not replace this with ask_human or reduce acceptance. Preserve useful evidence in state; after continuation do not repeat completed work."])
     ] : ["checkedAcceptance must be an array of plain strings."]),
     "state.acceptedEvidence and state.unresolvedQuestions are arrays of plain strings.",
     ...(input.workspaceEffect === "must_change"
@@ -261,7 +269,7 @@ export function stewardOrchestratorPrompt(input: {
     "",
     `Return exactly one RunDecision@${decisionVersion} JSON object with no code fence or extra text.`,
     "The following examples show the response structure only. Replace example state with the updated task state, and fill checkedAcceptance from actual evidence. Produce complete valid JSON: escape quotes, backslashes and newlines inside strings; close every object and array. Keep rationale, state and report content concise rather than repeating the same evidence.",
-    "For next_step use:",
+    ...(input.acceptanceOnly ? [] : ["For next_step use:",
     JSON.stringify({
       schemaVersion: `RunDecision@${decisionVersion}`,
       action: "next_step",
@@ -273,10 +281,10 @@ export function stewardOrchestratorPrompt(input: {
         target: { kind: "agent", agentId: "exact admitted agentId" },
         mandate: { kind: "objective", objective: "bounded next objective" }
       }
-    }, null, 2),
+    }, null, 2)]),
     ...(decisionVersion >= 3
       ? [
-          ...(input.sourceEnvelope === undefined
+          ...(input.sourceEnvelope === undefined && !input.acceptanceOnly
             ? [
                 "For await_source use:",
                 JSON.stringify({

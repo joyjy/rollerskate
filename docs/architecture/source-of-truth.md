@@ -37,7 +37,6 @@ timestamp: 2026-07-26
 | Local Chat 聊天展示 | Local `chat_messages` rebuildable projection | message 内容仍来自 immutable Event；read progress 只解释 Agent Execution，不存在用户 read cursor 或可修改 message record。 |
 | Server Room 聊天展示与待投递消息 | Server projection + Matrix transport | Local 仅保存执行所需 reference、result 与 delivery receipt。 |
 | 当前架构事实 | `docs/architecture/` + source | Active plan 不能覆盖已实现事实。 |
-| 未实现工作 | 内部规划 | 实现并验证后再迁入 architecture/runbook 与源码事实。 |
 
 ## Data movement limits
 

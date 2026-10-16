@@ -31,9 +31,11 @@ scripts/rs start
 
 `start` 等待 Runtime 和 Console ready 后返回，daemon 不依赖当前终端。浏览器默认打开 Local Console。没有 active Agent 时首页是 `Agents`；已有 active Agent 时首页是 `Chats / Local`。Console 直接由内置 Vite 从 `local/ui/src/` 提供，Agent 或开发者保存 Vue、TypeScript、CSS 后，已打开页面通过 HMR 更新，不需要重新 build 或重启 Runtime；修改 `local/src/` 等非 UI 源码后运行 `scripts/rs restart`。需要停止服务时运行 `scripts/rs stop`；调试进程生命周期时可显式使用 `scripts/rs start --foreground`，并用 `Ctrl-C` 停止。
 
+Run 卡片提示恢复时，直接在 **Chat 原卡片**点击 **请 agent 准备方案**。这会给原负责 agent 发送一次准备请求，不续跑、不取消、不重建任务；agent 通过 `prepare_chat_run_recovery` 提交修正方案。卡片展示原因、实际动作、工作区与验收检查，Owner 审阅后确认才在原 Run 执行；不需要编辑 JSON 或跳转 Steward。符合条件的初始只读 fallback 可直接在卡片确认重试；取消也在原卡片确认，不撤销已有外部效果或自动重建任务。Steward 只展示恢复诊断及回 Chat 入口，Schedules / Subscriptions 本轮没有改变。
+
 ## 2. 添加 Local Agent
 
-在 `Agents` 页面填写 1–32 字符的短 handle，例如 `researcher`，选择 Codex、Claude Code、Kimi Code 或 Pi client；可选启动参数按“一行一个 argv 参数”填写，然后选择 `Add Agent`。系统生成稳定 Principal ID；handle 只用于展示与 `@mention`。
+在 `Agents` 页面填写 1–32 字符的短 handle，例如 `researcher`，选择 Codex、Claude Code 或 Kimi Code client；可选启动参数按“一行一个 argv 参数”填写，然后选择 `Add Agent`。系统生成稳定 Principal ID；handle 只用于展示与 `@mention`。
 
 创建首个 active Agent 后 UI 自动进入 `Chats / Local`。Agents 页面还提供启动参数配置、rename、suspend 和 resume，不提供永久删除。
 
@@ -43,7 +45,6 @@ scripts/rs start
 scripts/rs agent create researcher --client codex
 scripts/rs agent create writer --client claude-code --launch-arg --model --launch-arg claude-sonnet-4-6
 scripts/rs agent create explorer --client kimi-code --launch-arg --model --launch-arg kimi-code/kimi-for-coding
-scripts/rs agent create analyst --client pi
 scripts/rs agent configure explorer --launch-arg --model --launch-arg kimi-code/k2.5
 scripts/rs agent list
 scripts/rs agent rename researcher helper
@@ -81,11 +82,12 @@ Agent result 产生本地通知后，Console 右上角 `Notices` 显示 bounded 
 当 Agent 判断 Owner 的当前消息已经足够形成可执行工作时，可以在该消息下提出 Run proposal。每个 Agent 的 proposal 是独立卡片，固定展示 goal、in/out scope、acceptance、workspace effect、Chat Lead、Run Orchestrator、participants，以及缺信息时至多一个结构化 blocker。
 
 - Proposal 只是提醒，不会自动执行。需要读写文件时，先在卡片选择 `Rollerskate source`、Local runtime workspace 或其他绝对 Git workspace；`Use workspace` 只做无副作用预检，并显示 canonical root、workspace revision、read/write grant 与 network-off 状态。只有 `Ready for Owner` 且没有关联 Run 时才显示 `Start Run`。
+- 工作区区域可按项目名 `Find workspaces`，选择候选或手改绝对路径。`Inspect selected path` 显示默认分支和 base SHA；填写用途后 `Fork Workspace` 创建旁置工作区并回填原卡片。`Use workspace` 继续使用所选路径，最后仍需 `Start Run`。Fork 成功但后续校验失败时用保留的结果继续；网络结果未知时 `Recover Fork result` 重用原请求。默认分支未知时可配置 `git config rollerskate.defaultBranch <真实默认分支>` 后重新检查，不猜 main/master；搜索配置与权限边界见 [Workspace 发现与 Fork](../architecture/workspace-discovery.md)。
 - 不采用某张卡片时选择 `Decline proposal`；拒绝只作用于该 Agent 的 exact proposal，刷新或重启后仍显示 `Declined`，不会影响同一消息下其他卡片。已启动的卡片不能再拒绝。
 - 选择 `Start Run` 只确认这张卡片屏幕上这一版 proposal + workspace revision 和 exact effect；proposal 或 workspace 漂移时，旧确认会被拒绝，需要重新预检。
 - `Needs clarification` 只显示一个 blocker，不提供启动按钮。应在 Chat 中补充信息，让 Agent 针对新的 Owner message 重新提案。
 - 启动后卡片从既有 Steward Run 回读 started、needs-human 或 terminal 状态与 bounded summary；选择 `Open Run` 进入 `/console/steward?runId=<runId>` 查看完整控制和诊断。
-- 没有 proposal 的 Owner message 仍可使用 `Hand off to Run`。已有 proposal 时该入口隐藏且 API fail closed，不能绕过 current-revision confirmation。
+- 消息列表不提供直接启动 Run 的旁路；需要卡片时向 Agent 请求 proposal，选择工作区并检查后再确认。阅读状态圈在回执生成前显示灰色等待状态，之后显示各 Agent 的处理进度。
 
 Local Runtime 每张 proposal 卡片最多关联一个 `chat-work:<messageId>:<dispatchEventId>` Run。同一卡片的浏览器重试或重复选择 `Start Run` 只返回同一个 Run；同一 Owner message 下不同 Agent 的卡片可以各自启动，不共享 participant 或 Run identity。
 

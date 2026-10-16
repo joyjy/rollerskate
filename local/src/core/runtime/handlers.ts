@@ -25,10 +25,11 @@ import type {
 import { RuntimeStore } from "./store.js";
 import type {
   AgentAdapterInput,
+  AgentInvocationJournal,
   AgentAdapterInvocation,
   ProviderPolicyObservationSnapshot
 } from "./agent-invocation.js";
-import { AgentInvocationError, assertProviderSessionIdentity } from "./agent-invocation.js";
+import { AgentInvocationError, AgentNetworkError, isTransientNetworkFailure, assertProviderSessionIdentity } from "./agent-invocation.js";
 import type { ChatReplyRoute } from "./store/types.js";
 
 export interface RuntimeAgentAdapter {
@@ -66,6 +67,7 @@ export class AgentHandler {
     agentId: string,
     workspace?: string
   ) => RuntimeAgentAdapter | undefined;
+  readonly #createInvocationJournal: ((execution: RuntimeExecution, event: AgentInputEvent | ChatDispatchEvent, adapter: RuntimeAgentAdapter) => AgentInvocationJournal) | undefined;
   readonly #store: RuntimeStore;
   readonly #retryBaseMilliseconds: number;
   readonly #executionGuards: readonly RuntimeAgentExecutionGuard[];
@@ -74,6 +76,7 @@ export class AgentHandler {
     undefined;
 
   public constructor(options: {
+    readonly createInvocationJournal?: (execution: RuntimeExecution, event: AgentInputEvent | ChatDispatchEvent, adapter: RuntimeAgentAdapter) => AgentInvocationJournal;
     readonly store: RuntimeStore;
     readonly adapters?: ReadonlyMap<string, RuntimeAgentAdapter>;
     readonly adapterForAgent?: (
@@ -85,6 +88,7 @@ export class AgentHandler {
     readonly retryBaseMilliseconds?: number;
   }) {
     this.#store = options.store;
+    this.#createInvocationJournal = options.createInvocationJournal;
     if (options.adapters !== undefined && options.adapterForAgent !== undefined) {
       throw new Error("AgentHandler accepts adapters or adapterForAgent, not both");
     }
@@ -110,13 +114,15 @@ export class AgentHandler {
     if (!isAgentInputEvent(event)) {
       throw new Error(`AgentHandler requires an Agent input Event: ${event.eventId}`);
     }
-    // Legacy queued retries must not replay a Chat turn that may have used tools.
-    if (event.type === "chat.dispatch" && execution.attemptCount > 1) {
+    // Only an explicit persisted transport retry may repeat a Chat turn.
+    const networkRetry = this.#store.isAgentNetworkRetry(execution);
+    if (event.type === "chat.dispatch" && execution.attemptCount > 1 && !networkRetry) {
       this.#store.cancelRunningAgentExecution(execution.executionId,"chat_retry_requires_new_instruction",at ?? new Date().toISOString());
       return undefined;
     }
     const invocationAt = at ?? new Date().toISOString();
     let invocationAdapter: RuntimeAgentAdapter | undefined;
+    let invocationJournal: AgentInvocationJournal | undefined;
     const blocked = this.#blocked(event, invocationAt);
     if (blocked !== undefined) {
       const completedAt = invocationAt;
@@ -149,17 +155,35 @@ export class AgentHandler {
       }
       const receipt = await this.#invokeInLane(
         this.resources(event).lanes[0]!,
-        () => {
+        async () => {
           const blocked = this.#blocked(event, at ?? new Date().toISOString());
           if (blocked !== undefined) throw new Error(blocked);
-          return adapter.invoke({
-            event,
-            ...(session === undefined ? {} : { providerSessionId: session.providerSessionId }),
-            reportProgress: (progress) => this.#store.recordAgentInvocationProgress(
-              execution.executionId,
-              assertInvocationIdentity(progress, adapter, workspaceAccess)
-            )
-          });
+          try { invocationJournal = this.#createInvocationJournal?.(execution, event, adapter); }
+          catch { console.error("agent.invocation_journal_unavailable", {executionId: execution.executionId}); }
+          const journal = invocationJournal;
+          try {
+            journal?.append("invocation.started", {providerSessionId: session?.providerSessionId});
+            const result = await adapter.invoke({
+              event,
+              ...(journal === undefined ? {} : {reportOutput: (output: import("./agent-invocation.js").AgentOutputEvent) => journal.append(output.kind, output.data)}),
+              ...(session === undefined ? {} : { providerSessionId: session.providerSessionId }),
+              reportProgress: (progress) => {
+                const checked = assertInvocationIdentity(progress, adapter, workspaceAccess);
+                this.#store.recordAgentInvocationProgress(execution.executionId, checked);
+                journal?.append("progress", checked);
+              }
+            });
+            assertProviderSessionIdentity(session?.providerSessionId, result.providerSessionId);
+            journal?.append("invocation.completed", {providerSessionId: result.providerSessionId, outcome: result.outcome});
+            return result;
+          } catch (error) {
+            // Provider stderr/stdout may contain prompt echoes or hidden reasoning.
+            // Persist typed failure metadata here; raw process diagnostics stay out of this log.
+            journal?.append("invocation.failed", {error: error instanceof Error ? error.name : "UnknownError",
+              ...(error instanceof AgentInvocationError ? {failure: error.failure} : {}),
+              ...(error instanceof AgentNetworkError ? {networkRejection: true} : {})});
+            throw error;
+          }
         }
       );
       assertProviderSessionIdentity(session?.providerSessionId, receipt.providerSessionId);
@@ -197,6 +221,12 @@ export class AgentHandler {
           at ?? new Date().toISOString()
         ).resultEvent;
       }
+      if (error instanceof AgentNetworkError && invocationAdapter !== undefined &&
+        error.adapterId === invocationAdapter.adapterId && error.workspace === invocationAdapter.workspace &&
+        isTransientNetworkFailure(error.message) && retryBlocked === undefined) {
+        return this.#store.failExecution(execution.executionId,error.message,at ?? new Date().toISOString(),
+          this.#retryBaseMilliseconds,{retry:"network"}).resultEvent;
+      }
       if (error instanceof AgentInvocationError) {
         if (invocationAdapter === undefined ||
           error.failure.adapterId !== invocationAdapter.adapterId ||
@@ -207,7 +237,7 @@ export class AgentHandler {
             "Agent invocation failure identity does not match the selected adapter",
             at ?? new Date().toISOString(),
             this.#retryBaseMilliseconds,
-            {retry:event.type === "chat.dispatch" ? "never" : "default"}
+            {retry:networkRetry || event.type === "chat.dispatch" ? "never" : "default"}
           ).resultEvent;
         }
         return this.#store.failExecution(
@@ -217,7 +247,11 @@ export class AgentHandler {
           this.#retryBaseMilliseconds,
           {
             trace: error.failure,
-            retry: event.type === "agent.request" || event.type === "chat.dispatch" ||
+            retry: retryBlocked === undefined && error.failure.reason === "protocol_error" &&
+              error.failure.rejectedBeforeWork === true && error.failure.meaningfulUpdateCount === 0 &&
+              isTransientNetworkFailure(error.message)
+              ? "network"
+              : networkRetry || event.type === "agent.request" || event.type === "chat.dispatch" ||
               error.failure.recovery === "unknown_outcome_no_replay"
               ? "never"
               : "default"
@@ -229,8 +263,16 @@ export class AgentHandler {
         message(error),
         at ?? new Date().toISOString(),
         this.#retryBaseMilliseconds,
-        {retry:event.type === "chat.dispatch" ? "never" : "default"}
+        {retry:networkRetry || event.type === "chat.dispatch" ? "never" : "default"}
       ).resultEvent;
+    } finally {
+      if (invocationJournal !== undefined) {
+        try {
+          const current = this.#store.execution(execution.executionId);
+          invocationJournal.append("execution.state", {status: current?.status, hasError: current?.lastError !== undefined});
+        } catch { console.error("agent.invocation_journal_state_unavailable", {executionId: execution.executionId}); }
+        finally { invocationJournal.close(); }
+      }
     }
   }
 
@@ -247,8 +289,8 @@ export class AgentHandler {
     const sessionLane = sessionId === undefined ? undefined : `session:${sessionId}`;
     const lane = event.type === "chat.dispatch" ? `chat-agent:${event.agentId}`
       : sessionLane ?? (context === undefined ? `request:${event.eventId}`
-        : `run:${context.runId}:cycle:${context.cycleId ?? "none"}:agent:${event.agentId}`);
-    return { agentId: event.agentId, lanes: [...new Set([lane, ...(sessionLane ? [sessionLane] : [])])],
+        : `run:${context.runId}:cycle:${context.cycleId ?? "none"}:step:${context.stepId}:agent:${event.agentId}`);
+    return { agentId: event.agentId, lanes: [...new Set([lane, ...(event.type === "chat.dispatch" ? [`chat-topic:${event.topicId}`] : []), ...(sessionLane ? [sessionLane] : [])])],
       ...(workspace === undefined ? {} : { workspace: { root: workspace, access: invocationWorkspaceAccess(event) } }) };
   }
 
@@ -405,14 +447,19 @@ export interface RuntimeDestinationAdapter {
 
 export class DeliveryHandler {
   readonly #adapters: ReadonlyMap<RuntimeDestination["kind"], RuntimeDestinationAdapter>;
+  readonly #admission: ((delivery: RuntimeDelivery, destination: RuntimeDestination) =>
+    {reason: string; permanent: boolean} | undefined) | undefined;
   readonly #retryBaseMilliseconds: number;
   readonly #store: RuntimeStore;
 
   public constructor(options: {
     readonly store: RuntimeStore;
     readonly adapters: ReadonlyMap<RuntimeDestination["kind"], RuntimeDestinationAdapter>;
+    readonly admission?: (delivery: RuntimeDelivery, destination: RuntimeDestination) =>
+      {reason: string; permanent: boolean} | undefined;
     readonly retryBaseMilliseconds?: number;
   }) {
+    this.#admission = options.admission;
     this.#store = options.store;
     this.#adapters = options.adapters;
     this.#retryBaseMilliseconds = options.retryBaseMilliseconds ?? 1_000;
@@ -429,6 +476,12 @@ export class DeliveryHandler {
       const destination = this.#store.destination(delivery.destinationId);
       if (destination === undefined) {
         throw new Error(`Destination not found: ${delivery.destinationId}`);
+      }
+      const gate = this.#admission?.(delivery,destination);
+      if(gate) {
+        const now = at ?? new Date().toISOString();
+        return this.#store.holdDelivery(delivery.deliveryId,gate.reason,
+          gate.permanent ? undefined : new Date(Date.parse(now)+30_000).toISOString(),now);
       }
       const adapter = this.#adapters.get(destination.kind);
       if (adapter === undefined) {

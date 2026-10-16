@@ -54,7 +54,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="console">
-    <header ref="headerElement">
+    <header ref="headerElement" class="console-header">
       <div class="header-inner">
         <div class="brand">
           <div class="brand-dot"></div>

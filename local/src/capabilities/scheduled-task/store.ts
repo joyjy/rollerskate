@@ -497,21 +497,25 @@ export class ScheduledTaskStore {
   ): Schedule {
     const schedule = this.require(scheduleId);
     const timestamp = iso(at, "at");
+    const waitingOnce = schedule.revision.kind === "once" &&
+      this.unterminatedRuns(scheduleId).some(run => run.status === "queued" &&
+        run.eventId === undefined && run.cycleId === undefined);
     const allowed: Readonly<Record<typeof action, readonly ScheduleStatus[]>> = {
       pause: ["active"],
       resume: ["paused"],
       cancel: ["active", "paused"]
     };
-    const target: ScheduleStatus = action === "pause"
+    const target: ScheduleStatus = action === "resume" && waitingOnce ? "completed" : action === "pause"
       ? "paused"
       : action === "resume"
         ? "active"
         : "cancelled";
     if (schedule.definition.status === target) return schedule;
-    if (!allowed[action].includes(schedule.definition.status)) {
+    if (!allowed[action].includes(schedule.definition.status) &&
+      !(waitingOnce && schedule.definition.status === "completed" && action !== "resume")) {
       throw new Error(`Schedule cannot ${action} from ${schedule.definition.status}: ${scheduleId}`);
     }
-    const next = action === "resume"
+    const next = action === "resume" && !waitingOnce
       ? initialOccurrence(schedule.revision, timestamp)
       : undefined;
     this.#database.prepare(`

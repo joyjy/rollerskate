@@ -36,9 +36,9 @@ function isRunBound(subscription: Subscription): boolean {
       <div class="row-title">{{ sub.title }}</div>
       <div class="row-meta">{{ sub.probe?.plugin.id ?? "File events" }}</div>
       <div v-if="sub.owner" class="row-meta">@{{ sub.owner.handle }} · {{ sub.owner.client }}</div>
-      <div v-else class="row-meta">Run-owned trigger source</div>
+      <div v-else class="row-meta">Trigger source</div>
       <div class="row-meta">
-        {{ isRunBound(sub) ? "Run binding" : `${sub.callbacks.length} legacy callback(s)` }}
+        {{ sub.kind === "free" && sub.definition.schema === "SubscriptionDefinition@5" ? "Subscription target" : isRunBound(sub) ? "Run binding" : `${sub.callbacks.length} legacy callback(s)` }}
       </div>
     </button>
   </div>

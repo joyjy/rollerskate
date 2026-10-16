@@ -19,7 +19,8 @@ import {
 import { eventTraceViews } from "../src/application/event/query.js";
 import {
   chatMentionPromptResourceId,
-  chatPromptResourceId
+  chatPromptResourceId,
+  parseChatRunProposalDraft
 } from "../src/core/chat/model.js";
 import { RuntimeStore } from "../src/core/runtime/store.js";
 import { parseChatDecisionReceipt } from "../src/core/runtime/store/codec.js";
@@ -736,6 +737,12 @@ test("bundled Chat prompt is a separately loaded resource", () => {
   assert.ok(!rendered.includes("type: Prompt"));
   assert.ok(!rendered.includes("resource: prompt.chat.free-turn"));
   assert.ok(!rendered.includes("{{CHAT_CONTEXT_JSON}}"));
+  assert.ok(!rendered.includes("{{CHAT_RUN_GUIDANCE}}"));
+  const example = /```json\n([\s\S]*?)\n```/u.exec(rendered)!;
+  const draft = parseChatRunProposalDraft(JSON.parse(example[1]!).proposal);
+  assert.equal(draft.desiredEffect, "read");
+  assert.equal(draft.workspaceRef, undefined);
+  assert.equal(draft.blockingQuestion, undefined);
 });
 
 test("direct mention uses a speech-only prompt resource", () => {
@@ -778,6 +785,12 @@ test("direct mention uses a speech-only prompt resource", () => {
   assert.match(rendered, /real `list_client_threads` and `read_client_thread` tools/);
   assert.ok(!rendered.includes("type: Prompt"));
   assert.ok(!rendered.includes("{{CHAT_CONTEXT_JSON}}"));
+  assert.ok(!rendered.includes("{{CHAT_RUN_GUIDANCE}}"));
+  const example = /```json\n([\s\S]*?)\n```/u.exec(rendered)!;
+  const draft = parseChatRunProposalDraft(JSON.parse(example[1]!).proposal);
+  assert.equal(draft.desiredEffect, "read");
+  assert.equal(draft.workspaceRef, undefined);
+  assert.equal(draft.blockingQuestion, undefined);
 });
 
 function profileContext(agentId: string, topicId: string, agentRevision: number) {

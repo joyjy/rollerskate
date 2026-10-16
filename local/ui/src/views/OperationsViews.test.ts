@@ -474,3 +474,24 @@ function invocationAudit(input: {
     causalityBoundary: null
   };
 }
+
+it("does not poll a placeholder detail when the Subscription list fails", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+  const fetchMock = vi.fn(async (_input: RequestInfo | URL) => Response.json({error: "list unavailable"}, {status: 500}));
+  vi.stubGlobal("fetch", fetchMock);
+  const router = createConsoleRouter(createMemoryHistory());
+  await router.push("/console/subscriptions");
+  await router.isReady();
+  const wrapper = mount(SubscriptionsView, {global: {plugins: [router]}});
+  try {
+    await flushPromises();
+    await vi.advanceTimersByTimeAsync(6_100);
+    expect(fetchMock.mock.calls.every(call => String(call[0]).startsWith("/api/subscriptions?"))).toBe(true);
+    expect(wrapper.text()).toContain("list unavailable");
+  } finally {
+    wrapper.unmount();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  }
+});

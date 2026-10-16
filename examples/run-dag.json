@@ -1,0 +1,80 @@
+{
+  "schemaVersion": "RunIntent@1",
+  "requestId": "dag-review-example",
+  "objective": "检查指定项目的实现与测试，汇总有证据的结论",
+  "acceptance": [
+    "每条结论有来源，冲突及证据缺口明确列出"
+  ],
+  "contextRefs": [
+    "README.md"
+  ],
+  "workspaceRef": "project:self",
+  "desiredEffect": "read",
+  "terminalEvidence": [
+    "汇总报告"
+  ],
+  "graph": {
+    "schemaVersion": "RunGraph@1",
+    "participants": {
+      "analyst": "agent:kimi",
+      "checker": "agent:pi-ds-pro"
+    },
+    "limits": {
+      "maxConcurrency": 2,
+      "maxNodeAttempts": 1,
+      "timeoutSeconds": 1800
+    },
+    "nodes": [
+      {
+        "id": "implementation",
+        "objective": "检查实现与说明是否一致",
+        "executor": "analyst",
+        "needs": [],
+        "contextRefs": [
+          "local/src/"
+        ],
+        "acceptance": [
+          "结论附文件位置，明确未验证项"
+        ],
+        "output": {
+          "name": "implementation-report",
+          "format": "markdown"
+        }
+      },
+      {
+        "id": "tests",
+        "objective": "检查测试覆盖与已有验证证据",
+        "executor": "checker",
+        "needs": [],
+        "contextRefs": [
+          "local/test/"
+        ],
+        "acceptance": [
+          "结论附文件位置，明确未验证项"
+        ],
+        "output": {
+          "name": "tests-report",
+          "format": "markdown"
+        }
+      },
+      {
+        "id": "assessment",
+        "objective": "交叉核对上游报告并汇总，明确冲突",
+        "executor": "analyst",
+        "needs": [
+          "implementation",
+          "tests"
+        ],
+        "contextRefs": [],
+        "acceptance": [
+          "结论附文件位置，明确未验证项"
+        ],
+        "output": {
+          "name": "assessment-report",
+          "format": "markdown"
+        }
+      }
+    ],
+    "resultNode": "assessment"
+  }
+}

@@ -113,11 +113,10 @@ function verifiedControls(
   if (client === "pi") {
     for (const flag of [
       "--no-extensions",
-      "--no-skills",
       "--no-prompt-templates",
-      "--no-themes",
-      "--no-context-files"
+      "--no-themes"
     ]) requireFlag(argv, flag, client, workspaceAccess);
+    reject(argv, ["--no-skills", "--no-context-files"], client, workspaceAccess);
     const mode = lastValue(argv, "--mode");
     if (mode !== "rpc") {
       throw new Error("pi output mode provider policy is not enforced by argv");
@@ -126,6 +125,12 @@ function verifiedControls(
       ? "read,write,edit,bash,grep,find,ls"
       : "read,grep,find,ls,read_git_diff";
     const actualTools = lastValue(argv, "--tools");
+    const webSearchEnabled = actualTools?.endsWith(",web_search") === true;
+    const baseTools = webSearchEnabled ? actualTools!.slice(0, -",web_search".length) : actualTools;
+    if (webSearchEnabled && (!resources.piWebSearchExtensionPath ||
+      !resources.piWebSearchExtensionSource?.trim() || !resources.piWebSearchDependencySource?.trim())) {
+      throw new Error("pi search extension policy is not enforced by resources");
+    }
     const configuredChatTools = (resources.piChatToolNames ?? "")
       .split(",").filter((name) => name !== "");
     const expectedChatToolSets = [
@@ -134,10 +139,10 @@ function verifiedControls(
       ["read_chat_history", ...configuredChatTools]
     ].filter((names) => names.length > 0)
       .map((names) => `${expected},${names.join(",")}`);
-    if (actualTools !== expected && !expectedChatToolSets.includes(actualTools ?? "")) {
+    if (baseTools !== expected && !expectedChatToolSets.includes(baseTools ?? "")) {
       throw new Error(`pi ${workspaceAccess} provider policy is not enforced by argv`);
     }
-    const chatToolsEnabled = actualTools !== expected;
+    const chatToolsEnabled = baseTools !== expected;
     const readGitExtension = resources.piReadonlyGitExtensionPath;
     const chatHistoryExtension = resources.piChatHistoryExtensionPath;
     const readGitExtensionSource = resources.piReadonlyGitExtensionSource;
@@ -150,7 +155,8 @@ function verifiedControls(
     }
     const expectedExtensions = [
       ...(workspaceAccess === "read" ? [readGitExtension] : []),
-      ...(chatToolsEnabled ? [chatHistoryExtension] : [])
+      ...(chatToolsEnabled ? [chatHistoryExtension] : []),
+      ...(webSearchEnabled ? [resources.piWebSearchExtensionPath!] : [])
     ];
     if (!sameValues(valuesAfter(argv, "--extension"), expectedExtensions)) {
       throw new Error(`pi ${workspaceAccess} extension policy is not enforced by argv`);

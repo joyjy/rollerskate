@@ -26,10 +26,8 @@ test("pi provider policy fails closed on read tool-list deviations", () => {
   };
   const isolation = [
     "--no-extensions",
-    "--no-skills",
     "--no-prompt-templates",
-    "--no-themes",
-    "--no-context-files"
+    "--no-themes"
   ];
   assert.doesNotThrow(() => providerPolicyObservationFromArgv(
     "pi",
@@ -46,6 +44,10 @@ test("pi provider policy fails closed on read tool-list deviations", () => {
     helperSource,
     resources
   ));
+  assert.throws(() => providerPolicyObservationFromArgv(
+    "pi", [...isolation, "--mode", "rpc", "--extension", resources.piReadonlyGitExtensionPath,
+      "--tools", "read,grep,find,ls,read_git_diff,web_search"], helperSource, resources
+  ), /search extension policy/);
   assert.throws(() => providerPolicyObservationFromArgv(
     "pi",
     [...isolation, "--mode", "rpc", "--tools", "read,grep,find,ls"],
@@ -77,17 +79,24 @@ test("pi provider policy fails closed on read tool-list deviations", () => {
   ), /read extension policy is not enforced/);
   assert.throws(() => providerPolicyObservationFromArgv(
     "pi",
-    ["--mode", "rpc", "--extension", resources.piReadonlyGitExtensionPath,
+    [...isolation, "--no-skills", "--mode", "rpc", "--extension", resources.piReadonlyGitExtensionPath,
       "--tools", "read,grep,find,ls,read_git_diff"],
     helperSource,
     resources
-  ), /read provider policy is not enforced/);
+  ), /read provider policy conflicts with unsafe argv/);
+  assert.throws(() => providerPolicyObservationFromArgv(
+    "pi",
+    [...isolation, "--no-context-files", "--mode", "rpc", "--extension", resources.piReadonlyGitExtensionPath,
+      "--tools", "read,grep,find,ls,read_git_diff"],
+    helperSource,
+    resources
+  ), /read provider policy conflicts with unsafe argv/);
 });
 
 test("pi provider policy identity attests bundled extension content", () => {
   const argv = [
-    "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes",
-    "--no-context-files", "--mode", "rpc", "--extension", "/trusted/read.mjs",
+    "--no-extensions", "--no-prompt-templates", "--no-themes",
+    "--mode", "rpc", "--extension", "/trusted/read.mjs",
     "--tools", "read,grep,find,ls,read_git_diff"
   ];
   const resources = {
@@ -139,6 +148,8 @@ test("pi discards oversized JSON trace and keeps a short Run result", async () =
   assert.equal(firstRequest.args.includes("--print"), false);
   assert.equal(valueAfter(firstRequest.args, "--session-id"), first.providerSessionId);
   assert.equal(firstRequest.args.includes("--session"), false);
+  assert.equal(firstRequest.args.includes("--no-skills"), false);
+  assert.equal(firstRequest.args.includes("--no-context-files"), false);
 
   await agent.invoke({ event: runEvent(), providerSessionId: first.providerSessionId });
   const resumed = invocation(fixture.invocation);
@@ -159,6 +170,7 @@ test("pi keeps JSON events and loads the bounded Rollerskate read tools in Chat"
     projectRoot: fixture.workspace,
     environment: {},
     timeoutMilliseconds: 3_000,
+    resolveWebSearch: () => true,
     chatToolGrant: chatToolGrant(),
     resolveChatToolContext: () => context
   });
@@ -170,6 +182,7 @@ test("pi keeps JSON events and loads the bounded Rollerskate read tools in Chat"
   assert.equal(valueAfter(request.args, "--session-id"), result.providerSessionId);
   const tools = valueAfter(request.args, "--tools")?.split(",") ?? [];
   assert.equal(tools.includes("read_chat_history"), true);
+  assert.equal(tools.includes("web_search"), true);
   assert.equal(tools.includes("subscription_history"), true);
   assert.equal(tools.includes("get_run"), true);
   assert.equal(tools.includes("event_trace"), true);
@@ -215,6 +228,26 @@ test("pi write grants preserve mutation tools and exclude the git extension", as
   assert.equal(flagValues(request.args, "--extension").some((path) =>
     /pi-readonly-git\.mjs$/u.test(path)
   ), false);
+});
+
+test("Pi search is opt-in and removed on resume without widening the other tools", async () => {
+  const fixture = piFixture();
+  let enabled = false;
+  const agent = new PiRuntimeAgent({executable: fixture.executable, projectRoot: fixture.workspace,
+    environment: {}, timeoutMilliseconds: 3000, resolveWebSearch: () => enabled});
+  const event = {...runEvent(), type: "chat.dispatch", source: {kind: "handler"},
+    topicId: "topic-test", sourceAttentionEventId: "attention-test", targetHandleSnapshot: "pi",
+    promptResourceId: "test"} as ChatDispatchEvent;
+  let session: string | undefined;
+  for (const on of [false, true, false]) {
+    enabled = on;
+    const result = await agent.invoke({event, ...(session ? {providerSessionId: session} : {})});
+    session = result.providerSessionId;
+    const request = invocation(fixture.invocation);
+    assert.equal(valueAfter(request.args, "--tools"), `read,grep,find,ls,read_git_diff${on ? ",web_search" : ""}`);
+    assert.equal(flagValues(request.args, "--extension").some(path => path.endsWith("pi-exa-extension.ts")), on);
+    assert.match(result.invocation!.effectivePrompt, on ? /Owner enabled/ : /Owner has not enabled/);
+  }
 });
 
 test("pi uses the shared meaningful stall watchdog and sends RPC abort", async () => {
@@ -710,3 +743,31 @@ function chatEvent(): ChatDispatchEvent {
     createdAt: "2026-07-25T00:00:00.000Z"
   };
 }
+
+
+test("pi exposes transient provider rejection only before meaningful work", async () => {
+  const workspace=temporaryDirectory("rollerskate-pi-network-");
+  const executable=join(workspace,"pi-fixture");
+  for(const toolStarted of [false,true]) {
+    writeFileSync(executable,`#!${process.execPath}
+const rl=require("node:readline").createInterface({input:process.stdin});
+const emit=value=>process.stdout.write(JSON.stringify(value)+"\\n");
+rl.on("line",line=>{const command=JSON.parse(line);
+if(command.type==="get_state")emit({id:command.id,type:"response",command:"get_state",success:true,data:{sessionId:process.argv[process.argv.indexOf("--session-id")+1]}});
+if(command.type==="prompt"){
+  emit({id:command.id,type:"response",command:"prompt",success:true});
+  ${toolStarted ? 'emit({type:"tool_execution_start",toolName:"bash"});' : ''}
+  emit({type:"message_end",message:{role:"assistant",stopReason:"error",errorMessage:"HTTP 503 Service unavailable",content:[]}});
+}
+if(command.type==="abort")process.exit(0);
+});`);
+    chmodSync(executable,0o755);
+    const agent=new PiRuntimeAgent({executable,projectRoot:workspace,environment:{},timeoutMilliseconds:3000});
+    await assert.rejects(agent.invoke({event:runEvent()}),error=>{
+      assert.ok(error instanceof AgentInvocationError);
+      assert.equal(error.failure.rejectedBeforeWork,toolStarted?undefined:true);
+      assert.match(error.message,/HTTP 503/);
+      return true;
+    });
+  }
+});

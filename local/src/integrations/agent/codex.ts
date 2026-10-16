@@ -1,3 +1,4 @@
+import { webSearchPrompt } from "./web-search-policy.js";
 import { realpathSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 
@@ -29,6 +30,7 @@ import {
 } from "./runner/protocol.js";
 
 export const CODEX_CLIENT_HISTORY_POLICY_ENV = "ROLLERSKATE_CLIENT_HISTORY_POLICY";
+export const READONLY_RUN_NETWORK_GRANT_ENV = "ROLLERSKATE_READONLY_RUN_NETWORK_GRANT";
 
 export interface CodexRuntimeAgentOptions {
   readonly executable: string;
@@ -38,6 +40,7 @@ export interface CodexRuntimeAgentOptions {
   readonly meaningfulOutputTimeoutMilliseconds?: number;
   readonly maxOutputBytes?: number;
   readonly launchArgs?: readonly string[];
+  readonly resolveWebSearch?: (event: AgentInputEvent | ChatDispatchEvent) => boolean;
   readonly resolveMcpServers?: (
     input: CodexMcpServerResolutionInput
   ) => readonly CodexMcpServer[];
@@ -89,12 +92,15 @@ export class CodexRuntimeAgent implements RuntimeAgentAdapter {
       this.#options.meaningfulOutputTimeoutMilliseconds ??
       this.#options.timeoutMilliseconds;
     const networkAccess = codexNetworkAccess(input.event);
+    const webSearch = input.event.type === "chat.dispatch" ? this.#options.resolveWebSearch?.(input.event) === true : undefined;
+    const effectivePrompt = [runtimeAgentEventPrompt(input.event), ...(webSearch === undefined ? [] : [webSearchPrompt(webSearch)])].join("\n\n");
     const threadParameters = codexThreadParameters(
       access,
       networkAccess,
       this.workspace,
       mcpServers,
-      this.#selection
+      this.#selection,
+      webSearch
     );
     const policyObservation = codexAppServerPolicyObservation(
       threadParameters,
@@ -105,7 +111,8 @@ export class CodexRuntimeAgent implements RuntimeAgentAdapter {
       this.#options.environment,
       mcpServers,
       policyObservation,
-      this.#options.serializeMcpPolicy
+      this.#options.serializeMcpPolicy,
+      input.event
     );
     const runner = new CodexAppServerRunner({
       adapterId: this.adapterId,
@@ -120,7 +127,8 @@ export class CodexRuntimeAgent implements RuntimeAgentAdapter {
     let receipt: RunnerTurnReceipt;
     try {
       receipt = await runner.invoke({
-        prompt: runtimeAgentEventPrompt(input.event),
+        ...(input.reportOutput === undefined ? {} : {onOutput: input.reportOutput}),
+        prompt: effectivePrompt,
         workspaceAccess: access,
         totalTimeoutMilliseconds,
         meaningfulOutputTimeoutMilliseconds,
@@ -157,7 +165,7 @@ export class CodexRuntimeAgent implements RuntimeAgentAdapter {
     return {
       providerSessionId: receipt.sessionId,
       outcome: response.outcome,
-      invocation: invocationDiagnostics(input.event, receipt, response.providerDiagnostics)
+      invocation: invocationDiagnostics(input.event, receipt, response.providerDiagnostics, effectivePrompt)
     };
   }
 }
@@ -167,7 +175,8 @@ function codexThreadParameters(
   networkAccess: boolean,
   projectRoot: string,
   servers: readonly CodexMcpServer[],
-  selection: { readonly model?: string; readonly reasoningEffort?: string }
+  selection: { readonly model?: string; readonly reasoningEffort?: string },
+  webSearch?: boolean
 ): Readonly<Record<string, unknown>> {
   const mcpServers = Object.fromEntries(servers.map((server) => {
     validateStdioMcpServer(server);
@@ -185,8 +194,9 @@ function codexThreadParameters(
     sandbox: access === "write" ? "workspace-write" : "read-only",
     ...(selection.model === undefined ? {} : { model: selection.model }),
     config: {
+      ...(webSearch === undefined ? {} : { web_search: webSearch ? "live" : "disabled" }),
       ...(selection.reasoningEffort === undefined ? {} : { model_reasoning_effort: selection.reasoningEffort }),
-      shell_environment_policy: { exclude: [CODEX_CLIENT_HISTORY_POLICY_ENV] },
+      shell_environment_policy: { exclude: [CODEX_CLIENT_HISTORY_POLICY_ENV, READONLY_RUN_NETWORK_GRANT_ENV] },
       ...(networkAccess
         ? { sandbox_workspace_write: { network_access: true } }
         : {}),
@@ -248,15 +258,23 @@ function codexEnvironment(
   environment: Readonly<Record<string, string>>,
   servers: readonly CodexMcpServer[],
   observation: ProviderPolicyObservationSnapshot & { readonly client: "codex" },
-  serializeMcpPolicy: CodexRuntimeAgentOptions["serializeMcpPolicy"]
+  serializeMcpPolicy: CodexRuntimeAgentOptions["serializeMcpPolicy"],
+  event: AgentInputEvent | ChatDispatchEvent
 ): Readonly<Record<string, string>> {
-  if (servers.length === 0) return environment;
+  const controlledEnvironment = { ...environment };
+  delete controlledEnvironment[READONLY_RUN_NETWORK_GRANT_ENV];
+  const grant = event.type === "agent.request" &&
+    event.runContext?.workspaceGrant?.access === "read" &&
+    event.runContext.workspaceGrant.networkAccess === true
+    ? { [READONLY_RUN_NETWORK_GRANT_ENV]: event.runContext.runId }
+    : {};
+  if (servers.length === 0) return { ...controlledEnvironment, ...grant };
   if (serializeMcpPolicy === undefined) {
     throw new Error("Codex MCP policy serializer is required");
   }
   const serializedPolicy = serializeMcpPolicy(observation);
   if (serializedPolicy.trim() === "") throw new Error("Codex MCP policy is empty");
-  return { ...environment, [CODEX_CLIENT_HISTORY_POLICY_ENV]: serializedPolicy };
+  return { ...controlledEnvironment, ...grant, [CODEX_CLIENT_HISTORY_POLICY_ENV]: serializedPolicy };
 }
 
 function codexWorkspaceAccess(

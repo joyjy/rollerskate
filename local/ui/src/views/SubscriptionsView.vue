@@ -51,7 +51,7 @@ const selectedQuery = useApi({
   url: detailUrl,
   schema: subscriptionSchema,
   interval: 3_000,
-  paused: mutationPaused,
+  paused: computed(() => mutationPaused.value || selectedId.value === ""),
   immediate: false
 });
 const selected = selectedQuery.data;
@@ -175,6 +175,7 @@ function goToPage(page: number) {
         @toggle-archive="archivedView = !archivedView"
       />
       <div v-if="loading && subscriptions.length === 0" class="state">Loading Subscriptions…</div>
+      <div v-else-if="loadError && subscriptions.length === 0" class="state error" role="alert">{{ loadError }}</div>
       <div v-else-if="subscriptions.length === 0" class="state">
         {{ archivedView ? "No archived Subscription." : "No Subscription is registered." }}
       </div>

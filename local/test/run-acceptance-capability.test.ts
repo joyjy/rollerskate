@@ -1,3 +1,4 @@
+import { withConsoleStewardApi } from "./helpers/console-steward-api.js";
 import { cancelStewardRun } from "../src/application/steward/control.js";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -17,7 +18,7 @@ import { openRuntimeDatabase } from "../src/infrastructure/sqlite/database.js";
 import { parseRunDecision } from "../src/modules/steward/caller-contract.js";
 import { planCallerRunDecision } from "../src/modules/steward/state-machine.js";
 
-for (const scenario of ["owner", "preauthorized", "cancel"] as const) test(`original acceptance survives bad dispatch notes and network adjustment (${scenario})`, async () => {
+for (const scenario of ["owner", "preauthorized", "cancel", "console"] as const) test(`original acceptance survives bad dispatch notes and network adjustment (${scenario})`, async () => {
   const preauthorized = scenario === "preauthorized";
   const root = mkdtempSync(join(tmpdir(), "rs-capability-test-"));
   const repo = join(root, "repo"), runtimeDirectory = join(root, "runtime");
@@ -105,7 +106,41 @@ for (const scenario of ["owner", "preauthorized", "cancel"] as const) test(`orig
       }
       assert.throws(() => authorizeRunNetwork(repo, runId, pending.requestEventId, pending.runVersion + 1, runtimeDirectory), /no longer pending/);
       assert.equal(runtime.eventsForRoot(started.rootEventId).length, eventCount);
-      assert.equal(authorizeRunNetwork(repo, runId, pending.requestEventId, pending.runVersion, runtimeDirectory).status, "accepted");
+      if (scenario === "console") {
+        const projectionBefore = runs.requireProjection(runId);
+        const sessionBefore = runtime.sessionForRunAgent(runId,agent.principalId)!;
+        await withConsoleStewardApi(repo,runtimeDirectory,async post => {
+          const path = `/api/runs/${runId}/authorize-network`;
+          const body = {requestEventId:pending.requestEventId,expectedVersion:pending.runVersion};
+          assert.equal((await post(path,body,"untrusted")).status,403);
+          const missingId = await post(path,{expectedVersion:pending.runVersion});
+          assert.equal(missingId.status,400);assert.match(String(missingId.body.error),/requestEventId/);
+          const missingVersion = await post(path,{requestEventId:pending.requestEventId});
+          assert.equal(missingVersion.status,400);assert.match(String(missingVersion.body.error),/expectedVersion/);
+          const wrongRequest = await post(path,{...body,requestEventId:"evt_wrong_request"});
+          assert.equal(wrongRequest.status,400);assert.match(String(wrongRequest.body.error),/not settled/);
+          const stale = await post(path,{...body,expectedVersion:pending.runVersion+1});
+          assert.equal(stale.status,400);assert.match(String(stale.body.error),/no longer pending/);
+          assert.deepEqual(runs.requireProjection(runId),projectionBefore);
+          assert.equal(runtime.eventsForRoot(started.rootEventId).length,eventCount);
+          const accepted = await post(path,body);
+          assert.equal(accepted.status,200,JSON.stringify(accepted.body));
+          assert.equal(accepted.body.status,"accepted");
+          assert.equal(accepted.body.runId,runId);
+          const continuation = runtime.event(String(accepted.body.eventId));
+          assert.equal(continuation?.type,"agent.request");
+          if (continuation?.type !== "agent.request") throw new Error("Expected capability continuation");
+          assert.equal(continuation.sessionId,sessionBefore.sessionId);
+          assert.equal(continuation.agentId,agent.principalId);
+          assert.equal(continuation.runContext?.runId,runId);
+          assert.equal(continuation.runContext?.workspaceGrant?.networkAccess,true);
+          assert.match(continuation.prompt,new RegExp(pending.requestEventId));
+          assert.equal((await post(path,body)).body.status,"already_applied");
+          assert.equal(runtime.eventsForRoot(started.rootEventId).length,eventCount+1);
+        });
+      } else {
+        assert.equal(authorizeRunNetwork(repo, runId, pending.requestEventId, pending.runVersion, runtimeDirectory).status, "accepted");
+      }
     }
     assert.equal(authorizeRunNetwork(repo, runId, pending.requestEventId, pending.runVersion, runtimeDirectory).status, "already_applied");
     await turn();
@@ -115,4 +150,33 @@ for (const scenario of ["owner", "preauthorized", "cancel"] as const) test(`orig
     assert.notEqual(binding?.schemaVersion === "OrchestratorBinding@3" ? binding.admissionDigest : undefined, started.admission.admissionDigest);
     assert.equal(calls, 3);
   } finally {database.close(); rmSync(root, {recursive: true, force: true});}
+});
+
+test("Owner may preauthorize network for a standalone write Run; an offline write Run may request it", () => {
+  const root = mkdtempSync(join(tmpdir(), "rs-write-network-test-"));
+  const repo = join(root, "repo"), runtimeDirectory = join(root, "runtime");
+  assert.equal(spawnSync("git", ["init", repo]).status, 0);
+  writeFileSync(join(repo, "README.md"), "fixture\n");
+  assert.equal(spawnSync("git", ["-C", repo, "add", "."]).status, 0);
+  assert.equal(spawnSync("git", ["-C", repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "fixture"]).status, 0);
+  addLocalAgent(repo, "codex", "codex", {runtimeDirectory});
+  const intent = {schemaVersion: "RunIntent@1", requestId: "write-network", objective: "Prepare a bounded change",
+    acceptance: ["Change is verified"], contextRefs: [], workspaceRef: pathToFileURL(repo).href,
+    desiredEffect: "change", requestedParticipantRefs: ["agent:codex"], terminalEvidence: ["readback"]};
+  try {
+    const authorized = startStewardRunFromOwnerIntent(repo, intent, {authorizeNetwork: true}, runtimeDirectory);
+    assert.equal(authorized.run.workspaceGrant?.access, "write");
+    assert.equal(authorized.run.workspaceGrant?.networkAccess, false);
+    assert.equal(authorized.run.orchestratorBinding?.schemaVersion === "OrchestratorBinding@3"
+      ? authorized.run.orchestratorBinding.ownerNetworkAuthorized : undefined, true);
+    cancelStewardRun(repo, authorized.run.runId, runtimeDirectory);
+    const offline = startStewardRunFromIntent(repo, {...intent, requestId: "write-offline"}, runtimeDirectory);
+    assert.equal(offline.run.workspaceGrant?.networkAccess, false);
+    const decision = parseRunDecision({schemaVersion: "RunDecision@6", expectedRunVersion: offline.run.version,
+      rationale: "Remote readback is required", state: {schemaVersion: "OrchestratorState@1", goal: intent.objective,
+        tasks: [], acceptedEvidence: [], unresolvedQuestions: []}, checkedAcceptance: [{id: "a1", status: "unknown", evidenceRefs: []}],
+      action: "request_capability", capability: {kind: "network", acceptanceIds: ["a1"],
+        targets: ["https://git.example.test/project"], reason: "Need current remote facts"}});
+    assert.deepEqual(planCallerRunDecision({run: offline.run, decision, now: new Date().toISOString()}), {kind: "request_capability"});
+  } finally {rmSync(root, {recursive: true, force: true});}
 });

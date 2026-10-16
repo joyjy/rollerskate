@@ -1,3 +1,7 @@
+import { parseChatCallbackInput, chatReturnState } from "../chat/callback.js";
+import { openRuntimeDatabaseReadOnly } from "../../infrastructure/sqlite/database.js";
+import { runtimePaths } from "../../infrastructure/runtime/config.js";
+import { RuntimeStore } from "../../core/runtime/store.js";
 import { localId } from "../../core/id.js";
 import { accessSync, constants, realpathSync, statSync } from "node:fs";
 import { delimiter, isAbsolute, resolve } from "node:path";
@@ -16,7 +20,7 @@ import { inspectCodexDesktopTarget } from "../../integrations/codex-desktop/ipc.
 
 export type RunPlan = { readonly executor: "agent"; readonly intent: RunIntent; readonly admission: StewardRunRequest }
   | { readonly executor: "command" | "observe"; readonly intent: DeterministicRunIntent; readonly runId: string;
-      readonly sourceId: string; readonly threadId?: string; readonly plugin: RegisteredSubscriptionPlugin;
+      readonly sourceId: string; readonly threadId?: string; readonly chatDispatchEventId?: string; readonly plugin: RegisteredSubscriptionPlugin;
       readonly pluginConfig: unknown; readonly probe: PollProbe;
       readonly command?: { readonly executable: string; readonly args: readonly string[]; readonly cwd: string };
       readonly authority: { readonly execution: "caller-inherited" | "registered-probe"; readonly probe: ReturnType<typeof registeredSubscriptionProbe>["policy"] };
@@ -35,6 +39,14 @@ export interface RunPreflight {
 export async function preflightRun(repoRoot: string, value: unknown, runtimeDirectory?: string, policy: RunIntentOwnerPolicy = {}): Promise<RunPreflight> {
   const diagnostics: Diagnostic[] = [];
   const unverified: { field: string; reason: string }[] = [];
+  async function discoverDesktop(threadId: string) {
+    try { await inspectCodexDesktopTarget(threadId, { timeoutMilliseconds: 5000,
+      ...(process.env.ROLLERSKATE_CODEX_IPC_SOCKET ? {socketPath: process.env.ROLLERSKATE_CODEX_IPC_SOCKET} : {}) }); }
+    catch (error) { diagnostics.push(diagnostic("DESTINATION_UNAVAILABLE", "resultDestinationRef", "a compatible local Desktop owner for the exact task",
+      error instanceof Error ? error.message : String(error), "Load the exact task in Desktop and check the IPC socket; no message was sent.")); }
+    unverified.push({ field: "resultDestinationRef", reason: "Discovery checks the current owner without sending input; future target activity and delivery are rechecked by Desktop when sending." });
+  }
+
   const result = (plan?: RunPlan): RunPreflight => ({ schemaVersion: "RunPreflight@1", status: diagnostics.length ? "failed" : "passed",
     diagnostics, unverified, ...(plan === undefined ? {} : { plan, planDigest: workDigest(plan) }) });
   const intent = check(diagnostics, "intent", "INTENT_SCHEMA", "a supported Run intent with exact fields",
@@ -43,25 +55,33 @@ export async function preflightRun(repoRoot: string, value: unknown, runtimeDire
   if (intent.schemaVersion === "RunIntent@1") {
     const admission = check(diagnostics, "intent", "AGENT_ADMISSION", "an admissible Agent work plan",
       "Correct the reported workspace, participant, source or destination binding.", () => compileRunIntentWithOwnerPolicy(repoRoot, intent, policy, runtimeDirectory));
+    if (admission?.resultDestination?.delivery.kind === "codex-desktop") {
+      await discoverDesktop(admission.resultDestination.delivery.address.threadId!);
+    }
     return result(admission ? { executor: "agent", intent, admission } : undefined);
   }
   if (Object.keys(policy).length) diagnostics.push(diagnostic("PERMISSION_UNSUPPORTED", "authority", "deterministic work uses caller authority or the registered probe grant",
     "Agent capability overrides do not apply to deterministic work", "Launch from an already authorized caller; do not supply Agent policy overrides."));
   const runId = deterministicRunId(intent.requestId);
   const sourceId = localId("sub");
+  let chatDispatchEventId: string | undefined;
   const threadId = intent.resultDestinationRef === undefined ? undefined : check(diagnostics, "resultDestinationRef", "DESTINATION_INVALID",
-    "codex-desktop:<exact task UUID>", "Provide an exact Codex Desktop task reference, or omit delivery.", () => {
+    "codex-desktop:<UUID> or rs-chat:<dispatch Event ID>", "Provide the exact original task or Chat dispatch reference, or omit delivery.", () => {
+      if (intent.resultDestinationRef!.startsWith("rs-chat:")) {
+        const target = parseChatCallbackInput({dispatchEventId: intent.resultDestinationRef!.slice("rs-chat:".length), title: intent.title});
+        const database = openRuntimeDatabaseReadOnly(runtimePaths(repoRoot, runtimeDirectory).database);
+        try {
+          const state = chatReturnState(database, new RuntimeStore(database, {migrate: false}), target.dispatchEventId);
+          if (state.status === "blocked") throw new Error(`Chat callback target unavailable: ${state.reason}`);
+          chatDispatchEventId = target.dispatchEventId;
+        } finally {database.close();}
+        return undefined;
+      }
       const prefix = "codex-desktop:";
       if (!intent.resultDestinationRef!.startsWith(prefix)) throw new Error("Unsupported deterministic result destination");
       return parseCodexDesktopActionInput({ threadId: intent.resultDestinationRef!.slice(prefix.length), title: intent.title }).threadId;
     });
-  if (threadId) {
-    try { await inspectCodexDesktopTarget(threadId, { timeoutMilliseconds: 5000,
-      ...(process.env.ROLLERSKATE_CODEX_IPC_SOCKET ? {socketPath: process.env.ROLLERSKATE_CODEX_IPC_SOCKET} : {}) }); }
-    catch (error) { diagnostics.push(diagnostic("DESTINATION_UNAVAILABLE", "resultDestinationRef", "a compatible local Desktop owner for the exact task",
-      error instanceof Error ? error.message : String(error), "Load the exact task in Desktop and check the IPC socket; no message was sent.")); }
-    unverified.push({ field: "resultDestinationRef", reason: "Discovery checks the current owner without sending input; future target activity and delivery are rechecked by Desktop when sending." });
-  }
+  if (threadId) await discoverDesktop(threadId);
   const runtime = check(diagnostics, "runtime", "RUNTIME_NOT_FRESH", "a running Runtime loaded from current artifacts",
     "Start or reload the Runtime from the expected revision.", () => {
       const status = runtimeOperationsView(repoRoot, runtimeDirectory, "");
@@ -118,6 +138,7 @@ export async function preflightRun(repoRoot: string, value: unknown, runtimeDire
     });
   if (diagnostics.length || !runtime || !source || !probe) return result();
   return result({ executor: work.kind, intent, runId, sourceId, ...(threadId ? { threadId } : {}),
+    ...(chatDispatchEventId ? {chatDispatchEventId} : {}),
     plugin: source.plugin, pluginConfig: source.config, probe, ...(command ? { command } : {}),
     authority: { execution: work.kind === "command" ? "caller-inherited" : "registered-probe", probe: registeredSubscriptionProbe(source.plugin, source.config).policy },
     runtimeRevision: runtime.expected });

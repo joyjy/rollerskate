@@ -74,6 +74,7 @@ export interface TargetedSubscriptionDefinition extends Omit<
 > {
   readonly schemaVersion: "SubscriptionDefinition@5";
   readonly target: ProactiveTarget;
+  readonly checkpointMilliseconds?: number;
 }
 
 export type FreeSubscriptionCallback = ProactiveCallbackDefinition;
@@ -115,6 +116,7 @@ export interface FreeSubscription {
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly latestError?: string;
+  readonly observationState?: import("./observation-state.js").ObservationState;
   readonly terminalKey?: string;
   readonly terminalObservation?: unknown;
 }

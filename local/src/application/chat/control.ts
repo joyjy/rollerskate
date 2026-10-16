@@ -1,3 +1,4 @@
+import { inspectWebSearchAccess } from "./web-search.js";
 import { codexChatDestination } from "../../integrations/codex-desktop/chat-destination.js";
 import { chatWorkForMessages } from "./work-query.js";
 import {
@@ -31,11 +32,9 @@ import {
 } from "../activity/client-history.js";
 import { materializeLocalTopicGovernance } from
   "../topic/governance-control.js";
-import { startStewardRunFromIntent } from "../steward/intent-control.js";
 import {
   projectChatRunProposals
 } from "./run-proposal.js";
-import { inspectCurrentChatRunProposal } from "./run-proposal-control.js";
 
 export interface LocalChatView {
   readonly chat: {
@@ -61,6 +60,7 @@ export interface LocalChatPresenceView {
     readonly status: LocalAgent["status"];
     readonly global?: ChatPresence;
     readonly topic?: ChatPresence;
+    readonly webSearch: ReturnType<typeof inspectWebSearchAccess>;
     readonly clientHistory?: {
       readonly client: LocalAgent["client"];
       readonly status: "active" | "revoked";
@@ -199,46 +199,6 @@ export function postLocalChatMessage(
   }
 }
 
-export function handoffLocalChatMessageToRun(
-  repoRoot: string,
-  eventId: string,
-  options: LocalControlOptions = {}
-) {
-  const snapshot = localRuntimeSnapshot(repoRoot, options);
-  const chat = openChat(repoRoot, options);
-  try {
-    const message = chat.message(eventId);
-    if (message.topicId !== snapshot.foundation.topicId || message.sender.kind !== "owner") {
-      throw new Error("Only an Owner message in the Local Topic can be handed off to a Run");
-    }
-    if (inspectCurrentChatRunProposal(repoRoot, message, snapshot.agents, options) !== undefined) {
-      throw new Error(
-        "Owner messages with a Run proposal require current revision confirmation"
-      );
-    }
-    return startStewardRunFromIntent(repoRoot, {
-      schemaVersion: "RunIntent@1",
-      requestId: `chat-work:${message.eventId}`,
-      objective: message.body,
-      acceptance: ["Complete the explicit work intent handed off from Local Chat"],
-      contextRefs: [
-        `chat-topic:${message.topicId}`,
-        `chat-message:${message.eventId}`
-      ],
-      ...(message.targets === undefined || message.targets.length === 0
-        ? {}
-        : {
-            requestedParticipantRefs: message.targets.map(
-              ({ principalId }) => `principal:${principalId}`
-            )
-          }),
-      terminalEvidence: ["Record a terminal Run receipt linked to the source Chat message"]
-    }, options.runtimeDirectory);
-  } finally {
-    chat.close();
-  }
-}
-
 export function localChatPresenceView(
   repoRoot: string,
   options: LocalControlOptions = {}
@@ -301,6 +261,7 @@ export function localChatPresenceView(
           principalId: agent.principalId,
           handle: agent.handle,
           status: agent.status,
+          webSearch: inspectWebSearchAccess(repoRoot, agent.principalId, agent.client, options.runtimeDirectory),
           ...(presence.global === undefined ? {} : { global: presence.global }),
           ...(presence.topic === undefined ? {} : { topic: presence.topic }),
           ...(history === undefined

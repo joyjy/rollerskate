@@ -1,3 +1,5 @@
+import { claudeOutputArgs, claudeOutputProtocol, type ClaudeOutputRequest } from "./claude-output-stream.js";
+import { webSearchPrompt } from "./web-search-policy.js";
 import { realpathSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 
@@ -17,10 +19,11 @@ import {
   type StdioMcpServer
 } from "./mcp-server.js";
 
-interface ClaudeCodeRequest {
+interface ClaudeCodeRequest extends ClaudeOutputRequest {
   readonly event: AgentInputEvent | ChatDispatchEvent;
   readonly providerSessionId?: string;
   readonly mcpServers: readonly StdioMcpServer[];
+  readonly webSearch: boolean;
 }
 
 interface ClaudeCodeResult {
@@ -48,6 +51,7 @@ export interface ClaudeCodeRuntimeAgentOptions {
   readonly timeoutMilliseconds: number;
   readonly maxOutputBytes?: number;
   readonly launchArgs?: readonly string[];
+  readonly resolveWebSearch?: (event: AgentInputEvent | ChatDispatchEvent) => boolean;
   readonly resolveMcpServers?: (
     input: Pick<ClaudeCodeRequest, "event" | "providerSessionId">
   ) => readonly StdioMcpServer[];
@@ -58,11 +62,13 @@ export class ClaudeCodeRuntimeAgent implements RuntimeAgentAdapter {
   public readonly providerPolicy;
   public readonly workspace: string;
   readonly #process: AgentProcessClient;
+  readonly #resolveWebSearch: ClaudeCodeRuntimeAgentOptions["resolveWebSearch"];
   readonly #resolveMcpServers: ClaudeCodeRuntimeAgentOptions["resolveMcpServers"];
 
   public constructor(options: ClaudeCodeRuntimeAgentOptions) {
     this.workspace = workspace(options.projectRoot);
     this.#resolveMcpServers = options.resolveMcpServers;
+    this.#resolveWebSearch = options.resolveWebSearch;
     this.providerPolicy = providerPolicyObservationFromArgv(
       "claude-code",
       claudeCodeOptions(undefined, options.launchArgs ?? []),
@@ -79,7 +85,7 @@ export class ClaudeCodeRuntimeAgent implements RuntimeAgentAdapter {
       workingDirectory: this.workspace,
       timeoutMilliseconds: options.timeoutMilliseconds,
       maxOutputBytes: options.maxOutputBytes ?? 1_048_576,
-      protocol: claudeCodeProtocol
+      protocol: claudeOutputProtocol(claudeCodeProtocol)
     });
   }
 
@@ -91,15 +97,18 @@ export class ClaudeCodeRuntimeAgent implements RuntimeAgentAdapter {
         ? {}
         : { providerSessionId: input.providerSessionId })
     };
+    const webSearch = input.event.type === "chat.dispatch" && this.#resolveWebSearch?.(input.event) === true;
     const result = await this.#process.invoke({
       ...resolutionInput,
-      mcpServers: this.#resolveMcpServers?.(resolutionInput) ?? []
+      ...(input.reportOutput === undefined ? {} : {reportOutput: input.reportOutput}),
+      mcpServers: this.#resolveMcpServers?.(resolutionInput) ?? [],
+      webSearch
     } satisfies ClaudeCodeRequest);
     const response = result.response as ClaudeCodeDecodedResponse;
     return {
       providerSessionId: response.providerSessionId,
       outcome: response.outcome,
-      invocation: invocationDiagnostics(input.event, result, response.providerDiagnostics)
+      invocation: invocationDiagnostics(input.event, result, response.providerDiagnostics, claudeCodeProtocol.encodeRequest({...input, mcpServers: [], webSearch}))
     };
   }
 }
@@ -113,36 +122,39 @@ function claudeCodeArgs(
     : request.event.type === "subscription.fire"
       ? request.event.invocation?.workspaceGrant.access
       : undefined;
-  const options = claudeCodeOptions(access, launchArgs);
+  const options = claudeOutputArgs(claudeCodeOptions(access, launchArgs, request.webSearch), request.reportOutput !== undefined);
   const mcpOptions = request.mcpServers.length === 0
     ? []
     : [
         "--mcp-config", stdioMcpConfig(request.mcpServers),
-        "--strict-mcp-config",
-        "--allowedTools", ...stdioMcpAllowedTools(request.mcpServers)
+        "--strict-mcp-config"
       ];
+  const allowed = [...stdioMcpAllowedTools(request.mcpServers), ...(request.webSearch ? ["WebSearch"] : [])];
+  const permissions = allowed.length === 0 ? [] : ["--allowedTools", ...allowed];
   return request.providerSessionId === undefined
-    ? [...options, ...mcpOptions]
-    : [...options, ...mcpOptions, "--resume", request.providerSessionId];
+    ? [...options, ...mcpOptions, ...permissions]
+    : [...options, ...mcpOptions, ...permissions, "--resume", request.providerSessionId];
 }
 
 function claudeCodeOptions(
   access: "read" | "write" | undefined,
-  launchArgs: readonly string[]
+  launchArgs: readonly string[],
+  webSearch = false
 ): string[] {
   return [
     ...launchArgs,
     "--print",
     "--output-format", "json",
     ...(access === "write"
-      ? ["--permission-mode", "acceptEdits", "--tools", "Read,Glob,Grep,Edit,Write,Bash"]
-      : ["--permission-mode", "plan", "--tools", "Read,Glob,Grep"])
+      ? ["--permission-mode", "acceptEdits", "--tools", `Read,Glob,Grep,Edit,Write,Bash${webSearch ? ",WebSearch" : ""}`]
+      : ["--permission-mode", "plan", "--tools", `Read,Glob,Grep${webSearch ? ",WebSearch" : ""}`])
   ];
 }
 
 const claudeCodeProtocol: AgentProcessProtocol = {
   encodeRequest(request: unknown): string {
-    return runtimeAgentEventPrompt((request as ClaudeCodeRequest).event);
+    const input = request as ClaudeCodeRequest;
+    return [runtimeAgentEventPrompt(input.event), ...(input.event.type === "chat.dispatch" ? [webSearchPrompt(input.webSearch)] : [])].join("\n\n");
   },
   decodeResponse(output: string): ClaudeCodeDecodedResponse {
     const parsed = JSON.parse(output) as ClaudeCodeResult;

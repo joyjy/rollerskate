@@ -34,7 +34,7 @@ test("schema v74 preserves v60 autonomous Runs and adds caller decision state", 
 
     downgradeAgentRunsToV60(paths.database);
     assert.equal(declaredVersion(paths.database), 60);
-    assert.equal(initializeRuntimeSchema(paths.database).schemaVersion, 75);
+    assert.equal(initializeRuntimeSchema(paths.database).schemaVersion, 80);
 
     const database = new DatabaseSync(paths.database);
     try {

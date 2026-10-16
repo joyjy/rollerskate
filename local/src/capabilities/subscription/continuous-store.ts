@@ -303,7 +303,7 @@ export class ContinuousSubscriptionStore {
     return withImmediateTransaction(this.#database, () => {
       const changed: string[] = [];
       for (const current of this.fileSubscriptions()) {
-        if (current.pendingOccurrenceKey === undefined ||
+        if (current.status === "paused" || current.pendingOccurrenceKey === undefined ||
           current.definition.schemaVersion !== "ContinuousSubscriptionDefinition@4" ||
           current.definition.target.kind !== "external_workflow") continue;
         const execution = workflows.execution({ kind: "continuous_subscription",
@@ -738,7 +738,7 @@ export class ContinuousSubscriptionStore {
     const current = this.require(subscriptionId);
     const target = action === "pause" ? "paused" : action === "resume" ? "active" : "cancelled";
     const allowed = action === "pause"
-      ? ["active"]
+      ? ["active", "blocked"]
       : action === "resume"
         ? ["paused"]
         : ["active", "paused", "blocked"];

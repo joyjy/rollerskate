@@ -62,7 +62,7 @@ Run R1 / Agent A Session A1
 
 ## Caller/Steward checkpoint 与 decision
 
-manual caller Run 从首个 Worker 开始；default steward Run 则先以 `stepCount = 0` 向固定 Codex Orchestrator 请求初始 `RunDecision@6`。初始 decision 建立 bounded `OrchestratorState@1`、拆分任务并选择首个 Worker，只有随后真正的 Worker 才消耗 step budget。每个 Worker `agent.request` 使用 `AgentStepResult@1`；结果严格包含 `outcome`、bounded summary、artifact references，以及可选 acceptance evidence、unresolved questions 和 observed workspace revision，不包含 delegate 或 terminal authority。Runtime 将结果和 request/result/Execution identity 固定成 `AgentRunCheckpoint@1`，原子写入 `agent_runs.checkpoint_json`，并把 Run 转为 `awaiting_orchestrator`。
+manual caller Run 从首个 Worker 开始；default steward Run 则先以 `stepCount = 0` 向准入选中的 Orchestrator 请求初始 `RunDecision@6`。初始 decision 建立 bounded `OrchestratorState@1`、拆分任务并选择首个 Worker，只有随后真正的 Worker 才消耗 step budget。每个 Worker `agent.request` 使用 `AgentStepResult@1`；结果严格包含 `outcome`、bounded summary、artifact references，以及可选 acceptance evidence、unresolved questions 和 observed workspace revision，不包含 delegate 或 terminal authority。Runtime 将结果和 request/result/Execution identity 固定成 `AgentRunCheckpoint@1`，原子写入 `agent_runs.checkpoint_json`，并把 Run 转为 `awaiting_orchestrator`。
 
 manual Owner 读取当前 checkpoint 与 Run version 后提交 strict `RunDecision@1`。steward mode 用 Orchestrator 的 run-scoped Session 建立 `agent.request`：首轮 prompt 包含 objective、remaining budget、fixed participant roster 和 admitted trigger authority，后续再加入 current checkpoint、source envelope 与从 immutable decisions/receipts 重建的 `OrchestratorState@1`；最多保留 32 个结构化 task，不复制完整 transcript 或隐藏推理。Orchestrator 返回 strict `RunDecision@6`：
 
@@ -85,6 +85,8 @@ Orchestrator prompt 区分业务产物与本次响应契约：目标中沿用的
 
 `run inspect.intervention` 是即时 read model，不新增表或 Run 状态。当当前 cycle 最新 Orchestrator request 的 result continuation 已 settled 且 receipt 为 `rejected_manual_fallback` 时，投影 `RunIntervention@1`（kind=manual_fallback、runId/runVersion、requestEventId、resultExecutionId、reason、allowedActions）。重试排队、后续决策或终态会使旧 fallback 消失。allowedActions 仅在符合初始只读、未过期恢复条件时包含 retry_orchestrator，另列 decide/cancel；调用时仍由 control 重新检查。跨系统 owner 可以据此执行自己的有界恢复/取消策略，RS 不替它决定业务失败。
 
+Run 终态投递支持 `vikunja-task`、`server-topic` 和 `codex-desktop`。准入与终态投递共用目标编译器。不支持的 kind 或地址在创建工作前被拒绝。只有 Vikunja 目标向 Orchestrator prompt 提供 task URL。Desktop 投递从绑定的 Run/cycle 终态和 destination snapshot 核对正文与目标，沿用单次尝试和未知结果不重发规则。Run 执行终态与 Delivery 传输结果分别保存。
+
 ## Lifecycle、cancel 与恢复
 
 Run 状态是 `active | waiting | awaiting_orchestrator | awaiting_source | succeeded | failed | needs_human | cancelled`。普通 Run 的 terminal result 直接结束 Run；series cycle 的 terminal result 关闭当前 cycle，并把 Run 转为 `awaiting_source`，清空 active cycle，但保留 Run identity。后续相同 source revision 可重新激活既有 cycle，不同 revision 创建新 cycle；series 只支持 autonomous orchestration。`run close` 才把 `awaiting_source` Run 正常结束为 `succeeded`，`cancel` 仍是显式 Owner 中止。
@@ -92,6 +94,8 @@ Run 状态是 `active | waiting | awaiting_orchestrator | awaiting_source | succ
 `cancel` 是幂等的 Owner control：它把 Run 标记为 cancelled，取消尚未开始的 queued work，并阻止 retry、delegate、child request 与 callback admission。已经运行的 provider process不被强杀；其 late result 仍可作为审计事实保存，但不能恢复 Run。
 
 Run、当前 step/Execution、checkpoint 与 `version` 提供 CAS/recovery authority。duplicate result、ResultHandler retry 或 restart 使用 deterministic child/callback/decision key，只能建立一次后继 Event/Execution。autonomous child terminal failure 仍通过 callback 返回 caller 决定；caller checkpoint 跨 restart 保持 `awaiting_orchestrator`，不会自行推进。
+
+Steward continuation 的结果处理异常沿用 Core Execution 重试预算。最后一次处理仍失败时，Steward 在独立事务中把当前 Run 或 cycle 标记为 failed，并取消排队工作。`StewardResultProcessingFailure@1` 回执保留 request、result、step 和错误身份。Core 随后保留失败 Execution，不重跑已成功的 Agent 工作。失败终态另行创建 Delivery；出站编译失败写入同一回执，不回滚已结束的状态。历史已耗尽的故障不自动重放，Owner 核对无在途执行后使用正式控制入口处置。
 
 Agent Run 的 provider Execution 固定 `maxAttempts=1`，因此 provider failure、output overflow 与 unknown side effect 不由 Core 自动重跑。autonomous continuation 遇到这些失败、strict contract-invalid，或 `must_change` succeeded result 没有 Runtime-observed revision change 时，在同一个 step admission 一次 `AgentTurnAdjudication@1`：Steward 只能接受一个无需猜测即可规范化且不与 Runtime evidence 冲突的完整结果、携带非空安全证据请求一次 retry，或进入 `needs_human`。adjudication 自身或获准 retry 再失败不会递归；write workspace 已 drift、network authority 存在、write-capable tool usage 无法排除，或 retry 后 effect 仍未满足时，Runtime safety gate 收敛为 `needs_human`。accepted normalized result 仍从 canonical adjudication output 投影到 Run Output Folder，不复制新表。Subscription callback 同样 `maxAttempts=1`，contract-invalid 直接失败，不启动隐式修正链。Worker provider failure或 malformed output 仍被收敛为 outcome=`failed` 的 `AgentStepResult@1` checkpoint；Orchestrator 输出不合法时保留该 checkpoint 给 manual recovery。Core 始终不理解这些具体 schema。
 
@@ -134,6 +138,8 @@ Vikunja Task URL 只是 Host 在 start 时传入的普通 destination snapshot�
 ## Steward 分流与比较
 
 `<runtime>/steward-policy.json` 是 Owner policy 的唯一配置源，经 `run steward-policy <file>` 校验 active Agent identity、客户端和总计 100 的正整数权重后原子保存。新 Run 的桶为 `SHA256("steward-policy@1:" + requestId)` 前四字节无符号大端值模 100，按 entries 顺序累计权重选择；比例是长期样本期望，不保证每十个 Run 恰好一次。配置只在新准入时读取，选中 Agent 不可用时明确失败，不悄悄回落到 Codex。既有 workspace/network guard 保持有效。
+
+公共 `RunIntent@1.stewardRef` 可显式选择本次负责人，优先于加权 policy，但不能覆盖调用方已固定的 Owner Steward。`workerRef` 解析为 `RunAuthorityEnvelope@1.workerAgentId`，与准入 roster 一起进入既有 binding JSON 和 admission digest，无新增持久化表。显式 worker 的 roster 只含两种角色的 exact Agent IDs；`next_step` 的 target 和成功前的 Worker checkpoint 由 state-machine 强制核验，初始、重试、续接与 source-cycle prompt 使用同一 authority。角色解析失败或重复请求改派均拒绝，不回落到其他 Agent。`requestedParticipantRefs` 继续表示可选 roster，与 `workerRef` 互斥。
 
 `StewardRunRequest@2.stewardSelection` 与 `OrchestratorBinding@3.selection` 固定 agentId、policyDigest、bucket，参与 admission digest；重复 request ID、后续 decision 和恢复使用既有 Run identity。可选字段用于读取已持久化的无 policy Run，不建立第二份分流状态或迁移已有 Run。回退到全 Codex 通过提交该 Agent 权重 100 的新 policy 完成，只影响未来准入。
 

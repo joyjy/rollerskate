@@ -5,7 +5,7 @@ import {
   agentStepResultSchema,
   agentTurnResultSchema
 } from "./event";
-import { nullableString, optionalString, runHumanQuestionSchema } from "./shared";
+import { nullableString, optionalString, runHumanQuestionSchema, runInterventionSchema } from "./shared";
 
 const agentRunAgentReferenceSchema = v.object({
   principalId: v.string(),
@@ -133,7 +133,27 @@ const runDecisionModernSchema = v.variant("action", [
   })
 ]);
 
+const runDecisionV6CommonSchema = {
+  ...runDecisionCommonSchema,
+  schemaVersion: v.literal("RunDecision@6"),
+  checkedAcceptance: v.array(v.object({
+    id: v.string(),
+    status: v.picklist(["pass", "fail", "unknown"]),
+    evidenceRefs: v.array(v.string())
+  }))
+};
+const runDecisionV6Schema = v.variant("action", [
+  ...runDecisionModernSchema.options.map(schema => v.object({
+    ...schema.entries, ...runDecisionV6CommonSchema
+  })),
+  v.object({...runDecisionV6CommonSchema, action: v.literal("ask_human"), question: v.string()}),
+  v.object({...runDecisionV6CommonSchema, action: v.literal("request_capability"), capability: v.object({
+    kind: v.literal("network"), acceptanceIds: v.array(v.string()), targets: v.array(v.string()), reason: v.string()
+  })})
+]);
+
 export const agentRunDecisionSchema = v.union([
+  runDecisionV6Schema,
   runDecisionModernSchema,
   v.object({schemaVersion:v.literal("RunDecision@5"),...runDecisionCommonSchema,action:v.literal("ask_human"),question:v.string()}),
   runDecisionV2Schema
@@ -158,7 +178,7 @@ const agentRunDecisionReceiptCommonSchema = {
 };
 
 export const agentRunDecisionReceiptSchema = v.variant("schemaVersion", [
-  v.object({schemaVersion:v.literal("AgentRunDecisionReceipt@3"),...agentRunDecisionReceiptCommonSchema,action:v.literal("ask_human"),questionId:v.string(),resultingRunStatus:v.literal("awaiting_orchestrator")}),
+  v.object({schemaVersion:v.literal("AgentRunDecisionReceipt@3"),...agentRunDecisionReceiptCommonSchema,action:v.picklist(["ask_human", "request_capability"]),questionId:v.string(),resultingRunStatus:v.literal("awaiting_orchestrator")}),
   v.looseObject({
     schemaVersion: v.literal("AgentRunDecisionReceipt@1"),
     ...agentRunDecisionReceiptCommonSchema,
@@ -244,7 +264,15 @@ export const chatRunHandoffReceiptSchema = v.looseObject({
 });
 
 const agentRunDetailViewInnerSchema = v.object({
+  intervention: v.optional(v.nullable(runInterventionSchema)),
   humanQuestion:v.optional(v.nullable(runHumanQuestionSchema)),
+  capabilityRequest: v.optional(v.nullable(v.object({
+    requestEventId: v.string(), runVersion: v.number(), status: v.union([
+      v.literal("pending"), v.literal("granted"), v.literal("closed"),
+      v.literal("expired"), v.literal("superseded")
+    ]), kind: v.literal("network"), acceptanceIds: v.array(v.string()),
+    targets: v.array(v.string()), reason: v.string(), continuationEventId: optionalString
+  }))),
   summary: agentRunSummarySchema,
   projection: v.looseObject({
     runId: v.string(),
@@ -389,6 +417,29 @@ const agentRunDetailViewInnerSchema = v.object({
 });
 
 export const agentRunDetailViewSchema = agentRunDetailViewInnerSchema;
+export const deterministicRunDetailViewSchema = v.looseObject({
+  runId: v.string(),
+  kind: v.union([v.literal("command"), v.literal("observe")]),
+  requestId: v.string(),
+  title: v.string(),
+  createdAt: v.string(),
+  updatedAt: v.string(),
+  status: v.union([
+    v.literal("running"),
+    v.literal("succeeded"),
+    v.literal("failed"),
+    v.literal("cancelled"),
+    v.literal("unknown"),
+    v.literal("attention_required")
+  ]),
+  result: v.unknown(),
+  deliveryStatus: v.string(),
+  errors: v.array(v.string())
+});
+export const runDetailViewSchema = v.union([
+  agentRunDetailViewSchema,
+  deterministicRunDetailViewSchema
+]);
 export const agentRunSummariesSchema = v.object({
   items: v.array(agentRunSummarySchema),
   total: v.number(),
@@ -403,6 +454,14 @@ export const cancelAgentRunReceiptSchema = v.looseObject({
     runId: v.string(),
     status: agentRunStatusSchema
   })
+});
+export const answerAgentRunReceiptSchema = v.looseObject({
+  status: v.union([v.literal("accepted"), v.literal("already_answered")]),
+  runId: v.string(), questionId: v.string(), eventId: v.string(), version: v.optional(v.number())
+});
+export const authorizeAgentRunCapabilityReceiptSchema = v.looseObject({
+  status: v.union([v.literal("accepted"), v.literal("already_applied")]),
+  runId: v.string(), version: v.optional(v.number()), eventId: v.string()
 });
 
 export const setAgentRunArchivedReceiptSchema = v.looseObject({
@@ -421,3 +480,4 @@ export type AgentRunStepOutput = v.InferOutput<typeof agentRunDetailViewSchema>[
 export type AgentRunDecisionOutput = v.InferOutput<typeof agentRunDecisionSchema>;
 export type AgentRunSummaryViewOutput = v.InferOutput<typeof agentRunSummarySchema>;
 export type AgentRunDetailViewOutput = v.InferOutput<typeof agentRunDetailViewSchema>;
+export type RunDetailViewOutput = v.InferOutput<typeof runDetailViewSchema>;

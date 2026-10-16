@@ -5,6 +5,7 @@ import {
   agentRunDecisionSchema,
   agentRunDecisionReceiptSchema,
   agentSummariesSchema,
+  chatWorkViewSchema,
   networkSafetyViewSchema,
   runtimeAuditSchema,
   subscriptionsSchema
@@ -23,6 +24,16 @@ describe("agentRunDecisionSchema", () => {
       unresolvedQuestions: []
     }
   };
+
+  it("reads v6 evidence checks and capability requests without accepting legacy string checks", () => {
+    const decision = {...common, schemaVersion: "RunDecision@6", action: "finish",
+      checkedAcceptance: [{id: "a1", status: "pass", evidenceRefs: ["receipt:1"]}],
+      finish: {scope: "run", outcome: "succeeded", summary: "done"}};
+    expect(v.safeParse(agentRunDecisionSchema, decision).success).toBe(true);
+    expect(v.safeParse(agentRunDecisionSchema, {...decision, checkedAcceptance: ["done"]}).success).toBe(false);
+    expect(v.safeParse(agentRunDecisionSchema, {...decision, action: "request_capability",
+      capability: {kind: "network", acceptanceIds: ["a1"], targets: ["https://example.com"], reason: "verify"}}).success).toBe(true);
+  });
 
   it("reads current v3 and persisted v2 step results, but not unrelated v1 input", () => {
     expect(v.safeParse(agentRunDecisionSchema, {
@@ -45,6 +56,21 @@ describe("agentRunDecisionSchema", () => {
       schemaVersion: "RunDecision@1",
       action: "needs_human"
     }).success).toBe(false);
+  });
+});
+
+describe("chatWorkViewSchema", () => {
+  it("decodes callback states returned by the work query", () => {
+    const result = v.safeParse(chatWorkViewSchema, {
+      kind: "command", detail: { tool: "get_run", runId: "run_cmd" }, runId: "run_cmd",
+      label: "command", state: "started", status: "running", terminal: false,
+      returnState: { status: "awaiting_result", reason: "still settling" }, updatedAt: "2026-09-15T00:00:00Z"
+    });
+    expect(result.success).toBe(true);
+    expect(v.safeParse(chatWorkViewSchema, {
+      kind: "agent", runId: "run_old", state: "started", status: "active", terminal: false,
+      returnState: { status: "not_requested" }, updatedAt: "2026-09-15T00:00:00Z"
+    }).success).toBe(true);
   });
 });
 
@@ -74,6 +100,10 @@ describe("agentRunDecisionReceiptSchema", () => {
       schemaVersion: "AgentRunDecisionReceipt@1",
       action: "finish",
       terminalStatus: "succeeded"
+    }).success).toBe(true);
+    expect(v.safeParse(agentRunDecisionReceiptSchema, {...common,
+      schemaVersion: "AgentRunDecisionReceipt@3", action: "request_capability",
+      questionId: "question_1", resultingRunStatus: "awaiting_orchestrator"
     }).success).toBe(true);
   });
 });
@@ -273,6 +303,15 @@ describe("v0.4 Console schemas", () => {
     }], total: 1, page: 1, pageSize: 20 });
 
     expect(result.success).toBe(true);
+    if (!result.success) throw new Error("invalid fixture");
+    const old = result.output.items[0]!;
+    const target = {schemaVersion: "ProactiveTarget@1", kind: "application_action", actionRef: "action:codex-desktop.push@1"};
+    const current = v.safeParse(subscriptionsSchema, {...result.output, items: [{...old,
+      definition: {...old.definition, schema: "SubscriptionDefinition@5", sourceBinding: null, target},
+      actionReceipt: {status: "succeeded"}
+    }]});
+    expect(current.success).toBe(true);
+    if (current.success) expect(current.output.items[0]).toMatchObject({definition: {target}, actionReceipt: {status: "succeeded"}});
   });
 
   it("accepts a Continuous Subscription checkpoint and pending callback view", () => {

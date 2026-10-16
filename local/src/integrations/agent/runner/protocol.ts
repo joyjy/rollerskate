@@ -1,3 +1,4 @@
+import type { AgentOutputEvent } from "../../../core/runtime/agent-invocation.js";
 import { performance } from "node:perf_hooks";
 
 export interface RunnerTurnRequest {
@@ -7,6 +8,7 @@ export interface RunnerTurnRequest {
   readonly model?: string;
   readonly totalTimeoutMilliseconds?: number | undefined;
   readonly meaningfulOutputTimeoutMilliseconds?: number;
+  readonly onOutput?: (event: AgentOutputEvent) => void;
   readonly onProgress?: (progress: RunnerProgress) => void;
 }
 
@@ -46,6 +48,7 @@ export type RunnerTerminationReason =
   | "protocol_error";
 
 export interface RunnerFailureTrace extends RunnerProgress {
+  readonly rejectedBeforeWork?: true;
   readonly failedAt: string;
   readonly reason: RunnerTerminationReason;
   readonly totalTimeoutMilliseconds?: number | undefined;
@@ -64,6 +67,7 @@ export class RunnerInvocationError extends Error {
 }
 
 export function runnerInvocationFailure(input: {
+  readonly rejectedBeforeWork?: boolean;
   readonly message: string;
   readonly progress: RunnerProgressTracker;
   readonly reason: RunnerTerminationReason;
@@ -74,6 +78,7 @@ export function runnerInvocationFailure(input: {
   const failedAt = new Date().toISOString();
   return new RunnerInvocationError(input.message, {
     ...input.progress.snapshot(failedAt),
+    ...(input.rejectedBeforeWork === true && input.progress.snapshot(failedAt).meaningfulUpdateCount === 0 ? {rejectedBeforeWork: true as const} : {}),
     failedAt,
     reason: input.reason,
     ...(input.totalTimeoutMilliseconds === undefined
@@ -121,6 +126,7 @@ export class RunnerProgressTracker {
     this.#sessionId = sessionId;
     this.#phase = "session_ready";
     this.observe("session", false);
+    this.emit(true);
   }
 
   public phase(phase: RunnerPhase): void {

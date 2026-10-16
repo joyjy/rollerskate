@@ -20,8 +20,8 @@ interface Hint { title: string; body: string; variant: "" | "unknown" | "failed"
 const hints: Record<SubscriptionStatus, Hint> = {
   active: { title: "Polling", body: "Runtime 正按持久 schedule 执行 Plugin 声明的单次 probe。", variant: "" },
   paused: { title: "Paused", body: "Subscription 已暂停，不会执行新的 poll。点击 Resume 恢复。", variant: "" },
-  completed: { title: "Completed", body: "Terminal observation 与已配置 callback 都已持久化收敛。", variant: "" },
-  blocked: { title: "Blocked", body: "Agent callback 缺少完成任务所需的权限、凭据、工具或外部前置条件。", variant: "unknown" },
+  completed: { title: "Completed", body: "观察已结束；目标执行结果以详情中的回执为准。", variant: "" },
+  blocked: { title: "Blocked", body: "任务缺少所需权限、工具或外部前置条件，请查看错误与回执。", variant: "unknown" },
   cancelled: { title: "Cancelled", body: "Subscription 已被用户取消，不会再自动执行。", variant: "" },
   expired: { title: "Expired", body: "Subscription 已超过 expiry 时间。", variant: "" }
 };
@@ -51,9 +51,9 @@ const canCancel = computed(() => ["active", "paused"].includes(props.subscriptio
       <dd>{{ subscription.title }}</dd>
       <dt>Owner</dt>
       <dd v-if="subscription.owner">@{{ subscription.owner.handle }} · {{ subscription.owner.client }}</dd>
-      <dd v-else>Run-owned source</dd>
+      <dd v-else>Trigger source</dd>
       <dt>Provider Session</dt>
-      <dd>{{ runBound ? "Run execution" : (subscription.kind === "free" ? "legacy per callback" : "legacy continuous callbacks") }}</dd>
+      <dd>{{ subscription.kind === "free" && subscription.definition.schema === "SubscriptionDefinition@5" ? "Target execution" : runBound ? "Run execution" : (subscription.kind === "free" ? "legacy per callback" : "legacy continuous callbacks") }}</dd>
       <dt>Local Session</dt>
       <dd>{{ subscription.kind === "free" ? subscription.definition.callbackPhaseStatus : (subscription.pendingOccurrenceKey ?? "checkpointed") }}</dd>
       <dt>Plugin</dt>

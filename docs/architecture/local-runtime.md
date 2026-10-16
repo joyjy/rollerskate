@@ -22,7 +22,7 @@ Interactive Channel 是 `application/channel` vertical，不是 Core Route 或�
 
 联网 Agent work request 复用唯一 loop 的 `agent-work-request` phase，但不成为 Event ingress。每个 Runtime process 为 active paired Agent 注册一个临时 route ID；phase 只续租、读取属于该 exact route 的 bounded request diagnostics、恢复已经 accepted 但未挂 receipt 的 Run，并把本机 terminal Run 的 bounded summary 回写 Server。普通 Chat/Topic/Vikunja 文本不会经过该 application control。Owner 必须用 `work-request accept|reject|await-owner` 显式决定；固定 Local policy revision 1 将 workflow 限于 `review@1|forum@1`、budget 限于 20 steps/0 depth、首版不接受 remote grant。Server accepted receipt 会编译成 `RunIntent@1` 和 Owner workflow policy，再以 `work-request:<id>` 幂等键建立 `OrchestratorBinding@3` Steward Run；Run 与 transcript 仍只在 Local SQLite，Server 只持有 Run ID receipt 和 bounded public result。
 
-Local Chat 默认仍只拥有 conversation Event/decision。没有 proposal 时，用户可对 exact Owner message 显式选择 `Hand off to Run`，application 以 `chat-work:<eventId>` 固定 request ID；Agent 返回 `propose_run` 时，每个 dispatch 独立投影一张卡片，Owner 选择并预检 exact workspace 后，以 `chat-work:<eventId>:<dispatchEventId>` 确认该卡片。两条路径都经同一 RunAdmissionCompiler 建立 Steward Run。Agent chat reply、普通 message、proposal 或 activation 都不能自动产生 Run，也不能调用 callback、command 或 destination。
+Local Chat 默认仍只拥有 conversation Event/decision。消息列表不提供 Owner message 直启 Run 的旁路；Agent 返回 `propose_run` 时，每个 dispatch 独立投影一张卡片，Owner 选择并预检 exact workspace 后，通过 current-revision confirmation 与同一 RunAdmissionCompiler 建立 Steward Run。既有 `chat-work:<eventId>` 历史来源继续只读解释，不保留新的直启写入口。Agent chat reply、普通 message、proposal 或 activation 都不能自动产生 Run，也不能调用 callback、command 或 destination。
 
 ```text
 RunIntent / Owner policy ─> Steward Run ─> canonical Agent Event + Execution
@@ -79,6 +79,10 @@ Route 只表示需要程序执行的 `Event.type → Handler kind`。`agent.requ
 
 `AgentHandler` 调用由 Principal identity 选择的 provider adapter。generic Agent input 可以使用 Execution 的有限指数退火，Agent Run 与 Subscription callback 则在 admission 时固定 `maxAttempts=1`，避免 provider error、output overflow 或未知 side effect 被 Core 盲目重放。传统 Agent input 成功或最终失败仍创建 `agent.result` fallback；Local Chat adapter 返回 `ChatDecision@1`，Runtime 原子保存 Session、Topic/Global presence、decision receipt 与可选 Agent sender `chat.message`，failure 只写 Execution/audit facts。Chat history 与 Kimi tool request continuation 由 application decorator 在 AgentHandler 外完成；Core 不枚举 `ClientHistoryRequest@1` 或领域 read tool。Chat 行为说明只存在于独立 prompt 资源，build 将资源复制到 `dist/resources`。
 
+未定向的普通 Chat 消息通过 `application/chat/rotation.ts` 进入每 Topic 的持久化轮转队列，纯状态转换由 `rotation-state.ts` 拥有。Owner 发言生成一次随机参与顺序；当前轮保持原顺序，连续补充合并为下一次判断，最新顺序用于下一轮。每次只创建一个 Chat dispatch，等待其 Execution 结算后再派发；Agent 回复使已判断的其他参与者重新排队，待唤醒者不重复入队，发言者不因自身回复重入。调用期间的 Owner 补充不会取消调用或被旧结果清除。Chat 调用完成即可让出轮次，不等待 Run 完成。无待判断者时收口；失败与预算耗尽不算全员静默，预算耗尽产生系统提示。新 Owner 可以重开已结束的讨论。
+
+`chat.rotation` 是现有唯一 loop 中的 application phase；不注册新 Event type 或后台 daemon。队列 transition 与 canonical dispatch admission 同事务提交，重启依原 Execution 对账，不重放模型调用。已有定向消息和 source-bound activation 保持原准入契约；Chat dispatch 通过已有多资源调度器共享 Topic lane。每条 Owner 消息仍固定自己的 attention 分母；一次 dispatch 可以覆盖多条实际进入提示词的 Owner 消息，已有关联不因下一轮回复而覆盖。提示词截断的消息不能标为已处理。队列只是唤醒协调，原消息、Session、Run 和工具授权继续由各自 source owner 持有。
+
 Chat 的 `list_chat_work` 通过 Host 注入的当前 `chat.dispatch` 绑定 Agent/Topic/Session，调用时复检 running Execution、Agent active、Topic active 和 participant membership；模型只能传 bounded page limit（默认 10、最多 20）和同 scope cursor。新发现能力不等于全局 Run 列表，也不改变既有 exact-ID `get_run`/`event_trace` read grant。`list_chat_work`、`get_run.work` 与 Chat proposal card 共用 Steward work projection：manual fallback 依据已结算的 intervention receipt 展示需要人处理，保留实际 `awaiting_orchestrator` 非终态；Run terminal 不由单个 provider turn 成功推导。产物只返回最多 20 条 metadata references，正文仍由 Run detail/source 拥有。查询借用调用方数据库连接，领域 lifecycle 只有一个 owner；不新增恢复 loop 或 mutable work table。
 
 Chat 写工具由 `tool-policy.ts` 声明，原生 MCP、pi extension 和 Kimi request continuation 使用相同调用边界。`start_chat_run` 把当前 Local Owner 的不可变原消息（及有界回复上下文）作为 mandate，Agent 解释执行意图，Host 验证 running dispatch、Owner identity、有效参与者与 Session；Host 不用关键词假装完成自然语言授权判定。读写 workspace 要求 Owner 本条消息中出现 exact canonical Git root，否则返回缺权，沿用现有 proposal preflight/confirmation。网络、发布和外部投递不随工具自动授权。`control_chat_run` 仅控制原 Agent/Session 关联的 exact Run，在同一事务中复检版本，复用取消、初始只读 Steward fallback retry，以及 `steward/human-input.ts` 的 exact question answer continuation；普通 Caller checkpoint 仍由原 Run decision owner 处理。每轮最多 20 次调用、单响应 256 KiB、总响应 1 MiB，写动作在变更前预留响应预算。
@@ -113,7 +117,7 @@ Session 保存本地 Session ID、Agent Principal、adapter、workspace 与 prov
 
 普通中断恢复把可安全重试的 Execution 与 `delivering` Delivery 放回有限重试状态。legacy ScheduleOccurrence 已经进入 provider invocation 时转为 `unknown` 并停止对应 Execution，等待显式 reconciliation；Run-bound occurrence 从 durable cycle/receipt 恢复，不能人工 resolve。已经 terminal 的 Agent Execution 不重放 provider 调用。
 
-Agent Run 始终指向唯一 active step/Execution。global recovery 复用既有 Execution；Run CAS 与 deterministic callback key 防止 retry、duplicate result 或 restart 创建第二个 child request。external workflow 在 effect boundary 前中断可按固定 budget 重试，boundary 后中断只能写 `unknown` 并等待 Owner 根据外部事实 resolve，不能盲目重放。cancel 不强杀已经运行的 provider process，但会取消 queued work，并拒绝后续 retry、delegate 与 callback admission。
+串行 Agent Run 指向当前 active step/Execution；固定 DAG 由 Steward 从 Event/receipt 派生完整活跃集合，Run 单指针仅保留其中一个活跃节点供兼容查询。global recovery 复用既有 Execution；Run CAS 与 deterministic callback key 防止 retry、duplicate result 或 restart 创建第二个 child request。external workflow 在 effect boundary 前中断可按固定 budget 重试，boundary 后中断只能写 `unknown` 并等待 Owner 根据外部事实 resolve，不能盲目重放。cancel 不强杀已经运行的 provider process，但会取消 queued work，并拒绝后续 retry、delegate 与 callback admission。
 
 Caller-orchestrated Run 固定 admission 时的 active participant roster，`maxDepth=0`，并为每个参与 Agent 复用自己的 `(runId, agentId)` Session。Worker 结果只把 Run 转为 `awaiting_orchestrator`；CLI/Console 从 typed checkpoint 展示等待状态。Local Owner 的 exact current-version decision 可以在同一 Run admission self/agent next step，或终结为 succeeded/failed/needs-human；duplicate request 只重放 receipt，stale、非 roster target 和任何 authority expansion 都拒绝。
 
@@ -147,13 +151,13 @@ Console 保持轻量页面组件和既有 CSS primitive，不拥有领域模型�
 
 ## Process boundary
 
-Agent adapter 使用 absolute executable、args array、`shell:false`、显式 cwd/environment、structured stdin/stdout、timeout 与输出上限。每个 Agent 的 `executionConfig.launchArgs` 持久保存独立 argv；application 层限制数量、单项/总字节，并拒绝覆盖 adapter 拥有的协议、Session、workspace 与 permission/sandbox 参数。配置变化进入 adapter cache key，下一次 invocation 自动重建 adapter，不要求重启 Runtime。普通 Steward Run 默认没有网络；只有非委派的 Codex Run（`maxDepth=0`）在 `workspace.access=write` 下显式声明 `workspace.networkAccess=true` 时，网络 authority 才随 workspace grant 固化并传给 Codex adapter。read-only、非 Codex 或可委派 Run 不能申请网络。
+Agent adapter 使用 absolute executable、args array、`shell:false`、显式 cwd/environment、structured stdin/stdout、timeout 与输出上限。每个 Agent 的 `executionConfig.launchArgs` 持久保存独立 argv；application 层限制数量、单项/总字节，并拒绝覆盖 adapter 拥有的协议、Session、workspace 与 permission/sandbox 参数。配置变化进入 adapter cache key，下一次 invocation 自动重建 adapter，不要求重启 Runtime。普通 Steward Run 默认没有网络；非委派的 Codex Run（`maxDepth=0`）可在 Owner 明确授权后申请网络，read-only Run 由 `request_capability` 完成权限转换，write Run 可在准入时声明网络。非 Codex 或可委派 Run 不能申请网络。
 
 Codex、Claude Code、Kimi Code 与 pi 都实现相同 `RuntimeAgentAdapter`，首次执行创建 provider Session，后续通过本地 Session 精确恢复。`integrations/agent/runner/` 以 ACP 的 turn/session 语义定义内部 provider-neutral 协议：request 包含 prompt、Session、workspace access、可选 model、独立 total/meaningful-idle budget 与 bounded progress callback，receipt 统一投影 assistant message、observed tool、usage 与 terminal；`process.ts` 统一拥有无 shell spawn、bounded stderr 与分级停止。ACP、Pi RPC 与 Codex app-server 只在各自 runner 内处理 wire protocol，adapter 只负责 Runtime Event prompt、grant/policy、progress/failure 转换与结果选择。MCP server 必须同时声明由 Runtime 控制的 tool manifest；Claude Code 据此生成 exact `--allowedTools`，避免 server 已注入但工具不可调用或额外工具被隐式放行。
 
 Codex 使用 app-server 的 LF-delimited JSON-RPC transport，每次调用严格执行 `initialize`、`initialized`、`thread/start|resume`、`turn/start`，接收 assistant/reasoning/plan/tool 的流式通知，并只在 `turn/completed` 后形成 `codex-runtime-app-server-v1` receipt。流式通知只投影 bounded progress kind 与计数，不持久化 delta 正文；默认连续 300 秒没有 meaningful update 时触发 stall，每次 assistant/reasoning/plan/tool update 都会续期。只有 workflow 显式声明 invocation budget 时才启用不可续期的 total deadline。stall、deadline/protocol error 对 active Turn 发送 `turn/interrupt` 后有界收进程。provider `interrupted`、协议退出与失败保持不同 termination reason；意外的 server approval request、非 completed turn、超限 protocol record 或 assistant aggregate 都 fail closed。workspace sandbox、`approvalPolicy=never`、network grant、model 与 invocation-scoped MCP server 通过 Thread params/config 传入，不再拼接 `codex exec --json` argv。Claude Code 仍使用 result JSON。Kimi Code 使用 ACP v1：`session/new` 创建 Session，后续以 `session/resume` 精确恢复，`session/prompt` 的 `end_turn` 是 terminal boundary；Chat 合并 assistant message，Run/Subscription 只取末条。adapter 只保留 assistant text 和 bounded tool identity，不保留 `rawInput`、`rawOutput` 等 trace；结果字节上限只约束 assistant text，因此超大 tool trace 不再吞掉短结果。Kimi 采用相同的 300 秒 meaningful-event watchdog 与显式 total deadline 语义；thought 会续期 idle。read grant 在新 Session 选择 `plan` mode，并只批准 read/search/think/fetch tool kind；write grant 选择 `default` mode 并按次批准工具请求；恢复时 access 已由 versioned Session reference 锁定，不重复设置 provider mode。bundled read/write profile 作为 prompt policy 注入，profile 内容、Session reference version 与 policy digest 编入 `kimi-code-runtime-acp-v1` identity；旧格式或 access 不匹配会新建 Session。可选 launch args 只允许 `--model <model>`，由 `session/set_config_option` 应用。macOS 上固定启用 Kimi legacy engine，规避 v2 workspace watcher 在空目录也可能触发的 `EMFILE` 回归；transport 仍是同一 ACP v1。Pi RPC 同样只在 `agent_settled` 后完成；read grant 加载 content-attested `read_git_diff`，扩展内容同时进入 `pi-runtime-rpc-v1:<digest>` identity 与 Runtime revision，同路径内容漂移会要求 Runtime reload。
 
-pi 使用 RPC mode，以 LF-delimited JSON command/event 交互；adapter 先验证 `get_state` 返回 Runtime 预生成并持久续用的 exact `--session-id`，再发送 `prompt`，只在 `agent_settled` 后形成结果。它不再把整个 provider stdout 当作一次进程结果，也不使用 `--print` 或 `--session`。增量 decoder 丢弃超过单条预算的 RPC record 并继续读取 terminal assistant；发生丢弃时 tool diagnostics 保持未知。`--tools` 白名单映射 read/write grant，read-only Git 与 Chat tools extension 由 adapter 独占装配，调用方不能注入 extension、skill、context file 或 system prompt。Chat read tool grant 携带 application manifest digest，工具名与 extension 内容都进入 provider policy identity。协议 identity 为 `pi-runtime-rpc-v1:<policy-digest>`；bundled extension 或 manifest 改变会漂移 identity、退役旧 Session，并要求加载匹配的新 Runtime artifact。Adapter 只声明 transport、Session resume 与 workspace read/write 等原语能力；它不枚举 Steward/Reviewer/Implementer 或 workflow result schema。Agent Run protocol prompt 按 run context 要求 autonomous `AgentTurnResult@1` 或 caller `AgentStepResult@1`；Core 仍保存不透明 output，由对应 Agent Run continuation 在 adapter 与 Core 之外校验并推进。
+pi 使用 RPC mode，以 LF-delimited JSON command/event 交互；adapter 先验证 `get_state` 返回 Runtime 预生成并持久续用的 exact `--session-id`，再发送 `prompt`，只在 `agent_settled` 后形成结果。它不再把整个 provider stdout 当作一次进程结果，也不使用 `--print` 或 `--session`。增量 decoder 丢弃超过单条预算的 RPC record 并继续读取 terminal assistant；发生丢弃时 tool diagnostics 保持未知。`--tools` 白名单映射 read/write grant，read-only Git 与 Chat tools extension 由 adapter 独占装配。Pi 原生加载全局与项目 `AGENTS.md` 以及已发布 skills；adapter 禁用其他 extensions、prompt templates 和 themes，调用方不能额外注入 extension、skill、context file 或 system prompt。Chat read tool grant 携带 application manifest digest，工具名与 extension 内容都进入 provider policy identity。协议 identity 为 `pi-runtime-rpc-v1:<policy-digest>`；bundled extension 或 manifest 改变会漂移 identity、退役旧 Session，并要求加载匹配的新 Runtime artifact。Adapter 只声明 transport、Session resume 与 workspace read/write 等原语能力；它不枚举 Steward/Reviewer/Implementer 或 workflow result schema。Agent Run protocol prompt 按 run context 要求 autonomous `AgentTurnResult@1` 或 caller `AgentStepResult@1`；Core 仍保存不透明 output，由对应 Agent Run continuation 在 adapter 与 Core 之外校验并推进。
 
 Runtime restart 对已 claim 为 `running` 的 Agent invocation 采用 fail-closed unknown，而不是消费剩余 attempt 重放 provider turn：Core 持久化 unknown/no-replay receipt，并生成 canonical failed result。Autonomous Agent Run 将其送入一次 bounded Steward adjudication；Subscription callback 直接失败，不自行重放；其他 owner 按自己的 durable continuation 收口。业务 vertical 不得各自把同一个中断 invocation 重排回队列。
 
@@ -170,6 +174,8 @@ Poll Plugin 只能计划和解析一次受限 probe；真实 HTTP/command 由 Ru
 - 需要二次处理时创建带因果关系的新 Event。
 - Server Event 接入属于 v0.4；v0.3 不修改 Server 路由实现。
 
+Codex 的联网 Run 可装配受控 `evaluate_jev` MCP 工具。`application/judgment` 持有工具准入，`integrations/jev` 持有固定 HTTP API、私有凭证读取及有界响应。工具不创建新的 Agent、Session、loop 或业务状态。结果沿用 Run outputs 和 artifact references；使用边界见 [Jev 工具](../runbook/jev.md)。
+
 ### Execution 准入资源
 
 限量准入是 Chat dispatch、Steward Run 与 Subscription Agent invocation 共用的 core 原语：SQLite queued/retry_wait/running 与 canonical Result 是唯一持久事实；不新增调度表。RuntimeCycle 在原子 claim 前按 handler 容量、Agent、Session/新 Run lane 和 workspace 读写冲突选择工作。等待项保持 queued/retry_wait，恢复仍沿用现有 interrupted/unknown 判定。Result 保留独立容量，并延续其源 invocation 的 workspace 保护直到结果消费完成。source phase I/O 生命周期不属于本切片。
@@ -181,3 +187,22 @@ Poll Plugin 只能计划和解析一次受限 probe；真实 HTTP/command 由 Ru
 ## 文件与网络权限的独立映射
 
 `ExternalWorkspaceGrant@1` 的文件 access 与 networkAccess 是独立的运行原语：只读取证 Run 可以在 Owner 明确授权后联网，写入交付 Run 同样独立声明网络。Core 只校验字段和持久化，不判断业务是否需要网络；Steward admission 拥有权限调整。Codex 的只读调用通过 `turn/start.sandboxPolicy={type:readOnly,networkAccess}` 映射，不能以 workspace-write 代替只读。Subscription 的准入限制仍归自身 owner。网络开关不是 HTTP 方法或目标域名白名单，不可宣称它强制远端只读。
+
+
+### Agent 瞬态网络退避
+
+Chat 与 Steward / Subscription 的 Agent invocation 共用 Core Execution 重试机制。provider/runner 只在明确拒绝请求、且完整事件流未出现有效输出或工具启动时声明可安全重试；Core 再校验 adapter/workspace、当前权限和瞬态网络错误分类。已执行工具、取消、鉴权失败、协议损坏或仅有无来源的超时不会因此获得重放权限。缓冲式 provider 的失败结果必须明确报告 error、零 turn 与零输出 token；仅“五分钟超时”不构成该证据。
+
+安全的瞬态网络失败在原 Execution 上进入 `retry_wait`，最多 5 次尝试，间隔 5 / 10 / 20 / 40 秒；沿用唯一 loop、Topic/Session lane、Event identity 和指数退避函数。失败 receipt 的可选 `networkRetry.failedAttempt` 绑定准确的下一次尝试，重启后仍可恢复等待；旧的 Chat queued retry 没有这份决策仍不能自动重放。重试成功只产生一次回复/结果，耗尽后才创建终态失败；重试途中遇到非网络错误立即终结，不继承额外预算。
+
+### 独立 Session 调度原语
+
+Session identity 由 session_id 和 adapter/provider_session_id 唯一确定；run_id/agent_id 是归属，不是 Session identity。schema v77 允许同一 Run/Agent 的多个独立 Session。Core 对显式 Session 保持互斥，对无 Session 的 Run agent.request 使用 run/cycle/step/Agent lane，普通 request 使用 Event lane，Chat 仍保持 Agent/Topic lane；workspace 读写锁与全局 Agent budget 不变。该原语同时服务独立单次请求和 Steward 固定 DAG 节点，Core 不识别 graph。串行 Steward 继续显式查找并复用最新 Session。`AgentRunContext@1.invocationBudget` 必须由持久化 mapper 保真读回，workflow 与 DAG 都通过同一预算原语限制调用。
+
+### 投递前 Owner 准入
+
+DeliveryHandler 可以接受 composition 注入的同步 admission。准入检查在调用 transport 之前执行。core 只处理临时 hold 或永久停止，不识别 Run、Subscription 或会话策略。Run 通知与 command/observe application-action 通知分别消费同一原语。静音将 Delivery 保留为 retry_wait，下一次检查间隔为 30 秒，不消耗 transport attempt。永久关闭保留 failed 与具体原因，不伪造 delivered。已进入 transport 的请求不能撤回，Owner 控制读回必须报告 delivering 记录。
+
+Chat 通知也使用同一 Owner authority。RuntimeCycle 在通知 attention/dispatch 的 handler 调用前检查，临时 hold 不消耗 provider attempt。RuntimeStore 在已运行 Chat turn 的 reply 落库事务中再次检查，受控回复不产生可见 Chat message 或 Delivery。原 provider 输出与 receipt 的 `replySuppressedReason` 保留。准入 callback 不解释业务 Run，也不重放已进入 provider 的执行。
+
+分段观察复用唯一 loop 的 Subscription phase。显式 checkpoint 只增加通知检查点，原 deadline 仍是固定总预算。来源可查性、业务进度与 Delivery 接收状态分别展示。Runtime 停止期间无法自行通知，恢复后继续原 Subscription，不重触业务。CLI 与持久状态见 [CLI Reference](../runbook/cli-reference.md) 和 [Database Reference](db-reference.md)。

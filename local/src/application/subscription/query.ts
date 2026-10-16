@@ -1,3 +1,4 @@
+import { callbackViews } from "../chat/callback-query.js";
 import { DeterministicApplicationActionRegistry } from "../proactive/action-registry.js";
 import type { FreeSubscription } from "../../capabilities/subscription/model.js";
 import type { DatabaseSync } from "node:sqlite";
@@ -107,10 +108,12 @@ export interface FreeSubscriptionView {
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly latestError: string | null;
+  readonly observationState: FreeSubscription["observationState"] | null;
   readonly terminalObservation: unknown | null;
   readonly agentRunId: string | null;
   readonly cycleId: string | null;
   readonly admissionReceipt: FreeSubscription["admissionReceipt"] | null;
+  readonly chatCallbacks: ReturnType<typeof callbackViews>;
   readonly actionReceipt: FreeSubscription["actionReceipt"] | null;
   readonly archivedAt: string | null;
   readonly availableActions: {
@@ -158,7 +161,7 @@ export function listSubscriptionViews(
       resources.callbacks.definitions(callbackOwner(subscription.subscriptionId)),
       callbackOccurrences(resources.callbacks, subscription),
       resources.foundation,
-      resources.runtime
+      resources.runtime, resources.database
     ));
     const continuous = listContinuousSubscriptionViews(repoRoot, runtimeDirectory);
     return [...subscriptions, ...continuous].sort((left, right) =>
@@ -258,7 +261,7 @@ function subscriptionViewsForIds(
         resources.callbacks.definitions(callbackOwner(subscriptionId)),
         callbackOccurrences(resources.callbacks, subscription),
         resources.foundation,
-        resources.runtime
+        resources.runtime, resources.database
       );
     });
   } finally {
@@ -285,7 +288,7 @@ export function inspectSubscriptionView(
       resources.callbacks.definitions(callbackOwner(subscriptionId)),
       callbackOccurrences(resources.callbacks, subscription),
       resources.foundation,
-      resources.runtime
+      resources.runtime, resources.database
     );
   } finally {
     closeQueryResources(resources);
@@ -356,7 +359,8 @@ function subscriptionView(
   callbackDefinitions: readonly ProactiveCallbackDefinition[],
   callbacks: readonly ProactiveCallbackOccurrence[],
   foundation: LocalFoundationStore,
-  runtime: RuntimeStore
+  runtime: RuntimeStore,
+  database: DatabaseSync
 ): FreeSubscriptionView {
   const owner = subscription.ownerAgentId === undefined
     ? null
@@ -407,11 +411,13 @@ function subscriptionView(
     createdAt: subscription.createdAt,
     updatedAt: subscription.updatedAt,
     latestError: subscription.latestError ?? null,
+    observationState: subscription.observationState ?? null,
     terminalObservation: subscription.terminalObservation ?? null,
     agentRunId: subscription.agentRunId ?? null,
     cycleId: subscription.cycleId ?? null,
     admissionReceipt: subscription.admissionReceipt ?? null,
     actionReceipt: subscription.actionReceipt ?? null,
+    chatCallbacks: callbackViews(database, subscription.subscriptionId),
     archivedAt: subscription.archivedAt ?? null,
     availableActions: {
       archive: subscription.archivedAt === undefined &&

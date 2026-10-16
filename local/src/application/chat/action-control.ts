@@ -1,9 +1,10 @@
+import { existingChatTask, chatTaskCandidates } from "./responsibility.js";
 import { AgentRunStore } from "../../infrastructure/sqlite/agent-run-store.js";
 import { answerRunHumanInTransaction } from "../steward/human-input.js";
 import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { ownerActionScope } from "./action-scope.js";
-import { chatRunRequestId, chatRunOriginSql } from "./work-origin.js";
+import { chatRunRequestId, chatRunOriginSql, chatTaskSpan } from "./work-origin.js";
 import { RuntimeStore } from "../../core/runtime/store.js";
 import { openRuntimeDatabase } from "../../infrastructure/sqlite/database.js";
 import { runtimePaths } from "../../infrastructure/runtime/config.js";
@@ -17,21 +18,32 @@ import type { ChatWorkQueryContext } from "./work-query.js";
 export function startChatRun(context: ChatWorkQueryContext, input: {
   readonly desiredEffect: "none" | "read" | "change";
   readonly workspacePath?: string;
+  readonly taskQuote?: string;
 }) {
   const database = openRuntimeDatabase(runtimePaths(context.repoRoot, context.runtimeDirectory).database);
   const runtime = new RuntimeStore(database);
   const foundation = new LocalFoundationStore(database, { migrate: false });
   try {
     return runtime.withImmediateTransaction(() => {
-      const scope = ownerActionScope(context, database, runtime, foundation);
+      const scope = ownerActionScope(context, database, runtime, foundation, true);
       if ("status" in scope) return scope;
       const {source, dispatch} = scope;
+      if (scope.resumedRunId) return {status:"duplicate",runId:scope.resumedRunId,
+        returnTo:{agentId:dispatch.agentId,dispatchEventId:dispatch.eventId}};
+      const task = chatTaskSpan(source.body, input.taskQuote);
+      const existing = existingChatTask(database, source.eventId, task);
+      if (existing) return {status: "duplicate", runId: existing.runId, returnTo: {agentId: existing.agentId, dispatchEventId: existing.dispatchEventId}};
+      const team = chatTaskCandidates(database, source, foundation.listAgents());
+      if (!team.owner) return {status: "unavailable", reason: "No named or eligible participant supports Steward execution"};
+      if (task === undefined && team.owner.principalId !== dispatch.agentId) return {status: "responsible_agent", agentId: team.owner.principalId,
+        reason: "The Host selected one responsible participant for this Owner message; do not create another task"};
+      if (!team.candidates.some(agent => agent.principalId === dispatch.agentId)) return {status:"unavailable", reason:"This participant cannot claim the selected task"};
       let workspaceRef: string | undefined;
       if (input.desiredEffect !== "none") {
         // A mentioned resource is not a broad filesystem grant: bind the exact
         // Owner-supplied root and preserve their whole instruction as constraints.
         if (input.workspacePath === undefined || !input.workspacePath.startsWith("/") ||
-          !source.body.split(/[\s\x60"“”‘’<>，。；：,;]+/u).includes(input.workspacePath)) {
+          !source.body.split(/[\s\x60"“”‘’<>=，。；：,;]+/u).includes(input.workspacePath)) {
           return { status: "needs_authorization", reason: "Choose the exact workspace using a Run proposal, or supply its absolute path in your instruction" };
         }
         const root = realpathSync(input.workspacePath);
@@ -44,6 +56,7 @@ export function startChatRun(context: ChatWorkQueryContext, input: {
       }
       const reply = source.replyToEventId === undefined ? undefined : runtime.event(source.replyToEventId);
       const objective = [
+        ...(task ? ["Selected task:", source.body.slice(task.start,task.end), "Original Owner instruction (shared constraints; execute only the selected task):"] : []),
         source.body,
         "Execution constraints:",
         "Execute only the Local Owner's instruction above. Respect all exclusions and questions;",
@@ -54,15 +67,15 @@ export function startChatRun(context: ChatWorkQueryContext, input: {
       ].join("\n");
       const admission = compileRunIntentInDatabase(context.repoRoot, {
         schemaVersion: "RunIntent@1",
-        requestId: chatRunRequestId(source.eventId, dispatch.eventId),
+        requestId: chatRunRequestId(source.eventId, dispatch.eventId, task),
         objective,
         acceptance: ["Satisfy the Owner's original instruction within the admitted authority; distinguish evidence, outcome and remaining blockers"],
         contextRefs: [`chat-message:${source.eventId}`, `chat-dispatch:${dispatch.eventId}`],
         desiredEffect: input.desiredEffect,
         ...(workspaceRef === undefined ? {} : { workspaceRef }),
-        requestedParticipantRefs: [`principal:${dispatch.agentId}`],
+        requestedParticipantRefs: task ? [`principal:${dispatch.agentId}`] : team.workers.map(agent=>`principal:${agent.principalId}`),
         terminalEvidence: ["Record the exact Run outcome and bounded output references for the originating Chat Session"]
-      }, database, context.runtimeDirectory);
+      }, database, context.runtimeDirectory, {stewardAgentId: dispatch.agentId});
       const started = startStewardRunFromAdmissionInTransaction(admission, database, new Date().toISOString());
       return { status: started.status, runId: started.run.runId,
         authoritySourceEventId: source.eventId, authority: admission.authority,

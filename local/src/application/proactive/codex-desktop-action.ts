@@ -1,3 +1,5 @@
+import { join } from "node:path";
+import { returnNotice, observationPreview } from "./return-notice.js";
 import { runtimeId } from "../../core/runtime/model.js";
 import { RuntimeStore } from "../../core/runtime/store.js";
 import type { CodexPushSourceResolver } from "../../integrations/codex-desktop/push.js";
@@ -40,7 +42,7 @@ export const codexDesktopPushAction: DeterministicApplicationActionRegistration 
   }
 };
 
-export function codexDesktopActionSource(actions: DeterministicApplicationActionRegistry): CodexPushSourceResolver {
+export function codexDesktopActionSource(actions: DeterministicApplicationActionRegistry, location: {repoRoot: string; runtimeDirectory: string}): CodexPushSourceResolver {
   return ({ delivery, destination }) => {
     const receipt = actions.receiptById(delivery.origin.id);
     if (receipt === undefined) return undefined;
@@ -54,7 +56,12 @@ export function codexDesktopActionSource(actions: DeterministicApplicationAction
       stableContractJson(delivery.payload) !== stableContractJson({ body: output.body })) {
       throw new Error("Codex Desktop Delivery differs from the canonical Subscription action receipt");
     }
-    return { body: contractText(output.body, "Desktop action body", 65_536), source: {
+    const stored = contractRecord(JSON.parse(contractText(output.body, "Desktop action body", 65_536)), "Desktop observation");
+    const quote = (value: string) => "'" + value.replace(/'/gu, "'\\''") + "'";
+    const read = [join(location.repoRoot, "scripts/rs"), "--runtime", location.runtimeDirectory,
+      "subscription", "receipt", receipt.receiptId].map(quote).join(" ");
+    return { body: returnNotice({title: contractText(stored.title, "title", 120),
+      ...observationPreview(stored.observation), read}), source: {
       kind: "rs-subscription-observation", subscriptionId: receipt.source.id,
       subscriptionKind: receipt.source.kind, definitionRevision: receipt.source.definitionRevision,
       occurrenceKey: receipt.occurrenceKey, actionReceiptId: receipt.receiptId

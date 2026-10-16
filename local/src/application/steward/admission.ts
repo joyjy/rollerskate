@@ -1,3 +1,5 @@
+import { validateRunResultDestination } from "./result-destination.js";
+import { assertExecutableGraph } from "../../modules/steward/graph-contract.js";
 import { acceptanceContract } from "../../modules/steward/acceptance.js";
 import { AgentRunStore } from "../../infrastructure/sqlite/agent-run-store.js";
 import { StewardPolicyStore } from "../../infrastructure/files/steward-policy-store.js";
@@ -30,12 +32,21 @@ import { registeredPluginsForTrigger } from
 
 export class StewardUnavailableError extends Error {}
 
+function parseExecutableRunIntent(input: unknown): RunIntent {
+  const intent = parseRunIntent(input);
+  if (intent.graph !== undefined) {
+    assertExecutableGraph(intent.graph);
+    if (intent.desiredEffect === "change" || intent.triggerIntent !== undefined) throw new Error("DAG execution requires a standalone read-only Run");
+  }
+  return intent;
+}
+
 export function compileRunIntent(
   repoRoot: string,
   input: RunIntent | unknown,
   runtimeDirectory?: string
 ): StewardRunRequest {
-  const intent = parseRunIntent(input);
+  const intent = parseExecutableRunIntent(input);
   const database = openRuntimeDatabaseReadOnly(runtimePaths(repoRoot, runtimeDirectory).database);
   try {
     return compileWithDatabase(repoRoot, intent, database, runtimeDirectory, {});
@@ -46,6 +57,7 @@ export function compileRunIntent(
 
 export interface RunIntentOwnerPolicy {
   readonly mandate?: CompiledRunMandate;
+  readonly stewardAgentId?: string;
   readonly authorizeNetwork?: boolean;
   readonly maxSteps?: number;
   readonly deadlineAt?: string;
@@ -60,7 +72,7 @@ export function compileRunIntentInDatabase(
 ): StewardRunRequest {
   return compileWithDatabase(
     repoRoot,
-    parseRunIntent(input),
+    parseExecutableRunIntent(input),
     database,
     runtimeDirectory,
     policy
@@ -73,7 +85,7 @@ export function compileRunIntentWithOwnerPolicy(
   policy: RunIntentOwnerPolicy,
   runtimeDirectory?: string
 ): StewardRunRequest {
-  const intent = parseRunIntent(input);
+  const intent = parseExecutableRunIntent(input);
   const database = openRuntimeDatabaseReadOnly(runtimePaths(repoRoot, runtimeDirectory).database);
   try {
     return compileWithDatabase(repoRoot, intent, database, runtimeDirectory, policy);
@@ -95,7 +107,18 @@ function compileWithDatabase(
   if (foundation === undefined) throw new Error("Local foundation is not initialized");
   const activeAgents = foundationStore.listAgents().filter(({ status }) => status === "active");
   const prior = new AgentRunStore(database, { migrate: false }).projectionByOwnerRequest(intent.requestId);
-  const configured = prior === undefined
+  const requestedSteward = intent.stewardRef === undefined ? undefined
+    : resolveAgentRef(intent.stewardRef, activeAgents, "stewardRef");
+  if (requestedSteward !== undefined && policy.stewardAgentId !== undefined && requestedSteward !== policy.stewardAgentId) {
+    throw new Error("stewardRef conflicts with the caller's fixed Steward");
+  }
+  if (requestedSteward !== undefined && prior !== undefined && requestedSteward !== prior.stewardAgentId) {
+    throw new Error("Run requestId is already bound to another Steward");
+  }
+  const selectedStewardId = policy.stewardAgentId ?? requestedSteward;
+  const configured = selectedStewardId !== undefined
+    ? {schemaVersion: "StewardPolicy@1" as const, entries: [{agentId: selectedStewardId, weight: 100}]}
+    : prior === undefined
     ? new StewardPolicyStore(runtimePaths(repoRoot, runtimeDirectory).stewardPolicy).load()
     : undefined;
   const selection = prior?.orchestratorBinding?.schemaVersion === "OrchestratorBinding@3"
@@ -107,30 +130,40 @@ function compileWithDatabase(
   if (steward === undefined || steward.status !== "active" || !supportsStewardClient(steward.client)) {
     throw new StewardUnavailableError("Run admission requires an active supported Steward Agent; selected Agent is unavailable");
   }
+  const workerAgentId = intent.workerRef === undefined ? undefined
+    : resolveAgentRef(intent.workerRef, activeAgents, "workerRef");
   const participantAgentIds = resolveParticipants(
-    intent.requestedParticipantRefs,
+    intent.graph !== undefined ? Object.values(intent.graph.participants) : intent.workerRef !== undefined ? [intent.workerRef]
+      : intent.requestedParticipantRefs ?? (intent.stewardRef === undefined ? undefined : []),
     steward.principalId,
     activeAgents
   );
-  const workspace = resolveWorkspace(repoRoot, foundation.workspacePath, intent);
-  if (policy.authorizeNetwork === true && (workspace?.access !== "read" || intent.triggerIntent !== undefined ||
+  const workspace = inspectRunWorkspace(repoRoot, foundation.workspacePath, intent);
+  if (policy.authorizeNetwork === true && (workspace === undefined || intent.triggerIntent !== undefined ||
     activeAgents.filter(a => participantAgentIds.includes(a.principalId)).some(a => a.client !== "codex"))) {
-    throw new Error("Network preauthorization requires a standalone read-only Run with Codex participants");
+    throw new Error("Network preauthorization requires a standalone Run with Codex participants");
   }
   const runtime = new RuntimeStore(database, { migrate: false });
   const resultDestination = resolveDestination(runtime, intent.resultDestinationRef);
   const trigger = resolveTriggerAuthority(repoRoot, intent, runtimeDirectory);
+  if (intent.graph !== undefined && policy.mandate !== undefined) throw new Error("DAG execution does not accept a workflow mandate override");
+  const graph = intent.graph === undefined ? undefined : {
+    ...intent.graph,
+    participants: Object.fromEntries(Object.entries(intent.graph.participants).map(([alias, ref]) => [alias, `principal:${resolveAgentRef(ref, activeAgents, "graph participant")}`]))
+  };
+  if (graph !== undefined && policy.maxSteps !== undefined && policy.maxSteps < graph.nodes.length) throw new Error("DAG exceeds the admitted step budget");
   const mandate = policy.mandate ?? { kind: "objective" as const, objective: intent.objective };
   const authority = parseRunAuthorityEnvelope({
     schemaVersion: "RunAuthorityEnvelope@1",
     ...(mandate.kind === "workflow" ? { workflowRef: mandate.workflowRef } : {}),
     participantAgentIds,
+    ...(workerAgentId === undefined ? {} : {workerAgentId}),
     ...(workspace === undefined ? {} : { workspace }),
     ...(trigger === undefined ? {} : { trigger }),
     destinationIds: resultDestination === undefined
       ? []
       : [resultDestination.destinationId],
-    maxSteps: policy.maxSteps ?? 20,
+    maxSteps: graph?.nodes.length ?? policy.maxSteps ?? 20,
     maxDepth: 0,
     ...(policy.deadlineAt === undefined ? {} : { deadlineAt: policy.deadlineAt })
   });
@@ -148,6 +181,7 @@ function compileWithDatabase(
     contextRefs: intent.contextRefs,
     terminalEvidence: intent.terminalEvidence,
     mandate,
+    ...(graph === undefined ? {} : {graph}),
     authority,
     ...(resultDestination === undefined ? {} : { resultDestination }),
     authoritySummary: authoritySummary(authority)
@@ -189,29 +223,30 @@ function resolveParticipants(
     readonly handle: string;
   }[]
 ): readonly string[] {
-  const byId = new Map(activeAgents.map((agent) => [agent.principalId, agent]));
-  const byHandle = new Map(activeAgents.map((agent) => [
-    normalizeAgentHandle(agent.handle).key,
-    agent
-  ]));
   const resolved = refs === undefined
     ? activeAgents.map(({ principalId }) => principalId)
-    : refs.map((ref) => {
-        const agent = ref.startsWith("agent:")
-          ? byHandle.get(normalizeAgentHandle(ref.slice("agent:".length)).key)
-          : ref.startsWith("principal:")
-            ? byId.get(ref.slice("principal:".length))
-            : undefined;
-        if (agent === undefined) throw new Error(`Run participant ref is not active: ${ref}`);
-        return agent.principalId;
-      });
+    : refs.map(ref => resolveAgentRef(ref, activeAgents, "participant ref"));
   return [...new Set([stewardAgentId, ...resolved])].sort();
 }
 
-function resolveWorkspace(
+function resolveAgentRef(
+  ref: string,
+  activeAgents: readonly { readonly principalId: string; readonly handle: string }[],
+  field: string
+): string {
+  const agent = ref.startsWith("agent:")
+    ? activeAgents.find(candidate => normalizeAgentHandle(candidate.handle).key === normalizeAgentHandle(ref.slice(6)).key)
+    : ref.startsWith("principal:")
+      ? activeAgents.find(candidate => candidate.principalId === ref.slice(10))
+      : undefined;
+  if (agent === undefined) throw new Error(`Run ${field} is not active: ${ref}`);
+  return agent.principalId;
+}
+
+export function inspectRunWorkspace(
   repoRoot: string,
   localWorkspace: string,
-  intent: RunIntent
+  intent: Pick<RunIntent, "workspaceRef" | "desiredEffect">
 ): RunAuthorityEnvelope["workspace"] | undefined {
   if (intent.workspaceRef === undefined) {
     if (intent.desiredEffect !== undefined && intent.desiredEffect !== "none") {
@@ -266,14 +301,16 @@ function resolveDestination(
   if (destination === undefined) {
     throw new Error(`Run result destination is not registered: ${destinationId}`);
   }
-  return {
-    schemaVersion: "RunResultDestination@2",
+  const result = {
+    schemaVersion: "RunResultDestination@2" as const,
     destinationId: destination.destinationId,
     delivery: {
       kind: destination.kind,
       address: destination.address
     }
   };
+  validateRunResultDestination(result);
+  return result;
 }
 
 function authoritySummary(authority: RunAuthorityEnvelope): string {

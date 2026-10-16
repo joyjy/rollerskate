@@ -33,20 +33,20 @@ test("new CLI cannot upgrade the database while an older Runtime owns the loop",
       () => runLocalApp(repo, [
         "--runtime", runtime, "start", "--no-open", "--ui-port", "4300"
       ]),
-      /Cannot upgrade Local database schema 59 to 75 while Runtime pid \d+ is running/
+      /Cannot upgrade Local database schema 59 to 80 while Runtime pid \d+ is running/
     );
     await assert.rejects(
       () => runLocalApp(repo, ["--runtime", runtime, "run", "list"]),
-      /Cannot upgrade Local database schema 59 to 75 while Runtime pid \d+ is running/
+      /Cannot upgrade Local database schema 59 to 80 while Runtime pid \d+ is running/
     );
     assert.equal(readSchemaVersion(databasePath), 59);
     assert.throws(
       () => runMigration([databasePath]),
-      /Cannot upgrade Local database schema 59 to 75 while Runtime pid \d+ is running/
+      /Cannot upgrade Local database schema 59 to 80 while Runtime pid \d+ is running/
     );
     assert.equal(readSchemaVersion(databasePath), 59);
 
-    setSchemaVersion(databasePath, 75);
+    setSchemaVersion(databasePath, 80);
     let sameVersionOutput = "";
     assert.equal(await runLocalApp(repo, [
       "--runtime", runtime, "run", "list"
@@ -62,13 +62,16 @@ test("new CLI cannot upgrade the database while an older Runtime owns the loop",
       );
     }
     assert.equal(readSchemaVersion(databasePath), 59);
+    const oldSchema = openRuntimeDatabase(databasePath);
+    oldSchema.exec("DROP TABLE run_subscriptions");
+    oldSchema.close();
     runMigration([databasePath]);
     let output = "";
     assert.equal(await runLocalApp(repo, [
       "--runtime", runtime, "run", "list"
     ], {}, { write(text) { output += text; } }), 0);
     assert.deepEqual(JSON.parse(output), []);
-    assert.equal(readSchemaVersion(databasePath), 75);
+    assert.equal(readSchemaVersion(databasePath), 80);
   } finally {
     rmSync(repo, { recursive: true, force: true });
     rmSync(runtime, { recursive: true, force: true });

@@ -42,6 +42,11 @@ export function withChatHistoryContinuation(
       currentProviderSessionId: string | undefined
     ) => ClientHistoryResult;
     readonly chatTools?: (event: ChatDispatchEvent) => ChatToolContext;
+    readonly requiredChatTool?: (event: ChatDispatchEvent) => {
+      readonly name: string;
+      readonly successStatus: string;
+      readonly reminder: string;
+    } | undefined;
   }
 ): RuntimeAgentAdapter {
   return {
@@ -54,6 +59,7 @@ export function withChatHistoryContinuation(
       const initial = await adapter.invoke(input);
       if (input.event.type !== "chat.dispatch") return initial;
       return continueHistoryRequests(adapter, {
+        ...input,
         event: input.event,
         ...(input.providerSessionId === undefined
           ? {}
@@ -76,6 +82,11 @@ async function continueHistoryRequests(
       currentProviderSessionId: string | undefined
     ) => ClientHistoryResult;
     readonly chatTools?: (event: ChatDispatchEvent) => ChatToolContext;
+    readonly requiredChatTool?: (event: ChatDispatchEvent) => {
+      readonly name: string;
+      readonly successStatus: string;
+      readonly reminder: string;
+    } | undefined;
   }
 ): Promise<AgentAdapterInvocation> {
   let receipt = initialReceipt;
@@ -86,7 +97,12 @@ async function continueHistoryRequests(
   let toolRequest = options.chatTools === undefined
     ? undefined
     : parseChatToolRequestForAdapter(adapter, receipt.outcome.body);
-  if (chatRequest === undefined && clientRequest === undefined && toolRequest === undefined) {
+  const requiredTool = adapter.providerPolicy?.client === "kimi-code"
+    ? options.requiredChatTool?.(input.event)
+    : undefined;
+  let requiredToolSatisfied = requiredTool === undefined;
+  if (chatRequest === undefined && clientRequest === undefined && toolRequest === undefined &&
+    requiredToolSatisfied) {
     return receipt;
   }
   const chatTools = options.chatTools?.(input.event);
@@ -95,11 +111,14 @@ async function continueHistoryRequests(
   let recalledMessages = 0;
   let recalledBytes = 0;
   let requests = 0;
-  while (chatRequest !== undefined || clientRequest !== undefined || toolRequest !== undefined) {
+  while (chatRequest !== undefined || clientRequest !== undefined || toolRequest !== undefined ||
+    !requiredToolSatisfied) {
     if (requests >= 20) throw new Error("Chat history access exceeds twenty requests");
     requests += 1;
     let response: string;
-    if (chatRequest !== undefined) {
+    if (chatRequest === undefined && clientRequest === undefined && toolRequest === undefined) {
+      response = requiredTool!.reminder;
+    } else if (chatRequest !== undefined) {
       if (!initializedChatCursor) {
         const initialHistory = options.chatHistory({
           topicId: input.event.topicId,
@@ -154,12 +173,16 @@ async function continueHistoryRequests(
       // before a tool can mutate, rather than discover overflow after admission.
       chatTools!.returnedBytes = Math.max(chatTools!.returnedBytes, recalledBytes + 4_096);
       let result: unknown;
+      input.reportOutput?.({kind: "tool.call", data: {name: toolRequest!.tool, arguments: toolRequest!.arguments}});
       try {
         result = callChatTool(chatTools!,toolRequest!.tool,toolRequest!.arguments);
       } catch (error) {
         result = {status:"tool_error",error:redact(error instanceof Error ? error.message : String(error)).slice(0,500),
           guidance:"Check the source state before deciding again. Do not replay the whole instruction or assume a failed response undid an effect."};
       }
+      input.reportOutput?.({kind: "tool.result", data: {name: toolRequest!.tool, result}});
+      if (toolRequest!.tool === requiredTool?.name && record(result) &&
+        result.status === requiredTool.successStatus) requiredToolSatisfied = true;
       response = [
         `Rollerskate tool result for ${toolRequest!.tool}:`,
         JSON.stringify(result)
@@ -171,12 +194,13 @@ async function continueHistoryRequests(
     }
     const expectedSessionId = receipt.providerSessionId;
     receipt = await adapter.invoke({
+      ...input,
       event: {
         ...input.event,
         prompt: [
           response,
-          "Return the original Chat decision schema now, or make another allowed history",
-          "request only when the returned result shows that it is necessary.",
+          "Return the original Chat decision schema only after completing any required tool request,",
+          "or make another allowed history or tool request when the returned result shows that it is necessary.",
           "For proactive_contribution, an empty or unhelpful history result is not itself",
           "a reason to stay silent; follow the original intent using the bounded Topic history."
         ].join("\n")
@@ -195,6 +219,10 @@ async function continueHistoryRequests(
       : undefined;
   }
   return receipt;
+}
+
+function record(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function parseChatToolRequestForAdapter(

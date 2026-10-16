@@ -202,9 +202,22 @@ export class RuntimeChatStore {
     at = new Date().toISOString()
   ): readonly ChatDispatchEvent[] {
     const timestamp = iso(at);
-    return withImmediateTransaction(this.#database, () => {
+    return withImmediateTransaction(this.#database, () =>
+      this.admitAttentionInTransaction(executionId, admissions, timestamp));
+  }
+
+  /** Append a bounded admission to an already acknowledged attention source.
+   * The caller owns the transaction and atomically records its scheduling state. */
+  public admitAttentionInTransaction(
+    executionId: string,
+    admissions: readonly AdmitChatAttention[],
+    at: string,
+    append = false
+  ): readonly ChatDispatchEvent[] {
+      const timestamp = iso(at);
       const execution = this.#requireExecution(executionId);
-      if (execution.handler !== "chat" || execution.status !== "running") {
+      if (execution.handler !== "chat" ||
+        (execution.status !== "running" && !(append && execution.status === "succeeded"))) {
         throw new Error(`ChatHandler execution is not running: ${executionId}`);
       }
       const sourceEvent = this.#query.event(execution.eventId);
@@ -230,7 +243,8 @@ export class RuntimeChatStore {
         const existing = attentionReceipts.find(
           (receipt) => receipt.agentId === admission.plan.agentId
         );
-        if (existing !== undefined) {
+        if (existing !== undefined && !(append && existing.dispatchEventId === undefined &&
+          (existing.outcome === "dispatched" || existing.reason === "sender"))) {
           if (existing.dispatchEventId !== undefined) {
             const event = this.#query.event(existing.dispatchEventId);
             if (event?.type !== "chat.dispatch") {
@@ -240,6 +254,7 @@ export class RuntimeChatStore {
           }
           continue;
         }
+        if (existing !== undefined) attentionReceipts.splice(attentionReceipts.indexOf(existing), 1);
         const plan = admission.plan.outcome === "dispatch" &&
           dispatchedTurns >= turnBudget
           ? { ...admission.plan, outcome: "skip" as const, reason: "turn-budget-exhausted" as const }
@@ -325,7 +340,6 @@ export class RuntimeChatStore {
         executionId
       );
       return dispatches;
-    });
   }
 
   public createReply(

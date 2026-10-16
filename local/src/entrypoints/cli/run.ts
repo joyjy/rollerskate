@@ -1,3 +1,4 @@
+import {readStewardRunWaitOutcome} from "../../application/steward/wait-query.js";
 import { compileRunIntentWithOwnerPolicy } from "../../application/steward/admission.js";
 import { authorizeRunNetwork } from "../../application/steward/capability.js";
 import { startStewardRunFromOwnerIntent } from "../../application/steward/intent-control.js";
@@ -115,6 +116,10 @@ export function runStewardCommand(
       runtimeDirectory
     ));
     return 0;
+  }
+  if(command === 'outcome') {
+    if(rest.length!==1) throw new Error('run outcome requires an exact Run ID');
+    write(output,readStewardRunWaitOutcome(repoRoot,rest[0]!,runtimeDirectory));return 0;
   }
   if (command === "inspect" || command === "trace") {
     requireCount(rest, 1, `run ${command} requires exactly one Steward Run id`);

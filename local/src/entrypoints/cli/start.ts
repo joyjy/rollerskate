@@ -11,7 +11,10 @@ import { createRuntimeLogStream } from "../../bootstrap/logging.js";
 import { startRuntime } from "../../bootstrap/runtime.js";
 import { startUiServer } from "../console/launcher.js";
 import type { AppOutput } from "./shared.js";
-import { findExecutable, parseBoundedInteger } from "./shared.js";
+import { parseBoundedInteger } from "./shared.js";
+
+import { providerEnvironment, providerExecutable } from "./provider-paths.js";
+import { openDaemonStderr } from "./daemon-diagnostics.js";
 
 export interface StartOptions {
   readonly noOpen: boolean;
@@ -35,15 +38,12 @@ export async function runStartForeground(
   output: AppOutput,
   startOptions: StartOptions
 ): Promise<number> {
+  environment = providerEnvironment(environment);
   const codexDesktopSocketPath = environment.ROLLERSKATE_CODEX_IPC_SOCKET?.trim() || undefined;
-  const codexExecutable = environment.ROLLERSKATE_CODEX_EXECUTABLE?.trim() ||
-    findExecutable("codex", environment.PATH);
-  const claudeCodeExecutable = environment.ROLLERSKATE_CLAUDE_CODE_EXECUTABLE?.trim() ||
-    findExecutable("claude", environment.PATH);
-  const kimiCodeExecutable = environment.ROLLERSKATE_KIMI_CODE_EXECUTABLE?.trim() ||
-    findExecutable("kimi", environment.PATH);
-  const piExecutable = environment.ROLLERSKATE_PI_EXECUTABLE?.trim() ||
-    findExecutable("pi", environment.PATH);
+  const codexExecutable = providerExecutable("codex", environment.ROLLERSKATE_CODEX_EXECUTABLE, environment);
+  const claudeCodeExecutable = providerExecutable("claude", environment.ROLLERSKATE_CLAUDE_CODE_EXECUTABLE, environment);
+  const kimiCodeExecutable = providerExecutable("kimi", environment.ROLLERSKATE_KIMI_CODE_EXECUTABLE, environment);
+  const piExecutable = providerExecutable("pi", environment.ROLLERSKATE_PI_EXECUTABLE, environment);
   const paths = runtimeLogPaths(repoRoot, runtimeDirectory);
   mkdirSync(paths.logs, { recursive: true, mode: 0o700 });
   const log = createRuntimeLogStream(paths.daemonLog);
@@ -149,7 +149,8 @@ export async function runStartDaemon(
   if (existing.running) {
     output.write([
       `Rollerskate is already running with pid ${existing.state!.pid}.`,
-      `Log: ${paths.daemonLog}`
+      `Log: ${paths.daemonLog}`,
+      `Diagnostics: ${paths.logs}/daemon-stderr.log`
     ].join("\n") + "\n");
     return 0;
   }
@@ -158,21 +159,25 @@ export async function runStartDaemon(
     throw new Error("cannot resolve the Rollerskate CLI launcher");
   }
   mkdirSync(paths.logs, { recursive: true, mode: 0o700 });
-  const child = spawn(process.execPath, [
-    launcher,
-    ...(runtimeDirectory === undefined ? [] : ["--runtime", runtimeDirectory]),
-    "start",
-    "--foreground",
-    ...(startOptions.noOpen ? ["--no-open"] : []),
-    "--ui-port",
-    String(startOptions.uiPort)
-  ], {
-    cwd: repoRoot,
-    detached: true,
-    env: environment,
-    stdio: "ignore",
-    windowsHide: true
-  });
+  const stderr = openDaemonStderr(paths.logs);
+  let child: ReturnType<typeof spawn>;
+  try {
+    child = spawn(process.execPath, [
+      launcher,
+      ...(runtimeDirectory === undefined ? [] : ["--runtime", runtimeDirectory]),
+      "start",
+      "--foreground",
+      ...(startOptions.noOpen ? ["--no-open"] : []),
+      "--ui-port",
+      String(startOptions.uiPort)
+    ], {
+      cwd: repoRoot,
+      detached: true,
+      env: { ...environment, ROLLERSKATE_DAEMON_STDERR: stderr.path },
+      stdio: ["ignore", "ignore", stderr.fd],
+      windowsHide: true
+    });
+  } finally { stderr.close(); }
   if (child.pid === undefined) {
     throw new Error("failed to spawn the Rollerskate daemon");
   }
@@ -197,11 +202,13 @@ export async function runStartDaemon(
           "Rollerskate started in the background.",
           `PID: ${pid}`,
           `UI: http://localhost:${startOptions.uiPort}/console/`,
-          `Log: ${paths.daemonLog}`
+          `Log: ${paths.daemonLog}`,
+          `Diagnostics: ${paths.logs}/daemon-stderr.log`
         ].join("\n") + "\n"
         : [
           `Rollerskate is already running with pid ${pid}.`,
-          `Log: ${paths.daemonLog}`
+          `Log: ${paths.daemonLog}`,
+          `Diagnostics: ${paths.logs}/daemon-stderr.log`
         ].join("\n") + "\n");
       return 0;
     }

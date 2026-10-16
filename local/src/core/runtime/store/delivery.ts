@@ -178,6 +178,18 @@ export class RuntimeDeliveryStore {
     });
   }
 
+  /** A pre-transport policy hold consumes no transport attempt or success receipt. */
+  public hold(deliveryId: string, reason: string, retryAt: string | undefined, at: string): RuntimeDelivery {
+    const timestamp = iso(at);
+    const changed = this.#database.prepare(`UPDATE deliveries
+      SET status = ?, attempt_count = max(0,attempt_count-1), next_attempt_at = ?,
+          last_error = ?, updated_at = ? WHERE delivery_id = ? AND status = 'delivering'`)
+      .run(retryAt === undefined ? 'failed' : 'retry_wait', iso(retryAt ?? at),
+        requireText(reason,'reason').slice(0,4096),timestamp,deliveryId);
+    if(changed.changes !== 1) throw new Error(`delivery is not delivering: ${deliveryId}`);
+    return this.#requireDelivery(deliveryId);
+  }
+
   public failed(
     deliveryId: string,
     error: string,

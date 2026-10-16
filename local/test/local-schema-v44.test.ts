@@ -22,6 +22,7 @@ const PRODUCT_TABLES = [
   "channel_send_receipts",
   "chat_messages",
   "chat_presence",
+  "chat_rotations",
   "continuous_subscriptions",
   "deliveries",
   "deterministic_action_receipts",
@@ -35,9 +36,11 @@ const PRODUCT_TABLES = [
   "legacy_trigger_migration_receipts",
   "local_foundation",
   "notices",
+  "notification_controls",
   "proactive_callback_definitions",
   "proactive_callback_occurrences",
   "proactive_source_migration_receipts",
+  "run_subscriptions",
   "scheduled_runs",
   "schedules",
   "schema_meta",
@@ -53,7 +56,7 @@ test("schema v74 creates the single post-v0.3.11 schema without legacy Review", 
   const databasePath = join(directory, "runtime.db");
   try {
     const diagnostics = initializeRuntimeSchema(databasePath);
-    assert.equal(diagnostics.schemaVersion, 75);
+    assert.equal(diagnostics.schemaVersion, 80);
     assert.deepEqual(diagnostics.tables, PRODUCT_TABLES);
 
     const database = new DatabaseSync(databasePath);
@@ -92,11 +95,12 @@ test("schema v74 upgrades a complete v52 database", () => {
     );
     foundationStore.close();
     const database = new DatabaseSync(databasePath);
+    database.exec("DROP TABLE notification_controls; DROP TABLE run_subscriptions");
     database.prepare(
       "UPDATE schema_meta SET value = '52' WHERE key = 'schema_version'"
     ).run();
     database.close();
-    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 75);
+    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 80);
     const migrated = new DatabaseSync(databasePath, { readOnly: true });
     try {
       const row = migrated.prepare(`
@@ -142,7 +146,7 @@ test("schema v74 rejects pre-v44 product data without modifying it", () => {
 
     assert.throws(
       () => initializeRuntimeSchema(databasePath),
-      /schema 43 cannot migrate directly to 75/
+      /schema 43 cannot migrate directly to 80/
     );
     const preserved = new DatabaseSync(databasePath, { readOnly: true });
     try {
@@ -237,6 +241,8 @@ test("schema v74 drops an entire legacy Review Event chain from v44", () => {
       DROP TABLE continuous_subscriptions;
       DROP TABLE proactive_callback_occurrences;
       DROP TABLE proactive_callback_definitions;
+      DROP TABLE notification_controls;
+      DROP TABLE run_subscriptions;
       UPDATE schema_meta SET value = '44' WHERE key = 'schema_version';
       COMMIT;
       PRAGMA foreign_keys = ON;
@@ -244,7 +250,7 @@ test("schema v74 drops an entire legacy Review Event chain from v44", () => {
     database.close();
 
     const diagnostics = initializeRuntimeSchema(databasePath);
-    assert.equal(diagnostics.schemaVersion, 75);
+    assert.equal(diagnostics.schemaVersion, 80);
     const migrated = new DatabaseSync(databasePath, { readOnly: true });
     try {
       assert.equal(count(migrated, "events"), 0);
@@ -268,12 +274,13 @@ test("schema v74 upgrades v56 with optional ExternalRef trigger bindings", () =>
     for (const table of ["schedules", "subscriptions", "continuous_subscriptions"]) {
       previous.exec(`ALTER TABLE ${table} DROP COLUMN external_ref_binding_json`);
     }
+    previous.exec("DROP TABLE notification_controls; DROP TABLE run_subscriptions");
     previous.prepare(
       "UPDATE schema_meta SET value = '56' WHERE key = 'schema_version'"
     ).run();
     previous.close();
 
-    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 75);
+    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 80);
     const migrated = new DatabaseSync(databasePath, { readOnly: true });
     try {
       for (const table of ["schedules", "subscriptions", "continuous_subscriptions"]) {
@@ -296,13 +303,14 @@ test("schema v74 upgrades v57 without introducing business tables", () => {
   try {
     initializeRuntimeSchema(databasePath);
     const previous = new DatabaseSync(databasePath);
+    previous.exec("DROP TABLE notification_controls; DROP TABLE run_subscriptions");
     previous.prepare(
       "UPDATE schema_meta SET value = '57' WHERE key = 'schema_version'"
     ).run();
     previous.close();
 
     const diagnostics = initializeRuntimeSchema(databasePath);
-    assert.equal(diagnostics.schemaVersion, 75);
+    assert.equal(diagnostics.schemaVersion, 80);
     assert.deepEqual(diagnostics.tables, PRODUCT_TABLES);
   } finally {
     rmSync(directory, { recursive: true, force: true });
@@ -334,12 +342,14 @@ test("schema v74 preserves legacy v58 Candidate tables without extending them", 
         1, 164273, 164273, '2026-08-13T00:00:00.000Z'
       );
       INSERT INTO release_candidates VALUES ('candidate-legacy', 'preserve');
+      DROP TABLE notification_controls;
+      DROP TABLE run_subscriptions;
       UPDATE schema_meta SET value = '58' WHERE key = 'schema_version';
     `);
     previous.close();
 
     const diagnostics = initializeRuntimeSchema(databasePath);
-    assert.equal(diagnostics.schemaVersion, 75);
+    assert.equal(diagnostics.schemaVersion, 80);
     assert.deepEqual(
       diagnostics.tables.filter((table) => !table.startsWith("release_candidate")),
       PRODUCT_TABLES
@@ -380,7 +390,7 @@ test("schema v74 tolerates complete legacy Candidate tombstones", () => {
     database.close();
 
     const diagnostics = initializeRuntimeSchema(databasePath);
-    assert.equal(diagnostics.schemaVersion, 75);
+    assert.equal(diagnostics.schemaVersion, 80);
     const preserved = new DatabaseSync(databasePath, { readOnly: true });
     try {
       assert.equal(count(preserved, "release_candidates"), 1);
@@ -394,8 +404,8 @@ test("schema v74 tolerates complete legacy Candidate tombstones", () => {
 
 test("schema v74 fails closed for newer and incomplete current schemas", () => {
   for (const [version, expected] of [
-    ["76", /newer than supported 75/],
-    ["75", /schema 75 is incomplete/]
+    ["81", /newer than supported 80/],
+    ["80", /schema 80 is incomplete/]
   ] as const) {
     const directory = mkdtempSync(join(tmpdir(), "rollerskate-schema-version-"));
     const databasePath = join(directory, "runtime.db");

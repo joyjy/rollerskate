@@ -1,10 +1,51 @@
 import * as v from "valibot";
 import { localAgentSchema } from "./local";
 import { chatPresenceSchema, runtimeEventSchema } from "./event";
-import { optionalString, runHumanQuestionSchema } from "./shared";
+import { optionalString, runHumanQuestionSchema, runInterventionSchema } from "./shared";
 
 export const chatWorkViewSchema = v.object({
+    kind: v.optional(v.union([
+      v.literal("agent"),
+      v.literal("command"),
+      v.literal("observe")
+    ])),
+    detail: v.optional(v.object({
+      tool: v.string(),
+      runId: v.string()
+    })),
     humanQuestion:v.optional(v.nullable(runHumanQuestionSchema)),
+    capabilityRequest: v.optional(v.nullable(v.object({
+      requestEventId: v.string(),
+      runVersion: v.number(),
+      status: v.union([
+        v.literal("pending"),
+        v.literal("granted"),
+        v.literal("closed"),
+        v.literal("expired"),
+        v.literal("superseded")
+      ]),
+      kind: v.literal("network"),
+      acceptanceIds: v.array(v.string()),
+      targets: v.array(v.string()),
+      reason: v.string(),
+      continuationEventId: v.optional(v.string())
+    }))),
+    intervention: v.optional(v.nullable(runInterventionSchema)),
+    returnState: v.optional(v.nullable(v.object({
+      status: v.union([
+        v.literal("ready"),
+        v.literal("waiting_origin"),
+        v.literal("waiting_agent"),
+        v.literal("blocked"),
+        v.literal("admitted"),
+        v.literal("agent_pending"),
+        v.literal("turn_completed"),
+        v.literal("failed"),
+        v.literal("awaiting_result"),
+        v.literal("not_requested")
+      ]),
+      reason: optionalString
+    }))),
     runId: v.string(),
     label: optionalString,
     version: v.optional(v.number()),
@@ -21,7 +62,10 @@ export const chatWorkViewSchema = v.object({
       v.literal("succeeded"),
       v.literal("failed"),
       v.literal("needs_human"),
-      v.literal("cancelled")
+      v.literal("cancelled"),
+      v.literal("running"),
+      v.literal("unknown"),
+      v.literal("attention_required")
     ]),
     terminal: v.optional(v.boolean()),
     attentionReason: optionalString,
@@ -36,6 +80,7 @@ export const chatWorkViewSchema = v.object({
 
 export const chatRunProposalDraftSchema = v.object({
   schema: v.literal("ChatRunProposalDraft@1"),
+  taskQuote: optionalString,
   goal: optionalString,
   scope: v.object({
     include: v.array(v.string()),
@@ -84,9 +129,12 @@ export const chatRunProposalViewSchema = v.object({
     label: v.string(),
     root: optionalString
   }))),
+  resolution: v.optional(v.object({taskSourceMessageEventId: optionalString, clarificationAnswer: optionalString})),
+  taskSourceChoices: v.optional(v.array(v.object({eventId:v.string(),body:v.string()}))),
   selectedWorkspace: v.optional(v.object({
     kind: v.union([v.literal("project"), v.literal("local"), v.literal("path")]),
-    root: v.string()
+    root: v.string(),
+    revision: optionalString
   })),
   runOrchestrator: v.optional(v.object({ agentId: v.string(), handle: v.string() })),
   participants: v.array(v.object({ agentId: v.string(), handle: v.string() })),
@@ -187,6 +235,12 @@ export const localChatPresenceViewSchema = v.object({
     status: v.union([v.literal("active"), v.literal("suspended")]),
     global: v.optional(chatPresenceSchema),
     topic: v.optional(chatPresenceSchema),
+    webSearch: v.optional(v.object({
+      status: v.union([v.literal("active"), v.literal("revoked")]),
+      supported: v.boolean(),
+      tool: v.nullable(v.string()),
+      reason: v.string()
+    })),
     clientHistory: v.optional(v.object({
       client: v.string(),
       status: v.union([v.literal("active"), v.literal("revoked")]),

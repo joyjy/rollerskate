@@ -332,12 +332,12 @@ function collectText(value: unknown, output: string[], key: string): void {
   }
 }
 
-export function redact(value: string): string {
+export function redact(value: string, maxLength = MAX_SUMMARY_BYTES): string {
   return value
     .replace(/\b(?:sk|rk|pk)-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED_CREDENTIAL]")
     .replace(/\bBearer\s+[A-Za-z0-9._~+/-]{12,}=*/gi, "Bearer [REDACTED]")
     .replace(/((?:token|secret|password|api[_-]?key)\s*[:=]\s*)[^\s,;]+/gi, "$1[REDACTED]")
-    .slice(0, MAX_SUMMARY_BYTES);
+    .slice(0, maxLength);
 }
 
 function digest(value: string): string {

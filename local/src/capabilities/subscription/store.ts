@@ -1,3 +1,4 @@
+import {advanceObservation, initialObservationState, parseObservationState} from "./observation-state.js";
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
@@ -54,6 +55,7 @@ interface SubscriptionRow {
   callback_phase_status: FreeSubscription["callbackPhaseStatus"];
   terminal_key: string | null;
   terminal_observation_json: string | null;
+  observation_state_json: string | null;
   status: SubscriptionStatus;
   started_at: string;
   deadline_at: string;
@@ -227,6 +229,7 @@ export class SubscriptionStore {
       maxWaitMilliseconds: input.maxWaitMilliseconds,
       maxAttempts: input.maxAttempts,
       target: input.target,
+      ...(input.checkpointMilliseconds === undefined ? {} : {checkpointMilliseconds: input.checkpointMilliseconds}),
       externalRefBinding: input.externalRefBinding ?? null
     }));
     const existingById = this.get(input.subscriptionId);
@@ -270,6 +273,14 @@ export class SubscriptionStore {
       JSON.stringify(input.target), binding?.runId ?? null,
       timestamp, timestamp
     );
+    if (input.checkpointMilliseconds !== undefined) {
+      if (input.target.kind !== "application_action" || !["action:codex-desktop.push@1", "action:chat.callback@1", "action:subscription.observe@1"].includes(input.target.actionRef)) {
+        throw new Error("Checkpoint requires a notification-only application action");
+      }
+      const state = initialObservationState(input.checkpointMilliseconds, input.maxWaitMilliseconds, definitionDigest);
+      this.#database.prepare("UPDATE subscriptions SET observation_state_json = ? WHERE subscription_id = ?")
+        .run(JSON.stringify(state), input.subscriptionId);
+    }
     return this.require(input.subscriptionId);
   }
 
@@ -371,6 +382,7 @@ export class SubscriptionStore {
       if (subscription.status !== "active") {
         return subscription;
       }
+      this.#recordProgressInTransaction(subscription, timestamp, observation);
       if (observation.terminal === null) {
         const exhausted = subscription.attemptCount >= subscription.maxAttempts ||
           Date.parse(timestamp) >= Date.parse(subscription.deadlineAt);
@@ -381,7 +393,7 @@ export class SubscriptionStore {
           new Date(Date.parse(timestamp) + subscription.intervalMilliseconds).toISOString(),
           timestamp, subscriptionId
         );
-        if (exhausted) this.#expireInTransaction(subscription, timestamp);
+        if (exhausted) this.#expireInTransaction(this.require(subscriptionId), timestamp);
       } else {
         const terminalKey = terminalOccurrenceKey(subscriptionId);
         const observationJson = terminalObservationJson(observation, terminalKey);
@@ -447,6 +459,7 @@ export class SubscriptionStore {
       const subscription = this.require(subscriptionId);
       if (subscription.status !== "active") return subscription;
       const timestamp = iso(at);
+      this.#recordProgressInTransaction(subscription, timestamp);
       const exhausted = subscription.attemptCount >= subscription.maxAttempts ||
         Date.parse(timestamp) >= Date.parse(subscription.deadlineAt);
       this.#database.prepare(`
@@ -617,6 +630,26 @@ export class SubscriptionStore {
     if (this.#ownsDatabase) this.#database.close();
   }
 
+  #recordProgressInTransaction(subscription: FreeSubscription, at: string, observation?: PollObservation): void {
+    const previous = subscription.observationState;
+    if (previous === undefined) return;
+    if (previous.sourceDigest !== subscription.definitionDigest) throw new Error("Observation source identity changed");
+    const update = advanceObservation(previous, subscription.startedAt, at, observation);
+    let state = update.state;
+    if (observation?.terminal == null && update.notice !== null && this.#actions !== undefined && subscription.target?.kind === "application_action") {
+      const occurrenceKey = `observation:${update.notice}:${state.checkpointIndex}:${subscription.attemptCount}`;
+      const receipt = this.#actions.executeInTransaction({target:subscription.target,
+        source:{kind:"subscription",id:subscription.subscriptionId,definitionRevision:`SubscriptionDefinition@5:${subscription.definitionRevision}`},
+        occurrenceKey, observation:{version:"ObservationCheckpoint@1",terminal:null,
+          summary:`${update.notice}: source ${state.sourceAvailability}; business ${state.businessState}; fixed deadline ${subscription.deadlineAt}`,
+          facts:{...state,deadlineAt:subscription.deadlineAt,reason:update.notice}}, at});
+      state = {...state,lastNoticeAt:at,lastNoticeReceiptId:receipt.receiptId,
+        ...(["source_unavailable","source_recovered"].includes(update.notice) ? {lastSourceNoticeAt:at} : {})};
+    }
+    this.#database.prepare("UPDATE subscriptions SET observation_state_json = ? WHERE subscription_id = ?")
+      .run(JSON.stringify(state),subscription.subscriptionId);
+  }
+
   #completeActionInTransaction(subscription: FreeSubscription, observationJson: string, terminalKey: string, timestamp: string, status: "completed" | "expired"): void {
     if (subscription.target?.kind !== "application_action") throw new Error("Application action target required");
     const subscriptionId = subscription.subscriptionId;
@@ -654,9 +687,9 @@ export class SubscriptionStore {
     if (subscription.target?.kind === "application_action") {
       const terminalKey = terminalOccurrenceKey(subscription.subscriptionId);
       const observationJson = terminalObservationJson({
-        version: "SubscriptionExpiry@1", terminal: "failure",
-        summary: "Subscription wait budget exhausted",
-        facts: { status: "expired", reason: Date.parse(timestamp) >= Date.parse(subscription.deadlineAt)
+        version: "SubscriptionExpiry@1", terminal: null,
+        summary: "Observation wait budget exhausted; business result unknown",
+        facts: { status: "expired", businessResult: "unknown", ...(subscription.observationState === undefined ? {} : {observationState:subscription.observationState,deadlineAt:subscription.deadlineAt}), reason: Date.parse(timestamp) >= Date.parse(subscription.deadlineAt)
           ? "deadline" : "max_attempts", attemptCount: subscription.attemptCount,
           ...(subscription.latestError === undefined ? {} : { latestError: subscription.latestError }) }
       }, terminalKey);
@@ -753,6 +786,7 @@ function mapSubscription(row: SubscriptionRow): FreeSubscription {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     ...(row.latest_error === null ? {} : { latestError: row.latest_error }),
+    ...(row.observation_state_json == null ? {} : {observationState: parseObservationState(row.observation_state_json)}),
     ...(row.terminal_key === null ? {} : { terminalKey: row.terminal_key }),
     ...(row.terminal_observation_json === null
       ? {}
@@ -845,7 +879,9 @@ function validateObservation(observation: PollObservation): void {
 }
 
 function terminalObservationJson(observation: PollObservation, terminalKey: string): string {
-  if (observation.terminal === null) throw new Error("terminal observation is required");
+  if (observation.terminal === null && !(observation.version === "SubscriptionExpiry@1" && observation.facts.status === "expired" && observation.facts.businessResult === "unknown")) {
+    throw new Error("terminal observation or explicit observation expiry is required");
+  }
   let encoded: string;
   try {
     encoded = JSON.stringify({

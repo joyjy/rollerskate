@@ -1,8 +1,10 @@
+import { findWorkspaces } from "../../application/workspace/discovery.js";
+import { parseWorkspaceLookup, parseWorkspaceFork } from "../../application/chat/workspace-tools.js";
+import { setWebSearchAccess } from "../../application/chat/web-search.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 import {
   dispatchLocalChatMessage,
-  handoffLocalChatMessageToRun,
   localChatPresenceView,
   localChatView,
   postLocalChatMessage,
@@ -10,12 +12,13 @@ import {
   setLocalChatPresence
 } from "../../application/chat/control.js";
 import {
+  forkLocalChatRunProposal,
   confirmLocalChatRunProposal,
   declineLocalChatRunProposal,
   preflightLocalChatRunProposal
 } from
   "../../application/chat/run-proposal-control.js";
-import type { ChatRunWorkspaceSelection } from
+import type { ChatRunWorkspaceSelection, ChatRunProposalResolution } from
   "../../application/chat/run-proposal.js";
 import {
   addLocalTopicParticipant,
@@ -85,6 +88,18 @@ export async function serveChatApi(
       json(response, 403, { error: "console_request_marker_required" });
       return;
     }
+    if (url.pathname === "/api/chat/workspaces/find" && method === "POST") {
+      json(response,200,findWorkspaces(repoRoot,parseWorkspaceLookup(await readJsonBody(request)),runtimeDirectory));
+      return;
+    }
+    const workspaceFork = url.pathname.match(/^\/api\/chat\/proposals\/([^/]+)\/([^/]+)\/fork$/);
+    if (workspaceFork && method === "POST") {
+      const body=await readJsonBody(request);
+      const {revision,...fork}=body;
+      json(response,200,forkLocalChatRunProposal(repoRoot,decodeURIComponent(workspaceFork[1]!),
+        decodeURIComponent(workspaceFork[2]!),requireString(body,"revision"),parseWorkspaceFork(fork),options));
+      return;
+    }
     if (url.pathname === "/api/chat/messages" && method === "POST") {
       const body = await readJsonBody(request);
       const replyToEventId = body.replyToEventId === undefined
@@ -95,15 +110,6 @@ export async function serveChatApi(
         requireString(body, "body"),
         options,
         replyToEventId === undefined ? {} : { replyToEventId }
-      ));
-      return;
-    }
-    const workHandoff = url.pathname.match(/^\/api\/chat\/messages\/([^/]+)\/run$/);
-    if (workHandoff !== null && method === "POST") {
-      json(response, 201, handoffLocalChatMessageToRun(
-        repoRoot,
-        decodeURIComponent(workHandoff[1]!),
-        options
       ));
       return;
     }
@@ -118,7 +124,8 @@ export async function serveChatApi(
         decodeURIComponent(proposalConfirmation[2]!),
         requireString(body, "revision"),
         options,
-        parseWorkspaceSelection(body, false)
+        parseWorkspaceSelection(body, false),
+        parseProposalResolution(body)
       );
       json(response, result.status === "duplicate" ? 200 : 201, result);
       return;
@@ -149,7 +156,8 @@ export async function serveChatApi(
         decodeURIComponent(proposalPreflight[2]!),
         requireString(body, "revision"),
         parseWorkspaceSelection(body, true)!,
-        options
+        options,
+        parseProposalResolution(body)
       ));
       return;
     }
@@ -281,12 +289,34 @@ export async function serveChatApi(
         : revokeClientHistoryAccess(repoRoot, parts[3]!, options));
       return;
     }
+    if (method === "POST" && parts.length === 5 && parts[1] === "chat" &&
+      parts[2] === "agents" && parts[4] === "web-search-access") {
+      const body = await readJsonBody(request);
+      const action = requireString(body, "action");
+      if (Object.keys(body).some(key => key !== "action") || (action !== "grant" && action !== "revoke")) {
+        throw new Error("action must be grant or revoke");
+      }
+      json(response, 200, setWebSearchAccess(repoRoot, parts[3]!, action === "grant", options.runtimeDirectory));
+      return;
+    }
     json(response, method === "GET" ? 404 : 405, {
       error: method === "GET" ? "not_found" : "method_not_allowed"
     });
   } catch (error) {
     json(response, 400, { error: error instanceof Error ? error.message : String(error) });
   }
+}
+
+function parseProposalResolution(body: Readonly<Record<string, unknown>>): ChatRunProposalResolution | undefined {
+  const value = body.resolution;
+  if (value === undefined) return undefined;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("resolution must be an object");
+  const fields = value as Record<string,unknown>;
+  if (Object.keys(fields).some(key => key !== "taskSourceMessageEventId" && key !== "clarificationAnswer")) throw new Error("Unknown proposal resolution field");
+  for (const [key,entry] of Object.entries(fields)) {
+    if (typeof entry !== "string" || entry.trim() === "" || entry.length > 4096) throw new Error(`${key} must contain 1–4096 characters`);
+  }
+  return fields as ChatRunProposalResolution;
 }
 
 function parseWorkspaceSelection(

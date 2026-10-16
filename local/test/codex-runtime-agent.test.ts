@@ -60,17 +60,20 @@ rl.on("line", (line) => {
 rl.on("close", () => {
   fs.appendFileSync(${JSON.stringify(invocations)}, JSON.stringify({
     args: process.argv.slice(2), messages,
-    policy: process.env.ROLLERSKATE_CLIENT_HISTORY_POLICY
+    policy: process.env.ROLLERSKATE_CLIENT_HISTORY_POLICY,
+    readonlyRunGrant: process.env.ROLLERSKATE_READONLY_RUN_NETWORK_GRANT
   }) + "\\n");
 });
 `);
   chmodSync(executable, 0o700);
+  let webSearch = false;
   const agent = new CodexRuntimeAgent({
     executable,
     projectRoot: workspace,
-    environment: {},
+    environment: { ROLLERSKATE_READONLY_RUN_NETWORK_GRANT: "run_spoofed" },
     timeoutMilliseconds: 3_000,
     launchArgs: ["--model", "gpt-5.6-sol", "--reasoning-effort", "medium"],
+    resolveWebSearch: () => webSearch,
     resolveMcpServers: ({ event }) => event.type === "chat.dispatch"
       ? [{
           name: "rollerskate_client_history",
@@ -105,12 +108,18 @@ rl.on("close", () => {
   await agent.invoke({event: {...readNetworkEvent, runContext: {...readNetworkEvent.runContext,
     workspaceGrant: {...readNetworkEvent.runContext.workspaceGrant, access: "read"}}}, providerSessionId: "read-only-session"});
 
+  webSearch = true;
+  await agent.invoke({event: chatEvent("search-on"), providerSessionId: "desktop-session"});
+  webSearch = false;
+  await agent.invoke({event: chatEvent("search-off"), providerSessionId: "desktop-session"});
+
   type Invocation = {
     args: string[];
     messages: Array<{ id?: number; method: string; params?: Record<string, unknown> }>;
     policy?: string;
+    readonlyRunGrant?: string;
   };
-  const [fresh, resumed, withTools, networkRun, readNetwork] = readFileSync(invocations, "utf8")
+  const [fresh, resumed, withTools, networkRun, readNetwork, searchOn, searchOff] = readFileSync(invocations, "utf8")
     .trim().split("\n").map((line) => JSON.parse(line) as Invocation);
   assert.deepEqual(fresh!.args, ["app-server", "--stdio"]);
   assert.deepEqual(resumed!.args, ["app-server", "--stdio"]);
@@ -140,6 +149,20 @@ rl.on("close", () => {
   assert.deepEqual(message(fresh!, "turn/start").params!.sandboxPolicy, {type: "readOnly", networkAccess: false});
   assert.equal(fresh!.policy, undefined);
   assert.equal(resumed!.policy, undefined);
+  assert.equal(fresh!.readonlyRunGrant, undefined);
+  assert.equal(networkRun!.readonlyRunGrant, undefined);
+  assert.equal(readNetwork!.readonlyRunGrant, readNetworkEvent.runContext.runId);
+
+  assert.equal((message(withTools!, "thread/resume").params!.config as Record<string, unknown>).web_search, "disabled");
+  for (const [invocation, mode] of [[searchOn!, "live"], [searchOff!, "disabled"]] as const) {
+    const thread = message(invocation, "thread/resume");
+    assert.equal(thread.params!.threadId, "desktop-session");
+    assert.equal((thread.params!.config as Record<string, unknown>).web_search, mode);
+    assert.ok((thread.params!.config as Record<string, unknown>).mcp_servers);
+    assert.deepEqual(message(invocation, "turn/start").params!.sandboxPolicy, {type: "readOnly", networkAccess: false});
+  }
+  assert.match(JSON.stringify(message(searchOn!, "turn/start")), /Owner enabled.*web search/);
+  assert.match(JSON.stringify(message(searchOff!, "turn/start")), /Owner has not enabled/);
 
   const toolConfig = message(withTools!, "thread/resume").params!.config as {
     mcp_servers: Record<string, { args: string[]; env_vars: string[] }>;
@@ -151,7 +174,7 @@ rl.on("close", () => {
   ]);
   assert.deepEqual(history.env_vars, ["ROLLERSKATE_CLIENT_HISTORY_POLICY"]);
   assert.deepEqual(toolConfig.shell_environment_policy.exclude,
-    ["ROLLERSKATE_CLIENT_HISTORY_POLICY"]);
+    ["ROLLERSKATE_CLIENT_HISTORY_POLICY", "ROLLERSKATE_READONLY_RUN_NETWORK_GRANT"]);
   const policy = JSON.parse(withTools!.policy!) as {
     client: string;
     activityAccess: string;
@@ -281,6 +304,26 @@ test("Codex stalls on protocol-only updates and interrupts the active Turn", asy
   assert.equal(codexInvocation(fixture.invocation).messages.some(
     (candidate) => candidate.method === "turn/interrupt"
   ), true);
+});
+
+test("Codex marks a network rejection safe only before any tool starts", async () => {
+  for (const networkRejection of ["before-work", "after-tool"] as const) {
+    const fixture = codexFixture({ networkRejection });
+    const agent = new CodexRuntimeAgent({
+      executable: fixture.executable,
+      projectRoot: fixture.workspace,
+      environment: {},
+      timeoutMilliseconds: 5_000
+    });
+    await assert.rejects(agent.invoke({ event: boundedRunEvent() }), (error: unknown) => {
+      assert.ok(error instanceof AgentInvocationError);
+      assert.match(error.message, /HTTP 503 Service unavailable/);
+      assert.equal(error.failure.reason, "protocol_error");
+      assert.equal(error.failure.rejectedBeforeWork, networkRejection === "before-work" ? true : undefined);
+      assert.equal(error.failure.meaningfulUpdateCount, networkRejection === "before-work" ? 0 : 1);
+      return true;
+    });
+  }
 });
 
 test("Codex distinguishes provider interruption from protocol exit", async () => {
@@ -455,6 +498,7 @@ function subscriptionEvent(eventId: string, workspace: string): AgentInputEvent 
 }
 
 function codexFixture(options: {
+  readonly networkRejection?: "before-work" | "after-tool";
   readonly meaningfulForever?: boolean;
   readonly meaningfulThenCompleteMilliseconds?: number;
   readonly stall?: boolean;
@@ -487,7 +531,14 @@ rl.on("line", (line) => {
     send({ id: 2, result: { turn: {
       id: "turn-fixture", items: [], status: "inProgress"
     } } });
-    ${options.exitBeforeSettlement === true ? "process.exit(143);" : options.cancelled === true ? `send({ method: "turn/completed", params: {
+    ${options.networkRejection !== undefined ? `${options.networkRejection === "after-tool" ? `send({ method: "item/started", params: {
+      threadId: "provider-session", turnId: "turn-fixture",
+      item: { id: "tool-fixture", type: "mcpToolCall", server: "fixture", tool: "send_channel_message" }
+    } });` : ""}
+    send({ method: "turn/completed", params: {
+      threadId: "provider-session",
+      turn: { id: "turn-fixture", items: [], status: "failed", error: { message: "HTTP 503 Service unavailable" } }
+    } });` : options.exitBeforeSettlement === true ? "process.exit(143);" : options.cancelled === true ? `send({ method: "turn/completed", params: {
       threadId: "provider-session",
       turn: { id: "turn-fixture", items: [], status: "interrupted" }
     } });` : options.stall === true ? `updates = setInterval(() => {

@@ -1,6 +1,6 @@
 # 调度基准
 
-`npm run --silent benchmark:scheduler > results.json` 默认测量当前 `HEAD`，运行三轮。使用 `--refs <ref,ref,...> --rounds 1` 比较当前分发仓库内实际存在且依赖一致的提交；refs 指向已提交源码，未提交修改不参与测量。
+`npm run --silent benchmark:scheduler > results.json` 比较 `52f4063`、`834d4b1` 与当前 `HEAD`，默认每个版本三轮，逐轮轮换版本顺序。`npm run --silent benchmark:scheduler -- --refs 52f4063,834d4b1 --rounds 1` 可缩小验证范围；refs 指向已提交源码，未提交修改不参与测量。
 
 入口为 `scripts/scheduler-benchmark/run.mjs`，负载为同目录 `workload.mjs`。runner 用 `git archive` 创建临时源码快照并 fresh build，复用本机已安装依赖，`--refs HEAD,working-tree` 可同时比较已提交基线和当前 `local/src` 快照，输出 sourceDigest；不 checkout、不创建 worktree、不联网、不调用真实 Agent、不读写默认 Runtime。protocol、lockfile、Local package 声明须在各 ref 间相同，否则拒绝比较；protocol 会 fresh build。临时源码、SQLite 与 loop state 在退出时按 exact path 清理。
 

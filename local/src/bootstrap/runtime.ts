@@ -1,5 +1,21 @@
+import { NotificationControlStore } from "../capabilities/subscription/notification-control-store.js";
+import { RunSubscriptionRuntime, runSubscriptionPushSource } from "../application/subscription/run-monitor.js";
+import { FileAgentInvocationJournal } from "../infrastructure/files/agent-invocation-journal.js";
+import { resolveStewardRunPush } from "../application/steward/result-destination.js";
+import { jevMcpServers } from "../application/judgment/jev.js";
+import { ChatRotation } from "../application/chat/rotation.js";
+import {
+  chatRunRecoveryToolRequirement,
+  isChatRunRecoveryActivation
+} from "../application/chat/run-recovery.js";
+import { chatTaskClaims } from "../application/chat/responsibility.js";
+import { chatCallbackAction } from "../application/chat/callback.js";
+import { chatWebSearchEnabled } from "../application/chat/web-search.js";
 import { observeOnlyAction } from "../application/subscription/observation-control.js";
 import { codexDesktopPushAction, codexDesktopActionSource } from "../application/proactive/codex-desktop-action.js";
+import { codexDesktopReminderAction, codexDesktopReminderActionSource } from "../application/proactive/desktop-reminder-action.js";
+import { createScheduleAdmissionGate } from "../application/schedule/readiness.js";
+import { readInteractivePowerState } from "../integrations/power/readiness.js";
 import { resolveCodexChatPush } from "../integrations/codex-desktop/chat-destination.js";
 import { admitChatWorkReturns, type ChatWorkReturnCursor } from "../application/chat/work-return.js";
 import { chmodSync, mkdirSync } from "node:fs";
@@ -312,14 +328,17 @@ async function assembleRuntime(
   const runtimeDatabase = openRuntimeDatabase(paths.database);
   const applicationActions = new DeterministicApplicationActionRegistry(
     runtimeDatabase,
-    [codexDesktopPushAction, observeOnlyAction, ...(options.deterministicApplicationActions ?? [])]
+    [codexDesktopPushAction, codexDesktopReminderAction, chatCallbackAction, observeOnlyAction, ...(options.deterministicApplicationActions ?? [])]
   );
   const externalWorkflowRegistry = loadOwnerExternalWorkflowRegistry(
     options.repoRoot,
     options.runtimeDirectory
   );
   const externalWorkflowStore = new ExternalWorkflowStore(runtimeDatabase);
-  const runtimeStore = new RuntimeStore(runtimeDatabase);
+  const runtimeStore = new RuntimeStore(runtimeDatabase,{chatReplyAdmission:event=>{
+    const control=new NotificationControlStore(runtimeDatabase).forEvent(event.eventId);
+    return control?`notification_${control.mode}:${control.targetId}`:undefined;
+  }});
   const scheduledTaskStore = new ScheduledTaskStore(runtimeDatabase);
   const agentRunStore = new AgentRunStore(runtimeDatabase);
   const foundation = foundationStore.foundation();
@@ -379,7 +398,8 @@ async function assembleRuntime(
           dispatchEventId: event.eventId,
           repoRoot: options.repoRoot,
           runtimeDirectory: paths.runtimeDirectory
-        })
+        }),
+        requiredChatTool: (event) => chatRunRecoveryToolRequirement(runtimeStore,event)
       });
     const agentNames: string[] = [];
     for (const localAgent of foundationStore.listAgents().filter(
@@ -482,9 +502,10 @@ async function assembleRuntime(
       RuntimeDestinationAdapter["kind"],
       RuntimeDestinationAdapter
     >([["macos-notification", macOsNotification]]);
-    const resolveActionPush = codexDesktopActionSource(applicationActions);
+    const resolveActionPush = codexDesktopActionSource(applicationActions, {repoRoot: options.repoRoot, runtimeDirectory: paths.runtimeDirectory});
+    const resolveReminderPush = codexDesktopReminderActionSource(applicationActions, {repoRoot: options.repoRoot, runtimeDirectory: paths.runtimeDirectory});
     deliveryAdapters.set("codex-desktop", new CodexDesktopDestinationAdapter(
-      input => resolveCodexChatPush(runtimeStore, input) ?? resolveActionPush(input),
+      input => resolveCodexChatPush(runtimeStore, input) ?? runSubscriptionPushSource(runtimeDatabase)(input) ?? resolveStewardRunPush(agentRunStore, input,{repoRoot:options.repoRoot,runtimeDirectory:paths.runtimeDirectory}) ?? resolveReminderPush(input) ?? resolveActionPush(input),
       codexPushRunner(options.codexDesktopSocketPath === undefined ? {} : { socketPath: options.codexDesktopSocketPath })
     ));
     if (matrixDelivery !== undefined) {
@@ -546,6 +567,13 @@ async function assembleRuntime(
     const scheduledTasks = new ScheduledTaskRuntime({
       store: scheduledTaskStore,
       runtime: runtimeStore,
+      admissionGate: createScheduleAdmissionGate({
+        runs: agentRunStore,
+        power: () => readInteractivePowerState(callbackKernel),
+        agentClient: agentId => foundationStore.agent(agentId)?.client,
+        ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+        ...(options.codexDesktopSocketPath === undefined ? {} : { socketPath: options.codexDesktopSocketPath })
+      }),
       validateTarget(revision) {
         if (revision.schemaVersion !== "ScheduleRevision@1") return undefined;
         const agent = foundationStore.agent(revision.agentId);
@@ -627,6 +655,7 @@ async function assembleRuntime(
     const topicAdmission = new TopicGovernanceAdmissionPolicy({
       getGovernance: (topicId) => topicGovernanceStore.get(topicId),
       listAgents: () => foundationStore.listAgents(),
+      allowHistoricalSession: isChatRunRecoveryActivation,
       runtime: runtimeStore
     });
     const topicSync = deviceCredential === undefined
@@ -642,24 +671,10 @@ async function assembleRuntime(
           admitHumanEvent: serverTopics.admitHumanEvent,
           admitAgentEvent: serverTopics.admitAgentEvent
         });
-    const runtimeCycle = new RuntimeCycle({
-      store: runtimeStore,
-      onWorkStateChanged,
-      handlers: new Map<RuntimeHandlerKind, RuntimeEventHandler>([
-        ["agent", new AgentHandler({
-          store: runtimeStore,
-          adapterForAgent,
-          executionGuards: [
-            ...modules.flatMap((module) => module.executionGuards),
-            topicAdmission
-          ],
-          resolveChatReplyRoute: (event) => resolveCodexChatReplyRoute(runtimeStore, event) ?? serverTopics.resolveChatReplyRoute(event)
-        })],
-        ["result", new ResultHandler(
-          runtimeStore,
-          modules.flatMap((module) => module.resultContinuations)
-        )],
-        ["chat", new ChatHandler({
+    const chatRotation = new ChatRotation(runtimeDatabase, runtimeStore);
+    const chatHandler = new ChatHandler({
+          listTaskClaims: (messageId) => chatTaskClaims(runtimeDatabase, messageId),
+          scheduler: chatRotation,
           store: runtimeStore,
           chat: localChat,
           listAgents: serverTopics.agentsForTopic,
@@ -698,11 +713,42 @@ async function assembleRuntime(
               error: message(error)
             })}\n`);
           }
-        })]
+        });
+    const runtimeCycle = new RuntimeCycle({
+      admission:event=>{
+        if(event.type!=='chat.activation' && event.type!=='chat.dispatch') return undefined;
+        const control=new NotificationControlStore(runtimeDatabase).forEvent(event.eventId);
+        return control?{reason:`notification_${control.mode}:${control.targetId}`,permanent:control.mode==='closed'}:undefined;
+      },
+      store: runtimeStore,
+      onWorkStateChanged,
+      handlers: new Map<RuntimeHandlerKind, RuntimeEventHandler>([
+        ["agent", new AgentHandler({
+          store: runtimeStore,
+          createInvocationJournal: (execution, event, adapter) => new FileAgentInvocationJournal(
+            paths.runtimeDirectory, execution, event, adapter.adapterId,
+            {secrets: Object.entries(options.environment).filter(([key]) => /secret|token|password|api.?key|credential/iu.test(key)).map(([, value]) => value)}
+          ),
+          adapterForAgent,
+          executionGuards: [
+            ...modules.flatMap((module) => module.executionGuards),
+            topicAdmission
+          ],
+          resolveChatReplyRoute: (event) => resolveCodexChatReplyRoute(runtimeStore, event) ?? serverTopics.resolveChatReplyRoute(event)
+        })],
+        ["result", new ResultHandler(
+          runtimeStore,
+          modules.flatMap((module) => module.resultContinuations)
+        )],
+        ["chat", chatHandler]
       ]),
       deliveryHandler: new DeliveryHandler({
         store: runtimeStore,
-        adapters: deliveryAdapters
+        adapters: deliveryAdapters,
+        admission: (delivery,destination) => {
+          const control = new NotificationControlStore(runtimeDatabase).forDelivery(delivery,destination);
+          return control ? {reason:`notification_${control.mode}:${control.scope}:${control.targetId}:r${control.revision}`,permanent:control.mode==='closed'} : undefined;
+        }
       })
     });
     const runProgress = new RunProgressProjector(
@@ -721,7 +767,14 @@ async function assembleRuntime(
       }
     });
     let chatReturnCursor: ChatWorkReturnCursor | undefined;
+    const runSubscriptions = new RunSubscriptionRuntime({database:runtimeDatabase, repoRoot:options.repoRoot,
+      runtimeDirectory:paths.runtimeDirectory, runtimeIdentity:`${process.pid}:${new Date().toISOString()}`,
+      startedAt:new Date().toISOString()});
     const phases: LoopPhase[] = [
+      {scope:"subscription.run-monitor", run:async () => {
+        const result = runSubscriptions.runCycle();
+        return result.notifications.length || result.blocked.length ? {type:"subscription.run_monitor_cycle",...result} : undefined;
+      }},
       workRequestPhase(workRequests),
       subscriptionPhase(subscriptions),
       continuousSubscriptionPhase(continuousSubscriptions),
@@ -740,6 +793,10 @@ async function assembleRuntime(
         const { eventIds } = returned;
         return eventIds.length === 0 ? undefined : {type: "chat.work_return", eventIds};
       } },
+      {scope: "chat.rotation", run: async () => {
+        const eventIds = chatRotation.advance(chatHandler);
+        return eventIds.length === 0 ? undefined : {type: "chat.rotation", eventIds};
+      }},
       runtimeProgressPhase(runProgress),
       runtimePhase(runtimeCycle)
     ];
@@ -929,13 +986,15 @@ function runtimeAgentForClient(
   switch (client) {
     case "codex":
       return new CodexRuntimeAgent({
+        resolveWebSearch: (event) => chatWebSearchEnabled(options.repoRoot, event, options.runtimeDirectory),
         executable: requireExecutable(options.codexExecutable, "Codex"),
         ...common,
         ...(agentId === undefined
           ? {}
           : {
               resolveMcpServers: ({ event, providerSessionId, invocationStartedAt }) => {
-                const servers = chatHistoryMcpServers(event, options);
+                const servers = [...chatHistoryMcpServers(event, options), ...jevMcpServers(event,
+                  options.environment.RS_JEV_ENV_FILE ?? `${runtimePaths(options.repoRoot, options.runtimeDirectory).runtimeDirectory}/jev.env`)];
                 if (event.type !== "chat.dispatch") return servers;
                 const grant = inspectClientHistoryAccess(options.repoRoot, agentId, {
                   ...(options.runtimeDirectory === undefined
@@ -967,6 +1026,7 @@ function runtimeAgentForClient(
       });
     case "claude-code":
       return new ClaudeCodeRuntimeAgent({
+        resolveWebSearch: (event) => chatWebSearchEnabled(options.repoRoot, event, options.runtimeDirectory),
         executable: requireExecutable(options.claudeCodeExecutable, "Claude Code"),
         ...common,
         resolveMcpServers: ({ event }) => chatHistoryMcpServers(event, options)
@@ -978,6 +1038,7 @@ function runtimeAgentForClient(
       });
     case "pi":
       return new PiRuntimeAgent({
+        resolveWebSearch: (event) => chatWebSearchEnabled(options.repoRoot, event, options.runtimeDirectory),
         executable: requireExecutable(options.piExecutable, "pi"),
         ...common,
         chatToolGrant: chatToolGrant(),

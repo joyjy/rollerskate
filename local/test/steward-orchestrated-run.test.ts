@@ -1,3 +1,6 @@
+import { startStewardRunFromIntent } from "../src/application/steward/intent-control.js";
+import { parseRunDecision } from "../src/modules/steward/caller-contract.js";
+import { planCallerRunDecision } from "../src/modules/steward/state-machine.js";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -6,6 +9,7 @@ import test from "node:test";
 
 import {
   startStewardRun,
+  validateCallerRunDecision,
   submitCallerRunDecision
 } from "../src/application/steward/control.js";
 import { StewardModule } from "../src/application/steward/module.js";
@@ -28,9 +32,10 @@ import { initializeRuntimeSchema } from "../src/infrastructure/sqlite/schema.js"
 
 test("default Codex Orchestrator drives a cross-Agent Run and resumes after restart", async () => {
   const fixture = setup();
+  const envelope = (value: string) => value;
   const codex = scriptedAgent(fixture.workspace, "codex-provider", [
-    initialDecision(1, fixture.agentIds.kimi),
-    nextDecision(3, fixture.agentIds.claude)
+    envelope(initialDecision(1, fixture.agentIds.kimi)),
+    envelope(nextDecision(3, fixture.agentIds.claude))
   ]);
   const kimi = scriptedAgent(fixture.workspace, "kimi-provider", [
     workerStep("Kimi scoped the work", ["scope accepted"])
@@ -96,7 +101,7 @@ test("default Codex Orchestrator drives a cross-Agent Run and resumes after rest
     "http://127.0.0.1:3456/tasks/41"
   );
 
-  const resumedCodex = scriptedAgent(fixture.workspace, "codex-provider", [finishDecision(5)]);
+  const resumedCodex = scriptedAgent(fixture.workspace, "codex-provider", [envelope(finishDecision(5))]);
   const second = harness(fixture, new Map([
     [fixture.agentIds.codex, resumedCodex.adapter],
     [fixture.agentIds.kimi, scriptedAgent(fixture.workspace, "kimi-provider", []).adapter],
@@ -214,6 +219,17 @@ test("a historical internal decision is rejected while manual v1 fallback remain
     }, fixture.runtimeDirectory, "2026-08-18T09:00:02.500Z"),
     /Historical spec requires an explicit persisted-data reader/u);
 
+    const manual = {schemaVersion: "RunDecision@1", action: "needs_human",
+      expectedRunVersion: checkpoint.version, rationale: "Owner reviewed recovery", checkedAcceptance: []};
+    assert.equal(validateCallerRunDecision(fixture.repo, started.run.runId, manual,
+      fixture.runtimeDirectory, "2026-08-18T09:00:02.500Z").status, "valid");
+    assert.equal(runtime.runs.requireProjection(started.run.runId).version, checkpoint.version);
+    assert.equal(runtime.runs.decisions(started.run.runId).length, 0);
+    assert.throws(() => validateCallerRunDecision(fixture.repo, started.run.runId,
+      {...manual, expectedRunVersion: checkpoint.version + 1}, fixture.runtimeDirectory), /expected version/);
+    assert.throws(() => validateCallerRunDecision(fixture.repo, started.run.runId,
+      {...manual, extra: true}, fixture.runtimeDirectory), /unknown field/);
+
     const finished = submitCallerRunDecision(fixture.repo, started.run.runId, {
       requestId: "owner-recovery",
       decision: {
@@ -232,6 +248,27 @@ test("a historical internal decision is rejected while manual v1 fallback remain
   } finally {
     runtime.close();
     fixture.close();
+  }
+});
+
+test("ambiguous or schema-invalid wrapped decisions retain manual fallback", async () => {
+  for (const output of [
+    `${finishDecision(1)}\n${finishDecision(1)}`,
+    `\`\`\`json\n${JSON.stringify({ ...JSON.parse(finishDecision(1)), unexpected: true })}\n\`\`\``
+  ]) {
+    const fixture = setup();
+    const agent = scriptedAgent(fixture.workspace, "codex-invalid", [output]);
+    const runtime = harness(fixture, new Map([[fixture.agentIds.codex, agent.adapter]]));
+    try {
+      const started = startStewardRun(fixture.repo, {
+        requestId: "ambiguous-decision", objective: "validate decision boundary",
+        participantAgentIds: [fixture.agentIds.codex]
+      }, fixture.runtimeDirectory, "2026-09-14T00:00:00.000Z");
+      await runtime.agent("2026-09-14T00:00:01.000Z");
+      runtime.result("2026-09-14T00:00:02.000Z");
+      assert.equal(runtime.runs.requireProjection(started.run.runId).status, "awaiting_orchestrator");
+      assert.equal(runtime.runs.decisions(started.run.runId).length, 0);
+    } finally { runtime.close(); fixture.close(); }
   }
 });
 
@@ -454,3 +491,50 @@ function setup() {
     }
   };
 }
+
+for (const reverse of [false, true]) test(`explicit Kimi/Pi roles dispatch and resume the pinned Steward (reverse=${reverse})`, async () => {
+  const fixture = setup();
+  const foundation = new LocalFoundationStore(runtimePaths(fixture.repo, fixture.runtimeDirectory).database);
+  const pi = foundation.addAgent("pi-deepseek", "pi");
+  foundation.close();
+  const steward = reverse ? pi.principalId : fixture.agentIds.kimi;
+  const worker = reverse ? fixture.agentIds.kimi : pi.principalId;
+  const common = {schemaVersion: "RunDecision@6", rationale: "Verify bounded evidence",
+    checkedAcceptance: [{id: "a1", status: "pass", evidenceRefs: ["worker evidence"]}],
+    state: {schemaVersion: "OrchestratorState@1", goal: "Cited conclusion", tasks: [], acceptedEvidence: [], unresolvedQuestions: []}};
+  const next = {...common, expectedRunVersion: 1, action: "next_step",
+    nextStep: {target: {kind: "agent", agentId: worker}, mandate: {kind: "objective", objective: "Read the fixture and report one cited fact"}}};
+  const finish = {...common, expectedRunVersion: 1, action: "finish",
+    finish: {scope: "run", outcome: "succeeded", summary: "Worker evidence verified", outputs: [{id: "report", title: "Report", contentType: "text/plain", value: "Verified fixture"}]}};
+  const lead = scriptedAgent(fixture.workspace, "lead-session", [JSON.stringify(next), JSON.stringify({...finish, expectedRunVersion: 3})]);
+  const executor = scriptedAgent(fixture.workspace, "worker-session", [workerStep("Fixture verified", ["fixture:fact"])]);
+  let runtime = harness(fixture, new Map([[steward, lead.adapter], [worker, executor.adapter]]));
+  try {
+    const started = startStewardRunFromIntent(fixture.repo, {schemaVersion: "RunIntent@1", requestId: "directed-run",
+      objective: "Cited conclusion", acceptance: ["Cited conclusion"], contextRefs: [], terminalEvidence: ["report"],
+      stewardRef: `principal:${steward}`, workerRef: `principal:${worker}`}, fixture.runtimeDirectory, "2026-09-15T00:00:00.000Z");
+    const runId = started.run.runId;
+    const rootEvent = runtime.runtime.event(started.rootEventId);
+    assert.equal(rootEvent?.type, "agent.request");
+    if (rootEvent?.type !== "agent.request") throw new Error("Expected initial Steward request");
+    assert.match(rootEvent.prompt, new RegExp(`Owner-designated Worker: ${worker}`));
+    assert.throws(() => planCallerRunDecision({run: started.run, decision: parseRunDecision(finish), now: "2026-09-15T00:00:01.000Z"}), /designated Worker must return/);
+    assert.throws(() => planCallerRunDecision({run: started.run, decision: parseRunDecision({...next, nextStep: {...next.nextStep, target: {kind: "agent", agentId: steward}}}), now: "2026-09-15T00:00:01.000Z"}), /target must be the designated Worker/);
+    await runtime.agent("2026-09-15T00:00:01.000Z");
+    runtime.result("2026-09-15T00:00:02.000Z");
+    assert.equal(runtime.runs.decisions(runId)[0]!.receipt.targetAgentId, worker);
+    await runtime.agent("2026-09-15T00:00:03.000Z");
+    runtime.result("2026-09-15T00:00:04.000Z");
+    assert.equal(runtime.runs.requireProjection(runId).checkpoint?.agentId, worker);
+    runtime.close();
+    runtime = harness(fixture, new Map([[steward, lead.adapter], [worker, executor.adapter]]));
+    await runtime.agent("2026-09-15T00:00:05.000Z");
+    runtime.result("2026-09-15T00:00:06.000Z");
+    assert.equal(runtime.runs.requireProjection(runId).status, "succeeded");
+    assert.deepEqual(lead.providerSessions, [undefined, "lead-session"]);
+    assert.equal(executor.providerSessions.length, 1);
+    assert.deepEqual(new Set(runtime.runtime.eventsForRoot(started.rootEventId).filter(event => event.type === "agent.request").map(event => event.agentId)), new Set([steward, worker]));
+    const view = inspectStewardRunView(fixture.repo, runId, fixture.runtimeDirectory);
+    assert.equal(view.outputFolders[0]!.outputs[0]!.value, "Verified fixture");
+  } finally { runtime.close(); fixture.close(); }
+});

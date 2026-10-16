@@ -43,7 +43,7 @@ export interface CompleteRuntimeExecution {
 
 export interface FailRuntimeExecutionOptions {
   readonly trace?: AgentInvocationFailure;
-  readonly retry?: "default" | "never";
+  readonly retry?: "default" | "never" | "network";
 }
 
 export interface ChatReplyRoute {

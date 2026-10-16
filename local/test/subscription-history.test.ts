@@ -353,7 +353,7 @@ test("Subscription history preserves invalid, not-found, and query failures", as
         "--runtime", fixture.runtimeDirectory,
         "subscription", "history", fixture.subscriptionId, "--json"
       ], {}, { write(text) { failureOutput += text; } }),
-      /schema 69 is not current 75; read-only queries do not migrate schema/
+      /schema 69 is not current 80; read-only queries do not migrate schema/
     );
     assert.equal(failureOutput, "");
   } finally {

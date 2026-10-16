@@ -1,0 +1,63 @@
+import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import test from "node:test";
+import { addLocalAgent } from "../src/application/agent/control.js";
+import { localChatView, postLocalChatMessage } from "../src/application/chat/control.js";
+import { ChatHandler } from "../src/application/chat/handler.js";
+import { callChatTool, createChatToolContext } from "../src/application/chat/tool-policy.js";
+import { admitChatWorkReturns } from "../src/application/chat/work-return.js";
+import { cancelStewardRun } from "../src/application/steward/control.js";
+import { TopicGovernanceAdmissionPolicy } from "../src/application/topic/admission.js";
+import { chatPromptResourceId } from "../src/core/chat/model.js";
+import { RuntimeStore } from "../src/core/runtime/store.js";
+import { openRuntimeDatabase } from "../src/infrastructure/sqlite/database.js";
+import { LocalChatStore } from "../src/infrastructure/sqlite/chat-store.js";
+
+import { TopicGovernanceStore } from "../src/infrastructure/sqlite/topic-governance-store.js";
+test("built-in history searches joined Topics, reads originals and revokes exact IDs/cursors on exit", () => {
+  const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+  const runtimeDirectory = mkdtempSync(join(tmpdir(),"rollerskate-joined-history-"));
+  const alice = addLocalAgent(repoRoot,"alice","codex",{runtimeDirectory});
+  const database = openRuntimeDatabase(join(runtimeDirectory,"runtime.db"));
+  const runtime = new RuntimeStore(database);
+  const chat = new LocalChatStore(database);
+  const governance = new TopicGovernanceStore(database);
+  try {
+    const original = postLocalChatMessage(repoRoot,"@alice 找到后续修正",{runtimeDirectory}).message;
+    governance.materializeDefault("topic_joined",[alice.principalId]);
+    governance.materializeDefault("topic_private",[]);
+    const post = (topicId:string,body:string,at:string) => chat.postOwnerMessage({topicId,ownerPrincipalId:original.sender.principalId!,body,at}).message;
+    const old = post("topic_joined","callback 旧判断","2026-09-01T00:00:01.000Z");
+    const corrected = post("topic_joined","callback 已修正，使用确切来源","2026-09-01T00:00:02.000Z");
+    const long = post("topic_joined","长原文".repeat(5000),"2026-09-01T00:00:03.000Z");
+    const secret = post("topic_private","callback 不可见","2026-09-01T00:00:04.000Z");
+    const execution = runtime.claimDueExecutions(100).find(item=>item.eventId===original.eventId)!;
+    const [id] = new ChatHandler({store:runtime,chat,listAgents:()=>[alice]}).handle(execution);
+    runtime.claimDueExecutions(100);
+    const context = createChatToolContext({repoRoot,runtimeDirectory,dispatchEventId:id!});
+    type Search = {items:{eventId:string;topicId:string;body:string}[];nextBeforeEventId:string;hasMore:boolean};
+    const found = callChatTool(context,"search_chat_history",{query:"callback",speaker:"owner",limit:1}) as Search;
+    assert.equal(found.items[0]!.eventId,corrected.eventId);
+    assert.equal(found.hasMore,true);
+    const next = callChatTool(context,"search_chat_history",{query:"callback",beforeEventId:found.nextBeforeEventId}) as Search;
+    assert.deepEqual(next.items.map(item=>item.eventId),[old.eventId]);
+    const read = callChatTool(context,"get_chat_message",{eventId:corrected.eventId,surrounding:1}) as {message:{body:string};before:{eventId:string}[];after:{eventId:string}[]};
+    assert.equal(read.message.body,corrected.body);
+    assert.equal(read.before[0]!.eventId,old.eventId);
+    assert.equal(read.after[0]!.eventId,long.eventId);
+    const part = callChatTool(context,"get_chat_message",{eventId:long.eventId,surrounding:0}) as {message:{body:string;nextOffset:number}};
+    const rest = callChatTool(context,"get_chat_message",{eventId:long.eventId,surrounding:0,offset:part.message.nextOffset}) as typeof part;
+    assert.equal(part.message.body+rest.message.body,long.body);
+    assert.throws(()=>callChatTool(context,"get_chat_message",{eventId:secret.eventId}),/outside/);
+    assert.throws(()=>callChatTool(context,"search_chat_history",{query:"",topicId:"topic_private"}),/outside/);
+    const current = governance.require("topic_joined");
+    governance.commitRevision("topic_joined",{expectedRevision:1,action:"participant_remove",actor:{kind:"owner",principalId:original.sender.principalId!},changedFields:["participants"],
+      next:{status:current.status,participants:[],strategyPolicy:current.strategyPolicy,conversationPolicy:current.conversationPolicy}});
+    assert.throws(()=>callChatTool(context,"get_chat_message",{eventId:corrected.eventId}),/outside/);
+    assert.throws(()=>callChatTool(context,"search_chat_history",{query:"callback",beforeEventId:found.nextBeforeEventId}),/outside/);
+    assert.equal((callChatTool(context,"search_chat_history",{query:"callback"}) as Search).items.length,0);
+  } finally {governance.close();chat.close();runtime.close();database.close();rmSync(runtimeDirectory,{recursive:true,force:true});}
+});

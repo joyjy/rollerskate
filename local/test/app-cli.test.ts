@@ -562,7 +562,7 @@ test("start discovers the Pi executable for an active Pi Agent", async () => {
   const pi = join(repo, "pi");
   writeFileSync(pi, "#!/bin/sh\nexit 0\n");
   chmodSync(pi, 0o700);
-  addLocalAgent(repo, "pi", "pi", { runtimeDirectory: runtime });
+  addLocalAgent(repo, "pi-deepseek", "pi", { runtimeDirectory: runtime });
   const script = join(process.cwd(), "..", "scripts", "rs");
   const child = spawn(script, [
     "--runtime",

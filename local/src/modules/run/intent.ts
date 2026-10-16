@@ -8,6 +8,7 @@ export interface DeterministicRunIntent {
   readonly title: string;
   readonly resultDestinationRef?: string;
   readonly maxWaitMilliseconds?: number;
+  readonly checkpointMilliseconds?: number;
   readonly work: { readonly kind: "command"; readonly executable: string; readonly args: readonly string[]; readonly cwd: string }
     | { readonly kind: "observe"; readonly mode: "until" | "continuous"; readonly sourceRef: string; readonly input: unknown };
 }
@@ -18,8 +19,8 @@ export type WorkRunIntent = RunIntent | DeterministicRunIntent;
 export function parseWorkRunIntent(value: unknown): WorkRunIntent {
   const input = contractRecord(value, "Run intent");
   if (input.schemaVersion === "RunIntent@1") return parseRunIntent(value);
-  exactContractKeys(input, ["schemaVersion", "requestId", "title", "resultDestinationRef", "maxWaitMilliseconds", "work"],
-    "RunIntent@2", ["resultDestinationRef", "maxWaitMilliseconds"]);
+  exactContractKeys(input, ["schemaVersion", "requestId", "title", "resultDestinationRef", "maxWaitMilliseconds", "checkpointMilliseconds", "work"],
+    "RunIntent@2", ["resultDestinationRef", "maxWaitMilliseconds", "checkpointMilliseconds"]);
   if (input.schemaVersion !== "RunIntent@2") throw new Error("Expected RunIntent@1 or RunIntent@2");
   const work = contractRecord(input.work, "work");
   let parsedWork: DeterministicRunIntent["work"];
@@ -40,11 +41,18 @@ export function parseWorkRunIntent(value: unknown): WorkRunIntent {
   } else throw new Error("Unknown work tool; expected command or observe (Agent work uses RunIntent@1)");
   const continuous = parsedWork.kind === "observe" && parsedWork.mode === "continuous";
   if (continuous && input.maxWaitMilliseconds !== undefined) throw new Error("Continuous observation has no wait deadline; omit maxWaitMilliseconds");
+  if (continuous && input.checkpointMilliseconds !== undefined) throw new Error("Continuous observation has no checkpoint deadline; omit checkpointMilliseconds");
+  const maxWaitMilliseconds = continuous ? undefined
+    : contractInteger(input.maxWaitMilliseconds, "maxWaitMilliseconds", 1000, 31 * 86_400_000);
+  const checkpointMilliseconds = input.checkpointMilliseconds === undefined ? undefined
+    : contractInteger(input.checkpointMilliseconds, "checkpointMilliseconds", 1000, maxWaitMilliseconds!);
   const parsed: DeterministicRunIntent = {
     schemaVersion: "RunIntent@2", requestId: contractText(input.requestId, "requestId", 256),
     title: contractText(input.title, "title", 120),
     ...(input.resultDestinationRef === undefined ? {} : { resultDestinationRef: contractText(input.resultDestinationRef, "resultDestinationRef", 256) }),
-    ...(continuous ? {} : {maxWaitMilliseconds: contractInteger(input.maxWaitMilliseconds, "maxWaitMilliseconds", 1000, 31 * 86_400_000)}), work: parsedWork
+    ...(maxWaitMilliseconds === undefined ? {} : {maxWaitMilliseconds}),
+    ...(checkpointMilliseconds === undefined ? {} : {checkpointMilliseconds}),
+    work: parsedWork
   };
   if (Buffer.byteLength(JSON.stringify(parsed)) > 65_536) throw new Error("Run intent exceeds 65536 bytes");
   return parsed;

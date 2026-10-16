@@ -262,6 +262,7 @@ export function parseChatDecisionReceipt(value: string | null): ChatDecisionRece
     ...(proposal === undefined ? {} : { proposal }),
     ...(presence === undefined ? {} : { presenceTransition: presence }),
     ...(typeof parsed.replyEventId === "string" ? { replyEventId: parsed.replyEventId } : {}),
+    ...(typeof parsed.replySuppressedReason === "string" ? { replySuppressedReason: parsed.replySuppressedReason } : {}),
     ...(profile === undefined
       ? {}
       : {
@@ -404,6 +405,7 @@ export function normalizeAgentInvocationFailure(
   return {
     schemaVersion: "AgentInvocationFailure@1",
     ...progress,
+    ...(candidate.rejectedBeforeWork === true && progress.meaningfulUpdateCount === 0 ? {rejectedBeforeWork: true as const} : {}),
     failedAt,
     reason: candidate.reason as AgentInvocationFailure["reason"],
     ...(candidate.totalTimeoutMilliseconds === undefined

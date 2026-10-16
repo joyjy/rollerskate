@@ -3,33 +3,36 @@ import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import type { ChatReadProgress } from "@/types/local";
 
 const props = defineProps<{
-  progress: ChatReadProgress;
+  progress?: ChatReadProgress;
 }>();
 
+const progress = computed<ChatReadProgress>(() => props.progress ?? {schema:"ChatReadProgress@1",total:0,read:0,agents:[]});
+const pending = computed(() => progress.value.total === 0);
+
 const readDegrees = computed(() =>
-  props.progress.total === 0
+  progress.value.total === 0
     ? 0
-    : Math.round((props.progress.read / props.progress.total) * 360)
+    : Math.round((progress.value.read / progress.value.total) * 360)
 );
 
 const reading = computed(() =>
-  props.progress.agents.filter((agent) => agent.state === "reading").length
+  progress.value.agents.filter((agent) => agent.state === "reading").length
 );
 
 const failed = computed(() =>
-  props.progress.agents.filter((agent) => agent.state === "failed").length
+  progress.value.agents.filter((agent) => agent.state === "failed").length
 );
 
 const activeDegrees = computed(() =>
-  props.progress.total === 0
+  progress.value.total === 0
     ? 0
-    : Math.round(((props.progress.read + reading.value) / props.progress.total) * 360)
+    : Math.round(((progress.value.read + reading.value) / progress.value.total) * 360)
 );
 
 const resolvedDegrees = computed(() =>
-  props.progress.total === 0
+  progress.value.total === 0
     ? 0
-    : Math.round(((props.progress.read + reading.value + failed.value) / props.progress.total) * 360)
+    : Math.round(((progress.value.read + reading.value + failed.value) / progress.value.total) * 360)
 );
 
 const root = ref<HTMLDetailsElement | null>(null);
@@ -107,7 +110,7 @@ onBeforeUnmount(() => {
 });
 
 const label = computed(() =>
-  `${props.progress.read} of ${props.progress.total} Agents read this message${
+  pending.value ? "Waiting for Agent processing status" : `${progress.value.read} of ${progress.value.total} Agents read this message${
     reading.value === 0 ? "" : `; ${reading.value} reading`
   }${failed.value === 0 ? "" : `; ${failed.value} failed`}`
 );
@@ -124,7 +127,6 @@ function stateLabel(state: ChatReadProgress["agents"][number]["state"]): string 
 
 <template>
   <details
-    v-if="progress.total > 0"
     ref="root"
     class="read-progress"
     @toggle="syncOpened"
@@ -153,7 +155,7 @@ function stateLabel(state: ChatReadProgress["agents"][number]["state"]): string 
         @mouseenter="showFromHover"
         @mouseleave="scheduleHoverHide"
       >
-        <strong>{{ progress.read }}/{{ progress.total }} read</strong>
+        <strong>{{ pending ? "Waiting for Agent processing status" : `${progress.read}/${progress.total} read` }}</strong>
         <ul>
           <li v-for="agent in progress.agents" :key="agent.agentId">
             <span class="agent">@{{ agent.handleSnapshot }}</span>
@@ -173,14 +175,17 @@ function stateLabel(state: ChatReadProgress["agents"][number]["state"]): string 
 <style scoped>
 .read-progress {
   position: relative;
-  display: inline-flex;
+  display: block;
+  flex: 0 0 24px;
+  width: 24px;
+  height: 24px;
 }
 .read-progress summary {
   display: grid;
   place-items: center;
   width: 24px;
   height: 24px;
-  margin: -4px;
+  margin: 0;
   border-radius: 6px;
   cursor: pointer;
   list-style: none;

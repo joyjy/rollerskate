@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { runSubscriptionCommand } from "../src/entrypoints/cli/subscription.js";
 import { localId } from "../src/core/id.js";
 import { RuntimeStore } from "../src/core/runtime/store.js";
 import { DeliveryHandler } from "../src/core/runtime/handlers.js";
@@ -79,12 +80,17 @@ test("Owner CLI registration waits without Agent work, then pushes one canonical
       const [delivery] = runtime.claimDueDeliveries(10, later);
       assert.ok(delivery);
       let calls = 0;
-      const adapter = new CodexDesktopDestinationAdapter(codexDesktopActionSource(actions), async (threadId, message) => {
+      const adapter = new CodexDesktopDestinationAdapter(codexDesktopActionSource(actions, {repoRoot: f.root, runtimeDirectory: f.root}), async (threadId, message) => {
         calls++;
-        const data = JSON.parse(message.split("\n").slice(1).join("\n"));
-        assert.equal(data.source.subscriptionId, input.subscriptionId);
-        assert.equal(data.source.kind, "rs-subscription-observation");
-        assert.equal(JSON.parse(data.body).observation.facts.status, "done");
+        assert.match(message, /Wait for fixture.*success \/ done/);
+        assert.ok(message.includes(delivery.origin.id));
+        assert.ok(message.includes(f.root));
+        assert.ok(!message.includes("bodySha256"));
+        let readback = "";
+        assert.equal(runSubscriptionCommand(f.root, ["receipt", delivery.origin.id], {write: text => {readback += text;}}, f.root), 0);
+        const data = JSON.parse(readback);
+        assert.equal(data.receipt.source.id, input.subscriptionId);
+        assert.equal(data.evidence.observation.facts.status, "done");
         return JSON.stringify({ schema: "CodexPushReceipt@1", threadId, status: "accepted", turnId: "turn", ownerClientId: "owner", messageId: "msg" });
       });
       const destination = runtime.destination(delivery.destinationId)!;
@@ -122,7 +128,7 @@ test("continuous checkpoints enqueue once per occurrence; stale observations and
 });
 
 for (const path of ["deadline", "pending-budget", "probe-error"] as const) {
-  test(`exhausted ${path} records and delivers a source-owned failure once`, () => {
+  test(`exhausted ${path} records unknown business result and delivers expiry once`, () => {
     const f = setup();
     try {
       const input = { ...f.registration(), maxAttempts: 1 };
@@ -139,6 +145,8 @@ for (const path of ["deadline", "pending-budget", "probe-error"] as const) {
       assert.equal(expired.actionReceipt?.status, "succeeded");
       const body = JSON.parse(String(desktopSubscriptionDeliveries(f.root, input.subscriptionId, f.root)[0]?.payload.body));
       assert.equal(body.observation.facts.status, "expired");
+      assert.equal(body.observation.terminal, null);
+      assert.equal(body.observation.facts.businessResult, "unknown");
       if (path === "probe-error") assert.equal(body.observation.facts.latestError, "probe unavailable");
       f.oneShot.due(current.deadlineAt);
       assert.equal(desktopSubscriptionDeliveries(f.root, input.subscriptionId, f.root).length, 1);
@@ -154,4 +162,27 @@ test("registration rejects unregistered authority and ambiguous targets before a
     }
     assert.equal(f.oneShot.list().length, 0);
   } finally { f.close(); }
+});
+
+test("large unknown outcome stays explicit in a short notice and exact old evidence remains queryable", () => {
+  const f = setup();
+  try {
+    const input = f.registration("continuous");
+    registerDesktopSubscription(f.root, input, f.root);
+    f.continuous.recordObservation(input.subscriptionId, {version:"old", occurrenceKey:"old", terminal:"failure",
+      facts:{status:"unknown", reason:"Outcome cannot be determined", log:"bulk-evidence-".repeat(500)}});
+    f.continuous.recordObservation(input.subscriptionId, {version:"new", occurrenceKey:"new", terminal:"success", facts:{status:"done"}});
+    const deliveries = desktopSubscriptionDeliveries(f.root, input.subscriptionId, f.root);
+    const old = deliveries.find(item => JSON.parse(String(item.payload.body)).observation.version === "old")!;
+    const notice = codexDesktopActionSource(f.actions, {repoRoot:f.root,runtimeDirectory:f.root})({delivery:old,destination:f.runtime.destination(old.destinationId)!})!;
+    assert.match(notice.body, /failure \/ unknown/);
+    assert.match(notice.body, /Outcome cannot be determined/);
+    assert.ok(notice.body.length < 800);
+    assert.ok(!notice.body.includes("bulk-evidence"));
+    let readback = "";
+    runSubscriptionCommand(f.root,["receipt",old.origin.id],{write:text=>{readback+=text;}},f.root);
+    assert.equal(JSON.parse(readback).evidence.observation.version,"old");
+    assert.ok(JSON.parse(readback).evidence.observation.facts.log.length > 5000);
+    assert.throws(()=>runSubscriptionCommand(f.root,["receipt","dar1_missing"],{write:()=>{}},f.root),/not found/);
+  } finally {f.close();}
 });

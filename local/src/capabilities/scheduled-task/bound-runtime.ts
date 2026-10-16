@@ -60,7 +60,22 @@ export class BoundScheduleRuntime {
 
   public projectOccurrence(run: ScheduledRun, schedule: Schedule, at: string): boolean {
     if (run.agentRunId === undefined || this.#runBinding === undefined) return false;
-    if (run.cycleId === undefined) return false;
+    if (run.cycleId === undefined) {
+      // Terminal-source reconciliation is independent of execution readiness.
+      return this.#store.withImmediateTransaction(() => {
+        const current = this.#store.requireRun(run.runId);
+        const state = this.#runBinding!.runState(run.agentRunId!);
+        if (current.status !== "queued" || current.cycleId !== undefined ||
+          state === undefined || !isTerminalRunState(state.status)) return false;
+        const source = this.#store.require(current.scheduleId);
+        this.#store.patchRun(current.runId, {
+          status: "skipped", decisionReason: source.definition.status === "cancelled" ?
+            "schedule-cancelled" : `bound-run-${state.status}`, completedAt: at
+        }, at);
+        this.#reconcileSourceLifecycle(source, run.agentRunId!, at);
+        return true;
+      });
+    }
     const cycle = this.#runBinding.cycleState(run.cycleId);
     if (cycle === undefined) {
       this.#store.patchRun(run.runId, {
@@ -93,15 +108,18 @@ export class BoundScheduleRuntime {
     return true;
   }
 
-  public async decideDue(schedule: Schedule, at: string): Promise<BoundScheduleDecision> {
+  public async decideDue(schedule: Schedule, at: string, admission:
+    { readonly status: "ready" } | { readonly status: "defer" | "skip"; readonly reason: string } =
+    { status: "ready" }): Promise<BoundScheduleDecision> {
     const initialRevision = requireRunTargetRevision(schedule.revision);
     const initialBinding = runTargetBinding(initialRevision);
-    const freshness = await this.#freshness(initialRevision);
+    const freshness = admission.status === "ready" ? await this.#freshness(initialRevision) : undefined;
     return this.#store.withImmediateTransaction(() => {
       const current = this.#store.require(schedule.definition.scheduleId);
       const currentRevision = requireRunTargetRevision(current.revision);
       const currentBinding = runTargetBinding(currentRevision);
       if (currentBinding.runId !== initialBinding.runId ||
+        current.definition.status !== "active" ||
         current.definition.currentRevision !== schedule.definition.currentRevision ||
         current.definition.nextOccurrenceKey !== schedule.definition.nextOccurrenceKey) {
         throw new Error(`Schedule occurrence changed before admission: ${schedule.definition.scheduleId}`);
@@ -130,7 +148,7 @@ export class BoundScheduleRuntime {
       const misfire = current.definition.nextOccurrenceMissing ||
         Date.parse(at) > Date.parse(firstAt) + currentRevision.misfireGraceMilliseconds;
       let result: BoundScheduleDecision;
-      if (freshness.status !== "matched") {
+      if (freshness !== undefined && freshness.status !== "matched") {
         const status = freshness.status === "rejected" ? "skipped" : "failed";
         result = {
           kind: status === "skipped" ? "skip" : "failed",
@@ -140,6 +158,10 @@ export class BoundScheduleRuntime {
             decisionReason: freshness.reason
           }).run
         };
+      } else if (admission.status === "skip") {
+        result = { kind: "skip", run: this.#store.insertDueRunInTransaction({
+          ...common, status: "skipped", decisionReason: admission.reason
+        }).run };
       } else if (misfire && currentRevision.misfirePolicy === "skip") {
         result = {
           kind: "skip",
@@ -198,19 +220,23 @@ export class BoundScheduleRuntime {
           const occurrence = this.#store.insertDueRunInTransaction({
             ...common,
             status: "queued",
-            decisionReason: misfire ? "misfire-run-once" : "due"
+            decisionReason: admission.status === "defer" ? admission.reason :
+              misfire ? "misfire-run-once" : "due"
           }).run;
           if (this.#runBinding === undefined) {
             throw new Error("ScheduleRevision@2 Run binding adapter is unavailable");
           }
-          result = {
+          if (admission.status === "ready" && freshness?.status !== "matched") {
+            throw new Error("Schedule admission requires matched freshness");
+          }
+          result = admission.status === "defer" ? { kind: "queue", run: occurrence } : {
             kind: "admit",
             run: activateScheduleOccurrenceInTransaction({
               store: this.#store,
               adapter: this.#runBinding,
               occurrence,
               revision: currentRevision,
-              freshnessEvidence: freshness.evidence,
+              freshnessEvidence: freshness?.status === "matched" ? freshness.evidence : [],
               at
             })
           };
@@ -250,15 +276,6 @@ export class BoundScheduleRuntime {
         }, at);
         return "skipped";
       }
-      if (freshness.status !== "matched") {
-        const status = freshness.status === "rejected" ? "skipped" : "failed";
-        this.#store.patchRun(current.runId, {
-          status,
-          decisionReason: freshness.reason,
-          completedAt: at
-        }, at);
-        return status === "skipped" ? "skipped" : "failed";
-      }
       const runState = this.#requireRunState(revision);
       if (isTerminalRunState(runState.status)) {
         this.#store.patchRun(current.runId, {
@@ -268,6 +285,15 @@ export class BoundScheduleRuntime {
         }, at);
         this.#reconcileSourceLifecycle(schedule, runTargetBinding(revision).runId, at);
         return "skipped";
+      }
+      if (freshness.status !== "matched") {
+        const status = freshness.status === "rejected" ? "skipped" : "failed";
+        this.#store.patchRun(current.runId, {
+          status,
+          decisionReason: freshness.reason,
+          completedAt: at
+        }, at);
+        return status === "skipped" ? "skipped" : "failed";
       }
       if (schedule.definition.status === "paused" &&
         !current.occurrenceKey.startsWith("manual:")) {

@@ -60,6 +60,7 @@ export interface AgentInvocationProgress extends AgentInvocationProgressBase {
 }
 
 export interface AgentInvocationFailure extends AgentInvocationProgressBase {
+  readonly rejectedBeforeWork?: true;
   readonly schemaVersion: "AgentInvocationFailure@1";
   readonly failedAt: string;
   readonly reason: "stall" | "deadline" | "protocol_exit" | "cancelled" | "protocol_error";
@@ -79,10 +80,36 @@ export class AgentInvocationError extends Error {
   }
 }
 
+/** Provider rejected a request before any model turn/tool execution; adapter-owned evidence. */
+export class AgentNetworkError extends Error {
+  public constructor(message: string, public readonly adapterId: string, public readonly workspace: string) {
+    super(message);
+    this.name = "AgentNetworkError";
+  }
+}
+
+/** Match transport/provider errors, never arbitrary timeouts or auth/configuration failures. */
+export function isTransientNetworkFailure(message: string): boolean {
+  if (/\b(?:401|403)\b|unauthorized|forbidden|invalid.api.key|authentication|permission denied/iu.test(message)) return false;
+  return /\b(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENETUNREACH|UND_ERR_CONNECT_TIMEOUT)\b|\b(?:HTTP|status|API(?:Error| error)?)[ :_=-]*(?:429|500|502|503|504)\b|\b(?:rate.limit(?:ed| exceeded)?|too many requests|service unavailable|bad gateway|gateway timeout)\b/iu.test(message);
+}
+
+/** Public provider output only; hidden reasoning must never be passed as data. */
+export interface AgentOutputEvent {
+  readonly kind: "assistant.delta" | "assistant.message" | "tool.call" | "tool.update" | "tool.result" | "thought";
+  readonly data?: unknown;
+}
+
+export interface AgentInvocationJournal {
+  append(kind: string, data?: unknown): void;
+  close(): void;
+}
+
 export interface AgentAdapterInput {
   readonly event: AgentInputEvent | ChatDispatchEvent;
   readonly providerSessionId?: string;
   readonly reportProgress?: (progress: AgentInvocationProgress) => void;
+  readonly reportOutput?: (event: AgentOutputEvent) => void;
 }
 
 export interface ProviderPolicyObservationSnapshot {

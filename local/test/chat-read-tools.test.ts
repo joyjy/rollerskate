@@ -1,3 +1,4 @@
+import { queryChatReadTool } from "../src/application/chat/read-tool-query.js";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -47,7 +48,7 @@ test("Chat read tool policy exposes bounded read-only evidence without raw autho
     };
     assert.equal(capabilities.mutationAllowed, false);
     assert.deepEqual(capabilities.tools.map(({ name }) => name), [
-      "describe_capabilities", "subscription_history", "list_chat_work", "get_run", "event_trace"
+      "search_chat_history", "get_chat_message", "get_chat_callback", "describe_capabilities", "subscription_history", "list_chat_work", "get_run", "event_trace"
     ]);
     assert.ok(chatReadToolDefinitions.every((definition) =>
       definition.annotations.readOnlyHint && !definition.annotations.destructiveHint
@@ -72,7 +73,8 @@ test("Chat read tool policy exposes bounded read-only evidence without raw autho
     assert.equal(longerPrefix.queryStatus, "success");
     assert.equal(longerPrefix.subscriptionId, fixture.subscriptionId);
 
-    const runEvidence = callChatReadTool(context, "get_run", {
+    assert.throws(() => callChatReadTool(context, "get_run", {runId:run.runId}), /scope is unavailable/);
+    const runEvidence = queryChatReadTool(context, {tool:"get_run",
       runId: run.runId
     }) as { schemaVersion: string; summary: { runId: string }; steps: unknown[] };
     assert.equal(runEvidence.schemaVersion, "ChatRunEvidence@1");

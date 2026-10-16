@@ -19,7 +19,6 @@ import { useMutation } from "@/composables/useMutation";
 import ChatList from "@/components/ChatList.vue";
 import ChatTimeline from "@/components/ChatTimeline.vue";
 import ChatComposer from "@/components/ChatComposer.vue";
-import ChatContextPanel from "@/components/ChatContextPanel.vue";
 import ChatGovernancePanel from "@/components/ChatGovernancePanel.vue";
 import type { ChatListItem, ChatTimelineMessage } from "@/types/chat";
 import type {
@@ -47,7 +46,9 @@ const proposalOverlays = ref<Record<string, {
   readonly sourceRevision: string;
   readonly proposal: ChatRunProposal;
 }>>({});
+const pendingLocalMessage = ref<{ readonly eventId: string; readonly body: string; readonly createdAt: string } | null>(null);
 const chatTimelineRef = ref<InstanceType<typeof ChatTimeline> | null>(null);
+const chatComposerRef = ref<InstanceType<typeof ChatComposer> | null>(null);
 const pollingPaused = computed(() => pending.value !== null);
 const {
   data: chatView,
@@ -113,22 +114,9 @@ const mutation = useMutation({
     ]);
   }
 });
-const workHandoffMutation = useMutation({
-  execute(input: { eventId: string }, signal) {
-    return requestJson(
-      `/api/chat/messages/${encodeURIComponent(input.eventId)}/run`,
-      chatRunHandoffReceiptSchema,
-      {
-        method: "POST",
-        headers: { "X-Rollerskate-Request": "console" },
-        signal
-      }
-    );
-  }
-});
 const presenceAgents = computed(() => presenceQuery.data.value?.agents ?? []);
 const error = computed(() =>
-  mutation.error.value ?? workHandoffMutation.error.value ??
+  mutation.error.value ??
   loadError.value ?? presenceQuery.error.value ??
   governanceQuery.error.value ?? topicSchedulesQuery.error.value
 );
@@ -261,6 +249,13 @@ const visibleMessages = computed<readonly ChatTimelineMessage[]>(() => {
       });
 });
 
+let revealedRecoveryRun = "";
+watch([visibleMessages, () => router?.currentRoute.value.query.runId], async ([messages, requested]) => {
+  if (typeof requested !== "string" || requested === revealedRecoveryRun) return;
+  const source = messages.find(message => message.runProposals?.some(proposal => proposal.linkedRun?.runId === requested) || message.works?.some(work => work.runId === requested));
+  if (source) { await nextTick(); chatTimelineRef.value?.scrollToMessage(source.eventId); revealedRecoveryRun = requested; }
+});
+
 function mention(agent: LocalAgent) {
   const token = `@${agent.handle} `;
   if (!composer.value.toLocaleLowerCase().includes(`@${agent.handle.toLocaleLowerCase()}`)) {
@@ -272,19 +267,30 @@ function reply(message: ChatTimelineMessage) {
   if (selectedIsLocal.value) replyingTo.value = message;
 }
 
-async function handoffToRun(message: ChatTimelineMessage) {
-  if (pending.value || !selectedIsLocal.value || message.sender.kind !== "owner") return;
-  pending.value = `handoff:${message.eventId}`;
-  const receipt = await workHandoffMutation.execute({ eventId: message.eventId });
-  pending.value = null;
-  if (receipt !== null) {
-    await router?.push({ name: "steward", query: { runId: receipt.run.runId } });
-  }
+async function requestRecovery(runId: string, requestId: string) {
+  if (!selectedIsLocal.value || pending.value) return;
+  pending.value = "recovery";
+  try {
+    await mutation.execute({path: `/api/runs/${encodeURIComponent(runId)}/request-recovery`, body: {requestId}});
+    await refreshChat();
+  } finally { pending.value = null; }
+}
+
+async function clarifyProposal(message: ChatTimelineMessage, proposal: ChatRunProposal, workspacePath?: string) {
+  if (!selectedIsLocal.value || pending.value !== null) return;
+  replyingTo.value = message;
+  const clarification = `@${proposal.chatLead.handle} 关于提案「${proposal.finalForm.goal ?? ""}」：${workspacePath
+    ? `本次指定的 workspace 是 ${workspacePath}。`
+    : ""}`;
+  composer.value = [composer.value.trim(), clarification].filter(Boolean).join("\n\n");
+  await nextTick();
+  chatComposerRef.value?.focus();
 }
 
 async function preflightProposal(
   proposal: ChatRunProposal,
-  selection: ChatRunWorkspaceSelection
+  selection: ChatRunWorkspaceSelection,
+  resolution?: ChatRunProposal["resolution"]
 ) {
   if (!selectedIsLocal.value || proposalOperations.value[proposal.proposalId] !== undefined) {
     return;
@@ -303,7 +309,7 @@ async function preflightProposal(
           "Content-Type": "application/json",
           "X-Rollerskate-Request": "console"
         },
-        body: JSON.stringify({ revision: sourceRevision, ...workspaceBody(selection) })
+        body: JSON.stringify({ revision: sourceRevision, ...workspaceBody(selection), ...(resolution === undefined ? {} : {resolution}) })
       }
     );
     proposalOverlays.value[proposal.proposalId] = {
@@ -338,6 +344,7 @@ async function confirmProposal(
         },
         body: JSON.stringify({
           revision: proposal.revision,
+          ...(proposal.resolution === undefined ? {} : {resolution:proposal.resolution}),
           ...(selection === undefined ? {} : workspaceBody(selection))
         })
       }
@@ -407,6 +414,7 @@ async function send(body: string) {
   pending.value = "send";
   const topicId = selectedChat.value?.id ?? "local";
   const isLocal = selectedIsLocal.value;
+  if (isLocal) pendingLocalMessage.value = {eventId: "pending-local-message", body: text, createdAt: new Date().toISOString()};
   if (!isLocal) {
     serverSendStates.value[topicId] = "pending";
     serverIntentIds.value[topicId] ??= globalThis.crypto.randomUUID();
@@ -434,11 +442,10 @@ async function send(body: string) {
       delete serverIntentIds.value[topicId];
       serverSendStates.value[topicId] = "sent";
     }
-    await nextTick();
-    chatTimelineRef.value?.scrollToBottom();
   } else if (!isLocal) {
     serverSendStates.value[topicId] = "failed";
   }
+  if (isLocal) pendingLocalMessage.value = null;
   pending.value = null;
 }
 
@@ -556,6 +563,16 @@ async function setHistoryAccess(agent: LocalAgent, action: "grant" | "revoke") {
   });
   pending.value = null;
 }
+async function setWebSearchAccess(agent: LocalAgent, action: "grant" | "revoke") {
+  if (pending.value || agent.status !== "active") return;
+  pending.value = `web-search:${agent.principalId}`;
+  try {
+    await mutation.execute({
+      path: `/api/chat/agents/${encodeURIComponent(agent.principalId)}/web-search-access`,
+      body: { action }
+    });
+  } finally { pending.value = null; }
+}
 </script>
 
 <template>
@@ -579,9 +596,15 @@ async function setHistoryAccess(agent: LocalAgent, action: "grant" | "revoke") {
       <section class="panel chat-panel">
         <div v-if="error" class="inline-error" role="alert">{{ error }}</div>
         <details v-if="selectedIsLocal" class="mobile-context">
-          <summary>Topic controls, participants & history</summary>
+          <summary>Topic controls & participants</summary>
           <ChatGovernancePanel
             :agents="chatView?.agents ?? []"
+            :presence-agents="presenceAgents"
+            :sessions="chatView?.sessions ?? []"
+            @new-session="newSession"
+            @set-presence="setPresence"
+            @set-history-access="setHistoryAccess"
+            @set-web-search-access="setWebSearchAccess"
             :governance="governanceQuery.data.value"
             :schedules="topicSchedulesQuery.data.value ?? []"
             :pending="pending"
@@ -589,15 +612,6 @@ async function setHistoryAccess(agent: LocalAgent, action: "grant" | "revoke") {
             @participant-action="participantAction"
             @schedule-action="scheduleAction"
             @schedule-create="scheduleCreate"
-          />
-          <ChatContextPanel
-            :agents="chatView?.agents ?? []"
-            :presence-agents="presenceAgents"
-            :sessions="chatView?.sessions ?? []"
-            :pending="pending"
-            @new-session="newSession"
-            @set-presence="setPresence"
-            @set-history-access="setHistoryAccess"
           />
         </details>
         <ChatTimeline
@@ -607,18 +621,22 @@ async function setHistoryAccess(agent: LocalAgent, action: "grant" | "revoke") {
           :active-agents="activeAgents"
           :current-human-id="currentHumanId"
           :allow-reply="selectedIsLocal"
-          :allow-work-handoff="selectedIsLocal"
           :pending="pending"
           :proposal-operations="proposalOperations"
           :proposal-errors="proposalErrors"
+          :proposal-source-revisions="Object.fromEntries(Object.entries(proposalOverlays).map(([id,value])=>[id,value.sourceRevision]))"
+          :pending-message="selectedIsLocal ? pendingLocalMessage ?? undefined : undefined"
           @reply="reply"
-          @handoff="handoffToRun"
           @preflight-proposal="preflightProposal"
           @confirm-proposal="confirmProposal"
           @decline-proposal="declineProposal"
+          @request-recovery="requestRecovery"
+          @recovery-changed="refreshChat"
+          @clarify-proposal="clarifyProposal"
           @open-run="openRun"
         />
         <ChatComposer
+          ref="chatComposerRef"
           v-model="composer"
           :agents="chatView?.agents ?? []"
           :active-agents="activeAgents"
@@ -653,6 +671,12 @@ async function setHistoryAccess(agent: LocalAgent, action: "grant" | "revoke") {
         <template v-if="selectedIsLocal">
           <ChatGovernancePanel
             :agents="chatView?.agents ?? []"
+            :presence-agents="presenceAgents"
+            :sessions="chatView?.sessions ?? []"
+            @new-session="newSession"
+            @set-presence="setPresence"
+            @set-history-access="setHistoryAccess"
+            @set-web-search-access="setWebSearchAccess"
             :governance="governanceQuery.data.value"
             :schedules="topicSchedulesQuery.data.value ?? []"
             :pending="pending"
@@ -660,15 +684,6 @@ async function setHistoryAccess(agent: LocalAgent, action: "grant" | "revoke") {
             @participant-action="participantAction"
             @schedule-action="scheduleAction"
             @schedule-create="scheduleCreate"
-          />
-          <ChatContextPanel
-            :agents="chatView?.agents ?? []"
-            :presence-agents="presenceAgents"
-            :sessions="chatView?.sessions ?? []"
-            :pending="pending"
-            @new-session="newSession"
-            @set-presence="setPresence"
-            @set-history-access="setHistoryAccess"
           />
         </template>
         <div v-else class="topic-agent-panel">

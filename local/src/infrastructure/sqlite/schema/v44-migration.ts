@@ -46,6 +46,7 @@ export const TARGET_TABLES = [
   ...V60_TARGET_TABLES,
   "agent_run_cycles",
   "agent_run_decisions",
+  "chat_rotations",
   "deterministic_action_receipts",
   "external_workflow_executions",
   "external_workflow_recovery_receipts",
@@ -127,6 +128,7 @@ export function assertSupportedSchemaShape(
   const actual = productTables(database).filter((table) =>
     table !== "reviews" &&
     table !== "agent_run_cycles" &&
+    !(table === "chat_rotations" && rowCount(database, table) === 0) &&
     !governanceTables.includes(table) &&
     !freeChatTables.includes(table) &&
     !slice56Tables.includes(table) &&

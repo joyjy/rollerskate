@@ -11,22 +11,38 @@ export interface StdioMcpToolServer {
   readonly name: string;
   readonly version: string;
   readonly tools: readonly Record<string, unknown>[];
-  call(name: string, args: unknown): unknown | Promise<unknown>;
+  call(name: string, args: unknown, signal?: AbortSignal): unknown | Promise<unknown>;
   close?(): void;
 }
 
 export async function runStdioMcpToolServer(server: StdioMcpToolServer): Promise<void> {
   const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
   let pending = Promise.resolve();
+  const calls = new Map<string | number | null, AbortController>();
   input.on("line", (line) => {
-    pending = pending.then(() => handleLine(line, server));
+    try {
+      const message: unknown = JSON.parse(line);
+      if (record(message) && message.method === "notifications/cancelled" && record(message.params)) {
+        const id = message.params.requestId;
+        if (typeof id === "string" || typeof id === "number") calls.get(id)?.abort();
+        return;
+      }
+      if (record(message) && message.method === "tools/call" &&
+        (typeof message.id === "string" || typeof message.id === "number" || message.id === null)) {
+        if (!calls.has(message.id)) calls.set(message.id, new AbortController());
+      }
+    } catch { /* Normal request handling reports malformed JSON. */ }
+    pending = pending.then(() => handleLine(line, server, calls));
   });
-  await new Promise<void>((resolve) => input.once("close", resolve));
+  await new Promise<void>((resolve) => input.once("close", () => {
+    for (const controller of calls.values()) controller.abort();
+    resolve();
+  }));
   await pending;
   server.close?.();
 }
 
-async function handleLine(line: string, server: StdioMcpToolServer): Promise<void> {
+async function handleLine(line: string, server: StdioMcpToolServer, calls: Map<string | number | null, AbortController>): Promise<void> {
   let request: JsonRpcRequest;
   try {
     const value = JSON.parse(line) as unknown;
@@ -67,7 +83,7 @@ async function handleLine(line: string, server: StdioMcpToolServer): Promise<voi
       const params = record(request.params) ? request.params : {};
       if (typeof params.name !== "string") throw new Error("tools/call name is required");
       try {
-        const result = await server.call(params.name, params.arguments);
+        const result = await server.call(params.name, params.arguments, calls.get(request.id)?.signal);
         write({
           jsonrpc: "2.0",
           id: request.id,
@@ -87,6 +103,7 @@ async function handleLine(line: string, server: StdioMcpToolServer): Promise<voi
           }
         });
       }
+      calls.delete(request.id);
       return;
     }
     write({

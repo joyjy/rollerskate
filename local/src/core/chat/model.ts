@@ -109,6 +109,7 @@ export interface ChatPresence {
 
 export interface ChatRunProposalDraft {
   readonly schema: "ChatRunProposalDraft@1";
+  readonly taskQuote?: string;
   readonly goal?: string;
   readonly scope: {
     readonly include: readonly string[];
@@ -388,8 +389,9 @@ export function parseChatRunProposalDraft(value: unknown): ChatRunProposalDraft 
   }
   exactKeys(value, [
     "schema", "goal", "scope", "acceptance", "desiredEffect", "workspaceRef",
-    "blockingQuestion"
+    "blockingQuestion", "taskQuote"
   ], "ChatRunProposalDraft@1");
+  const taskQuote = optionalBoundedText(value.taskQuote, "ChatRunProposalDraft.taskQuote", 4_096);
   const goal = optionalBoundedText(value.goal, "ChatRunProposalDraft.goal", 4_096);
   const scope = value.scope === undefined
     ? { include: [] as readonly string[], exclude: [] as readonly string[] }
@@ -425,6 +427,7 @@ export function parseChatRunProposalDraft(value: unknown): ChatRunProposalDraft 
     : `Please clarify ${missing.join(", ")} before starting this Run.`);
   return {
     schema: "ChatRunProposalDraft@1",
+    ...(taskQuote === undefined ? {} : {taskQuote}),
     ...(goal === undefined ? {} : { goal }),
     scope,
     acceptance,

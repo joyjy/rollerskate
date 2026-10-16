@@ -1,14 +1,14 @@
 ---
 type: Runbook
 title: Local Steward And Review Workflow Runbook
-description: 使用 CLI 启动、检查、追踪、人工接管和取消 autonomous/manual/default-Codex Steward Run，并通过 review@1 执行审查协作。
+description: 使用 CLI 启动、检查、追踪、人工接管和取消 autonomous/manual/Steward Run，并通过 review@1 执行审查协作。
 tags: [rollerskate, local, agent-run, steward, orchestrator, review, workflow, cli, console]
 timestamp: 2026-07-26
 ---
 
 # Local Steward And Review Workflow Runbook
 
-Steward 不依赖 Server 或 Matrix。公共 start 只接受 `RunIntent@1`，由 Owner 持有的 deterministic compiler 通过 canonical spec registry 选择 active、client/handle 均为 `codex` 的 Local Agent 作为 Orchestrator，解析 participant/workspace/destination reference，并固定 `RunAuthorityEnvelope@1`。Steward 不是 Agent 类型。Runtime 为每个参与 Agent 建立 Run 专属 Session；旧 autonomous/manual raw input 只保留为内部 legacy seam。default steward 固定 `OrchestratorBinding@3`，先由 Codex `RunDecision@3` 拆分并选择首个 Worker，之后按 Worker checkpoint 继续编排或绑定已准入 source，失败时可人工接管。CLI 使用简短的 `run` 子命令，持久对象使用 `agent_runs` 与 `agent_run_decisions`，都属于 Steward application domain。
+Steward 不依赖 Server 或 Matrix。公共 start 只接受 `RunIntent@1`，由 Owner 持有的 deterministic compiler 通过 canonical spec registry 按显式 `stewardRef` 或 Owner policy 选择 active Local Agent 作为 Orchestrator（未配置时默认 `codex`），解析 participant/workspace/destination reference，并固定 `RunAuthorityEnvelope@1`。Steward 不是 Agent 类型。指定负责人/执行者及二人 roster 的约束见 [CLI Reference](./cli-reference.md#显式指定负责人和执行者)。Runtime 为每个参与 Agent 建立 Run 专属 Session；旧 autonomous/manual raw input 只保留为内部 legacy seam。default steward 固定 `OrchestratorBinding@3`，先由选中的 Steward `RunDecision@6` 拆分并选择首个 Worker，之后按 Worker checkpoint 继续编排或绑定已准入 source，失败时可人工接管。CLI 使用简短的 `run` 子命令，持久对象使用 `agent_runs` 与 `agent_run_decisions`，都属于 Steward application domain。
 
 ## 1. 准备 Agent
 
@@ -70,7 +70,7 @@ scripts/rs start --no-open
 
 Agent 不填写 callback target。Runtime 从 caller 的 Run Session 固定 callback binding；child provider retry 不 callback，child terminal 后只恢复一次 caller。A → B → C 会形成 durable async call stack，B 的完成先回 B 的 caller，再由 B 决定如何回 A。
 
-default steward 的第一个 Agent invocation 就是固定 Codex Orchestrator：它在 `stepCount = 0` 时读取 objective、remaining budget、participant roster 和 admitted authority，建立最多 32 个结构化 task 的 `OrchestratorState@1`，并用 strict `RunDecision@3` 选择首个 Worker。之后 checkpoint-driven Worker 必须返回 `AgentStepResult@1`；结果不会直接完成整个 Run，而是形成 `AgentRunCheckpoint@1`，状态进入 `awaiting_orchestrator`，同一 Codex Session 再读取 checkpoint 与历史状态做下一次 decision。
+default steward 的第一个 Agent invocation 就是准入选中的 Orchestrator：它在 `stepCount = 0` 时读取 objective、remaining budget、participant roster 和 admitted authority，建立最多 32 个结构化 task 的 `OrchestratorState@1`，并用 strict `RunDecision@6` 选择首个 Worker。之后 checkpoint-driven Worker 必须返回 `AgentStepResult@1`；结果不会直接完成整个 Run，而是形成 `AgentRunCheckpoint@1`，状态进入 `awaiting_orchestrator`，同一 Steward Session 再读取 checkpoint 与历史状态做下一次 decision。
 
 如果 Orchestrator 输出 malformed/stale/越权 decision，或返回未在 registry/authority 中登记的 source template，Runtime 保留 current decision source：后续轮次保留 Worker checkpoint，首轮则保留 `stepCount = 0` 的初始 source。此时先用 `inspect` 读取 current state 和 Run version，再提交 manual `RunDecision@1`：
 

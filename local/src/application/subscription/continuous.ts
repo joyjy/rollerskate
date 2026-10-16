@@ -1,3 +1,5 @@
+import type { DatabaseSync } from "node:sqlite";
+import { callbackViews } from "../chat/callback-query.js";
 import { DeterministicApplicationActionRegistry } from "../proactive/action-registry.js";
 import { ExternalWorkflowStore } from "../../infrastructure/proactive/external-workflow-store.js";
 import { realpathSync, statSync } from "node:fs";
@@ -52,6 +54,7 @@ export interface ContinuousSubscriptionView {
   readonly pendingCycleId: string | null;
   readonly pendingAdmissionReceipt:
     ReturnType<ContinuousSubscriptionStore["require"]>["pendingAdmissionReceipt"] | null;
+  readonly chatCallbacks?: ReturnType<typeof callbackViews>;
   readonly latestActionReceipt:
     ReturnType<ContinuousSubscriptionStore["require"]>["latestActionReceipt"] | null;
   readonly latestError: string | null;
@@ -128,7 +131,7 @@ export function listContinuousSubscriptionViews(
   repoRoot: string,
   runtimeDirectory?: string
 ): ContinuousSubscriptionView[] {
-  return withResources(repoRoot, runtimeDirectory, false, ({ store, foundation }) => {
+  return withResources(repoRoot, runtimeDirectory, false, ({ store, foundation, database }) => {
     const subscriptions = store.list(100);
     const callbacks = store.visibleCallbacks(
       subscriptions.map(({ subscriptionId }) => subscriptionId)
@@ -138,7 +141,7 @@ export function listContinuousSubscriptionViews(
       return view(
         subscription,
         owner,
-        callbacks.get(subscription.subscriptionId) ?? []
+        callbacks.get(subscription.subscriptionId) ?? [], database
       );
     });
   });
@@ -149,14 +152,14 @@ export function inspectContinuousSubscriptionView(
   subscriptionId: string,
   runtimeDirectory?: string
 ): ContinuousSubscriptionView | undefined {
-  return withResources(repoRoot, runtimeDirectory, false, ({ store, foundation }) => {
+  return withResources(repoRoot, runtimeDirectory, false, ({ store, foundation, database }) => {
     const subscription = store.get(subscriptionId);
     if (subscription === undefined) return undefined;
     const owner = continuousOwner(subscription, foundation);
     return view(
       subscription,
       owner,
-      store.visibleCallbacks([subscriptionId]).get(subscriptionId) ?? []
+      store.visibleCallbacks([subscriptionId]).get(subscriptionId) ?? [], database
     );
   });
 }
@@ -167,7 +170,7 @@ export function inspectContinuousSubscriptionViews(
   runtimeDirectory?: string
 ): ReadonlyMap<string, ContinuousSubscriptionView> {
   if (subscriptionIds.length > 100) throw new Error("subscriptionIds exceeds 100 items");
-  return withResources(repoRoot, runtimeDirectory, false, ({ store, foundation }) => {
+  return withResources(repoRoot, runtimeDirectory, false, ({ store, foundation, database }) => {
     const subscriptions = subscriptionIds.flatMap((subscriptionId) => {
       const subscription = store.get(subscriptionId);
       return subscription === undefined ? [] : [subscription];
@@ -180,7 +183,7 @@ export function inspectContinuousSubscriptionViews(
       return [subscription.subscriptionId, view(
         subscription,
         owner,
-        callbacks.get(subscription.subscriptionId) ?? []
+        callbacks.get(subscription.subscriptionId) ?? [], database
       )];
     }));
   });
@@ -193,14 +196,14 @@ export function setContinuousSubscriptionArchivedView(
   runtimeDirectory?: string,
   at = new Date().toISOString()
 ): ContinuousSubscriptionView | undefined {
-  return withResources(repoRoot, runtimeDirectory, true, ({ store, foundation }) => {
+  return withResources(repoRoot, runtimeDirectory, true, ({ store, foundation, database }) => {
     if (store.get(subscriptionId) === undefined) return undefined;
     const subscription = store.setArchived(subscriptionId, archived, at);
     const owner = continuousOwner(subscription, foundation);
     return view(
       subscription,
       owner,
-      store.visibleCallbacks([subscriptionId]).get(subscriptionId) ?? []
+      store.visibleCallbacks([subscriptionId]).get(subscriptionId) ?? [], database
     );
   });
 }
@@ -208,7 +211,8 @@ export function setContinuousSubscriptionArchivedView(
 function view(
   subscription: ReturnType<ContinuousSubscriptionStore["require"]>,
   owner: NonNullable<ReturnType<LocalFoundationStore["agent"]>> | null,
-  callbacks: readonly ProactiveCallbackOccurrence[]
+  callbacks: readonly ProactiveCallbackOccurrence[],
+  database?: DatabaseSync
 ): ContinuousSubscriptionView {
   const visibleOccurrenceKey = subscription.pendingOccurrenceKey ??
     subscription.checkpointOccurrenceKey;
@@ -252,6 +256,7 @@ function view(
       agentRunId: subscription.agentRunId ?? null,
       pendingCycleId: subscription.pendingCycleId ?? null,
       pendingAdmissionReceipt: subscription.pendingAdmissionReceipt ?? null,
+      chatCallbacks: database ? callbackViews(database, subscription.subscriptionId) : [],
       latestActionReceipt: subscription.latestActionReceipt ?? null,
       latestError: subscription.latestError ?? null,
       archivedAt: subscription.archivedAt ?? null,
@@ -278,6 +283,7 @@ function withResources<T>(
   runtimeDirectory: string | undefined,
   migrate: boolean,
   callback: (resources: {
+    readonly database: DatabaseSync;
     readonly store: ContinuousSubscriptionStore;
     readonly foundation: LocalFoundationStore;
   }) => T
@@ -289,7 +295,7 @@ function withResources<T>(
     const options = { migrate };
     const store = new ContinuousSubscriptionStore(database, { ...options, applicationActions: new DeterministicApplicationActionRegistry(database), externalWorkflows: new ExternalWorkflowStore(database) });
     const foundation = new LocalFoundationStore(database, options);
-    return callback({ store, foundation });
+    return callback({ store, foundation, database });
   } finally {
     database.close();
   }

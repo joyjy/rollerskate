@@ -83,6 +83,7 @@ export function startStewardRunFromAdmissionInTransaction(
 function startInputFromAdmission(admission: StewardRunRequest): StartStewardRunInput {
   return {
     requestId: admission.idempotencyKey,
+    ...(admission.graph === undefined ? {} : {graph: admission.graph}),
     steward: admission.stewardSelection?.agentId ?? "codex",
     ...(admission.mandate.kind === "objective"
       ? { objective: renderIntentMandate(admission) }

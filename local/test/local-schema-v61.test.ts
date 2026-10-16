@@ -25,7 +25,7 @@ test("schema v74 preserves existing Deliveries while admitting Vikunja task dest
     store.close();
 
     downgradeDeliveriesToV61(databasePath);
-    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 75);
+    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 80);
 
     const restored = new RuntimeStore(databasePath);
     try {

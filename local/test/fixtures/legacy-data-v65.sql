@@ -1,5 +1,5 @@
 -- Frozen schema 65: 060e7121ca493d2ead461d5137cdd8fa392b20e5, local/src/infrastructure/sqlite/schema/definition.ts
--- Public distribution client allowlist applied to historical table definitions; never derive this fixture from the current schema.
+-- Relevant historical table definitions; never derive this fixture from the current schema.
 CREATE TABLE schema_meta (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL

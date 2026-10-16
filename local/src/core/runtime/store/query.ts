@@ -261,9 +261,11 @@ export class RuntimeStoreQuery {
     const row = this.#database.prepare(cycleId === undefined ? `
       SELECT * FROM agent_sessions
       WHERE run_id = ? AND cycle_id IS NULL AND agent_id = ?
+      ORDER BY created_at DESC, session_id DESC LIMIT 1
     ` : `
       SELECT * FROM agent_sessions
       WHERE run_id = ? AND cycle_id = ? AND agent_id = ?
+      ORDER BY created_at DESC, session_id DESC LIMIT 1
     `).get(...(cycleId === undefined
       ? [requireText(runId, "runId"), requireText(agentId, "agentId")]
       : [

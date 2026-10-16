@@ -27,7 +27,7 @@ test("runtime schema rejects unsupported direct migration without dropping old w
 
     assert.throws(
       () => initializeRuntimeSchema(databasePath),
-      /schema 20 cannot migrate directly to 75/
+      /schema 20 cannot migrate directly to 80/
     );
     const preserved = new DatabaseSync(databasePath, { readOnly: true });
     try {

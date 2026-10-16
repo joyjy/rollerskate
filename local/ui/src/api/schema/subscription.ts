@@ -132,7 +132,11 @@ const freeSubscriptionSchema = v.object({
     v.literal("blocked"), v.literal("cancelled"), v.literal("expired")
   ]),
   owner: v.nullable(subscriptionOwnerSchema),
-  definition: v.union([legacyFreeDefinitionSchema, boundFreeDefinitionSchema]),
+  definition: v.union([legacyFreeDefinitionSchema, boundFreeDefinitionSchema, v.object({
+    ...boundFreeDefinitionSchema.entries,
+    schema: v.literal("SubscriptionDefinition@5"),
+    target: v.unknown()
+  })]),
   callbacks: v.array(proactiveCallbackOccurrenceSchema),
   probe: subscriptionProbeSchema,
   schedule: subscriptionScheduleSchema,
@@ -140,6 +144,8 @@ const freeSubscriptionSchema = v.object({
   updatedAt: v.string(),
   latestError: nullableString,
   terminalObservation: v.unknown(),
+  chatCallbacks: v.optional(v.array(v.unknown())),
+  actionReceipt: v.optional(v.nullable(v.unknown())),
   agentRunId: v.optional(nullableString),
   cycleId: v.optional(nullableString),
   admissionReceipt: v.optional(v.nullable(subscriptionAdmissionReceiptSchema)),
@@ -148,6 +154,7 @@ const freeSubscriptionSchema = v.object({
 });
 
 const continuousSubscriptionSchema = v.object({
+  chatCallbacks: v.optional(v.array(v.unknown())),
   kind: v.literal("continuous"),
   id: v.string(),
   title: v.string(),

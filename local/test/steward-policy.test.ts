@@ -1,3 +1,4 @@
+import { compileRunIntent, compileRunIntentWithOwnerPolicy } from "../src/application/steward/admission.js";
 import { cancelStewardRun, setStewardRunArchived } from "../src/application/steward/control.js";
 import { stewardStatsView } from "../src/application/steward/stats-query.js";
 import assert from "node:assert/strict";
@@ -75,3 +76,39 @@ for (const client of ["kimi-code", "pi"] as const) {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 }
+
+test("explicit role admission overrides weights, freezes both roles and rejects ambiguity", () => {
+  const root = mkdtempSync(join(tmpdir(), "rs-explicit-roles-"));
+  const paths = runtimePaths(root, root);
+  initializeRuntimeSchema(paths.database);
+  bootstrapLocalFoundation(paths);
+  const foundation = new LocalFoundationStore(paths.database);
+  const codex = foundation.addAgent("codex", "codex");
+  const kimi = foundation.addAgent("kimi", "kimi-code");
+  const pi = foundation.addAgent("pi-deepseek", "pi");
+  foundation.close();
+  const intent = {schemaVersion: "RunIntent@1", requestId: "explicit-team", objective: "Inspect evidence",
+    acceptance: ["Cited conclusion"], contextRefs: [], terminalEvidence: ["report"],
+    stewardRef: "agent:kimi", workerRef: "agent:pi-deepseek"};
+  try {
+    configureStewardPolicy(root, {schemaVersion: "StewardPolicy@1", entries: [{agentId: codex.principalId, weight: 100}]}, root);
+    const first = startStewardRunFromIntent(root, intent, root);
+    assert.equal(first.run.stewardAgentId, kimi.principalId);
+    assert.equal(first.admission.authority.workerAgentId, pi.principalId);
+    assert.deepEqual(first.admission.authority.participantAgentIds, [kimi.principalId, pi.principalId].sort());
+    configureStewardPolicy(root, {schemaVersion: "StewardPolicy@1", entries: [{agentId: pi.principalId, weight: 100}]}, root);
+    const duplicate = startStewardRunFromIntent(root, intent, root);
+    assert.equal(duplicate.run.runId, first.run.runId);
+    assert.equal(duplicate.admission.admissionDigest, first.admission.admissionDigest);
+    assert.throws(() => startStewardRunFromIntent(root, {...intent, stewardRef: "agent:pi-deepseek"}, root), /already bound/);
+    assert.throws(() => startStewardRunFromIntent(root, {...intent, workerRef: "agent:codex"}, root), /already bound/);
+    assert.throws(() => compileRunIntent(root, {...intent, requestedParticipantRefs: ["agent:codex"]}, root), /cannot be combined/);
+    assert.throws(() => compileRunIntentWithOwnerPolicy(root, {...intent, requestId: "owner-conflict"}, {stewardAgentId: codex.principalId}, root), /fixed Steward/);
+    const solo = compileRunIntent(root, {...intent, requestId: "solo", workerRef: undefined}, root);
+    assert.deepEqual(solo.authority.participantAgentIds, [kimi.principalId]);
+    const changed = new LocalFoundationStore(paths.database);
+    changed.setAgentStatus(pi.principalId, "suspended");
+    changed.close();
+    assert.throws(() => compileRunIntent(root, {...intent, requestId: "unavailable-worker"}, root), /workerRef is not active/);
+  } finally { rmSync(root, {recursive: true, force: true}); }
+});

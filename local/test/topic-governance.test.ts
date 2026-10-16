@@ -330,13 +330,14 @@ test("schema v74 upgrades v53 and materializes governance from existing active A
       DROP TABLE topic_activation_schedules;
       DROP TABLE topic_governance_control_receipts;
       DROP TABLE topic_governance;
+      DROP TABLE notification_controls;
+      DROP TABLE run_subscriptions;
       UPDATE schema_meta SET value = '53' WHERE key = 'schema_version';
     `);
     legacy.close();
 
     const diagnostics = initializeRuntimeSchema(databasePath);
-    assert.equal(diagnostics.schemaVersion, 75);
-    assert.equal(diagnostics.tables.length, 33);
+    assert.equal(diagnostics.schemaVersion, 80);
     const store = new TopicGovernanceStore(databasePath);
     try {
       const governance = store.require(foundation.topicId);

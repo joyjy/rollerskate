@@ -28,6 +28,16 @@ export interface ChatAgentChoice {
   readonly handle: string;
 }
 
+export interface OwnerChatMessageInput {
+  readonly topicId: string;
+  readonly ownerPrincipalId: string;
+  readonly body: string;
+  readonly targets?: readonly ChatAgentChoice[];
+  readonly replyDestination?: RuntimeDestination;
+  readonly replyToEventId?: string;
+  readonly at?: string;
+}
+
 export interface ExternalOwnerChatMessageAdmission {
   readonly source: {
     readonly kind: EventSourceKind;
@@ -106,15 +116,11 @@ export class LocalChatStore {
     return this.#requireChatMessage(requireEventId(eventId));
   }
 
-  public postOwnerMessage(input: {
-    readonly topicId: string;
-    readonly ownerPrincipalId: string;
-    readonly body: string;
-    readonly targets?: readonly ChatAgentChoice[];
-    readonly replyDestination?: RuntimeDestination;
-    readonly replyToEventId?: string;
-    readonly at?: string;
-  }): ChatMessageAdmission {
+  public postOwnerMessage(input: OwnerChatMessageInput): ChatMessageAdmission {
+    return withImmediateTransaction(this.#database, () => this.postOwnerMessageInTransaction(input));
+  }
+
+  public postOwnerMessageInTransaction(input: OwnerChatMessageInput): ChatMessageAdmission {
     const body = requireBody(input.body);
     const at = timestamp(input.at);
     const messageId = newEventId();
@@ -139,16 +145,14 @@ export class LocalChatStore {
             targets: normalizedTargets(input.targets)
           })
     };
-    return withImmediateTransaction(this.#database, () => {
-      if (input.replyToEventId !== undefined) {
-        const referenced = this.#requireChatMessage(input.replyToEventId);
-        if (referenced.topicId !== payload.topicId) {
-          throw new Error("Reply reference must belong to the same Topic");
-        }
+    if (input.replyToEventId !== undefined) {
+      const referenced = this.#requireChatMessage(input.replyToEventId);
+      if (referenced.topicId !== payload.topicId) {
+        throw new Error("Reply reference must belong to the same Topic");
       }
-      this.#insertChatMessage(messageId, payload, at, undefined, undefined, undefined, true, input.replyDestination);
-      return { message: this.#requireChatMessage(messageId) };
-    });
+    }
+    this.#insertChatMessage(messageId, payload, at, undefined, undefined, undefined, true, input.replyDestination);
+    return { message: this.#requireChatMessage(messageId) };
   }
 
   public admitExternalOwnerMessage(
@@ -548,6 +552,17 @@ export class LocalChatStore {
       state: row.updated_at > row.created_at ? "resumed" : "created",
       updatedAt: row.updated_at
     };
+  }
+
+  public postSystemMessageInTransaction(input: {
+    topicId: string; body: string; sourceEventId: string; idempotencyKey: string; at: string;
+  }): void {
+    const externalId = `chat-system:${input.idempotencyKey}`;
+    if (this.#database.prepare("SELECT 1 FROM events WHERE source_kind='handler' AND source_external_id=?")
+      .get(externalId) !== undefined) return;
+    this.#insertChatMessage(newEventId(), {
+      topicId: input.topicId, sender: {kind: "system", handleSnapshot: "RS"}, body: input.body
+    }, timestamp(input.at), input.sourceEventId, externalId, "handler", false);
   }
 
   #insertChatMessage(

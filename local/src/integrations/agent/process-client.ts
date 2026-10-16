@@ -1,3 +1,4 @@
+import { AgentNetworkError } from "../../core/runtime/agent-invocation.js";
 import { spawn } from "node:child_process";
 import { isAbsolute } from "node:path";
 
@@ -227,6 +228,16 @@ export class AgentProcessClient {
             .subarray(0, 16_384)
             .toString("utf8")
             .trim();
+          // Streaming providers can return the same typed rejection on non-zero exit.
+          if (responseDecoder !== undefined) {
+            try { responseDecoder.finish(); }
+            catch (error) { if (error instanceof AgentNetworkError) { finish(error); return; } }
+          }
+          // Some providers return a typed rejection envelope with a non-zero exit.
+          if (this.#config.protocol?.decodeResponse !== undefined && stdoutText !== "") {
+            try { this.#config.protocol.decodeResponse(stdoutText,request); }
+            catch (error) { if (error instanceof AgentNetworkError) { finish(error); return; } }
+          }
           const detail = [
             ...(stderrText === "" ? [] : [`stderr: ${stderrText}`]),
             ...(stdoutText === "" ? [] : [`stdout: ${stdoutText}`])
@@ -249,6 +260,7 @@ export class AgentProcessClient {
                 )
           );
         } catch (error) {
+          if (error instanceof AgentNetworkError) { finish(error); return; }
           finish(new Error(
             (this.#config.protocol === undefined
               ? `agent returned invalid JSON: `

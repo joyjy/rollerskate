@@ -1,3 +1,4 @@
+import type { RunGraph } from "./graph-contract.js";
 import { assertAcceptanceSatisfied } from "./acceptance.js";
 import { randomBytes } from "node:crypto";
 import type {
@@ -55,6 +56,7 @@ export type AgentRunStatus =
   | "cancelled";
 
 export interface InlineRunMandateSnapshot {
+  readonly graph?: RunGraph;
   readonly schemaVersion: "RunMandateSnapshot@1";
   readonly kind: "objective";
   readonly objective: string;
@@ -246,6 +248,10 @@ export function planCallerRunDecision(input: {
   if (run.orchestrationMode !== "caller" || run.orchestratorBinding === undefined) {
     throw new Error("Run is not caller-orchestrated");
   }
+  if (run.mandate.kind === "objective" && run.mandate.graph !== undefined) {
+    if (decision.action !== "finish" && decision.action !== "ask_human" && decision.action !== "needs_human") throw new Error("Fixed DAG permits only final acceptance or a human question");
+    if (decision.action === "finish" && decision.finish.outcome === "succeeded" && run.checkpoint?.result.outcome !== "succeeded") throw new Error("DAG with unsuccessful nodes cannot finish succeeded");
+  }
   const initialStewardDecision =
     (run.orchestratorBinding.schemaVersion === "OrchestratorBinding@2" ||
       run.orchestratorBinding.schemaVersion === "OrchestratorBinding@3") &&
@@ -274,7 +280,7 @@ export function planCallerRunDecision(input: {
       assertAcceptanceSatisfied(contract, decision.checkedAcceptance, decision.state.unresolvedQuestions);
     }
     if (decision.action === "request_capability") {
-      if (run.workspaceGrant?.access !== "read" || run.workspaceGrant.networkAccess || run.sourceBinding !== undefined || run.activeCycleId !== undefined) throw new Error("Network adjustment requires a standalone read-only offline Run");
+      if (run.workspaceGrant === undefined || run.workspaceGrant.networkAccess || run.sourceBinding !== undefined || run.activeCycleId !== undefined) throw new Error("Network adjustment requires a standalone offline Run");
       if (run.deadlineAt !== undefined && Date.parse(input.now) >= Date.parse(run.deadlineAt)) throw new Error("Agent Run deadline exhausted");
       if (decision.capability.acceptanceIds.some(id => !contract.items.some(item => item.id === id))) throw new Error("Capability request has unknown acceptance ID");
       return {kind: "request_capability"};
@@ -284,7 +290,12 @@ export function planCallerRunDecision(input: {
     if (run.deadlineAt !== undefined && Date.parse(input.now) >= Date.parse(run.deadlineAt)) throw new Error("Agent Run deadline exhausted");
     return {kind:"ask_human",question:decision.question};
   }
+  const workerAgentId = run.orchestratorBinding.schemaVersion === "OrchestratorBinding@3"
+    ? run.orchestratorBinding.authority.workerAgentId : undefined;
   if (decision.action === "finish") {
+    if (decision.finish.outcome === "succeeded" && workerAgentId !== undefined && run.checkpoint?.agentId !== workerAgentId) {
+      throw new Error("acceptance_incomplete: designated Worker must return a checkpoint before success");
+    }
     const scope = (decision.schemaVersion === "RunDecision@3" || decision.schemaVersion === "RunDecision@4" || decision.schemaVersion === "RunDecision@5" || decision.schemaVersion === "RunDecision@6")
       ? decision.finish.scope
       : run.activeCycleId === undefined ? "run" : "cycle";
@@ -352,6 +363,9 @@ export function planCallerRunDecision(input: {
   if (run.mandate.participantAgentIds === undefined ||
     !run.mandate.participantAgentIds.includes(targetAgentId)) {
     throw new Error("RunDecision target is outside the admitted participant roster");
+  }
+  if (workerAgentId !== undefined && targetAgentId !== workerAgentId) {
+    throw new Error("RunDecision target must be the designated Worker");
   }
   return {
     kind: "next_step",

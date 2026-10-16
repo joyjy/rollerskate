@@ -20,6 +20,10 @@ import type { ExternalWorkflowExecutionRuntime } from
 
 export type { ScheduleRunBindingAdapter } from "./bound-runtime.js";
 
+export type ScheduleAdmission = { readonly status: "ready" } |
+  { readonly status: "defer" | "skip"; readonly reason: string };
+export type ScheduleAdmissionGate = (revision: ScheduleRevision, at: string) => Promise<ScheduleAdmission>;
+
 export interface ScheduledTaskCycleResult {
   readonly projected: readonly string[];
   readonly admitted: readonly string[];
@@ -36,6 +40,7 @@ export class ScheduledTaskRuntime {
   readonly #bound: BoundScheduleRuntime;
   readonly #actions: DeterministicApplicationActionRuntime | undefined;
   readonly #workflows: ExternalWorkflowExecutionRuntime | undefined;
+  readonly #admissionGate: ScheduleAdmissionGate | undefined;
 
   public constructor(options: {
     readonly store: ScheduledTaskStore;
@@ -45,6 +50,7 @@ export class ScheduledTaskRuntime {
     readonly runBinding?: ScheduleRunBindingAdapter;
     readonly applicationActions?: DeterministicApplicationActionRuntime;
     readonly externalWorkflows?: ExternalWorkflowExecutionRuntime;
+    readonly admissionGate?: ScheduleAdmissionGate;
   }) {
     this.#store = options.store;
     this.#runtime = options.runtime;
@@ -52,6 +58,7 @@ export class ScheduledTaskRuntime {
     this.#externalRefGuard = options.externalRefGuard;
     this.#actions = options.applicationActions;
     this.#workflows = options.externalWorkflows;
+    this.#admissionGate = options.admissionGate;
     this.#bound = new BoundScheduleRuntime({
       store: options.store,
       ...(options.externalRefGuard === undefined
@@ -80,7 +87,8 @@ export class ScheduledTaskRuntime {
       if (schedule.revision.schemaVersion === "ScheduleRevision@2" ||
         (schedule.revision.schemaVersion === "ScheduleRevision@3" &&
           schedule.revision.target.kind === "steward_run")) {
-        const result = await this.#bound.decideDue(schedule, now);
+        const admission = await this.#checkAdmission(schedule.revision, now);
+        const result = await this.#bound.decideDue(schedule, now, admission);
         if (result.kind === "admit") admitted.push(result.run.runId);
         if (result.kind === "failed") failed.push(result.run.runId);
         if (result.kind === "skip") skipped.push(result.run.runId);
@@ -366,6 +374,29 @@ export class ScheduledTaskRuntime {
       current.scheduleId,
       current.scheduleRevision
     );
+    if (schedule.definition.status === "paused" &&
+      !current.occurrenceKey.startsWith("manual:")) {
+      // Bound sources must still reconcile a terminal Run while paused.
+      if (revision.schemaVersion === "ScheduleRevision@2" ||
+        (revision.schemaVersion === "ScheduleRevision@3" && revision.target.kind === "steward_run")) {
+        return this.#bound.admitPending(current, revision, at);
+      }
+      return "deferred";
+    }
+    const admission = await this.#checkAdmission(revision, at);
+    // Readiness probes are asynchronous; never consume a changed or cancelled source.
+    const latest = this.#store.require(current.scheduleId);
+    const pending = this.#store.requireRun(current.runId);
+    if (pending.status !== "queued" || pending.eventId !== undefined ||
+      latest.definition.currentRevision !== schedule.definition.currentRevision ||
+      latest.definition.status !== schedule.definition.status) return "deferred";
+    if (admission.status !== "ready") {
+      this.#store.patchRun(current.runId, {
+        decisionReason: admission.reason,
+        ...(admission.status === "skip" ? { status: "skipped", completedAt: at } : {})
+      }, at);
+      return admission.status === "skip" ? "skipped" : "deferred";
+    }
     if (revision.schemaVersion === "ScheduleRevision@2" ||
       (revision.schemaVersion === "ScheduleRevision@3" &&
         revision.target.kind === "steward_run")) {
@@ -521,6 +552,11 @@ export class ScheduledTaskRuntime {
       }, at);
     }
     return "admitted";
+  }
+
+  async #checkAdmission(revision: ScheduleRevision, at: string): Promise<ScheduleAdmission> {
+    try { return await this.#admissionGate?.(revision, at) ?? { status: "ready" }; }
+    catch { return { status: "defer", reason: "waiting-readiness-probe" }; }
   }
 }
 

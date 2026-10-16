@@ -44,7 +44,7 @@ body {
   font-size: 14px;
 }
 
-header {
+.console-header {
   background: var(--surface);
   border-bottom: 1px solid var(--border);
   position: sticky;

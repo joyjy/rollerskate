@@ -104,10 +104,11 @@ test("schema v74 retires synthetic Chat state exactly once without deleting hist
         at
       );
     }
+    database.exec("DROP TABLE notification_controls; DROP TABLE run_subscriptions");
     database.exec("UPDATE schema_meta SET value = '69' WHERE key = 'schema_version'");
     database.close();
 
-    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 75);
+    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 80);
     const migrated = new DatabaseSync(databasePath);
     try {
       const mode = migrated.prepare(`

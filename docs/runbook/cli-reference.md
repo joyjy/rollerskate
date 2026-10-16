@@ -15,11 +15,14 @@ timestamp: 2026-07-24
 ```text
 scripts/rs [--runtime <absolute-path>] [command]
 scripts/rs --help
+scripts/rs usage
 ```
 
 - 默认 Runtime home 是 `~/.rollerskate/`。
 - `--runtime <absolute-path>` 必须放在 command 前，用于隔离整套 Runtime state；它不是 workspace 参数。
 - 不带 command 会报错；使用 `scripts/rs --help` 查看命令。
+
+`usage` 汇总最近 30 天的本地 CLI 调用，包含零调用命令、组汇总、活跃天数和退出结果。日志只记录白名单命令名、时间、耗时和退出码，不记录参数值；来源无法核实时为 unknown。后台 Runtime 工作和安装前历史不在覆盖范围内，记录失败不影响原命令。
 
 ## Local Runtime
 
@@ -80,7 +83,9 @@ Session、output transport、workspace 与 permission/sandbox 参数由 adapter 
 
 公共 Run 不接受 raw `workspace`、network 或 budget。`run start` 只接收 `RunIntent@1`；Owner compiler 从稳定 `workspaceRef` 与 `desiredEffect` 生成 canonical grant，当前默认 network off、`maxSteps=20`、`maxDepth=0`。
 
-`scripts/rs start` 默认在 `PATH` 中发现 `codex`、`claude`、`kimi` 与 `pi`。需要固定 executable 时分别设置 `ROLLERSKATE_CODEX_EXECUTABLE`、`ROLLERSKATE_CLAUDE_CODE_EXECUTABLE`、`ROLLERSKATE_KIMI_CODE_EXECUTABLE` 或 `ROLLERSKATE_PI_EXECUTABLE`。单个 Agent 的 adapter 或可选 same-client history capability 不可用时，只让该 Agent 的 Execution 失败；同一 Chat 中其他 Agent 的 attention 与 dispatch 继续推进。
+`scripts/rs start` 优先在 `PATH` 中发现 `codex`、`claude`、`kimi` 与 `pi`，再查找 `$HOME/.kimi-code/bin`；该已安装目录也会追加到 Agent 子进程的 PATH，不读取 shell 配置。需要固定 executable 时分别设置 `ROLLERSKATE_CODEX_EXECUTABLE`、`ROLLERSKATE_CLAUDE_CODE_EXECUTABLE`、`ROLLERSKATE_KIMI_CODE_EXECUTABLE` 或 `ROLLERSKATE_PI_EXECUTABLE`。单个 Agent 的 adapter 或可选 same-client history capability 不可用时，只让该 Agent 的 Execution 失败；同一 Chat 中其他 Agent 的 attention 与 dispatch 继续推进。
+
+后台启动将原生 stderr 写入私有 `logs/daemon-stderr.log`（目录 0700、文件 0600，拒绝符号链接）。文件包含异常监测与退出码记录；结构化异常记录脱敏，但 Node 原生错误栈可能包含敏感内容，分享前须检查。进程每 10 秒检查文件，超过 5 MiB 时截断，并在写结构化终态前检查；检查间隔内可能短暂超限。SIGKILL、断电等无法由进程记录退出码，须结合 heartbeat 判断。
 
 `agent profile` 读取 Server 上的公开 profile；`update` 使用包含 `expectedRevision` 的 JSON 做 compare-and-swap。公开 profile 只承载公共身份、角色、disclosure 和表达规则，不包含本地 prompt、workspace、memory、credential 或工具权限。
 
@@ -190,13 +195,18 @@ Notice Center 从 SQLite `notices` 读取由 `macos-notification` Delivery snaps
 查询和控制：
 
 ```text
+scripts/rs subscription run-monitors
 scripts/rs subscription list
 scripts/rs subscription inspect <id>
+scripts/rs subscription deliveries <id>
+scripts/rs subscription receipt <action-receipt-id>
 scripts/rs subscription history <id> --json
 scripts/rs subscription pause <id>
 scripts/rs subscription resume <id>
 scripts/rs subscription cancel <id>
 ```
+
+`run-monitors` 以只读方式列出最多 100 个 Run Subscription，并从 Run source 读回当前 status/version；`inspect sub_run_<32 lowercase hex>` 返回该 monitor 与当前 Run projection。`deliveries <sub_run-id>` 返回与该 monitor 关联的 host Delivery 和以 `chat-activation:run-subscription:<sub_run-id>:` 为 external ID 前缀的 Chat activation/Execution。历史 `steward-run:<run-id>:<cycle-or-run>:terminal` Delivery 也会列出。这里 `delivered` 仅表示 transport accepted；失败和不确定结果仍保留为 Delivery 事实，不会被查询命令重发。Run Subscription 默认自动监控。Owner 使用 `subscription notifications` 控制通知，使用 close 停止终态 Run 的监控。
 
 确定性观察统一通过 `run preflight/start --source <plugin-ref> --input <business-input.json>` 提交；`--continuous` 保留连续观察，省略表示有界 until。`--return-to codex-desktop:<UUID>` 绑定回传任务，省略则只保存结果。`subscription register-desktop` 已关闭新建；已有定义、回执和 `subscription deliveries <id>` 仍可读。文件 workflow 的 Owner 注册/恢复是集成管理面，不是普通工作提交入口。
 
@@ -267,8 +277,14 @@ Console 的 `/console/subscriptions` 把 one-shot 与 Continuous 合并成 trigg
 
 新的 Agent-backed Schedule 只能由带 `triggerIntent: "once" | "cron"` 的 `RunIntent@1` 建立。Steward 在 admitted authority 内选择 `schedule.once@1 | schedule.cron@1` template；application 原子写 `ScheduleRevision@3` 与 exact Run target。Owner 也可把 paused legacy V1 显式迁移到 mode-0600 registry 中的 versioned external workflow target。definition 不含 raw Agent、prompt、workspace、Session、callback、executable、argv、command 或 destination。
 
+Owner 确定性定时工作使用 `schedule register-workflow <registration.json>`，输入为 `ExternalWorkflowScheduleRegistration@1`；完整示例见 [Scheduled Task](scheduled-tasks.md#注册-owner-external-workflow-schedule)。命令只注册 paused source，不执行工作。同一 schedule ID 与相同 owner/definition 重试保持原状态；更改时间、owner 或注册表 digest 被拒绝，不覆盖历史。
+
+固定文案 Desktop 提醒使用 `schedule register-reminder <registration.json>`，输入为 `DesktopReminderScheduleRegistration@1`，首次注册 paused。默认在计划时间后 24 小时过期，可用 `expiresAt` 覆盖；时间 grace 与有效期独立。完整输入和睡眠等待原因见 [Scheduled Task](scheduled-tasks.md#固定文案-desktop-提醒与睡眠恢复)。
+
 ```text
 scripts/rs schedule list
+scripts/rs schedule register-workflow <registration.json>
+scripts/rs schedule register-reminder <registration.json>
 scripts/rs schedule inspect <schedule-id>
 scripts/rs schedule pause <schedule-id>
 scripts/rs schedule resume <schedule-id>
@@ -306,6 +322,7 @@ Console 的 `/console/schedules` 是 trigger diagnostics。`GET /api/schedules?p
 ```
 
 ```text
+scripts/rs run validate <intent-json-file>
 scripts/rs run preflight <intent-json-file> [--authorize-network]
 scripts/rs run start <intent-json-file> [--authorize-network]
 scripts/rs run authorize-network <run-id> --request-event <event-id> --expected-version <version>
@@ -323,11 +340,45 @@ scripts/rs run archive <run-id>
 scripts/rs run unarchive <run-id>
 ```
 
-`run preflight` 只编译并返回 `StewardRunRequest@2`、authority summary 与稳定 admission digest，不创建 Event/Execution/Run。`workspaceRef` 当前接受 `project:self`、`local:workspace` 或显式本机 `file://` Git workspace；resolver 固定 canonical root 和当前 revision。`desiredEffect: read` 生成只读 grant，`change` 生成 `write + must_change`，`none` 不能同时提供 workspace。participant 使用 `agent:<handle>` 或 `principal:<id>`，compiler 总会加入 active `codex` Steward；destination 使用已登记的 `destination:<dst-id>`。无法唯一解析、未登记、effect 冲突或 authority 不可满足时，在 Event 创建前失败。
+`run preflight` 只编译并返回 `StewardRunRequest@2`、authority summary 与稳定 admission digest，不创建 Event/Execution/Run。`workspaceRef` 当前接受 `project:self`、`local:workspace` 或显式本机 `file://` Git workspace；resolver 固定 canonical root 和当前 revision。`desiredEffect: read` 生成只读 grant，`change` 生成 `write + must_change`，`none` 不能同时提供 workspace。participant 使用 `agent:<handle>` 或 `principal:<id>`，compiler 总会加入本次准入选中的 active Steward；destination 使用已登记的 `destination:<dst-id>`。无法唯一解析、未登记、effect 冲突或 authority 不可满足时，在 Event 创建前失败。 Agent Run 终态目标支持 `vikunja-task`、`server-topic` 和 `codex-desktop`。不支持的 kind 或地址在准入被拒绝；Desktop 目标额外做只读 owner discovery。
+
+### DAG 输入与执行
+
+`RunIntent@1` 可携带 `graph: RunGraph@1`，完整样例见 [`examples/run-dag.json`](../../examples/run-dag.json)。外层继续持有 objective、acceptance、contextRefs、workspaceRef、desiredEffect、terminalEvidence 与回传目标；graph 不重复声明这些权限或运行状态。
+
+运行 `scripts/rs run validate examples/run-dag.json` 可离线校验并读回规范化 intent 与 digest，不要求已初始化 Runtime，不写数据库或发起 Agent。成功退出 0，返回 `status=valid, scope=format`；无效输入退出 2，返回 `status=invalid`。有效输入均返回 `execution.status=requires_preflight`。校验不证明 Agent 已注册、上下文路径可读、工作区隔离、权限或环境满足要求。
+
+`graph` 字段约定：
+
+- `schemaVersion` 为 `RunGraph@1`；`participants` 将角色短名称映射到 `agent:<handle>` 或 `principal:<id>`，与外层 `workerRef`、`requestedParticipantRefs` 互斥；外层 `stewardRef` 仍可指定负责人。
+- `nodes` 包含 1–64 个节点。每个节点必须声明唯一 `id`、`objective`、`executor`（participant 角色名）、`needs`、`contextRefs`、非空 `acceptance` 和 `output: {name, format}`；format 为 `markdown | json | text`，产物名称按节点限定作用域。
+- `needs` 是唯一依赖来源，不另写 edges。它表示等待全部直接上游成功并接收其产物引用；节点排列顺序不代表执行顺序。拒绝重复依赖、未知节点、自依赖与任意环。
+- `resultNode` 指定唯一最终结果节点；所有节点必须是它的直接或间接上游，或它本身，不能留有不参与最终结果的分支。
+- `limits` 必须声明 `maxConcurrency`（1–64）、`maxNodeAttempts`（1–10，包含首次尝试）与 `timeoutSeconds`（1–86400，整个图的预算）。这些是执行时的请求上限，不授予重试或其他权限。
+- graph 整体最大 32768 UTF-8 字节；节点 ID、角色名及 output name 最长 64 字符，首字符为字母，其余为字母、数字、下划线或连字符。节点不能自带 workspace、network 或 grant 扩大外层权限。
+
+`run validate` 只校验格式并返回 `execution.status=requires_preflight`；`run preflight/start` 会解析参与者身份并执行固定 DAG。首版只接受 standalone、只读或无外部工作区、`maxNodeAttempts=1`，不支持 trigger、workflow override 或并行写入。`maxConcurrency` 是图内 queued/running 节点上限，实际并发还受 Runtime 全局资源预算约束。
+
+启动时派发无依赖节点；结果收件与 Run CAS、后继入队在同一事务内完成。每个节点开启独立 Session，包括同一 Agent 的多个节点。后继 prompt 获得直接依赖的 canonical result Event 引用、summary、artifactRefs 与验收证据；`output.name/format` 是交付约定，正文通过既有 `AgentStepResult@1.summary`（最多 4096 字符）或 artifactRefs 传递，不建立另一套 artifact store。所有依赖成功后才能派发；失败/needs_human 的后代标记 blocked，独立分支继续收口。图结束后由 Steward 按原始 acceptance 最终验收，可 finish、needs_human 或 ask_human，不能扩图。
+
+`run inspect` 的 `graphNodes` 展示派生节点状态。Run 的 activeStep/Execution 是某个活跃节点的兼容指针，不代表全部并发。重启恢复 queued 工作；已启动但结果未知的 Agent 调用记失败，不自动重跑；取消后迟到结果只留审计。`timeoutSeconds` 从 Run 启动算起，收件和调用前检查绝对 deadline，单次调用预算取剩余时间且最多 900 秒；已运行调用不会因取消强杀，结果收件时再次核对终态。
+
+### 显式指定负责人和执行者
+
+```sh
+scripts/rs run preflight --id cited-review-42 --objective '检查指定文件并输出有来源的结论' --acceptance '结论带文件位置和验证证据' --workspace file:///absolute/workspace --effect read --steward kimi --worker pi-deepseek
+scripts/rs run start --id cited-review-42 --objective '检查指定文件并输出有来源的结论' --acceptance '结论带文件位置和验证证据' --workspace file:///absolute/workspace --effect read --steward kimi --worker pi-deepseek
+```
+
+交换为 `--steward pi-deepseek --worker kimi` 即反向派工。flag 接受 handle、`agent:<handle>` 或 `principal:<id>`；JSON 使用 `stewardRef` 和 `workerRef`，值须为 `agent:` 或 `principal:` reference，不能用 CLI flags 覆盖 JSON 文件中的角色。
+
+`stewardRef` 覆盖本次新 Run 的加权选择，不修改全局 policy；与调用方已固定的 Steward 冲突时拒绝。`workerRef` 将所有 `next_step` 固定到该 Agent，准入 roster 仅含选中的 Steward 与 Worker，不会另选 Codex 或其他 Agent。负责人必须先取得指定 Worker 的 checkpoint 才能成功结束当前 Run/cycle，并继续承担既有逐项验收。Worker 不可用时失败，不自动换人。
+
+仅指定 `--worker` 时负责人仍由 policy/default 选择；要固定二人组合须同时指定两项。仅指定 `--steward` 且没有 `requestedParticipantRefs` 时 roster 只含负责人。旧的 `requestedParticipantRefs` 表示可选执行者集合，不能与 `workerRef` 同时使用。相同 request ID 已绑定的负责人、执行者与 authority 不能被重试改写；重复请求、续接和恢复沿用已固定身份。
 
 `run start` 只接受同一 `RunIntent@1`，其 `requestId` 同时是 idempotency key。原始 `schemaVersion: 1` / `StartStewardRunInput` 仅保留为内部 legacy seam，不是公共 CLI contract。compiler 当前固定 `maxSteps=20`、`maxDepth=0` 与初始 network off；Steward prompt 只看到 objective、acceptance、terminal evidence 和人可读 authority summary，不能改写 raw grant。
 
-Console `POST /api/runs` 同样只接收 `RunIntent@1`。accepted External Work Request 先由本机 Owner receipt 缩小 workflow/budget/participant，再经过同一 compiler 建立 `OrchestratorBinding@3` Run。Local Chat 的普通消息仍是对话：没有 proposal 时，用户在 exact Owner message 上选择 `Hand off to Run`，以 `chat-work:<eventId>` 幂等创建 Run；有 proposal 时，每个 Agent dispatch 独立成卡，Owner 先做 workspace preflight，再以 `chat-work:<eventId>:<dispatchEventId>` 确认 exact revision。两者都不能由 Agent 自动触发。
+Console `POST /api/runs` 接收 `RunIntent@1`。accepted External Work Request 先由本机 Owner receipt 缩小 workflow/budget/participant，再经过同一 compiler 建立 `OrchestratorBinding@3` Run。Local Chat 保留 Owner 的 Hand off / proposal 预检确认入口；Agent 可在当前 Host dispatch 中用 `start_chat_run` 执行已明确授权的原 Owner 指令，workspace 路径与 effect 必须通过原消息校验。工作责任绑定与去重由 application Chat admission 持有，不能从普通对话或历史任务推导新权限。
 
 默认 `run list` 只返回未归档 Run；`--archived` 只返回 archived Run。`run archive` 仅接受 terminal Run，`run unarchive` 可逆恢复默认可见性；两者都不删除或改写 Run、Event、Execution、Session、cycle、decision、output 与 trace 证据。
 
@@ -343,7 +394,7 @@ proposal digest 同时绑定 exact registry mapping 与 rendered workflow artifa
 
 Steward 可用 `request_capability` 提交 network 请求，包含 acceptanceIds、targets 和 reason；`run inspect.capabilityRequest` 返回 exact requestEventId/runVersion/status。仅支持 standalone、无 source/cycle 的只读 Run。未获授权时暂停在原 Run，保留 checkpoint/state；Owner 可用 `run authorize-network` 确认 exact 请求，重复提交返回原续行 Event，取消、过期、版本漂移或不可用参与者不能续行。`start --authorize-network` 是 Owner 对本次 Run 的显式网络预授权，要求全体参与者为 Codex；初始仍离线，Steward 请求时自动准入，不再次问人。该参数不属于 RunIntent，Chat/外部请求不能通过输入字段自授权限。网络开关不强制 HTTP 方法或域名 allowlist；targets 是可审阅的使用目的，不能把此开关称为远端只读保护。文件仍保持 read-only，Codex 每次 turn 使用明确的 `readOnly.networkAccess` policy，包括恢复 Session。权限变更、续行 Event 和 Run CAS 同事务提交，不重复已完成 Worker。
 
-`run inspect` 的 `intervention` 可返回 `RunIntervention@1`：只有 settled 的 manual fallback 才包含失败原因、exact request/result execution 和允许的恢复动作；普通 pending 时为 null。`outputFolders` 是结构化终态输出入口，包含稳定 outputId、原始 id、contentType、schemaVersion 与 value；新 Run 通过 `RunDecision@4.finish.outputs` 返回，不能用 trace 或 acceptedEvidence 替代。
+`run inspect` 的 `intervention` 可返回 `RunIntervention@1`：只有 settled 的 manual fallback 才包含失败原因、exact request/result execution 和允许的恢复动作；普通 pending 时为 null。JSON 语法错误包含字符位置和行列；初始自动重试与 `retry-orchestrator` 对这类错误携带完整原始输出，要求同一 Steward 仅修正语法并匹配当前 Run version，不重新执行任务。修正结果仍走完整决策契约与验收，不自动补删括号，不切换 Agent，也不增加重试预算。`outputFolders` 是结构化终态输出入口，包含稳定 outputId、原始 id、contentType、schemaVersion 与 value；新 Run 通过 `RunDecision@4.finish.outputs` 返回，不能用 trace 或 acceptedEvidence 替代。
 
 `run retry-orchestrator` 是 Owner 对 `OrchestratorBinding@3` 初始只读决策的精确恢复入口，既适用于独立 Run，也适用于 source-bound Run 的 active cycle；只接受处于 `awaiting_orchestrator`、尚未产生 Worker checkpoint、且 workspace 非 write 的 Run。命令从当前 Run version、状态和 fixed roster 重新渲染 prompt，并复用最新已 settled Steward request 的 Run context 与只读 Session recovery evidence，追加一次新的 Steward request；它不会创建新 Run/cycle、改变 source binding 或重放未知 write outcome。`--request-id` 形成稳定 external ID：同一 key 重复调用返回同一 Event/Execution 的 `duplicate` receipt，即使 Run/cycle 后续已终结；不同 key 表示 Owner 明确授权另一次恢复尝试。独立 Run 或新 source cycle 的首次 Steward provider/contract failure 由 Runtime 自动重试一次，第二次失败仍保留 manual fallback。
 
@@ -373,7 +424,7 @@ scripts/rs run list --limit 20
 scripts/rs run cancel <runId>
 ```
 
-示例不授权安装。参数按 argv 传递，不隐式执行 shell；进程继承调用者权限与环境，stdin 关闭，日志私有。`--timeout` 是观察预算，默认 3600 秒、范围 1–2678400；确定性 Run 的 `cancel` 只取消后续观察，不杀进程或撤回已入队 Delivery。进程退出之后的软件可用性、镜像 digest 等仍按任务验收。
+示例不授权安装。参数按 argv 传递，不隐式执行 shell；进程继承调用者权限与环境，stdin 关闭，日志私有。`--timeout` 是固定总观察预算，默认 3600 秒、范围 1–2678400；确定性 Run 的 `cancel` 只取消后续观察，不杀进程或撤回已入队 Delivery。进程退出之后的软件可用性、镜像 digest 等仍按任务验收。
 
 ```json
 {
@@ -392,8 +443,93 @@ scripts/rs run cancel <runId>
 
 `work.input` 只包含来源所需的业务参数，具体字段由所选已登记 plugin 定义；不接受调用方拼装 probe policy、callback、内部 ID 或 grant。连续观察设置 `work.mode=continuous` 并省略 `maxWaitMilliseconds`。命令的 work 为 `{kind:"command", executable, args, cwd}`。确定性回传目前支持 `codex-desktop:<UUID>`，Agent 保留 `destination:<id>`；不支持的执行器/目标组合在准入失败，不猜测降级。
 
+### GitLab Pipeline typed submission
+
+对已经由 Owner 登记的 `build-pipeline` source，使用窄入口提交 GitLab pipeline 观察，无需手写 plugin input 或 shell watcher：
+
+```sh
+scripts/rs run pipeline preflight --id example-ci-813610 --project example-org/example-repo --pipeline 813610 --expected-sha 0123456789abcdef0123456789abcdef01234567 --return-to codex-desktop:<当前任务完整UUID> --timeout 3600
+scripts/rs run pipeline start --id example-ci-813610 --project example-org/example-repo --pipeline 813610 --expected-sha 0123456789abcdef0123456789abcdef01234567 --return-to codex-desktop:<当前任务完整UUID> --timeout 3600
+```
+
+可选 `--checkpoint 300` 启用 5 分钟分段检查。command、until observe 和 pipeline 支持这个参数。调用必须同时显式传入 `--timeout <总秒数>`，检查点不能超过总预算。continuous 和 Agent Run 不支持这个参数。旧调用保持原语义，历史 Subscription 不自动启用。
+
+Subscription 保存查询时间、来源可查性、业务状态、进度摘要和通知回执 ID。`run inspect <id>` 的 `source.observationState` 可查看这些状态。实际投递状态仍从 `deliveries` 或 `chatCallbacks` 回读。入队不代表原会话已接收。
+
+检查点到达时，原 Subscription 报告仍运行或未知。进度通知最多每个检查点间隔 1 次。来源首次查询失败立即通知，后续来源变化受同一间隔限制。查询恢复后，原 Subscription 在固定截止时间内继续观察。Runtime 重启保留检查点位置和原截止时间，不重新触发业务。
+
+总预算耗尽只表示观察结束，业务结果保持未知。超时通知包含最后成功查询时间和固定截止时间。继续等待需要新的明确预算，不能自动延长。Runtime 进程停止期间无法自行通知，恢复后补查原来源。当前没有接入独立的 RS 进程失联通知器。
+
+CI 构建和发布的新观察分别显式传入 `--checkpoint 300` 和有依据的总 `--timeout`。5 分钟是检查间隔，不是总预算。命令日志大小和修改时间只表示输出变化；日志无新增不能证明业务失败。
+
+所有字段均必填：`--id` 是不可变 request identity，`--project`、`--pipeline` 和 full lowercase 40/64-character `--expected-sha` 绑定 GitLab 目标，`--return-to` 是精确回传目标，`--timeout` 是观察预算（秒）。`preflight` 只解析 Owner source、编译 Plugin plan 和验证 Runtime/目标，不创建 Run、Subscription 或发送消息；`start` 仍经过同一 `RunIntent@2` admission，并不启动 shell watcher。
+
+这不是内置 GitLab Capability。Owner 在既有 `~/.rollerskate/subscription-plugins.json` 的 `plugin:build-pipeline@1` entry 中指向受版本控制的 `project:examples/plugins/build-pipeline.ts`，并声明它的 typed interface；旧 entry 可省略 `gitlabPipeline`，但 typed submission 会明确拒绝，绝不回退为 command：
+
+```json
+{
+  "ref": "plugin:build-pipeline@1",
+  "pluginPath": "project:examples/plugins/build-pipeline.ts",
+  "pluginId": "build-pipeline",
+  "workspaceRef": "file:///absolute/authorized/workspace",
+  "triggerKinds": ["until"],
+  "allowedHttpOrigins": [],
+  "allowedExecutables": ["/absolute/path/to/glab-wrapper"],
+  "gitlabPipeline": {
+    "inputSchema": "GitLabPipelineInput@1",
+    "transport": {"kind": "command", "executable": "/absolute/path/to/glab-wrapper", "cwd": "/absolute/authorized/workspace"}
+  }
+}
+```
+
+`gitlabPipeline.transport.executable` 必须是同一 entry 的 `allowedExecutables` 成员。source 的 `evaluate` 同时核验 returned pipeline ID 和 SHA；ID 不同是 source failure，SHA 不同是 terminal failure，不能将别的 pipeline/revision 视为本请求成功。source artifact 或 authority 在 admission 中漂移仍由统一 Run 重新预检并拒绝。
+
 `preflight` 返回 `RunPreflight@1`：`status=passed|failed`、`plan`、`planDigest`、`diagnostics`、`unverified`。诊断包含 `code/field/expected/actual/fix`。它检查契约、工具声明、已登记权限、规范化路径及 Runtime freshness，对指定 Desktop 任务做只读 owner discovery，并在无权限的 plugin 沙箱中调用 plan；不会执行实际 probe、工作命令、创建 Run/Subscription 或发送消息。工具参数和权限检查在每次实际 probe 执行前复用，动态计划不能绕过。任意 shell 效果、远端凭据与未来 Desktop 目标可用性列为 unverified，不能当作已证明；执行时仍由原权限和 transport admission 约束。
 
 `start` 总是重新编译，不接收预检结果作为授权。确定性结果返回 `runId/sourceId/run`，命令额外返回 `launch`（state、pid、回执和日志路径）。0 表示已准入或返回同一已准入请求；1 表示启动失败；2 表示配置/准入检查失败；3 表示准入或启动可能已发生、结果未知。退出码都不证明工作成功。相同 request ID 和相同意图返回原 Run，不同意图报 `REQUEST_CONFLICT`，不重复执行；中断预留保持 unknown，不能换 ID 盲重试。
 
 `run inspect` 同时返回执行回执、source 和 Delivery 状态。命令成功与回传成功独立；无 destination 显示 `not_requested`，未入队显示 `not_enqueued`。Delivery `delivered` 只证明 Desktop 接受传输，真正接收仍核对目标任务。旧 `command start` 关闭，`command inspect <历史commandId>` 仅保留本轮已有命令回执的读回。后台完成与权限规则见 [Desktop push](codex-desktop-push.md#预计耗时较长的本地命令)。
+
+### RS Chat callback
+
+命令或外部条件可用 `run start ... --return-to rs-chat:<dispatch-event-id>` 回到原 Chat 负责人；`describe_capabilities` 返回当前 Host 绑定的 `callbackTarget`。不要从最近消息猜测目标。原 dispatch 固定 Topic、Agent 和 Session，负责人忙时排队；退出 Topic 或 Session 更换后读回显示 blocked，不自动改投其他会话。
+
+命令/观察源沿用 `RunIntent@2`、Subscription 与不可变 action receipt；`run inspect <run-id>` 和 Subscription Console 的 `chatCallbacks` 区分 source 结果、回传 admission、实际 Agent 回合。`turn_completed` 只说明 Agent 回合结束，任务验收仍须负责人读 `get_chat_callback` 的 exact receipt/source/observation 并核验。回传内容是证据，不新增权限。
+
+### 回传通知与证据
+
+Desktop observation、Chat callback、Run 和 Channel 回传发送简短状态、必要的结果或阻塞摘要及精确查询入口。完整 observation、日志和审计来源保存在原记录中。Desktop 通知提供绑定源码入口与 runtime 的 `subscription receipt <action-receipt-id>` 命令，读取不可变的具体 occurrence；Chat 使用 `get_chat_callback`、`get_run` 或 `get_channel_follow`。Run 通知带预期 version，读取时须核对当前版本。接收成功、callback 已记录和业务验收成功仍分别判断；先读证据再继续原任务。
+
+### Chat 工作发现与人工处理
+
+`list_chat_work` 发现当前负责 Agent、Topic、Session 的 Agent Run、命令和观察；存在多个候选时通过来源区分，不猜最近一项。分页按返回值同时传 `beforeDispatchEventId` 和 `beforeRunId`。`get_run` 使用准确 Run ID 读取有界证据；旧 Session、已退出的参与者或跨 Topic 请求被拒绝。Owner Console 可以查看失效结果，查看本身不授权新 Agent 接续。
+
+Chat 卡片区分工作结果与回传：`waiting_agent` 等待原会话空闲，`blocked` 显示 Session/参与者或 admission 原因，`failed` 显示负责人回合失败；`turn_completed` 仅表示回合结束，业务验收仍须核对证据。命令/观察从既有 Run 详情读回，不提供 Agent 取消操作。
+
+从 Chat 卡片选择 `Open Run details` 可直接在既有详情回答 pending 问题，或批准 network 请求、拒绝并取消，以及取消当前 Agent Run。Console 请求携带准确 question/request ID 与 `expectedVersion`，版本过期先刷新；回答消息和同一 Run 的续行在一个事务提交，不依赖 Chat Agent 成功调用工具。取消只阻止 Run 后续调度，不撤回已发生的外部效果。
+
+## Agent 执行过程日志
+
+`run-log list --run <run-id>` 列出执行日志。`run-log read <absolute-jsonl-path> [--after-sequence <N>]` 读取运行中的完整行或压缩日志。`run-log payload <absolute-payload-path>` 读取旁路结果。`run-log stats` 返回容量。`run-log compress|cleanup [--older-than-days <N>]` 默认预览；执行需 `--apply --revision <preview-SHA>`。活动或未封存日志受保护。路径、脱敏、保留期与清理确认见 [Agent 执行过程日志](agent-invocation-logs.md)。
+
+
+## Owner 通知控制与恢复读回
+
+```sh
+scripts/rs subscription notifications inspect codex-thread <exact-thread-uuid>
+scripts/rs subscription notifications mute codex-thread <exact-thread-uuid> --reason 'Owner 暂停消息'
+scripts/rs subscription notifications resume codex-thread <exact-thread-uuid> --reason 'Owner 恢复消息'
+scripts/rs subscription notifications mute run <exact-run-id> --reason 'Owner 暂停该 Run 消息'
+scripts/rs subscription notifications close run <terminal-run-id> --reason '结果已处理，关闭监控'
+scripts/rs subscription resume <subscription-id> > /tmp/subscription-resume.json
+scripts/rs subscription resume-readback /tmp/subscription-resume.json
+scripts/rs run outcome <exact-run-id>
+```
+
+`notifications ... run` 与 `run outcome` 接受 Agent Run 的 UUIDv7 ID。command/observe 的 `run_d_` ID 不支持逐 Run 通知控制。command/observe 可使用 exact `codex-thread` 控制 Desktop 通知，通过 `run inspect` 查看业务结果。
+
+写入通知控制需要显式 reason。mute 控制新通知和已经排队的消息。检查返回的 `inFlightDeliveryIds`，`inFlightAttentionExecutionIds` 也列出已启动的通知回合。两个在途数组都为空时，静音读回才返回 `effective=true`。已经发出的请求不能撤回。其他目标会话继续正常投递。
+
+resume 只释放静音控制，不重发 failed 或 unknown 的历史投递。close 不可恢复，Run 仍执行时须用 mute。close 保留投递失败证据，不将未发送记为 delivered。会话和 Run 控制共同生效，解除一层不能绕过另一层。
+
+普通 Subscription resume 返回受理 receipt 和当时 readback。保存该 JSON 后，可以使用 resume-readback 查询。currently_active 不是未来持续运行或业务成功保证。paused/blocked 会返回当前原因。run outcome 根据持久 Run ID 返回业务终态、摘要和独立监控状态，等待进程退出不取消后台 Run。Desktop accepted 只证明传输受理，不能代表业务成功。

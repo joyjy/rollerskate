@@ -274,7 +274,8 @@ describe("ChatsView", () => {
           agents: [{
             principalId: agent.principalId,
             handle: agent.handle,
-            status: "active"
+            status: "active",
+            webSearch: {status: "revoked", supported: true, tool: "web_search", reason: "Native search"}
           }]
         };
       }
@@ -299,7 +300,7 @@ describe("ChatsView", () => {
     expect(wrapper.find("textarea").exists()).toBe(true);
     expect(wrapper.text()).not.toContain("prn_1");
 
-    const allow = wrapper.findAll("button").find((button) => button.text() === "Allow");
+    const allow = wrapper.find(`[aria-label="Client history for @${agent.handle}"]`);
     await allow!.trigger("click");
     await flushPromises();
     const historyCall = mockedRequestJson.mock.calls.find(([path, , call]) =>
@@ -307,6 +308,11 @@ describe("ChatsView", () => {
     expect(JSON.parse(String(historyCall?.[2]?.body))).toEqual({ action: "grant" });
     expect(wrapper.text()).toContain("Codex");
     expect(wrapper.text()).toContain("Client history");
+    await wrapper.get(`[aria-label="Web search for @${agent.handle}"]`).trigger("click");
+    await flushPromises();
+    const searchCall = mockedRequestJson.mock.calls.find(([path, , call]) =>
+      path === "/api/chat/agents/prn_1/web-search-access" && call?.method === "POST");
+    expect(JSON.parse(String(searchCall?.[2]?.body))).toEqual({action: "grant"});
     wrapper.unmount();
   });
 
@@ -442,6 +448,38 @@ describe("ChatsView", () => {
     wrapper.unmount();
   });
 
+  it("prepares a scoped clarification reply without discarding a draft or sending automatically", async () => {
+    const agent = localAgent();
+    mockedRequestJson.mockImplementation(async (path) => {
+      const control = controlResponse(path, [agent.principalId]);
+      if (control !== undefined) return control;
+      if (path === "/api/network/topics") return [];
+      if (path === "/api/network") return networkView(false, false);
+      if (path === "/api/chat") {
+        const view = chatWithProposal(agent, false);
+        const proposal = view.messages.items[0]!.runProposals[0]!;
+        return { ...view, messages: { ...view.messages, items: [{ ...view.messages.items[0],
+          runProposals: [{ ...proposal, ready: false,
+            blocker: { code: "clarification_required", action: "reply", message: "Which repository?" },
+            workspaceChoices: [{ kind: "path", label: "Other Git workspace" }],
+            selectedWorkspace: { kind: "path", root: "/workspace/snippet-lab" }
+          }] }] } };
+      }
+      throw new Error(`Unexpected ${path}`);
+    });
+    const wrapper = mount(ChatsView);
+    await flushPromises();
+    await wrapper.get("textarea").setValue("Keep this draft.");
+    await wrapper.findAll("button").find(button => button.text() === "Reply to clarify")!.trigger("click");
+    await flushPromises();
+    const text = (wrapper.get("textarea").element as HTMLTextAreaElement).value;
+    expect(text).toContain("Keep this draft.");
+    expect(text).toContain("/workspace/snippet-lab");
+    expect(wrapper.find(".reply-preview").exists()).toBe(true);
+    expect(mockedRequestJson.mock.calls.some(([path, , options]) => options?.method === "POST" && path !== "/api/chat/workspaces/find")).toBe(false);
+    wrapper.unmount();
+  });
+
   it("confirms the current proposal revision and keeps linked Run state in Chat", async () => {
     const agent = localAgent();
     let linked = false;
@@ -475,7 +513,34 @@ describe("ChatsView", () => {
     });
     expect(wrapper.find("button.start-action").exists()).toBe(false);
     expect(wrapper.text()).toContain("Run started · active");
-    expect(wrapper.text()).toContain("Open Run");
+    expect(wrapper.text()).toContain("查看详情");
+    wrapper.unmount();
+  });
+
+  it("requests a recovery proposal on the original Chat Run without losing the composer draft", async () => {
+    const agent = localAgent();
+    mockedRequestJson.mockImplementation(async (path) => {
+      const control = controlResponse(path, [agent.principalId]);
+      if (control !== undefined) return control;
+      if (path === "/api/network/topics") return [];
+      if (path === "/api/network") return networkView(false, false);
+      if (path === "/api/chat/presence") return {topicId:"local_1",agents:[]};
+      if (String(path).endsWith("/recovery")) return {proposal:null,request:null};
+      if (path === "/api/runs/run_proposal/request-recovery") return {status:"accepted"};
+      const view = chatWithProposal(agent,true);
+      const item = view.messages.items[0]!;
+      const proposal = item.runProposals[0]!;
+      return {...view,messages:{...view.messages,items:[{...item,runProposals:[{...proposal,
+        linkedRun:{...proposal.linkedRun,intervention:{schemaVersion:"RunIntervention@1",kind:"manual_fallback",runId:"run_proposal",runVersion:2,requestEventId:"evt_result",resultExecutionId:"exe_result",reason:"Malformed protocol",allowedActions:["decide","cancel"]}}}]}]}};
+    });
+    const wrapper = mount(ChatsView); await flushPromises();
+    await wrapper.get("textarea").setValue("Keep this draft");
+    await wrapper.findAll("button").find(button=>button.text()==="请 agent 准备方案")!.trigger("click"); await flushPromises();
+    const call = mockedRequestJson.mock.calls.find(([path,,options])=>path==="/api/runs/run_proposal/request-recovery" && options?.method==="POST");
+    const body = JSON.parse(String(call?.[2]?.body));
+    expect(body.requestId).toEqual(expect.any(String));
+    expect((wrapper.get("textarea").element as HTMLTextAreaElement).value).toBe("Keep this draft");
+    expect(wrapper.findAll("textarea")).toHaveLength(1);
     wrapper.unmount();
   });
 
@@ -518,6 +583,38 @@ describe("ChatsView", () => {
     wrapper.unmount();
   });
 
+  it("sends the exact native clarification and task source through preflight and confirmation", async () => {
+    const agent = localAgent();
+    const resolution = {taskSourceMessageEventId:"evt_original",clarificationAnswer:"Use this workspace."};
+    mockedRequestJson.mockImplementation(async (path,_schema,options) => {
+      const control = controlResponse(path,[agent.principalId]);
+      if(control !== undefined) return control;
+      if(path === "/api/network/topics") return [];
+      if(path === "/api/network") return networkView(false,false);
+      if(path === "/api/chat/presence") return {topicId:"local_1",agents:[]};
+      if(String(path).endsWith("/preflight")) return {schema:"ChatRunProposalPreflight@1",sourceRevision:`sha256:${"a".repeat(64)}`,
+        proposal:{...workspaceProposal(agent,false,`sha256:${"b".repeat(64)}`,true),resolution}};
+      if(String(path).endsWith("/confirm")) return {status:"accepted",run:{runId:"run_resolved"}};
+      const view=chatWithWorkspaceProposal(agent,false);
+      const proposal=view.messages.items[0]!.runProposals![0]!;
+      return {...view,messages:{...view.messages,items:[{...view.messages.items[0],runProposals:[{...proposal,finalForm:{...proposal.finalForm,blockingQuestion:"Which workspace?"},taskSourceChoices:[{eventId:"evt_original",body:"Inspect service-a"}]}]}]}};
+    });
+    const wrapper=mount(ChatsView);
+    await flushPromises();
+    await wrapper.get('[aria-label="Workspace project name"]').setValue("/repo");
+    await wrapper.get('[aria-label="Original task instruction"]').setValue("evt_original");
+    await wrapper.get('[aria-label="Clarification answer"]').setValue(resolution.clarificationAnswer);
+    await wrapper.findAll("button").find(b=>b.text()==="Check proposal")!.trigger("click");
+    await flushPromises();
+    await wrapper.get("button.start-action").trigger("click");
+    await flushPromises();
+    for(const action of ["preflight","confirm"]) {
+      const call=mockedRequestJson.mock.calls.find(([path])=>String(path).endsWith(`/${action}`));
+      expect(JSON.parse(String(call?.[2]?.body)).resolution).toEqual(resolution);
+    }
+    wrapper.unmount();
+  });
+
   it("preflights Owner-selected workspace authority before starting a proposal", async () => {
     const agent = localAgent();
     let linked = false;
@@ -552,6 +649,7 @@ describe("ChatsView", () => {
     await flushPromises();
 
     expect(wrapper.text()).toContain("Workspace required");
+    await wrapper.get('[aria-label="Workspace project name"]').setValue("/repo");
     await wrapper.get("button.secondary-action").trigger("click");
     await flushPromises();
 
@@ -560,9 +658,9 @@ describe("ChatsView", () => {
         options?.method === "POST");
     expect(JSON.parse(String(preflightCall?.[2]?.body))).toEqual({
       revision: `sha256:${"a".repeat(64)}`,
-      workspaceKind: "project"
+      workspaceKind: "path", workspacePath: "/repo"
     });
-    expect(wrapper.text()).toContain("Verified read authority");
+    expect(wrapper.text()).toContain("Workspace checked");
     expect(wrapper.text()).toContain("/repo");
     await wrapper.get("button.start-action").trigger("click");
     await flushPromises();
@@ -588,6 +686,7 @@ describe("ChatsView", () => {
 });
 
 function controlResponse(path: RequestInfo | URL, participantAgentIds: readonly string[]) {
+  if (path === "/api/chat/workspaces/find") return {schema:"WorkspaceCandidates@1",items:[],truncated:false};
   if (path === "/api/chat/governance") {
     return {
       governance: {

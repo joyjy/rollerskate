@@ -57,7 +57,7 @@ test("doctor checks local state and exact Matrix identity without exposing the t
     assert.equal(requests, 2);
     assert.equal(result.status, "ready");
     assert.equal(result.projectRoot, setup.config.projectRoot);
-    assert.equal(result.schemaVersion, 75);
+    assert.equal(result.schemaVersion, 80);
     assert.deepEqual(result.matrix, {
       homeserver: "https://matrix.example",
       roomId: "!room:example",
@@ -85,7 +85,7 @@ test("local doctor validates Local-first state without legacy config", async () 
     assert.equal(result.status, "ready");
     assert.equal(result.projectRoot, foundation.workspacePath);
     assert.equal(result.database, paths.database);
-    assert.equal(result.schemaVersion, 75);
+    assert.equal(result.schemaVersion, 80);
     assert.equal(result.matrix, undefined);
     assert.equal(result.codexExecutable, undefined);
   } finally {

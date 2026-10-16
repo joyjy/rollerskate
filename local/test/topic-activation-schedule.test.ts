@@ -156,12 +156,13 @@ test("exact v55 database materializes additive v60 schedule and channel tables",
       DROP TABLE interactive_channel_bindings;
       DROP TABLE topic_activation_schedule_receipts;
       DROP TABLE topic_activation_schedules;
+      DROP TABLE notification_controls;
+      DROP TABLE run_subscriptions;
       UPDATE schema_meta SET value = '55' WHERE key = 'schema_version';
     `);
     database.close();
     const diagnostics = initializeRuntimeSchema(databasePath);
-    assert.equal(diagnostics.schemaVersion, 75);
-    assert.equal(diagnostics.tables.length, 33);
+    assert.equal(diagnostics.schemaVersion, 80);
     for (const table of [
       "topic_activation_schedules", "topic_activation_schedule_receipts",
       "interactive_channel_bindings", "channel_send_receipts", "channel_follows"

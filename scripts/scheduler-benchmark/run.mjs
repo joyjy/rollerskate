@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const args = process.argv.slice(2);
-let refs = ['HEAD'];
+let refs = ['52f4063', '834d4b1', 'HEAD'];
 let rounds = 3;
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--refs') refs = args[++i]?.split(',') ?? [];

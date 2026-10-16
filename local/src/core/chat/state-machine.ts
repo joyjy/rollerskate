@@ -14,7 +14,8 @@ export type ChatAttentionReason =
   | "activation"
   | "activation-not-selected"
   | "activation-expired"
-  | "turn-budget-exhausted";
+  | "turn-budget-exhausted"
+  | "history-not-in-prompt";
 
 const chatAttentionReasons: readonly ChatAttentionReason[] = [
   "available",
@@ -29,7 +30,8 @@ const chatAttentionReasons: readonly ChatAttentionReason[] = [
   "activation",
   "activation-not-selected",
   "activation-expired",
-  "turn-budget-exhausted"
+  "turn-budget-exhausted",
+  "history-not-in-prompt"
 ];
 
 export function isChatAttentionReason(value: unknown): value is ChatAttentionReason {

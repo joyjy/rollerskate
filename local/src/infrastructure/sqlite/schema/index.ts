@@ -1,4 +1,9 @@
+import { migrateV80Schema } from "./v80-migration.js";
+import { migrateV79Schema } from "./v79-migration.js";
+import { migrateV77Schema } from "./v77-migration.js";
+import { migrateV78Schema } from "./v78-migration.js";
 import { migrateV74Schema } from "./v74-migration.js";
+import { migrateV76Schema } from "./v76-migration.js";
 import { migrateV73Schema } from "./v73-migration.js";
 import { migrateV72Schema } from "./v72-migration.js";
 import type { DatabaseSync } from "node:sqlite";
@@ -64,7 +69,7 @@ import { assertV70SchemaShape, migrateV70Schema } from "./v70-migration.js";
 import { assertV71SchemaShape, migrateV71Schema } from "./v71-migration.js";
 import { assertNoLiveRuntimeSchemaUpgrade } from "./upgrade-guard.js";
 
-export const LOCAL_SCHEMA_VERSION = 75;
+export const LOCAL_SCHEMA_VERSION = 80;
 
 export function assertCurrentLocalSchema(database: DatabaseSync): void {
   const declaredVersion = schemaVersion(database);
@@ -101,6 +106,11 @@ export function migrateLocalDatabase(database: DatabaseSync): void {
     dropChatProjectionObjects(database);
     createSchema(database);
     backfillScheduleCallbacks(database);
+    migrateCurrentRuntimeData(database);
+    return;
+  }
+  if (declaredVersion === 79 || declaredVersion === 78 || declaredVersion === 77 || declaredVersion === 76 || declaredVersion === 75) {
+    migrateV76Schema(database, LOCAL_SCHEMA_VERSION);
     migrateCurrentRuntimeData(database);
     return;
   }
@@ -341,6 +351,11 @@ export function migrateLocalDatabase(database: DatabaseSync): void {
 
 function migrateCurrentRuntimeData(database: DatabaseSync): void {
   migrateV74Schema(database, LOCAL_SCHEMA_VERSION);
+  migrateV76Schema(database, LOCAL_SCHEMA_VERSION);
+  migrateV77Schema(database, LOCAL_SCHEMA_VERSION);
+  migrateV78Schema(database, LOCAL_SCHEMA_VERSION);
+  migrateV79Schema(database, LOCAL_SCHEMA_VERSION);
+  migrateV80Schema(database, LOCAL_SCHEMA_VERSION);
   database.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS subscriptions_bound_run
       ON subscriptions(agent_run_id) WHERE agent_run_id IS NOT NULL;
@@ -453,7 +468,8 @@ function isCurrentSchema(database: DatabaseSync): boolean {
   const tables = productTables(database);
   const currentTables = tables.filter((table) =>
     !LEGACY_RELEASE_CANDIDATE_TABLES.some((legacy) => legacy === table));
-  return currentTables.length === TARGET_TABLES.length &&
+  return currentTables.length === TARGET_TABLES.length + 2 &&
+    currentTables.includes("run_subscriptions") && currentTables.includes("notification_controls") &&
     TARGET_TABLES.every((table) => currentTables.includes(table)) &&
     hasSupportedLegacyReleaseCandidateTables(database, tables) &&
     ["schedules", "subscriptions", "continuous_subscriptions"].every((table) =>
@@ -471,7 +487,7 @@ function isCurrentSchema(database: DatabaseSync): boolean {
     ) && ["agent_run_id", "cycle_id", "admission_receipt_json"].every(
       (column) => tableColumns(database, "scheduled_runs").includes(column)
     ) && ["source_binding_json", "target_json", "agent_run_id", "cycle_id",
-      "admission_receipt_json"].every(
+      "admission_receipt_json", "observation_state_json"].every(
       (column) => tableColumns(database, "subscriptions").includes(column)
     ) && ["file_source_json", "file_listener_json", "definition_schema", "source_binding_json", "target_json", "agent_run_id",
       "pending_cycle_id", "pending_admission_receipt_json"].every(

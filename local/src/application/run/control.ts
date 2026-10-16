@@ -41,10 +41,11 @@ export async function startRun(repoRoot: string, value: unknown, runtimeDirector
       intent: plan.intent, intentDigest: workDigest(plan.intent), planDigest: preflight.planDigest! });
     const continuous = plan.intent.work.kind === "observe" && plan.intent.work.mode === "continuous";
     const maxWaitMilliseconds = plan.intent.maxWaitMilliseconds ?? 3600_000;
-    const intervalMilliseconds = Math.min(Math.floor(maxWaitMilliseconds / 2), Math.max(5000, Math.ceil(maxWaitMilliseconds / 99_999)));
+    const intervalMilliseconds = Math.min(plan.intent.checkpointMilliseconds ?? Infinity, Math.floor(maxWaitMilliseconds / 2), Math.max(5000, Math.ceil(maxWaitMilliseconds / 99_999)));
     registerObservationSource(repoRoot, { subscriptionId: plan.sourceId, title: plan.intent.title, mode: continuous ? "continuous" : "until",
-      ...(plan.threadId ? { threadId: plan.threadId } : {}), plugin: plan.plugin, pluginConfig: plan.pluginConfig,
-      intervalMilliseconds, ...(continuous ? {} : {maxWaitMilliseconds, maxAttempts: Math.min(100_000, Math.ceil(maxWaitMilliseconds / intervalMilliseconds) + 1)})
+      ...(plan.threadId ? { threadId: plan.threadId } : {}),
+      ...(plan.chatDispatchEventId ? {chatDispatchEventId: plan.chatDispatchEventId} : {}), plugin: plan.plugin, pluginConfig: plan.pluginConfig,
+      intervalMilliseconds, ...(plan.intent.checkpointMilliseconds === undefined ? {} : {checkpointMilliseconds: plan.intent.checkpointMilliseconds}), ...(continuous ? {} : {maxWaitMilliseconds, maxAttempts: Math.min(100_000, Math.ceil(maxWaitMilliseconds / intervalMilliseconds) + 1)})
     }, runtimeDirectory);
     const launch = plan.command ? await startCommand(repoRoot, { commandId: plan.runId, subscriptionId: plan.sourceId,
       ...(plan.threadId ? { threadId: plan.threadId } : {}), cwd: plan.command.cwd, argv: [plan.command.executable, ...plan.command.args] }, runtimeDirectory) : undefined;

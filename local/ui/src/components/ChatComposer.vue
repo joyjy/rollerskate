@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch } from "vue";
+import { nextTick, onMounted, ref, watch } from "vue";
 import type { LocalAgent } from "@/types/local";
 
 const props = defineProps<{
@@ -20,14 +20,30 @@ const emit = defineEmits<{
 }>();
 
 const text = ref(props.modelValue);
+const textarea = ref<HTMLTextAreaElement | null>(null);
+defineExpose({ focus: () => textarea.value?.focus() });
+
+const maximumHeight = 160;
+
+function resize() {
+  const element = textarea.value;
+  if (element === null) return;
+  element.style.height = "auto";
+  element.style.height = `${Math.min(element.scrollHeight, maximumHeight)}px`;
+  element.style.overflowY = element.scrollHeight > maximumHeight ? "auto" : "hidden";
+}
 
 watch(() => props.modelValue, (value) => {
   if (value !== text.value) text.value = value;
+  void nextTick(resize);
 });
 
 watch(text, (value) => {
   emit("update:modelValue", value);
+  void nextTick(resize);
 });
+
+onMounted(resize);
 
 function send() {
   const body = text.value.trim();
@@ -59,8 +75,9 @@ function send() {
       <span v-if="activeAgents.length === 0">No active Agents</span>
     </div>
     <textarea
+      ref="textarea"
       v-model="text"
-      rows="3"
+      rows="1"
       :placeholder="`Message ${topicHandle ?? '#local'}…`"
       :disabled="pending !== null"
       @keydown.meta.enter.prevent="send"
@@ -117,8 +134,10 @@ function send() {
 .mention-row button:disabled { opacity: 0.5; cursor: not-allowed; }
 textarea {
   width: 100%;
-  resize: vertical;
-  min-height: 72px;
+  box-sizing: border-box;
+  resize: none;
+  min-height: 42px;
+  max-height: 160px;
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 10px;

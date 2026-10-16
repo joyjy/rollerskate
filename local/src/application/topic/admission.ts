@@ -26,6 +26,7 @@ export class TopicGovernanceAdmissionPolicy implements RuntimeAgentExecutionGuar
   public readonly moduleId = "topic-governance";
   readonly #getGovernance: (topicId: string) => TopicGovernance | undefined;
   readonly #listAgents: () => readonly LocalAgent[];
+  readonly #allowHistoricalSession: (source: ChatActivationEvent) => boolean;
   readonly #runtime: Pick<
     RuntimeStore,
     "event" | "chatAttentionReceipts" | "chatPresence" | "currentLocalAgentSession"
@@ -34,6 +35,7 @@ export class TopicGovernanceAdmissionPolicy implements RuntimeAgentExecutionGuar
   public constructor(options: {
     readonly getGovernance: (topicId: string) => TopicGovernance | undefined;
     readonly listAgents: () => readonly LocalAgent[];
+    readonly allowHistoricalSession?: (source: ChatActivationEvent) => boolean;
     readonly runtime: Pick<
       RuntimeStore,
       "event" | "chatAttentionReceipts" | "chatPresence" | "currentLocalAgentSession"
@@ -41,6 +43,7 @@ export class TopicGovernanceAdmissionPolicy implements RuntimeAgentExecutionGuar
   }) {
     this.#getGovernance = options.getGovernance;
     this.#listAgents = options.listAgents;
+    this.#allowHistoricalSession = options.allowHistoricalSession ?? (() => false);
     this.#runtime = options.runtime;
   }
 
@@ -57,7 +60,8 @@ export class TopicGovernanceAdmissionPolicy implements RuntimeAgentExecutionGuar
       .filter(({ status }) => status === "active")
       .map((participant) => [participant.agentId, participant] as const));
     const eligible = candidates.filter((agent) =>
-      (source.type !== "chat.activation" || source.sessionId === undefined || this.#runtime.currentLocalAgentSession(agent.principalId)?.sessionId === source.sessionId) &&
+      (source.type !== "chat.activation" || source.sessionId === undefined || this.#allowHistoricalSession(source) ||
+        this.#runtime.currentLocalAgentSession(agent.principalId)?.sessionId === source.sessionId) &&
       agent.status === "active" && activeParticipants.has(agent.principalId));
     return {
       candidates: eligible,
@@ -82,7 +86,7 @@ export class TopicGovernanceAdmissionPolicy implements RuntimeAgentExecutionGuar
     if (source?.type !== "chat.activation" && source?.type !== "chat.message") {
       return skipDecision("topic-attention-source-unavailable");
     }
-    if (source.type === "chat.activation" && source.sessionId !== undefined &&
+    if (source.type === "chat.activation" && source.sessionId !== undefined && !this.#allowHistoricalSession(source) &&
       (event.sessionId !== source.sessionId || this.#runtime.currentLocalAgentSession(event.agentId)?.sessionId !== source.sessionId)) {
       return skipDecision("chat-return-session-changed");
     }

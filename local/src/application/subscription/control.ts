@@ -30,6 +30,7 @@ import {
   type SubscriptionConsoleView,
   type SubscriptionInspection
 } from "./query.js";
+import { readSubscriptionResumeOutcome, type SubscriptionResumeReceipt } from "./resume-query.js";
 import {
   setContinuousSubscriptionArchivedView
 } from "./continuous.js";
@@ -117,6 +118,29 @@ export function controlSubscriptionView(
     runtime.withImmediateTransaction(() => controlSubscriptionInTransaction(database, subscriptionId, action));
   } finally { runtime.close(); database.close(); }
   return inspectSubscriptionView(repoRoot, subscriptionId, runtimeDirectory);
+}
+
+/** A resume receipt proves the control transaction committed, not that the source stayed active. */
+export function resumeSubscriptionWithReadback(
+  repoRoot: string,
+  subscriptionId: string,
+  runtimeDirectory?: string,
+  at = new Date().toISOString()
+) {
+  const database = openRuntimeDatabase(runtimePaths(repoRoot, runtimeDirectory).database);
+  const runtime = new RuntimeStore(database);
+  let receipt: SubscriptionResumeReceipt;
+  try {
+    const accepted = runtime.withImmediateTransaction(() =>
+      controlSubscriptionInTransaction(database, subscriptionId, "resume", undefined, at));
+    receipt = {
+      schemaVersion: "SubscriptionResumeReceipt@1",
+      subscriptionId,
+      acceptedAt: at,
+      acceptedStateToken: accepted.stateToken
+    };
+  } finally { runtime.close(); database.close(); }
+  return { receipt, readback: readSubscriptionResumeOutcome(repoRoot, receipt, runtimeDirectory) };
 }
 
 function withSubscription<T>(database: DatabaseSync, subscriptionId: string,

@@ -9,7 +9,7 @@ import { localChatView, postLocalChatMessage } from "../src/application/chat/con
 import { ChatHandler } from "../src/application/chat/handler.js";
 import { callChatTool, createChatToolContext } from "../src/application/chat/tool-policy.js";
 import { admitChatWorkReturns } from "../src/application/chat/work-return.js";
-import { cancelStewardRun } from "../src/application/steward/control.js";
+import { submitCallerRunDecision, cancelStewardRun } from "../src/application/steward/control.js";
 import { TopicGovernanceAdmissionPolicy } from "../src/application/topic/admission.js";
 import { chatPromptResourceId } from "../src/core/chat/model.js";
 import { RuntimeStore } from "../src/core/runtime/store.js";
@@ -60,8 +60,15 @@ test("Owner Chat tools admit once, share UI evidence, and return to the exact id
     assert.equal(duplicate.runId,accepted.runId);
     assert.equal(duplicate.status,"duplicate");
     const card = localChatView(repoRoot,options).messages.items.find(item=>item.eventId===first.message.eventId)!.works![0];
+    assert.equal(card!.kind,"agent");
+    if (card?.kind !== "agent") throw new Error("Expected Agent Run card");
     assert.deepEqual(card,(callChatTool(first.context,"get_run",{runId:accepted.runId}) as {work:unknown}).work);
     assert.deepEqual(returns().eventIds,[]); // no provider Session until the first turn settles
+    assert.throws(() => submitCallerRunDecision(repoRoot, accepted.runId, {
+      requestId: "recovery-before-settled", requireManualFallback: true,
+      decision: {schemaVersion: "RunDecision@1", action: "needs_human", expectedRunVersion: card!.version,
+        rationale: "Must not override a running Steward", checkedAcceptance: []}
+    }, runtimeDirectory), /no longer has a settled manual recovery/);
     complete(first);
     const busy = dispatch("@alice 取消刚才的研究任务。");
     const args = {runId:accepted.runId,expectedVersion:card!.version,action:"cancel"};
@@ -89,7 +96,7 @@ test("Owner Chat tools admit once, share UI evidence, and return to the exact id
     assert.match(returnedDispatch.prompt,/start_chat_run/);
     const returnExecution = runtime.claimDueExecutions(100,at()).find(item=>item.eventId===returnedDispatch.eventId)!;
     const resultContext = createChatToolContext({repoRoot,runtimeDirectory,dispatchEventId:returnedDispatch.eventId});
-    assert.equal((callChatTool(resultContext,"start_chat_run",{desiredEffect:"none"}) as {status:string}).status,"needs_authorization");
+    assert.equal((callChatTool(resultContext,"start_chat_run",{desiredEffect:"none"}) as {status:string}).status,"duplicate");
     // A fresh Runtime handle sees the durable return marker, not process memory.
     const reopened = openRuntimeDatabase(join(runtimeDirectory,"runtime.db"));
     const recovered = new RuntimeStore(reopened);
@@ -111,10 +118,8 @@ test("Owner Chat tools admit once, share UI evidence, and return to the exact id
     complete(last,"alice-new-session");
     cancelStewardRun(repoRoot,lastRun.runId,runtimeDirectory);
     const page = returns();
-    assert.deepEqual(page.eventIds,[]);
-    assert.ok(page.nextCursor);
-    const next = admitChatWorkReturns({repoRoot,runtimeDirectory,database,runtime,after:page.nextCursor!});
-    assert.equal(next.eventIds.length,1); // blocked early candidates cannot starve later work
+    assert.equal(page.eventIds.length,1); // blocked early monitors do not starve the later ready Session
+    assert.deepEqual(returns().eventIds,[]); // repeated source scans do not admit a duplicate
 
   } finally {
     chat.close();runtime.close();database.close();rmSync(runtimeDirectory,{recursive:true,force:true});

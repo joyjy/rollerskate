@@ -5,6 +5,18 @@ import { describe, expect, it } from "vitest";
 import ChatReadProgress from "@/components/ChatReadProgress.vue";
 
 describe("ChatReadProgress", () => {
+  it("keeps a pending ring visible before receipts arrive and updates without remounting", async () => {
+    const wrapper = mount(ChatReadProgress);
+    expect(wrapper.find(".progress-ring").exists()).toBe(true);
+    expect(wrapper.get("summary").attributes("aria-label")).toBe("Waiting for Agent processing status");
+    await wrapper.setProps({progress:{schema:"ChatReadProgress@1",total:1,read:0,agents:[
+      {agentId:"kimi",handleSnapshot:"kimi",state:"reading",reason:"direct-mention"}
+    ]}});
+    expect(wrapper.get("summary").attributes("aria-label")).toContain("1 reading");
+    expect(wrapper.get(".progress-ring").attributes("style")).toContain("--active-degrees: 360deg");
+    wrapper.unmount();
+  });
+
   it("renders completed and actively reading progress with an accessible per-Agent detail", async () => {
     const wrapper = mount(ChatReadProgress, {
       attachTo: document.body,

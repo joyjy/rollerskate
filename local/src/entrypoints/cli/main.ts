@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { installDaemonDiagnostics } from "./daemon-diagnostics.js";
+
 import { realpathSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -12,6 +14,7 @@ import {
 } from "../../application/runtime/control.js";
 import { doctorLocalRuntime } from "../../application/runtime/doctor.js";
 import { runtimeOperationsView } from "../../application/runtime/query.js";
+import { runInvocationLogCommand } from "./invocation-logs.js";
 import { runAgentCommand, runWorkspaceCommand } from "./agent.js";
 import { runCodexPushCommand } from "./codex-push.js";
 import { runCommandCommand } from "./command.js";
@@ -40,6 +43,12 @@ import {
 import { runSubscriptionCommand } from "./subscription.js";
 import { runTopicCommand } from "./topic.js";
 import { runWorkRequestCommand } from "./work-request.js";
+import {
+  appendCliUsage,
+  cliUsageDirectory,
+  renderCliUsage,
+  resolveUsageCommand
+} from "../../application/runtime/cli-usage.js";
 
 export type {
   InteractivePrompts,
@@ -58,8 +67,10 @@ const HELP = [
   "Usage:",
   "  scripts/rs [--runtime <absolute-path>] [command]",
   "  scripts/rs --help",
+  "  scripts/rs run-log list|read|payload|stats|compress|cleanup ...  inspect and maintain execution JSONL",
+  "  scripts/rs usage  show local CLI usage for the last 30 days",
   "  scripts/rs codex-push --thread <UUID> [--socket <path>] [--timeout <seconds>] send",
-  "  scripts/rs run preflight|start|inspect ...  submit Agent work, commands or observations",
+  "  scripts/rs run validate|preflight|start|pipeline|inspect ...  submit Agent work, commands or observations",
   "  scripts/rs start [--foreground] [--no-open] [--ui-port <port>]  start Local Runtime + Console",
   "  scripts/rs restart [--foreground] [--no-open] [--ui-port <port>]  restart on current sources",
   "  scripts/rs stop          stop Local Runtime daemon gracefully",
@@ -99,6 +110,7 @@ const HELP = [
   "  scripts/rs notice inspect <notice-id>",
   "  scripts/rs notice mark-read|ack <notice-id>",
   "  scripts/rs notice rebuild",
+  "  scripts/rs subscription run-monitors  list Run-bound monitors",
   "  scripts/rs subscription deliveries <subscription-id>",
   "  scripts/rs subscription history <subscription-id> --json",
   "  scripts/rs subscription list|inspect|pause|resume|cancel ...",
@@ -113,7 +125,7 @@ const RUNTIME_COMMANDS = new Set([
   "setup", "doctor", "status", "trace", "event", "workload", "failure",
   "recover", "pause", "resume", "device", "workspace", "agent", "activity",
   "topic", "notice", "chat", "channel", "subscription", "schedule", "run",
-  "work-request", "room", "admin", "command"
+  "work-request", "room", "admin", "command", "run-log"
 ]);
 
 export async function runLocalApp(
@@ -133,7 +145,16 @@ export async function runLocalApp(
     output.write(`${HELP}\n`);
     return 0;
   }
+  if (command === "usage") {
+    rejectArguments(rest);
+    output.write(renderCliUsage(
+      cliUsageDirectory(repoRoot, global.runtimeDirectory)
+    ));
+    return 0;
+  }
+  if (command === "run-log") return runInvocationLogCommand(repoRoot, rest, output, global.runtimeDirectory);
   if (command === "codex-push") return runCodexPushCommand(rest, output);
+  if (command === "run" && rest[0] === "validate") return runWorkCommand(repoRoot, rest, output, global.runtimeDirectory);
   if (command === "start") {
     const options = parseStartOptions(rest);
     assertRuntimeSchemaUpgradeAllowed(repoRoot, global.runtimeDirectory);
@@ -320,6 +341,42 @@ export async function runLocalApp(
   }
 }
 
+export async function runLocalAppWithUsage(
+  repoRoot: string,
+  argv: readonly string[],
+  environment: NodeJS.ProcessEnv = process.env,
+  output: AppOutput = process.stdout,
+  dependencies: LocalAppDependencies = {}
+): Promise<number> {
+  const global = parseGlobalOptions(argv, environment);
+  const command = resolveUsageCommand(global.argv, RUNTIME_COMMANDS);
+  if (command === undefined) {
+    return runLocalApp(repoRoot, argv, environment, output, dependencies);
+  }
+  const startedAt = new Date();
+  const startMilliseconds = Date.now();
+  let exitCode = 1;
+  try {
+    exitCode = await runLocalApp(repoRoot, argv, environment, output, dependencies);
+    return exitCode;
+  } finally {
+    try {
+      appendCliUsage(
+        cliUsageDirectory(repoRoot, global.runtimeDirectory),
+        {
+          command,
+          at: startedAt.toISOString(),
+          durationMilliseconds: Math.max(0, Date.now() - startMilliseconds),
+          exitCode,
+          source: "unknown"
+        }
+      );
+    } catch {
+      // Usage logging must not replace the command result.
+    }
+  }
+}
+
 function parseGlobalOptions(
   argv: readonly string[],
   environment: NodeJS.ProcessEnv
@@ -350,7 +407,13 @@ function resolveRepoRoot(): string {
 
 const invokedPath = process.argv[1];
 if (invokedPath !== undefined && import.meta.url === pathToFileURL(invokedPath).href) {
-  runLocalApp(resolveRepoRoot(), process.argv.slice(2)).then(
+  const invocation = process.argv.slice(process.argv[2] === "--runtime" ? 4 : 2);
+  if (invocation[0] === "start" && invocation.includes("--foreground")) {
+    installDaemonDiagnostics(process.env.ROLLERSKATE_DAEMON_STDERR === undefined ? {} : {
+      stderrPath: process.env.ROLLERSKATE_DAEMON_STDERR
+    });
+  }
+  runLocalAppWithUsage(resolveRepoRoot(), process.argv.slice(2)).then(
     (code) => {
       process.exitCode = code;
     },

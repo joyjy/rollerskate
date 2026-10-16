@@ -1,3 +1,4 @@
+import type {Event} from "../event/model.js";
 import { isAgentInputEvent } from "../event/model.js";
 import { ExecutionScheduler, type SchedulingEntry } from "./scheduling.js";
 import {
@@ -20,6 +21,7 @@ export interface RuntimeCycleResult {
 }
 
 export class RuntimeCycle {
+  readonly #admission: ((event:Event)=>{reason:string;permanent:boolean}|undefined)|undefined;
   readonly #deliveryHandler: Pick<DeliveryHandler, "handle">;
   readonly #handlers: ReadonlyMap<RuntimeEventHandler["kind"], RuntimeEventHandler>;
   readonly #store: RuntimeStore;
@@ -33,10 +35,12 @@ export class RuntimeCycle {
 
   public constructor(options: {
     readonly store: RuntimeStore;
+    readonly admission?: (event:Event)=>{reason:string;permanent:boolean}|undefined;
     readonly handlers: ReadonlyMap<RuntimeEventHandler["kind"], RuntimeEventHandler>;
     readonly deliveryHandler: Pick<DeliveryHandler, "handle">;
     readonly onWorkStateChanged?: () => void;
   }) {
+    this.#admission = options.admission;
     this.#store = options.store;
     this.#handlers = options.handlers;
     for (const [kind, handler] of this.#handlers) {
@@ -185,6 +189,12 @@ export class RuntimeCycle {
     try {
       const event = this.#store.event(execution.eventId);
       if (event === undefined) throw new Error(`Event not found: ${execution.eventId}`);
+      const gate=this.#admission?.(event);
+      if(gate) {
+        const now=at??new Date().toISOString();
+        this.#store.holdExecution(executionId,gate.reason,gate.permanent?undefined:new Date(Date.parse(now)+30_000).toISOString(),now);
+        return {executionId};
+      }
       const route = runtimeRoute(event.type);
       if (execution.handler !== route.handler) {
         throw new Error(`Execution does not match Event Route: ${execution.executionId}`);

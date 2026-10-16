@@ -120,7 +120,8 @@ export class CodexAppServerRunner implements AgentRunner {
           });
         })();
       };
-      const terminate = (reason: RunnerTerminationReason, message: string) => {
+      let protocolComplete = true;
+      const terminate = (reason: RunnerTerminationReason, message: string, rejectedBeforeWork = false) => {
         if (settled) return;
         progress.phase(reason === "protocol_exit" ? "terminated" : "cancelling");
         const protocolStop = reason === "protocol_exit" || threadId === undefined ||
@@ -142,6 +143,7 @@ export class CodexAppServerRunner implements AgentRunner {
         }
         finish(runnerInvocationFailure({
           message,
+          rejectedBeforeWork: rejectedBeforeWork && protocolComplete,
           progress,
           reason,
           totalTimeoutMilliseconds,
@@ -152,11 +154,13 @@ export class CodexAppServerRunner implements AgentRunner {
       const finishTerminalFailure = (
         reason: "cancelled" | "protocol_error",
         message: string,
-        protocolStop: "acknowledged" | "unavailable"
+        protocolStop: "acknowledged" | "unavailable",
+        rejectedBeforeWork = false
       ) => {
         progress.phase("terminated");
         finish(runnerInvocationFailure({
           message,
+          rejectedBeforeWork: rejectedBeforeWork && protocolComplete,
           progress,
           reason,
           totalTimeoutMilliseconds,
@@ -191,6 +195,7 @@ export class CodexAppServerRunner implements AgentRunner {
       const decoder = new JsonLineResponseDecoder({
         maxLineBytes: MAX_PROTOCOL_RECORD_BYTES,
         onDiscardedLine: () => {
+          protocolComplete = false;
           terminate("protocol_error",
             `Codex app-server protocol record exceeds ${MAX_PROTOCOL_RECORD_BYTES} bytes`
           );
@@ -208,7 +213,7 @@ export class CodexAppServerRunner implements AgentRunner {
             if (value.error !== undefined) {
               terminate(
                 "protocol_error",
-                `Codex initialize failed: ${rpcError(value.error)}`
+                `Codex initialize failed: ${rpcError(value.error)}`, true
               );
               return true;
             }
@@ -232,7 +237,7 @@ export class CodexAppServerRunner implements AgentRunner {
             if (value.error !== undefined) {
               terminate(
                 "protocol_error",
-                `Codex Thread setup failed: ${rpcError(value.error)}`
+                `Codex Thread setup failed: ${rpcError(value.error)}`, true
               );
               return true;
             }
@@ -270,7 +275,7 @@ export class CodexAppServerRunner implements AgentRunner {
             if (value.error !== undefined) {
               terminate(
                 "protocol_error",
-                `Codex turn start failed: ${rpcError(value.error)}`
+                `Codex turn start failed: ${rpcError(value.error)}`, true
               );
               return true;
             }
@@ -300,11 +305,16 @@ export class CodexAppServerRunner implements AgentRunner {
           const progressEvent = codexProgress(value, threadId, turnId);
           if (progressEvent !== undefined) {
             progress.observe(progressEvent.kind, progressEvent.meaningful);
+            if (progressEvent.kind === "thought") request.onOutput?.({kind: "thought"});
+            else if (progressEvent.kind === "tool" && isRecord(value.params)) {
+              request.onOutput?.({kind: value.method === "item/started" ? "tool.call" : value.method === "item/completed" ? "tool.result" : "tool.update", data: value.params});
+            }
             if (progressEvent.meaningful) resetMeaningfulTimeout();
           }
           if (value.method === "item/agentMessage/delta" && isRecord(value.params) &&
             matchesActiveTurn(value.params, threadId, turnId) &&
             typeof value.params.itemId === "string" && typeof value.params.delta === "string") {
+            request.onOutput?.({kind: "assistant.delta", data: {itemId: value.params.itemId, text: value.params.delta}});
             addAssistantText(value.params.itemId, value.params.delta, false);
           }
           if (value.method === "item/completed" && isRecord(value.params) &&
@@ -313,6 +323,7 @@ export class CodexAppServerRunner implements AgentRunner {
             const item = value.params.item;
             if (item.type === "agentMessage" && typeof item.id === "string" &&
               typeof item.text === "string") {
+              request.onOutput?.({kind: "assistant.message", data: {itemId: item.id, text: item.text}});
               addAssistantText(item.id, item.text, true);
             } else if (typeof item.type === "string" &&
               !["reasoning", "userMessage", "plan"].includes(item.type)) {
@@ -358,7 +369,8 @@ export class CodexAppServerRunner implements AgentRunner {
               finishTerminalFailure(
                 "protocol_error",
                 `Codex turn ended with ${String(status)}${detail}`,
-                "unavailable"
+                "unavailable",
+                status === "failed"
               );
             }
           }

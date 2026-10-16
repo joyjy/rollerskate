@@ -1,3 +1,5 @@
+import { RunMonitorStore, type RunSubscription } from "../../capabilities/subscription/run-monitor-store.js";
+import { graphState, type GraphNodeState } from "./graph.js";
 import { runCapabilityRequest } from "./capability.js";
 import { runHumanQuestion } from "./human-input.js";
 import type { AgentRequestEvent } from "../../core/event/model.js";
@@ -12,7 +14,7 @@ import type {
 } from "../../modules/steward/state-machine.js";
 import {
   parseAgentStepResult,
-  parseRunDecision,
+  parseRunDecisionOutput,
   type AgentRunCheckpoint,
   type AgentRunDecisionReceipt,
   type AgentStepResult,
@@ -106,6 +108,8 @@ export interface AgentExchangeCountView {
 }
 
 export interface StewardRunDetailView {
+  readonly monitoring: RunSubscription | null;
+  readonly graphNodes: readonly GraphNodeState[];
   readonly intervention: StewardRunIntervention | null;
   readonly capabilityRequest: ReturnType<typeof runCapabilityRequest>;
   readonly humanQuestion: ReturnType<typeof runHumanQuestion>;
@@ -327,7 +331,9 @@ export function inspectStewardRunView(
       humanQuestion: runHumanQuestion(run,stores.runs,stores.runtime),
       intervention: stewardRunIntervention(run, requests, stores.runtime),
       summary: summary(run, stores.foundation),
+      monitoring: new RunMonitorStore(stores.database).getByRun(run.runId) ?? null,
       projection: run,
+      graphNodes: graphState(run, stores.runs, stores.runtime),
       cycles,
       triggerSource: triggerSourceView(run, cycles, stores),
       checkpoint: run.checkpoint ?? null,
@@ -382,6 +388,9 @@ function outputFolders(
 function outputsForSteps(steps: readonly StewardRunStepView[]): StewardOutputView[] {
   return steps.flatMap((step) => {
     const result = step.result;
+    // Current Steward deliverables come only from accepted decision receipts above.
+    if (result?.schemaVersion === "RunDecision@4" || result?.schemaVersion === "RunDecision@5" ||
+      result?.schemaVersion === "RunDecision@6") return [];
     const primary = primaryOutput(result);
     if (primary === null) return [];
     return [
@@ -496,10 +505,10 @@ function parseStepOutput(
   if (request.runContext?.resultContractId === "agent-step-result@1") {
     return parseAgentStepResult(output);
   }
-  if (request.runContext?.resultContractId === "run-decision@2" ||
-    request.runContext?.resultContractId === "run-decision@3") {
-    return parseRunDecision(JSON.parse(output) as unknown, {
-      allowHistorical: request.runContext.resultContractId === "run-decision@2"
+  if (["run-decision@2", "run-decision@3", "run-decision@4", "run-decision@5", "run-decision@6"]
+    .includes(request.runContext?.resultContractId ?? "")) {
+    return parseRunDecisionOutput(output, {
+      allowHistorical: request.runContext?.resultContractId === "run-decision@2"
     });
   }
   if (request.runContext?.resultContractId === "agent-turn-adjudication@1") {

@@ -27,7 +27,7 @@ rollerskate/
 │   │   ├── capabilities/         # 随源码发布的第一方能力
 │   │   ├── integrations/         # Agent、Matrix、Server 与外部 provider 适配
 │   │   ├── infrastructure/       # SQLite/file persistence 与运行资源加载
-│   │   ├── entrypoints/          # CLI 与 loopback HTTP 转换
+│   │   ├── entrypoints/          # CLI、loopback HTTP 与受控 MCP 转换
 │   │   └── bootstrap/            # 固定 runtime composition 与 migration
 │   ├── resources/                # 随 build 发布的 prompt 与 versioned workflow
 │   ├── scripts/                  # Local package build helper
@@ -45,9 +45,7 @@ rollerskate/
 ├── assets/                       # 人类入口视觉资产
 └── docs/
     ├── architecture/             # 当前架构、ownership 与 ADR
-    ├── plan/                     # 尚未完成验收的 release plans
-    ├── runbook/                  # 安装、运行与故障处理
-    └── verification/             # 版本验收范围与外部证据
+    └── runbook/                  # 安装、运行与故障处理
 ```
 
 ## Boundary Notes
@@ -58,14 +56,17 @@ rollerskate/
 - `entrypoints/` 只把 CLI/HTTP 转成 application control/query，并在同一 loopback HTTP server 上挂载 Vite middleware；`local/ui/src/` 是 Console 产品运行源，只走 loopback API，两者都不直接访问 store。
 - `examples/plugins/` 只能实现 Capability 预留的沙箱 strategy slot，不能注册 Capability、Event、Route、Handler 或 loop；`examples/probes/` 和 `examples/commands/` 只演示 host-owned probe 与外部进程 receipt 边界，不属于 Runtime 产品源码。
 - `scripts/`、`dev/` 和 `assets/` 不拥有产品行为；`dev/secrets/` 是 ignored 本地状态。
+- `application/judgment/` 拥有 Run 判断工具准入，`integrations/jev/` 拥有外部判断 API，`entrypoints/mcp/` 只转换工具调用。边界见 [Local Runtime](local-runtime.md)，操作见 [Jev 工具](../runbook/jev.md)。
 - `local/src/application/run/` 拥有统一工作编译、预检、确定性 admission 与组合查询；`modules/run/intent.ts` 拥有确定性意图，`infrastructure/files/run-admission-store.ts` 只保存 immutable admission。`application/command/` 拥有继承调用者权限的一次性执行者和回执查询，`entrypoints/command/` 仅转换输入，`infrastructure/command/receipt.ts` 拥有命令回执，`resources/command/` 拥有固定只读 completion probe。Subscription/source、Delivery 与 Agent Run 的可变事实仍归原 owner；详见 [统一 Run](unified-run.md)。验证入口为 `local/test/run-preflight.test.ts`、`local/test/shell-command.test.ts` 与原 Steward/Subscription 测试。
+
+- `application/workspace/` 拥有工作区内容检查、独立 Git 元数据发现与 Fork；`infrastructure/files/workspace-fork-store.ts` 持有独占请求和不可变回执。Chat/Console 共用 application，细节见 [Workspace 发现与 Fork](workspace-discovery.md)。
 
 ## Architecture And Validation
 
 - `packages/protocol/`：[System topology](./system-topology.md)、[Event and Handler flow](./event-and-chat-flow.md)；`npm run verify -w @rollerskate/protocol`。
 - `local/src/` 与 `local/ui/src/`：[Local Runtime](./local-runtime.md)、[State and recovery](./state-and-recovery.md)、[Subscription](./poll-subscription.md)、[Local Steward And Review Workflow](./local-review.md)；`npm run verify -w @rollerskate/local`、`npm --prefix local/ui test`、`npm --prefix local/ui run type-check`、`npm --prefix local/ui run build`。
 - `server/src/`：[Server foundation](./server-foundation.md)、[Room control plane](./room-control-plane.md)；`npm run verify -w @rollerskate/server`。
-- `examples/`：[ADR 0005](./adrs/0005-capability-and-plugin-boundary.md)、[Subscription](./poll-subscription.md)；Plugin 示例随 Local 验证。
+- `examples/`：[ADR 0005](./adrs/0005-capability-and-plugin-boundary.md)、[Subscription](./poll-subscription.md)；Plugin 示例随 Local 验证；`examples/commands/tests/` 的 Python 行为测试由根 `npm test` 调用 `npm run test:examples` 执行。
 - 全仓编排与 helper：[Architecture index](./index.md)、[State and recovery](./state-and-recovery.md)；`npm run verify`、`npm run dev:init`。
 
 ## Shared Contracts
@@ -83,11 +84,12 @@ rollerskate/
 - `local/src/modules/agent/client-profile.ts`：受支持 Agent client、adapter ID、per-Agent launch args schema 与 reserved-argument policy 的事实源。
 - `local/src/integrations/agent/runner/`：ACP-shaped provider-neutral turn request/receipt、共享 process lifecycle 与 wire transport 的事实源。`acp.ts` 使用官方 ACP SDK，拥有 initialize、new/resume、mode/config、permission、prompt terminal、bounded update projection 与 watchdog；`pi-rpc.ts` 拥有 Pi RPC command/event、exact Session state、`agent_settled` terminal 与 oversized-record discard；`codex-app-server.ts` 拥有 initialize、Thread start/resume、Turn terminal、delta/item/usage 投影、meaningful watchdog、`turn/interrupt` 与 fail-closed server request。`local/src/integrations/agent/*.ts` 与 `local/resources/agents/` 只拥有 Runtime Event prompt、workspace grant 到 provider policy、Chat/Run assistant 选择、Pi `--tools`/history extension 和 bundled prompt policy。
 - `local/src/core/chat/`：历史 `ChatDecision@1`、支持 `propose_run` 的 `ChatDecision@2`、bounded `ChatRunProposalDraft@1`、scoped presence 与纯 attention planning 的事实源。Proposal 是 Agent attention fact，不是 Owner execution authority。
-- `local/src/application/chat/`、`local/src/entrypoints/mcp/chat-{history,read-tools}.ts` 与 `local/resources/prompts/chat/`：Chat control/handler 编排、稳定 prompt resource ID、context rendering、current-Topic `read_chat_history` bounded cursor contract 与 Chat 行为资源的事实源。`read-tool-policy.ts` 持有只读 query 子集；`tool-policy.ts` 拥有整体 manifest、action schema、预算与 provider grant，`action-scope.ts` 统一 Host/Owner/Session 校验，`action-control.ts` 绑定 Owner 原消息和会话后调用 Run 准入；`resource-tools.ts` 与 `channel-tools.ts` 通过原领域 control/query 提供 Subscription/Schedule 控制与 Channel send/follow；`steward/human-input.ts` 从 Run/immutable decisions/answer Events 派生当前问题并原子续行，`read-tool-query.ts` 只通过 Subscription、Steward Run 与 Event application query 形成脱敏 bounded evidence；领域状态和 lifecycle 仍归原 owner。`chat/work-query.ts` 使用 Host dispatch、current Session 与有效 Topic roster 限定工作发现；`steward/work-query.ts` 将 Steward detail 的 lifecycle/intervention/output references 投影为 Agent 与卡片共用的 bounded read model。Codex 与 Claude Code 使用 invocation-scoped MCP server，pi 使用 content-attested extension，Kimi 的 `agent-continuation.ts` 提供同 Session `ChatToolRequest@1` fallback，并保持历史只读 request 可读。`run-proposal.ts` 从 exact Owner message 的每个 propose-run dispatch receipt 稳定投影独立 proposal/revision，并只引用对应 `agent_runs` 回流状态；`run-proposal-control.ts` 拥有 Owner workspace preflight，并在 exact message + dispatch + current-revision confirmation transaction 内复用 Steward `RunIntent@1` admission。`work-return.ts` 在唯一 loop 中从 accepted Run 或 Chat Channel send/follow 与原 dispatch/Session receipt 幂等 admission 一次准确 Chat activation；Chat 不写 Run lifecycle，`bootstrap/runtime.ts` 只装配 transport 和一个回流 phase。
+- `local/src/application/chat/`、`local/src/entrypoints/mcp/chat-{history,read-tools}.ts` 与 `local/resources/prompts/chat/`：Chat control/handler 编排、稳定 prompt resource ID、context rendering（普通/被 @ 回合共用 `resources/prompts/chat/run-guidance.md` 的提案决策规则）、current-Topic `read_chat_history` bounded cursor contract 与 Chat 行为资源的事实源。`read-tool-policy.ts` 持有只读 query 子集；`tool-policy.ts` 拥有整体 manifest、action schema、预算与 provider grant，`action-scope.ts` 统一 Host/Owner/Session 校验，`action-control.ts` 绑定 Owner 原消息和会话后调用 Run 准入；`resource-tools.ts` 与 `channel-tools.ts` 通过原领域 control/query 提供 Subscription/Schedule 控制与 Channel send/follow；`steward/human-input.ts` 从 Run/immutable decisions/answer Events 派生当前问题并原子续行，`read-tool-query.ts` 只通过 Subscription、Steward Run 与 Event application query 形成脱敏 bounded evidence；领域状态和 lifecycle 仍归原 owner。`chat/work-query.ts` 使用 Host dispatch、current Session 与有效 Topic roster 限定 Agent/命令/观察工作发现，确定性详情复用 `run/query.ts`；`chat/human-control.ts` 将 Console Owner 回答绑定原 Chat 来源并调用 Steward 人工续行，`callback-query.ts` 从 receipt/activation 投影回传状态；`steward/work-query.ts` 将 Steward detail 的 lifecycle/intervention/output references 投影为 Agent 与卡片共用的 bounded read model。Codex 与 Claude Code 使用 invocation-scoped MCP server，pi 使用 content-attested extension，Kimi 的 `agent-continuation.ts` 提供同 Session `ChatToolRequest@1` fallback，并保持历史只读 request 可读。`run-proposal.ts` 从 exact Owner message 的每个 propose-run dispatch receipt 稳定投影独立 proposal/revision，并只引用对应 `agent_runs` 回流状态；`run-proposal-control.ts` 拥有 Owner workspace preflight 与原卡片的显式来源/澄清确认；`steward/admission.ts` 的 `inspectRunWorkspace` 是预检与正式准入共用的路径和 revision 校验。卡片来源修正沿用 `work-origin.ts` 的任务/回调来源区分，并在 exact message + dispatch + current-revision confirmation transaction 内复用 Steward `RunIntent@1` admission。`work-return.ts` 在唯一 loop 中从 accepted Run 或 Chat Channel send/follow 与原 dispatch/Session receipt 幂等 admission 一次准确 Chat activation；Chat 不写 Run lifecycle，`bootstrap/runtime.ts` 只装配 transport 和一个回流 phase。
 - `local/src/application/runtime/query.ts`、`workload-query.ts` 与 `failure-query.ts`：Runtime process/control availability、Loop workload 与 bounded Failure projection 的共同 CLI/Console 语义出口。
 - `local/src/application/runtime/failure-control.ts`：exact failed Delivery 的 Owner recovery 入口；每次显式 retry 只追加一次 attempt budget，不复制或改写 origin、destination 与 payload。
 - `local/src/application/runtime/progress.ts`、`~/.rollerskate/runs/<runId>/progress.json` 与 `~/.rollerskate/progress.json`：从 `agent_runs` authority 重建的 per-Run 进展投影及发现索引；唯一 loop 原子覆盖，每个 Run 独立固定路径，不复制 transcript 或 terminal summary。
 - `local/src/application/event/query.ts`：Events list/trace 的共同 CLI/Console 语义出口。
+- `local/src/application/chat/rotation.ts` 与 `rotation-state.ts`：普通未定向与多 @ Owner 消息的 Topic 串行轮转、连续发言合并与进度关联；`chat_rotations` 保存协调状态，Event/Execution 保存消息和调用事实。`bootstrap/runtime.ts` 在唯一 loop 注册 `chat.rotation` phase；验证入口为 `local/test/chat-rotation{,-state}.test.ts` 和 `local/test/local-schema-v76.test.ts`。
 - `local/src/infrastructure/sqlite/chat-store.ts`：唯一 `Local` Chat 的 SQLite projection、Owner message admission 与 current Session pointer。
 - `local/src/core/loop.ts`：唯一长期运行 loop、phase 调度、顶层异常隔离与 running `RuntimeArtifactRevision@1` readback 的事实源；expected revision 的构建产物指纹算法归 `local/src/infrastructure/runtime/revision.ts`。
 - `local/src/core/runtime/model.ts`：Local Route、durable execution、generic result-contract routing context 与 completion callback primitive 的事实源；Core 不拥有具体 Agent result schema。
@@ -104,12 +106,15 @@ rollerskate/
 - `local/src/integrations/server/pairing-client.ts`、`device-client.ts` 与 `agent-client.ts`：匿名 Pairing、Human/Device control 与 Agent publish/principal 三种网络 authority 的窄 client；仅共享 bounded HTTP transport。
 - `local/src/integrations/vikunja/`：`playground@1` 的 read-only Vikunja `Connector@1` adapter、provider-neutral bounded snapshot、mode-0600 observation ledger，以及普通 `vikunja-task` Destination adapter 的事实源；只接受调用时提供的 token callback，不保存 `credentialRef` 或 secret value，也不拥有 Project policy、Run lifecycle 或第二个 loop。历史 effect ledger entry 只作为 inert tombstone 原样保留。真实隔离验证入口是 `npm --prefix local run smoke:vikunja`。
 - `local/src/integrations/codex-desktop/`：Desktop Destination、Chat source/dispatch/reply 绑定和随 Local 发布的同用户 IPC 传输；拥有 socket 校验、分帧、owner discovery、steer/start 与单次回执，不依赖个人工具库。`application/codex-desktop/control.ts` 提供 Owner CLI 入口，`chat/control.ts` 持有 Chat 准入；`bootstrap/runtime.ts` 直接装配内置传输，复用 canonical Event 与 Delivery，不新增队列或 loop。验证入口为 `local/test/codex-desktop-{ipc,delivery}.test.ts`。
-- `local/src/application/proactive/codex-desktop-action.ts`：Subscription 的固定 application action、事务内 Delivery 入队和 canonical receipt 出站核验；`application/subscription/desktop-control.ts` 持有 Owner registration 与 source-bound Delivery 查询，复用既有 source compiler 和 plugin registry。`codex-desktop-subscription.test.ts` 验证等待、delta、预算耗尽、来源防篡改与零 Agent Execution。
+- `local/src/application/proactive/codex-desktop-action.ts`：Subscription 的固定 application action、事务内 Delivery 入队和 canonical receipt 出站核验；`application/subscription/desktop-control.ts` 持有 Owner registration、source-bound Delivery 与 exact action receipt 查询，复用既有 source compiler 和 plugin registry。`application/proactive/return-notice.ts` 统一生成 Desktop/Chat 回传的有界摘要及证据入口，完整来源继续归原 receipt/Run。`codex-desktop-subscription.test.ts` 验证等待、delta、预算耗尽、来源防篡改与零 Agent Execution。
+- `local/src/application/chat/web-search.ts` 与 `modules/agent/web-search.ts`：Local Chat 原生搜索授权和 adapter 能力声明；`infrastructure/files/web-search-access-store.ts` 拥有私有授权文件。Console Participants 合并加入与工具设置，原生搜索参数由支持的 Agent integration 应用；Pi 通过受控 `resources/agents/pi-exa-extension.ts` / `pi-exa-search.mjs` 复用锁定的 `pi-web-access` Exa transport。不开启完整上游交互扩展，不增加 host 搜索服务或 Core 状态。
 - `local/src/application/network/`、`topic/` 与 `activity/`：Local Console 的 Network safety projection、Server Topic/profile control、bounded/redacted Local activity access，以及显式授权的 same-client history authority；history grant/audit 由 Runtime 私有文件拥有，正文不复制进 SQLite 或 Server。Codex 的 `integrations/activity/codex-thread-source.ts`、`entrypoints/mcp/client-history.ts` 与 adapter 装配共同拥有 active/archived task 的 `list_client_threads` / `read_client_thread` 路径；`application/chat/agent-continuation.ts` 只保留非 Codex Chat 的同 Session `ClientHistoryRequest@1` continuation，通用 Core `AgentHandler` 不解析 ClientHistory schema。
 - `local/src/capabilities/scheduled-task/model.ts`、`time.ts`、`store.ts`、`store/`、`bound-runtime.ts` 与 `run-binding.ts`：Schedule/ScheduleOccurrence、one-shot/cron/timezone、misfire/overlap 与 durable admission 的事实源；`ScheduleRevision@3` 使用统一 target并把 external workflow enqueue/terminal projection 留在 source transaction，V2 Run binding 与 V1 callback 只保留兼容读取/恢复。
 - `local/src/application/schedule/source-binding.ts`：把 `RunDecision@3 | @4` 的 exact `schedule.once@1 | schedule.cron@1` template 编译为带 Steward Run target 的 `ScheduleRevision@3`，并提供 source-owner 到 Steward application 的 transaction adapter；它不复制 Run state machine。
+- `local/src/application/proactive/schedule-registration.ts`：Owner external workflow Schedule 的原生注册入口；复用 registry 的 exact target 和既有 Schedule transaction，默认 paused，source ID 幂等，不拥有第二套时间或执行逻辑。
 - `local/src/application/steward/` 与 `local/src/modules/steward/`：Steward Run/series/cycle control/query、module manifest、autonomous `AgentTurnResult@1`、Worker `AgentStepResult@1` / checkpoint、manual `RunDecision@1`、Codex Orchestrator `RunDecision@2 | @3 | @4` / bounded `OrchestratorState@1`、`RunSourceBinding@1` / `TriggerOccurrenceEnvelope@1`、provider-neutral `RunResultDestination@2`、legacy trigger inventory/proposal/approval/migration receipt、纯状态机、mandate/workflow admission 与 source activation policy 的事实源；`agent_runs`、`agent_run_cycles`、`legacy_trigger_migration_receipts` 与 `AgentRunContext@1` 是该领域保留的持久格式。Source owner 必须调用 Steward application 的同事务 occurrence activation seam，不得自行写 Run/cycle/Event。
 - `local/src/application/steward/legacy-workflow-registry.ts`：Owner 持有的严格 `LegacyTriggerWorkflowRegistry@1` 读取入口；只允许 exact source kind/id/revision + callback 到 bundled versioned workflow、participant 与显式 `retain | deliver` terminal policy 的唯一映射，不能从 raw command 推导 authority；`retain` 禁止 destination，`deliver` 必须绑定既有 destination。
+- `local/src/capabilities/subscription/run-monitor-store.ts`：Run Subscription durable object 的唯一 persistence owner；`application/subscription/run-monitor.ts` 在唯一 loop 观察 canonical Run/Execution 并入队通知，`run-monitor-target.ts` 解析 immutable return binding，`run-monitor-query.ts` 拥有专用只读 CLI readback。`application/chat/run-monitor-return.ts` 负责 exact 原 dispatch/Session 的 Chat 通知准入及完整通知状态聚合；`steward/control.ts` 在 Run admission transaction 注册监控，`bootstrap/runtime.ts` 只装配一个 phase 和既有 Desktop source resolver。
 - `local/src/application/steward/result-destination.ts`：terminal cycle 到既有 `RunResultDestination@2` 的投影入口；Vikunja 可接收 bounded detail，Server Topic 只接收不含 observation 正文的状态通知。
 - `local/src/application/work-request/{control,runtime}.ts`：target Local 固定 policy、显式 owner decision、accepted→Owner-backed RunIntent compiler→`OrchestratorBinding@3` Steward Run→Server receipt/result 的幂等编排，以及唯一 loop 中的 ephemeral route lease/restart recovery；未接受 request 不创建 Event 或 Run。
 - `local/src/modules/external-resource/trigger-binding.ts` 与 `local/src/application/external-resource/{trigger-binding,trigger-guard}.ts`：Schedule/Subscription 可选 ExternalRef trigger binding 的 strict codec、CLI application seam，以及触发时对 Server Integration authority 和 Connector exact revision read 的复核；只返回 matched/rejected，不创建 Run、Event、外写或授权。
@@ -118,7 +123,7 @@ rollerskate/
 - `local/resources/workflows/`：versioned Agent workflow 资源；`review@1` 定义细粒度审查，`mr-readiness@1` 定义严格的 MR first-pass result，`forum@1` 定义临时协作；它们都不拥有 Runtime engine、外部业务 lifecycle 或 provider authority。
 - `local/resources/workflows/continuous-observation-monitor.md`：`continuous-observation-monitor@1` 的 bundled versioned workflow；只分类 exact source occurrence 并结束当前 cycle，不执行 command、不扩大 workspace/network authority，也不结束 continuous Run。
 - `local/src/infrastructure/runtime/config.ts`：Local runtime paths 与 config schema 的事实源。
-- `local/src/infrastructure/sqlite/schema/`：Local SQLite v72 的完整 DDL、组合 schema version、兼容 migration 与 projection trigger 的唯一事实边界；v65→v66 增加 Run source binding/envelope，v66→v67 重建 Schedule/occurrence，v67→v68 重建 Subscription parent，v68→v69 增加 immutable legacy old→new migration receipt，v69→v70 退役 synthetic Chat activation，v70→v71 引入 unified proactive target，v71→v72 增加 external workflow execution与 source migration receipt。schema upgrade guard 禁止 active Runtime 上原地升库。外层 `schema.ts` 与 `runtime-schema.ts` 是薄入口，runtime mappers 持有 row mapping。
+- `local/src/infrastructure/sqlite/schema/`：Local SQLite v75 的完整 DDL、组合 schema version、兼容 migration 与 projection trigger 的唯一事实边界；`schema/definition.ts` 只负责按稳定 DDL 执行顺序组合 `schema/definition/` 下按责任域维护的 SQL 片段，并负责兼容索引补建；各版本 migration 保持升级与重建顺序。v65→v66 增加 Run source binding/envelope，v66→v67 重建 Schedule/occurrence，v67→v68 重建 Subscription parent，v68→v69 增加 immutable legacy old→new migration receipt，v69→v70 退役 synthetic Chat activation，v70→v71 引入 unified proactive target，v71→v72 增加 external workflow execution 与 source migration receipt，v74→v75 扩展 Desktop Delivery kind。schema upgrade guard 禁止 active Runtime 上原地升库。外层 `schema.ts` 与 `runtime-schema.ts` 是薄入口，runtime mappers 持有 row mapping。
 - `local/src/infrastructure/sqlite/transaction.ts`：普通 SQLite store 的 synchronous `BEGIN IMMEDIATE` / commit / rollback 模板；schema creation/migration 因为拥有 introspection、PRAGMA 与 rebuild 顺序而保持显式 transaction。
 - `local/src/infrastructure/sqlite/runtime-operations-query.ts`：Runtime Workload、Failure 与 recovery precondition 的只读 SQLite facts adapter，不拥有 durable object 或 projection table。
 - `local/src/application/notice/` 与 `local/src/infrastructure/sqlite/notice-store.ts`：Notice list/inspect/read/ack/rebuild 的共同 application contract，以及可重建 projection 与 authoritative user state adapter；RuntimeStore 不拥有 Notice query/control。
@@ -139,13 +144,14 @@ rollerskate/
 - `local/ui/dist/` ← `local/ui/src/`，由 Vite build 生成，不跟踪、不手工修改；它只用于 production-build verification 或显式 frozen artifact，不是 `scripts/rs start` 的产品运行输入。
 - `server/dist/` ← `server/src/` 与 `server/test/`，由 TypeScript build 生成，不跟踪、不手工修改。
 - `dev/secrets/` ← `dev/init-secrets.mjs`，是 ignored 的本地开发 secret state，不是 repo source，不得提交。
+- `tmp/node-test-report.json` ← `node-test.config.mjs` 与 node-test-kit，属于本地验证报告，不是架构事实源。
 - `package-lock.json` 与各 package lockfile ← npm manifest resolution；通过 npm 维护，不手工声明依赖事实。
 
 ## Documentation Layers
 
 - `docs/architecture/`：当前架构、ownership、ADR、稳定不变量和 change guidance。
 - `docs/runbook/`：安装、运行、控制与故障处理步骤。
-- `README.md`：人类项目入口和项目状态摘要，不复制完整 source map。
+- `README.md` 与根 `index.md`：人类项目入口和项目状态摘要，不复制完整 source map。
 
 仓库当前没有独立 `doc/` API 生成输入层或 `knowledge/` 长期领域知识层；不要为了满足模板预建空目录。
 
@@ -161,3 +167,14 @@ Steward 分流：`modules/steward/steward-policy.ts` 拥有策略契约与确定
 调度基准入口为 `scripts/scheduler-benchmark/run.mjs`，受控负载为 `scripts/scheduler-benchmark/workload.mjs`；只装配待测 ref 的真实 core 与隔离 SQLite，不拥有生产调度逻辑。执行与指标口径见 [调度基准](../runbook/scheduler-benchmark.md)。
 
 Run 验收与能力调整归属：`modules/steward/acceptance.ts` 持有固定验收与完成校验，`run-contract-v6.ts` 持有结构化决策；`application/steward/capability.ts` 拥有能力请求查询、Owner 准入与事务续行。它们复用 Run aggregate、decision receipts 和 canonical agent.request，不新增 Core 调度机制。`local/src/smoke/run-capability.ts` 是显式运行的真实 Codex 回归入口，使用隔离数据库、一次性 Git workspace 与本机 HTTP source；不装配生产 Runtime。
+
+
+Chat 异步结果入口由 `local/src/application/chat/callback.ts` 定义固定 `action:chat.callback@1`，`callback-query.ts` 从已有 deterministic action receipts 与 canonical Chat executions 派生读回。`work-return.ts` 在现有回传 phase 统一处理 Run、Channel 和 callback；不增加 loop 或独立回传状态表。Run admission/observation composition 绑定 `rs-chat:<dispatch-event-id>`，Console 和 Chat tools 消费同一读回。
+
+`application/chat/responsibility.ts` 通过既有 Run owner request 绑定单个 Owner 消息的唯一负责人，Chat action/proposal 共用该边界；指定 Agent 优先，未指定时从受支持的已派发参与者按负载选择，Run participant envelope 包含当前 Topic 已加入且受支持的 Worker。`history-query.ts` 只读 `chat_messages`，按调用时 membership 限定全部已加入 Topic，提供关键词搜索、原文分片和周边消息；无需新索引或权限文件。个人 client history 仍由原授权存储独立管理。
+
+DAG 格式的唯一 parser 为 `local/src/modules/steward/graph-contract.ts`，由 `RunIntent@1.graph` 引用并登记到 spec registry；`application/run/validation.ts` 与 CLI `run validate` 提供离线校验，`local/test/run-graph.test.ts` 覆盖拓扑与 digest，`local/test/run-graph-execution.test.ts` 覆盖派发、汇合、故障、恢复与迁移。`application/steward/graph.ts` 持有固定图调度与派生 read model，沿用 Steward Run owner 和 canonical Event/Execution，不新增节点表。
+
+Agent 执行日志的输出 contract 属于 `core/runtime/agent-invocation.ts`。`integrations/agent/` 将各 provider 的公开流转换为该 contract。文件写入、封存、共享维护锁及 gzip reader 属于 `infrastructure/files/agent-invocation-*`；`application/runtime/invocation-logs.ts` 组合日志查询与既有 Run 归档状态，CLI 只转换参数。运行路径与维护规则见 [执行日志 runbook](../runbook/agent-invocation-logs.md)。
+
+- Owner 通知控制：`capabilities/subscription/notification-control-store.ts` 保存修订历史，`application/subscription/notification-control.ts` 拥有控制和在途读回。`bootstrap/runtime.ts` 将策略注入 DeliveryHandler admission。`application/subscription/resume-query.ts` 拥有恢复读回，`application/steward/wait-query.ts` 分开投影 Run 终态和监控状态。

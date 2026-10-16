@@ -81,6 +81,7 @@ export function activateRunSourceOccurrenceInTransaction(input: {
       runVersion: existingCycle === undefined ? run.version + 1 : run.version,
       maxSteps: run.maxSteps,
       completedWorkerSteps: 0,
+      ...(binding.authority.workerAgentId === undefined ? {} : {workerAgentId: binding.authority.workerAgentId}),
       participants: input.runs.activeParticipantTargets(participantIds),
       contractVersion: stewardDecisionVersion(binding),
       ...(binding.acceptanceContract === undefined ? {} : {acceptanceContract: binding.acceptanceContract}),

@@ -1,3 +1,4 @@
+import {RuntimeCycle} from "../src/core/runtime/cycle.js";
 import assert from "node:assert/strict";
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -10,7 +11,6 @@ import {
   localRuntimeSnapshot
 } from "../src/application/agent/control.js";
 import {
-  handoffLocalChatMessageToRun,
   localChatPresenceView,
   localChatView,
   postLocalChatMessage
@@ -205,12 +205,10 @@ test("concurrent propose_run decisions become independent stable Chat-owned prop
         orderedDispatches.map(({ eventId }) => eventId));
       assert.deepEqual(proposals.map(({ chatLead }) => chatLead.agentId),
         orderedDispatches.map(({ agentId }) => agentId));
-      assert.ok(proposals.every(({ runOrchestrator }) =>
-        runOrchestrator?.agentId === codex.principalId));
+      assert.ok(proposals.every(({ runOrchestrator, chatLead }) =>
+        runOrchestrator?.agentId === chatLead.agentId));
       for (const proposal of proposals) {
-        const expectedParticipants = proposal.chatLead.agentId === codex.principalId
-          ? [codex.principalId]
-          : [alice.principalId, codex.principalId].sort();
+        const expectedParticipants = [alice.principalId, codex.principalId].sort();
         assert.deepEqual(proposal.participants.map(({ agentId }) => agentId).sort(),
           expectedParticipants);
         assert.equal(proposal.ready, true);
@@ -227,8 +225,6 @@ test("concurrent propose_run decisions become independent stable Chat-owned prop
       assert.throws(() => confirmLocalChatRunProposal(
         repo, source.eventId, first.dispatchEventId, "sha256:stale", options
       ), /revision is stale/u);
-      assert.throws(() => handoffLocalChatMessageToRun(repo, source.eventId, options),
-        /require current revision confirmation/u);
       const second = proposals[1]!;
       const declined = declineLocalChatRunProposal(
         repo, source.eventId, second.dispatchEventId, second.revision, options
@@ -383,13 +379,63 @@ test("workspace proposal requires Owner preflight before exact revision confirma
   }
 });
 
+test("Owner resolves an existing proposal in its card without losing the original task or callback", () => {
+  const repo = gitRepoFixture("rollerskate-card-resolution-");
+  const runtimeDirectory = mkdtempSync(join(tmpdir(), "rollerskate-card-resolution-runtime-"));
+  const options = {runtimeDirectory};
+  const at = "2026-07-25T12:00:00.000Z";
+  try {
+    const alice = addLocalAgent(repo,"alice","codex",options);
+    const bob = addLocalAgent(repo,"bob","codex",options);
+    addLocalAgent(repo,"codex","codex",options);
+    const original = postLocalChatMessage(repo,"Inspect service-a; inspect project-b",{...options,now:()=>new Date(at)}).message;
+    const current = postLocalChatMessage(repo,"Where are the cards?",{...options,now:()=>new Date(at)}).message;
+    const runtime = new RuntimeStore(join(runtimeDirectory,"runtime.db"));
+    try {
+      const turn = runtime.claimDueExecutions(10,at).find(e=>e.eventId===current.eventId)!;
+      runtime.admitChatAttention(turn.executionId,[bob,alice].map(agent=>({plan:plan(agent.principalId,agent.handle,"dispatch","available"),prompt:"card",promptResourceId:chatPromptResourceId})),at);
+      const executions = runtime.claimDueExecutions(10,at).filter(e=>e.handler==="agent");
+      const sibling = executions.find(e=>runtime.event(e.eventId)?.agentId===bob.principalId)!;
+      runtime.completeExecution(sibling.executionId,{adapterId:"fixture",workspace:repo,providerSessionId:"sibling-card",chatDecision:proposalDecision("Inspect the reminder","read")},at);
+      const execution = executions.find(e=>runtime.event(e.eventId)?.agentId===alice.principalId)!;
+      const decision = proposalDecision("Inspect service-a","read");
+      runtime.completeExecution(execution.executionId,{adapterId:"fixture",workspace:repo,providerSessionId:"card-resolution",
+        chatDecision:{...decision,speech:{...decision.speech,proposal:{...decision.speech.proposal,taskQuote:"Inspect service-a",blockingQuestion:"Which Git workspace?"}}}},at);
+      const source = localChatView(repo,options).messages.items.find(m=>m.eventId===current.eventId)!.runProposals!.find(p=>p.chatLead.agentId===alice.principalId)!;
+      assert.deepEqual(source.taskSourceChoices?.map(c=>c.eventId),[original.eventId]);
+      const checked = preflightLocalChatRunProposal(repo,current.eventId,source.dispatchEventId,source.revision,{kind:"project"},options);
+      assert.equal(checked.proposal.ready,false);
+      assert.ok(checked.proposal.selectedWorkspace?.revision,"workspace validation must not be hidden by a proposal blocker");
+      const resolution = {taskSourceMessageEventId:original.eventId,clarificationAnswer:"Use the checked workspace above."};
+      const wrongSource = preflightLocalChatRunProposal(repo,current.eventId,source.dispatchEventId,source.revision,{kind:"project"},options,{...resolution,taskSourceMessageEventId:current.eventId});
+      assert.equal(wrongSource.proposal.ready,false);
+      assert.throws(()=>preflightLocalChatRunProposal(repo,current.eventId,source.dispatchEventId,source.revision,{kind:"project"},options,{...resolution,clarificationAnswer:" "}),/1–4096/);
+      const resolved = preflightLocalChatRunProposal(repo,current.eventId,source.dispatchEventId,source.revision,{kind:"project"},options,resolution);
+      assert.equal(resolved.proposal.ready,true);
+      const siblingView = localChatView(repo,options).messages.items.find(m=>m.eventId===current.eventId)!.runProposals!.find(p=>p.chatLead.agentId===bob.principalId)!;
+      assert.equal(siblingView.resolution,undefined,"checking one card must not resolve its sibling");
+      assert.equal(siblingView.linkedRun,undefined);
+      assert.throws(()=>confirmLocalChatRunProposal(repo,current.eventId,source.dispatchEventId,resolved.proposal.revision,options,{kind:"project"}),/stale/);
+      assert.throws(()=>confirmLocalChatRunProposal(repo,current.eventId,source.dispatchEventId,resolved.proposal.revision,options,{kind:"project"},{...resolution,clarificationAnswer:"Different answer"}),/stale/);
+      const started = confirmLocalChatRunProposal(repo,current.eventId,source.dispatchEventId,resolved.proposal.revision,options,{kind:"project"},resolution);
+      assert.equal(started.status,"accepted");
+      assert.match(started.run.ownerRequestId,/:task-source-v1:/);
+      assert.ok(started.run.mandate.kind === "objective" && started.run.mandate.objective.includes(resolution.clarificationAnswer));
+      const reread = localChatView(repo,options).messages.items.find(m=>m.eventId===current.eventId)!.runProposals!.find(p=>p.chatLead.agentId===alice.principalId)!;
+      assert.equal(reread.linkedRun?.runId,started.run.runId);
+      const duplicate = confirmLocalChatRunProposal(repo,current.eventId,source.dispatchEventId,resolved.proposal.revision,options,{kind:"project"},resolution);
+      assert.equal(duplicate.status,"duplicate");
+    } finally {runtime.close();}
+  } finally {rmSync(repo,{recursive:true,force:true});rmSync(runtimeDirectory,{recursive:true,force:true});}
+});
+
 test("proposal admission stays blocked without a Steward and ignores proactive proposal facts", () => {
   const repo = mkdtempSync(join(tmpdir(), "rollerskate-chat-proposal-guard-repo-"));
   const runtimeDirectory = mkdtempSync(join(tmpdir(), "rollerskate-chat-proposal-guard-runtime-"));
   const options = { runtimeDirectory };
   const at = "2026-07-25T12:00:00.000Z";
   try {
-    const alice = addLocalAgent(repo, "alice", "codex", options);
+    const alice = addLocalAgent(repo, "alice", "claude-code", options);
     const source = postLocalChatMessage(repo, "Please inspect this", {
       ...options,
       now: () => new Date(at)
@@ -753,3 +799,37 @@ function gitRepoFixture(prefix: string): string {
     "commit", "-qm", "fixture"], { cwd: repo });
   return repo;
 }
+
+
+test('notification admission holds queued attention and suppresses an already-running visible reply',async()=>{
+  const repo=mkdtempSync(join(tmpdir(),'rs-notice-chat-'));
+  const runtimeDirectory=mkdtempSync(join(tmpdir(),'rs-notice-chat-runtime-'));
+  const at='2026-10-16T10:00:00.000Z';
+  const agent=addLocalAgent(repo,'notice','codex',{runtimeDirectory});
+  postLocalChatMessage(repo,'original owner message',{runtimeDirectory,now:()=>new Date(at)});
+  let muted=true;
+  const runtime=new RuntimeStore(join(runtimeDirectory,'runtime.db'),{chatReplyAdmission:()=>muted?'notification_muted:Owner':undefined});
+  let invoked=0;
+  const cycle=new RuntimeCycle({store:runtime,admission:()=>muted?{reason:'notification_muted:Owner',permanent:false}:undefined,
+    handlers:new Map([['chat',{kind:'chat' as const,handle(execution){invoked++;runtime.admitChatAttention(execution.executionId,[],at);return [];}}]]),
+    deliveryHandler:{async handle(delivery){return delivery;}}});
+  await cycle.run(at);assert.equal(invoked,0);
+  const database=openRuntimeDatabase(join(runtimeDirectory,'runtime.db'));
+  const heldId=(database.prepare("SELECT execution_id FROM executions WHERE handler='chat'").get() as {execution_id:string}).execution_id;database.close();
+  const held=runtime.execution(heldId)!;
+  assert.equal(held.status,'retry_wait');assert.equal(held.attemptCount,0);
+  muted=false;
+  const later='2026-10-16T10:01:00.000Z';
+  const claimed=runtime.claimDueExecutions(1,later)[0]!;
+  const dispatch=runtime.admitChatAttention(claimed.executionId,[{plan:plan(agent.principalId,agent.handle,'dispatch','available'),prompt:'notice reply',promptResourceId:chatPromptResourceId}],later)[0]!;
+  const running=runtime.claimDueExecutions(1,later)[0]!;
+  muted=true;
+  const reply=runtime.completeExecution(running.executionId,{adapterId:'fake',workspace:runtimeDirectory,providerSessionId:'notice-test-session',
+    chatDecision:{schema:'ChatDecision@1',speech:{action:'reply',body:'must not become visible'},presence:{scope:'global',mode:'available',wakeKeywords:[]}},
+    chatReplyRoute:{continueAttention:false}},later);
+  assert.equal(reply,undefined);assert.equal(runtime.execution(running.executionId)!.status,'succeeded');
+  assert.equal(runtime.events(100).filter(x=>x.type==='chat.message').length,1);
+  assert.equal(runtime.chatDecisionReceipt(dispatch.eventId)!.replyEventId,undefined);
+  assert.equal(runtime.chatDecisionReceipt(dispatch.eventId)!.replySuppressedReason,'notification_muted:Owner');
+  runtime.close();
+});

@@ -17,6 +17,7 @@ import { startStewardRunFromIntent } from
 import { cancelStewardRun } from "../src/application/steward/control.js";
 import { ScheduledTaskRuntime } from
   "../src/capabilities/scheduled-task/runtime.js";
+import type { ScheduleAdmissionGate } from "../src/capabilities/scheduled-task/runtime.js";
 import { ScheduledTaskStore } from
   "../src/capabilities/scheduled-task/store.js";
 import { RuntimeStore } from "../src/core/runtime/store.js";
@@ -57,6 +58,14 @@ test("ScheduleRevision@3 binds atomically and a due once occurrence only activat
       WHERE owner_kind = 'schedule' AND owner_id = ?
     `).all(schedule!.definition.scheduleId), []);
 
+    const sleeping = scheduler(context, async () => ({ status: "defer", reason: "waiting-awake" }));
+    const deferred = await sleeping.runCycle("2026-08-26T04:01:00.000Z");
+    assert.equal(deferred.admitted.length, 0);
+    assert.equal(deferred.queued.length, 1);
+    assert.equal(context.runs.requireProjection(bound.runId).activeCycleId, undefined);
+    assert.equal(context.schedules.requireRun(deferred.queued[0]!).decisionReason, "waiting-awake");
+    closeContext(context);
+    context = openContext(fixture.paths.database);
     const cycle = scheduler(context);
     const admitted = await cycle.runCycle("2026-08-26T04:01:00.000Z");
     assert.equal(admitted.admitted.length, 1);
@@ -194,7 +203,7 @@ test("recurring Schedule owns misfire, overlap queue, duplicate run-now, restart
       "2026-08-26T05:03:20.000Z"
     );
     const cancelled = await scheduler(context).runCycle("2026-08-26T05:04:01.000Z");
-    assert.equal(cancelled.skipped.includes(queuedOccurrenceId), true);
+    assert.equal(cancelled.projected.includes(queuedOccurrenceId), true);
     assert.equal(
       context.schedules.requireRun(queuedOccurrenceId).decisionReason,
       "schedule-cancelled"
@@ -239,8 +248,9 @@ test("queued ScheduleRevision@3 occurrence closes when a terminal Run pauses its
       fixture.runtimeDirectory,
       "2026-08-26T07:02:10.000Z"
     );
-    const reconciled = await scheduler(context).runCycle("2026-08-26T07:02:11.000Z");
-    assert.equal(reconciled.skipped.includes(queued.queued[0]!), true);
+    const reconciled = await scheduler(context, async () => ({ status: "defer", reason: "waiting-awake" }))
+      .runCycle("2026-08-26T07:02:11.000Z");
+    assert.equal(reconciled.projected.includes(queued.queued[0]!), true);
     assert.equal(
       context.schedules.requireRun(queued.queued[0]!).decisionReason,
       "bound-run-cancelled"
@@ -320,11 +330,12 @@ function bindSchedule(
   );
 }
 
-function scheduler(context: Context): ScheduledTaskRuntime {
+function scheduler(context: Context, admissionGate?: ScheduleAdmissionGate): ScheduledTaskRuntime {
   return new ScheduledTaskRuntime({
     store: context.schedules,
     runtime: context.runtime,
     validateTarget: () => undefined,
+    ...(admissionGate === undefined ? {} : { admissionGate }),
     runBinding: scheduleRunBindingAdapter({
       runtime: context.runtime,
       runs: context.runs

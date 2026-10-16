@@ -254,7 +254,7 @@ test("AgentTurnResult@1 parses complete and one-child delegate results", () => {
     mandate: {
       kind: "workflow",
       workflowRef: "review@1",
-      inputs: { plan: "workspace/review-plan.md" }
+      inputs: { plan: "artifacts/review-plan.md" }
     },
     summary: "delegate review",
     artifactRefs: []

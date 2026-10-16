@@ -131,8 +131,10 @@ export class AcpRunner implements AgentRunner {
     let assistantOutputBytes = 0;
     const application = acp
       .client({ name: "rollerskate-local" })
-      .onRequest(acp.methods.client.session.requestPermission, ({ params }) =>
-        kimiPermissionDecision(request.workspaceAccess, params))
+      .onRequest(acp.methods.client.session.requestPermission, ({ params }) => {
+        progress.observe("tool", true);
+        return kimiPermissionDecision(request.workspaceAccess, params);
+      })
       .onNotification(acp.methods.client.session.update, ({ params }) => {
         if (terminationStarted || params.sessionId !== activeSessionId) return;
         const update = params.update;
@@ -158,6 +160,12 @@ export class AcpRunner implements AgentRunner {
           });
         }
         const kind = progressKind(update);
+        if (kind === "thought") request.onOutput?.({kind: "thought"});
+        else if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") {
+          request.onOutput?.({kind: "assistant.delta", data: {text: update.content.text}});
+        } else if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
+          request.onOutput?.({kind: update.sessionUpdate === "tool_call" ? "tool.call" : "tool.update", data: update});
+        }
         if (kind !== undefined) progress.observe(kind, isMeaningfulUpdate(update));
         if (isMeaningfulUpdate(update)) resetMeaningfulTimeout();
       });
@@ -273,6 +281,7 @@ export class AcpRunner implements AgentRunner {
         message: `${errorMessage(error)}${detail === "" ? "" : `\nstderr: ${detail}`}`,
         progress,
         reason: connectionClosed ? "protocol_exit" : "protocol_error",
+        rejectedBeforeWork: error instanceof acp.RequestError,
         totalTimeoutMilliseconds,
         meaningfulOutputTimeoutMilliseconds,
         protocolStop: "unavailable"

@@ -1,3 +1,5 @@
+import { chatCallbackAction, parseChatCallbackInput, chatReturnState } from "../chat/callback.js";
+import { RuntimeStore } from "../../core/runtime/store.js";
 import { SubscriptionStore } from "../../capabilities/subscription/store.js";
 import { ContinuousSubscriptionStore } from "../../capabilities/subscription/continuous-store.js";
 import { ScheduledTaskStore } from "../../capabilities/scheduled-task/store.js";
@@ -23,11 +25,13 @@ export interface ObservationSourceInput {
   readonly title: string;
   readonly mode: "until" | "continuous";
   readonly threadId?: string;
+  readonly chatDispatchEventId?: string;
   readonly plugin: RegisteredSubscriptionPlugin;
   readonly pluginConfig: unknown;
   readonly intervalMilliseconds: number;
   readonly maxWaitMilliseconds?: number;
   readonly maxAttempts?: number;
+  readonly checkpointMilliseconds?: number;
 }
 
 /** Internal composition only: callers cannot supply new probe authority or action code. */
@@ -35,12 +39,19 @@ export function registerObservationSource(repoRoot: string, input: ObservationSo
   const database = openRuntimeDatabase(runtimePaths(repoRoot, runtimeDirectory).database);
   try {
     assertCurrentLocalSchema(database);
-    const actions = new DeterministicApplicationActionRegistry(database, [codexDesktopPushAction, observeOnlyAction]);
+    const actions = new DeterministicApplicationActionRegistry(database, [codexDesktopPushAction, chatCallbackAction, observeOnlyAction]);
     const compiler = new OwnerProactiveSourceCompiler({ database, actions,
       schedules: new ScheduledTaskStore(database, { migrate: false }),
       oneShot: new SubscriptionStore(database, { migrate: false }),
       continuous: new ContinuousSubscriptionStore(database, { migrate: false }) });
-    const action = input.threadId === undefined ? { actionRef: observeOnlyAction.ref, input: {} }
+    if (input.threadId && input.chatDispatchEventId) throw new Error("Only one result destination is allowed");
+    if (input.chatDispatchEventId) {
+      parseChatCallbackInput({dispatchEventId: input.chatDispatchEventId, title: input.title});
+      const state = chatReturnState(database, new RuntimeStore(database, {migrate: false}), input.chatDispatchEventId);
+      if (state.status === "blocked") throw new Error(`Chat callback target unavailable: ${state.reason}`);
+    }
+    const action = input.chatDispatchEventId ? {actionRef: chatCallbackAction.ref, input: {dispatchEventId: input.chatDispatchEventId, title: input.title}}
+      : input.threadId === undefined ? { actionRef: observeOnlyAction.ref, input: {} }
       : { actionRef: CODEX_DESKTOP_PUSH_ACTION, input: { threadId: input.threadId, title: input.title } };
     const probe = registeredSubscriptionProbe(input.plugin, input.pluginConfig);
     if (input.mode === "continuous") compiler.compile({ kind: "continuous_subscription", action, source: {
@@ -50,7 +61,8 @@ export function registerObservationSource(repoRoot: string, input: ObservationSo
     else compiler.compile({ kind: "subscription", action, source: {
       schemaVersion: "SubscriptionDefinition@5", revision: "1", subscriptionId: input.subscriptionId, title: input.title,
       probe: { ...probe, artifactRevision: input.plugin.artifactRevision, artifactDigest: input.plugin.artifactDigest },
-      intervalMilliseconds: input.intervalMilliseconds, maxWaitMilliseconds: input.maxWaitMilliseconds!, maxAttempts: input.maxAttempts!
+      intervalMilliseconds: input.intervalMilliseconds, maxWaitMilliseconds: input.maxWaitMilliseconds!, maxAttempts: input.maxAttempts!,
+      ...(input.checkpointMilliseconds === undefined ? {} : {checkpointMilliseconds: input.checkpointMilliseconds})
     } });
   } finally { database.close(); }
   return inspectSubscriptionView(repoRoot, input.subscriptionId, runtimeDirectory);

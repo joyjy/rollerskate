@@ -28,6 +28,31 @@ describe("ChatGovernancePanel", () => {
     wrapper.unmount();
   });
 
+  it("keeps joining and native tool controls in one participant list", async () => {
+    const agent = localAgent();
+    const outside = {...agent, principalId: "prn_2", handle: "bob"};
+    const wrapper = mount(ChatGovernancePanel, {props: {
+      agents: [agent, outside], governance: governance(agent.principalId), schedules: [], pending: null,
+      presenceAgents: [{principalId: agent.principalId, handle: agent.handle, status: agent.status,
+        webSearch: {status: "revoked", supported: true, tool: "web_search", reason: "Native search"}}]
+    }});
+    expect(wrapper.findAll(".participant-entry")).toHaveLength(2);
+    expect(wrapper.findAll(".participant-tools")).toHaveLength(1);
+    expect(wrapper.findAll(".identity")).toHaveLength(0);
+    const search = wrapper.get('[aria-label="Web search for @alice"]');
+    expect(search.attributes("aria-pressed")).toBe("false");
+    await search.trigger("click");
+    expect(wrapper.emitted("setWebSearchAccess")).toEqual([[agent, "grant"]]);
+    await wrapper.setProps({pending: "web-search:prn_1"});
+    expect(search.text()).toBe("Saving…");
+    expect(search.attributes("disabled")).toBeDefined();
+    await wrapper.setProps({pending: null, presenceAgents: [{principalId: agent.principalId, handle: agent.handle,
+      status: agent.status, webSearch: {status: "active", supported: true, tool: "web_search", reason: "Native search"}}]});
+    await search.trigger("click");
+    expect(wrapper.emitted("setWebSearchAccess")?.[1]).toEqual([agent, "revoke"]);
+    wrapper.unmount();
+  });
+
   it("creates a recurring schedule without exposing IDs or revisions", async () => {
     const agent = localAgent();
     const wrapper = mount(ChatGovernancePanel, {

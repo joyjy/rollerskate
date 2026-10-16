@@ -1,18 +1,22 @@
+import { inspectChatRunRecovery, confirmChatRunRecovery, requestChatRunRecovery } from "../../application/chat/run-recovery.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 import {
+  retryStewardOrchestrator,
   cancelStewardRun,
   closeStewardRunSeries,
   setStewardRunArchived,
   submitCallerRunDecision
 } from "../../application/steward/control.js";
+import { answerStewardRunFromConsole } from "../../application/chat/human-control.js";
+import { authorizeRunNetwork } from "../../application/steward/capability.js";
 import { startStewardRunFromIntent } from
   "../../application/steward/intent-control.js";
 import {
-  inspectStewardRunView,
   latestStewardRunView,
   pageStewardRunViews
 } from "../../application/steward/query.js";
+import { inspectRun } from "../../application/run/query.js";
 import type { ConsoleRequestMarker } from "./http.js";
 import {
   json,
@@ -67,7 +71,7 @@ export async function serveStewardApi(
       return;
     }
     if (parts.length === 3 && method === "GET") {
-      json(response, 200, inspectStewardRunView(repoRoot, runId, runtimeDirectory));
+      json(response, 200, inspectRun(repoRoot, runId, runtimeDirectory));
       return;
     }
     if (parts.length === 4 && parts[3] === "cancel" && method === "POST") {
@@ -75,7 +79,35 @@ export async function serveStewardApi(
         json(response, 403, { error: "console_request_marker_required" });
         return;
       }
-      json(response, 200, cancelStewardRun(repoRoot, runId, runtimeDirectory));
+      const body = await readJsonBody(request);
+      json(response, 200, cancelStewardRun(
+        repoRoot, runId, runtimeDirectory, undefined,
+        expectedVersion(body)
+      ));
+      return;
+    }
+    if (parts.length === 4 && parts[3] === "answer" && method === "POST") {
+      if (requestMarker !== "console") {
+        json(response, 403, { error: "console_request_marker_required" });
+        return;
+      }
+      const body = await readJsonBody(request);
+      json(response, 200, answerStewardRunFromConsole(
+        repoRoot, runId, requireString(body, "questionId"),
+        expectedVersion(body), requireString(body, "answer"), runtimeDirectory
+      ));
+      return;
+    }
+    if (parts.length === 4 && parts[3] === "authorize-network" && method === "POST") {
+      if (requestMarker !== "console") {
+        json(response, 403, { error: "console_request_marker_required" });
+        return;
+      }
+      const body = await readJsonBody(request);
+      json(response, 200, authorizeRunNetwork(
+        repoRoot, runId, requireString(body, "requestEventId"),
+        expectedVersion(body), runtimeDirectory
+      ));
       return;
     }
     if (parts.length === 4 && parts[3] === "close" && method === "POST") {
@@ -106,6 +138,31 @@ export async function serveStewardApi(
       ));
       return;
     }
+    if (parts.length === 4 && parts[3] === "recovery" && method === "GET") {
+      json(response, 200, inspectChatRunRecovery(repoRoot, runId, runtimeDirectory));
+      return;
+    }
+    if (parts.length === 4 && parts[3] === "request-recovery" && method === "POST") {
+      if (requestMarker !== "console") { json(response, 403, {error: "console_request_marker_required"}); return; }
+      const body = await readJsonBody(request);
+      json(response, 200, requestChatRunRecovery(repoRoot, runId, requireString(body, "requestId"), runtimeDirectory));
+      return;
+    }
+    if (parts.length === 4 && parts[3] === "confirm-recovery" && method === "POST") {
+      if (requestMarker !== "console") { json(response, 403, {error: "console_request_marker_required"}); return; }
+      const body = await readJsonBody(request);
+      json(response, 200, confirmChatRunRecovery(repoRoot, runId, requireString(body, "revision"), runtimeDirectory));
+      return;
+    }
+    if (parts.length === 4 && parts[3] === "retry-orchestrator" && method === "POST") {
+      if (requestMarker !== "console") {
+        json(response, 403, { error: "console_request_marker_required" });
+        return;
+      }
+      const body = await readJsonBody(request);
+      json(response, 200, retryStewardOrchestrator(repoRoot, runId, requireString(body, "requestId"), runtimeDirectory, undefined, expectedVersion(body)));
+      return;
+    }
     if (parts.length === 4 && parts[3] === "decide" && method === "POST") {
       if (requestMarker !== "console") {
         json(response, 403, { error: "console_request_marker_required" });
@@ -133,4 +190,12 @@ export async function serveStewardApi(
   } catch (error) {
     json(response, 400, { error: error instanceof Error ? error.message : String(error) });
   }
+}
+
+function expectedVersion(body: Record<string, unknown>): number {
+  const value = body.expectedVersion;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
+    throw new Error("expectedVersion must be a positive integer");
+  }
+  return value;
 }

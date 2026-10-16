@@ -1,3 +1,5 @@
+import { createRequire } from "node:module";
+import { webSearchPrompt } from "./web-search-policy.js";
 import { randomUUID } from "node:crypto";
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
@@ -32,6 +34,7 @@ interface PiRequest {
   readonly event: AgentInputEvent | ChatDispatchEvent;
   readonly providerSessionId: string;
   readonly chatToolContext?: PiChatToolContext;
+  readonly webSearch?: boolean;
 }
 
 interface PiDecodedResponse {
@@ -48,6 +51,7 @@ export interface PiRuntimeAgentOptions {
   readonly meaningfulOutputTimeoutMilliseconds?: number;
   readonly maxOutputBytes?: number;
   readonly launchArgs?: readonly string[];
+  readonly resolveWebSearch?: (event: AgentInputEvent | ChatDispatchEvent) => boolean;
   readonly resolveChatToolContext?: (
     input: Pick<PiRequest, "event" | "providerSessionId">
   ) => PiChatToolContext | undefined;
@@ -77,6 +81,12 @@ const piReadonlyGitExtension = fileURLToPath(new URL(
   "../../../resources/agents/pi-readonly-git.mjs",
   import.meta.url
 ));
+
+const piWebSearchExtension = fileURLToPath(new URL(
+  "../../../resources/agents/pi-exa-extension.ts", import.meta.url
+));
+const require = createRequire(import.meta.url);
+const piWebSearchDependencyFiles = ["package.json", "exa.ts", "utils.ts", "activity.ts", "credential-source.ts"];
 
 export class PiRuntimeAgent implements RuntimeAgentAdapter {
   public readonly adapterId: string;
@@ -118,10 +128,13 @@ export class PiRuntimeAgent implements RuntimeAgentAdapter {
     const chatToolContext = this.#resolveChatToolContext?.(resolutionInput);
     const request = {
       ...resolutionInput,
+      webSearch: input.event.type === "chat.dispatch" && this.#processOptions.resolveWebSearch?.(input.event) === true,
       ...(chatToolContext === undefined
         ? {}
         : { chatToolContext })
     } satisfies PiRequest;
+    const effectivePrompt = [runtimeAgentEventPrompt(request.event),
+      ...(request.event.type === "chat.dispatch" ? [webSearchPrompt(request.webSearch === true)] : [])].join("\n\n");
     const access = piWorkspaceAccess(request.event);
     const totalTimeoutMilliseconds = invocationTimeoutMilliseconds(input.event);
     const meaningfulOutputTimeoutMilliseconds =
@@ -165,7 +178,8 @@ export class PiRuntimeAgent implements RuntimeAgentAdapter {
     let result: RunnerTurnReceipt;
     try {
       result = await process.invoke({
-        prompt: runtimeAgentEventPrompt(request.event),
+        ...(input.reportOutput === undefined ? {} : {onOutput: input.reportOutput}),
+        prompt: effectivePrompt,
         sessionId: request.providerSessionId,
         workspaceAccess: access,
         totalTimeoutMilliseconds,
@@ -196,7 +210,7 @@ export class PiRuntimeAgent implements RuntimeAgentAdapter {
     return {
       providerSessionId: response.providerSessionId,
       outcome: response.outcome,
-      invocation: invocationDiagnostics(input.event, result, response.providerDiagnostics)
+      invocation: invocationDiagnostics(input.event, result, response.providerDiagnostics, effectivePrompt)
     };
   }
 }
@@ -219,7 +233,8 @@ function piArgs(
     ...piOptions(
       access,
       launchArgs,
-      invocationToolNames
+      invocationToolNames,
+      request.webSearch === true
     ),
     "--session-id", request.providerSessionId
   ];
@@ -240,22 +255,22 @@ function piWorkspaceAccess(
 function piOptions(
   access: "read" | "write" | undefined,
   launchArgs: readonly string[],
-  chatToolNames: readonly string[] = []
+  chatToolNames: readonly string[] = [],
+  webSearch = false
 ): string[] {
   rejectPiResourceLaunchArgs(launchArgs);
   return [
     ...launchArgs,
     "--no-extensions",
-    "--no-skills",
     "--no-prompt-templates",
     "--no-themes",
-    "--no-context-files",
     "--mode", "rpc",
     ...(access !== "write" ? ["--extension", piReadonlyGitExtension] : []),
     ...(chatToolNames.length > 0 ? ["--extension", piChatHistoryExtension] : []),
+    ...(webSearch ? ["--extension", piWebSearchExtension] : []),
     "--tools", access === "write"
-      ? ["read", "write", "edit", "bash", "grep", "find", "ls", ...chatToolNames].join(",")
-      : ["read", "grep", "find", "ls", "read_git_diff", ...chatToolNames].join(",")
+      ? ["read", "write", "edit", "bash", "grep", "find", "ls", ...chatToolNames, ...(webSearch ? ["web_search"] : [])].join(",")
+      : ["read", "grep", "find", "ls", "read_git_diff", ...chatToolNames, ...(webSearch ? ["web_search"] : [])].join(",")
   ];
 }
 
@@ -308,6 +323,9 @@ function piPolicyResources(
 ):
 Readonly<Record<string, string>> {
   return {
+    piWebSearchExtensionPath: piWebSearchExtension,
+    piWebSearchExtensionSource: readFileSync(piWebSearchExtension, "utf8") + readFileSync(new URL("../../../resources/agents/pi-exa-search.mjs", import.meta.url), "utf8"),
+    piWebSearchDependencySource: piWebSearchDependencyFiles.map(name => readFileSync(require.resolve(`pi-web-access/${name}`), "utf8")).join("\n"),
     piReadonlyGitExtensionPath: piReadonlyGitExtension,
     piReadonlyGitExtensionSource: readFileSync(piReadonlyGitExtension, "utf8"),
     piChatHistoryExtensionPath: piChatHistoryExtension,

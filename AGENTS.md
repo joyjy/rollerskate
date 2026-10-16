@@ -4,8 +4,8 @@ Rollerskate 是一个 npm monorepo。仓库根目录只负责 workspace 编排�
 
 ## Read First
 
-- [Source Map](docs/architecture/source-map.md) 是 package、source root、ownership、generated artifact 与验证入口的唯一事实源。
-- [Architecture Index](docs/architecture/index.md) 是当前产品架构、稳定不变量、ADR 与专题文档入口。
+- [Architecture Index](docs/architecture/index.md) 是当前产品架构、稳定不变量、ADR 与专题文档入口；一般架构阅读先从这里开始。
+- [Source Map](docs/architecture/source-map.md) 只在修改 source root、ownership、shared contract、generated artifact 或验证入口时读取，并作为这些边界的唯一事实源。
 - 新增或修改 SQLite table、migration、materialized projection/index 或 durable object/state 前，必须先读 [Database Reference](docs/architecture/db-reference.md)，完成 Event-only / index / object 分类，并明确 owner、字段事实源、事务和 rebuild/reconciliation 规则。
 - 未实现计划不能覆盖 architecture 文档和源码事实；公开源码快照不包含内部规划与 release evidence。
 
@@ -18,6 +18,7 @@ Rollerskate 是一个 npm monorepo。仓库根目录只负责 workspace 编排�
 - 第一方玩法叫 Capability，必须进入源码、测试、migration 和正式发布流程。第三方若要新增完整 Capability，必须修改源码；当前不提供可安装 Capability/Handler/Route 扩展点。
 - 用户 Plugin 只能填入某个 Capability 预先声明的沙箱 strategy slot。Plugin 不能注册 Event type、Route、Handler、loop 或 store，不能直接访问 Runtime、Agent、network、filesystem、process、secrets 或 environment。
 - 新 ingress 先定义固定 schema，再构造 canonical Event；不开放 generic emit、fanout 或 Observer API。
+- Schema 与协议演进优先保持向后兼容：文案调整、可选字段和其他非破坏性小改动，不得仅因版本号、摘要或非关键字段差异阻断运行、调用或历史展示。优先采用可选字段、合理默认值和兼容读取；只有能证明旧数据或旧调用无法安全解释、涉及权限变化或确需迁移时才引入不兼容，并说明真实消费者、迁移路径和验证证据。限制应落在受影响的操作，保留可安全执行的功能及只读展示，不用全局拒绝代替兼容处理。
 - 新外部输出实现 Destination/Delivery integration，不把 Room、webhook 或 channel 建模为 Handler Route。
 - Console 浏览器源码属于 `local/ui/src/`；loopback API/static host 属于 `local/src/entrypoints/console/`，只能调用 application control/query，不能直接读写 store。
 - 不创建根 `src/`。任何 `dist/` 都是生成物，不得编辑、评审或当作源码事实。

@@ -1,14 +1,17 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-import { useRoute, useRouter } from "vue-router";
+import { RouterLink, useRoute, useRouter } from "vue-router";
 
 import { requestJson } from "@/api/client";
 import {
-  agentRunDetailViewSchema,
+  answerAgentRunReceiptSchema,
   agentRunSummariesSchema,
+  authorizeAgentRunCapabilityReceiptSchema,
   cancelAgentRunReceiptSchema,
-  setAgentRunArchivedReceiptSchema
+  setAgentRunArchivedReceiptSchema,
+  runDetailViewSchema
 } from "@/api/schema";
+import type { AgentRunDetailViewOutput, RunDetailViewOutput } from "@/api/schema";
 import AgentRunOverview from "@/components/AgentRunOverview.vue";
 import ListControls from "@/components/ListControls.vue";
 import PaginationControls from "@/components/PaginationControls.vue";
@@ -50,7 +53,7 @@ const detailUrl = computed(() =>
   `/api/runs/${encodeURIComponent(selectedId.value)}`);
 const detailQuery = useApi({
   url: detailUrl,
-  schema: agentRunDetailViewSchema,
+  schema: runDetailViewSchema,
   interval: 5_000,
   paused: computed(() => mutationPaused.value || selectedId.value === ""),
   immediate: false
@@ -63,12 +66,23 @@ const total = computed(() => runsQuery.data.value?.total ?? 0);
 const pageCount = computed(() =>
   Math.max(1, Math.ceil(total.value / PAGE_SIZE)));
 const detail = detailQuery.data;
+function isAgentRunDetail(value: RunDetailViewOutput): value is AgentRunDetailViewOutput {
+  return "summary" in value;
+}
+const agentDetail = computed<AgentRunDetailViewOutput | null>(() =>
+  detail.value !== null && isAgentRunDetail(detail.value) ? detail.value : null
+);
+const deterministicDetail = computed<Exclude<RunDetailViewOutput, AgentRunDetailViewOutput> | null>(() =>
+  detail.value !== null && !isAgentRunDetail(detail.value) ? detail.value : null
+);
 const loading = computed(() =>
   runsQuery.loading.value ||
   (selectedId.value !== "" && detailQuery.loading.value));
 const error = computed(() =>
   archiveMutation.error.value ??
   cancelMutation.error.value ??
+  answerMutation.error.value ??
+  capabilityMutation.error.value ??
   detailQuery.error.value ??
   runsQuery.error.value);
 
@@ -108,13 +122,14 @@ watch(selectedId, (next) => {
 }, { immediate: true });
 
 const cancelMutation = useMutation({
-  async execute(runId: string, signal: AbortSignal) {
+  async execute(input: { runId: string; expectedVersion: number }, signal: AbortSignal) {
     return requestJson(
-      `/api/runs/${encodeURIComponent(runId)}/cancel`,
+      `/api/runs/${encodeURIComponent(input.runId)}/cancel`,
       cancelAgentRunReceiptSchema,
       {
         method: "POST",
-        headers: { "X-Rollerskate-Request": "console" },
+        headers: { "X-Rollerskate-Request": "console", "Content-Type": "application/json" },
+        body: JSON.stringify({ expectedVersion: input.expectedVersion }),
         signal
       }
     );
@@ -122,6 +137,25 @@ const cancelMutation = useMutation({
   async refresh() {
     await Promise.all([runsQuery.refresh(), detailQuery.refresh()]);
   }
+});
+
+const answerMutation = useMutation({
+  async execute(input: { runId: string; questionId: string; expectedVersion: number; answer: string }, signal: AbortSignal) {
+    return requestJson(`/api/runs/${encodeURIComponent(input.runId)}/answer`, answerAgentRunReceiptSchema, {
+      method: "POST", headers: { "X-Rollerskate-Request": "console", "Content-Type": "application/json" },
+      body: JSON.stringify(input), signal
+    });
+  },
+  async refresh() { await detailQuery.refresh(); }
+});
+const capabilityMutation = useMutation({
+  async execute(input: { runId: string; requestEventId: string; expectedVersion: number }, signal: AbortSignal) {
+    return requestJson(`/api/runs/${encodeURIComponent(input.runId)}/authorize-network`, authorizeAgentRunCapabilityReceiptSchema, {
+      method: "POST", headers: { "X-Rollerskate-Request": "console", "Content-Type": "application/json" },
+      body: JSON.stringify(input), signal
+    });
+  },
+  async refresh() { await detailQuery.refresh(); }
 });
 
 const archiveMutation = useMutation({
@@ -142,13 +176,31 @@ const archiveMutation = useMutation({
   }
 });
 
-async function cancelRun(runId: string) {
+async function cancelRun(runId: string, expectedVersion?: number) {
   mutationPaused.value = true;
   try {
-    await cancelMutation.execute(runId);
+    const run = agentDetail.value;
+    const version = expectedVersion ?? (run === null ? undefined : run.projection.version);
+    if (run !== null && typeof version === "number" && Number.isSafeInteger(version) && version > 0) {
+      await cancelMutation.execute({ runId, expectedVersion: version });
+    }
   } finally {
     mutationPaused.value = false;
   }
+}
+
+async function answerRun(runId: string, questionId: string, expectedVersion: number, answer: string) {
+  mutationPaused.value = true;
+  try { await answerMutation.execute({ runId, questionId, expectedVersion, answer }); }
+  finally { mutationPaused.value = false; }
+}
+async function authorizeCapability(runId: string, requestEventId: string, expectedVersion: number) {
+  mutationPaused.value = true;
+  try { await capabilityMutation.execute({ runId, requestEventId, expectedVersion }); }
+  finally { mutationPaused.value = false; }
+}
+async function denyCapability(runId: string, expectedVersion: number) {
+  await cancelRun(runId, expectedVersion);
 }
 
 async function archiveRun(runId: string, archived: boolean) {
@@ -255,14 +307,44 @@ function goToPage(page: number) {
       <template v-else-if="detail">
         <div v-if="error" class="state error" role="alert">{{ error }}</div>
         <AgentRunOverview
-          :run="detail"
+          v-if="agentDetail"
+          :run="agentDetail"
           :cycle-id="routeCycleId"
           :output-id="routeOutputId"
           :cancelling="cancelMutation.pending.value"
+          :answering="answerMutation.pending.value"
+          :authorizing="capabilityMutation.pending.value"
           :archiving="archiveMutation.pending.value"
           @cancel="cancelRun"
+          @answer="answerRun"
+          @authorize-capability="authorizeCapability"
+          @deny-capability="denyCapability"
           @archive="archiveRun"
         />
+        <section v-else-if="deterministicDetail" class="panel deterministic-detail">
+          <div class="panel-header">
+            <span>{{ deterministicDetail.kind === "command" ? "Command Run" : "Observation Run" }}</span>
+            <span class="status" :class="deterministicDetail.status">{{ deterministicDetail.status }}</span>
+          </div>
+          <div class="panel-body">
+            <div class="run-head">
+              <div>
+                <strong>{{ deterministicDetail.title }}</strong>
+                <div class="dim">{{ formatDateTime(deterministicDetail.updatedAt) }}</div>
+              </div>
+            </div>
+            <dl class="detail-grid">
+              <dt>Run</dt><dd class="mono">{{ deterministicDetail.runId }}</dd>
+              <dt>Request</dt><dd class="mono">{{ deterministicDetail.requestId }}</dd>
+              <dt>Result</dt><dd>{{ deterministicDetail.result ?? "unknown" }}</dd>
+              <dt>Return</dt><dd>{{ deterministicDetail.deliveryStatus }}</dd>
+            </dl>
+            <div v-if="deterministicDetail.errors.length" class="source-error">
+              {{ deterministicDetail.errors.join("; ") }}
+            </div>
+            <p class="detail-note">Command and observation Runs use their source-owned controls. Agent answer, capability, and cancel controls are available only on Agent Run details.</p>
+          </div>
+        </section>
       </template>
       <div v-else class="state">Select a Steward Run.</div>
     </main>
@@ -283,4 +365,15 @@ function goToPage(page: number) {
 .run-status.succeeded { background: var(--success-soft); color: var(--success); }
 .run-status.failed, .run-status.needs_human { background: var(--warning-soft); color: var(--warning); }
 .run-status.cancelled { background: var(--muted-soft); color: var(--muted); }
+.deterministic-detail { border-radius: var(--radius); border: 1px solid var(--border); background: var(--surface); overflow: hidden; }
+.deterministic-detail .panel-header { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--text-secondary); }
+.deterministic-detail .panel-body { padding: 14px; }
+.deterministic-detail .status { margin-left: auto; padding: 2px 7px; border-radius: 999px; background: var(--primary-soft); color: var(--primary); font-size: 10px; }
+.deterministic-detail .status.succeeded { background: var(--success-soft); color: var(--success); }
+.deterministic-detail .status.failed, .deterministic-detail .status.attention_required { background: var(--warning-soft); color: var(--warning); }
+.deterministic-detail .status.cancelled { background: var(--muted-soft); color: var(--muted); }
+.detail-grid { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: 6px 10px; margin: 14px 0 0; }
+.detail-grid dt { color: var(--text-dim); }
+.detail-grid dd { margin: 0; overflow-wrap: anywhere; }
+.detail-note { margin: 14px 0 0; color: var(--text-secondary); font-size: 12px; }
 </style>

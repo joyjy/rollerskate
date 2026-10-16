@@ -80,12 +80,14 @@ export class RuntimeStore {
   readonly #delivery: RuntimeDeliveryStore;
   readonly #eventStore: RuntimeEventStore;
   readonly #audit: RuntimeAuditQuery;
+  readonly #chatReplyAdmission: ((event:Event)=>string|undefined)|undefined;
   readonly #onWorkAvailable: () => void;
 
   public constructor(
     database: string | DatabaseSync,
-    options: { readonly migrate?: boolean } = {}
+    options: { readonly migrate?: boolean; readonly chatReplyAdmission?: (event:Event)=>string|undefined } = {}
   ) {
+    this.#chatReplyAdmission=options.chatReplyAdmission;
     const databasePath = typeof database === "string"
       ? resolve(database)
       : mainDatabasePath(database);
@@ -186,6 +188,14 @@ export class RuntimeStore {
     return dispatches;
   }
 
+  public appendChatAttentionInTransaction(
+    executionId: string,
+    admissions: readonly AdmitChatAttention[],
+    at: string
+  ): readonly ChatDispatchEvent[] {
+    return this.#chat.admitAttentionInTransaction(executionId, admissions, at, true);
+  }
+
   public createChatActivation(
     input: CreateChatActivation,
     at = new Date().toISOString()
@@ -246,6 +256,14 @@ export class RuntimeStore {
 
   public nextFutureExecutionAt(at: string): string | undefined {
     return this.#query.nextFutureExecutionAt(iso(at));
+  }
+
+  /** Pre-effect notification admission may defer/cancel attention without a provider attempt. */
+  public holdExecution(executionId: string, reason: string, retryAt: string | undefined, at: string): void {
+    const changed=this.#database.prepare(`UPDATE executions SET status=?, attempt_count=max(0,attempt_count-1),
+      next_attempt_at=?, last_error=?, updated_at=?, completed_at=? WHERE execution_id=? AND status='running'`)
+      .run(retryAt===undefined?'cancelled':'retry_wait',retryAt??at,reason.slice(0,4096),at,retryAt===undefined?at:null,executionId);
+    if(changed.changes!==1) throw new Error(`Execution is not running: ${executionId}`);
   }
 
   public claimDueExecutions(
@@ -356,7 +374,8 @@ export class RuntimeStore {
         if ("presence" in decision) {
           this.#chat.applyPresence(event, decision.presence, timestamp);
         }
-        const reply = decision.speech.action === "reply"
+        const replySuppressedReason=this.#chatReplyAdmission?.(event);
+        const reply = decision.speech.action === "reply" && replySuppressedReason===undefined
           ? this.#chat.createReply(
               event,
               session.sessionId,
@@ -385,6 +404,7 @@ export class RuntimeStore {
           dispatchEventId: event.eventId,
           sessionId: session.sessionId,
           speechAction: decision.speech.action,
+          ...(replySuppressedReason===undefined?{}:{replySuppressedReason}),
           ...(decision.speech.action === "silent"
             ? { silenceReason: decision.speech.reason }
             : {}),
@@ -434,6 +454,15 @@ export class RuntimeStore {
     return outcome;
   }
 
+  /** A persisted retry decision permits this exact next attempt, including after restart. */
+  public isAgentNetworkRetry(execution: RuntimeExecution): boolean {
+    const row = this.#database.prepare(`SELECT receipt_json FROM executions WHERE execution_id = ?`)
+      .get(execution.executionId) as {receipt_json: string | null} | undefined;
+    if (!row?.receipt_json) return false;
+    const receipt = JSON.parse(row.receipt_json) as {networkRetry?: {failedAttempt?: number}};
+    return receipt.networkRetry?.failedAttempt === execution.attemptCount - 1;
+  }
+
   public failExecution(
     executionId: string,
     error: string,
@@ -449,19 +478,23 @@ export class RuntimeStore {
       const normalizedTrace = options.trace === undefined
         ? undefined
         : normalizeAgentInvocationFailure(options.trace);
-      const traceJson = normalizedTrace === undefined
-        ? null
-        : JSON.stringify({ schema: "AgentInvocationFailureReceipt@1", trace: normalizedTrace });
+      const networkRetry = options.retry === "network";
+      const maxAttempts = networkRetry ? 5 : execution.maxAttempts;
+      const traceJson = normalizedTrace === undefined && !networkRetry ? null : JSON.stringify({
+        schema: normalizedTrace === undefined ? "AgentNetworkRetryReceipt@1" : "AgentInvocationFailureReceipt@1",
+        ...(normalizedTrace === undefined ? {} : {trace: normalizedTrace}),
+        ...(networkRetry ? {networkRetry: {failedAttempt: execution.attemptCount}} : {})
+      });
       if (traceJson !== null && Buffer.byteLength(traceJson, "utf8") > 65_536) {
         throw new Error("Agent invocation failure receipt exceeds 65536 bytes");
       }
-      if (options.retry !== "never" && execution.attemptCount < execution.maxAttempts) {
-        const next = annealedRetryAt(timestamp, execution.attemptCount, retryBaseMilliseconds);
+      if (options.retry !== "never" && execution.attemptCount < maxAttempts) {
+        const next = annealedRetryAt(timestamp, execution.attemptCount, networkRetry ? 5_000 : retryBaseMilliseconds);
         this.#database.prepare(`
           UPDATE executions SET status = 'retry_wait', next_attempt_at = ?, last_error = ?,
-            started_at = NULL, updated_at = ?, receipt_json = COALESCE(?, receipt_json)
+            started_at = NULL, updated_at = ?, receipt_json = COALESCE(?, receipt_json), max_attempts = ?
           WHERE execution_id = ?
-        `).run(next, failure, timestamp, traceJson, executionId);
+        `).run(next, failure, timestamp, traceJson, maxAttempts, executionId);
         const retried = this.#requireExecution(executionId);
         return { execution: retried };
       }
@@ -853,6 +886,10 @@ export class RuntimeStore {
     const delivery = this.#delivery.retryFailed(deliveryId, at);
     this.#onWorkAvailable();
     return delivery;
+  }
+
+  public holdDelivery(deliveryId: string, reason: string, retryAt: string | undefined, at: string): RuntimeDelivery {
+    return this.#delivery.hold(deliveryId,reason,retryAt,at);
   }
 
   public deliveryFailed(

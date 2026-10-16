@@ -68,6 +68,39 @@ describe("StewardView", () => {
     wrapper.unmount();
   });
 
+  it("opens a deterministic command Run from a Chat deep link without Agent controls", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith("/api/runs?")) return Response.json(runPage(url, []));
+      if (url === "/api/runs/run_command") return Response.json({
+        runId: "run_command",
+        kind: "command",
+        requestId: "req_command",
+        title: "Run shell check",
+        createdAt: "2026-09-15T00:00:00.000Z",
+        updatedAt: "2026-09-15T00:00:01.000Z",
+        status: "succeeded",
+        result: "success",
+        deliveryStatus: "turn_completed",
+        errors: []
+      });
+      return Response.json({ error: "unexpected" }, { status: 500 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const router = createConsoleRouter(createMemoryHistory());
+    await router.push("/console/steward?runId=run_command");
+    const wrapper = mount(StewardView, { global: { plugins: [router] } });
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("Command Run");
+    expect(wrapper.text()).toContain("Run shell check");
+    expect(wrapper.text()).toContain("turn_completed");
+    expect(wrapper.text()).not.toContain("Cancel");
+    expect(wrapper.text()).toContain("Command and observation Runs use their source-owned controls");
+    wrapper.unmount();
+  });
+
   it("keeps selection in sync with ?runId when a row is clicked", async () => {
     const runA = summary({ runId: "run_a" });
     const runB = summary({
@@ -347,7 +380,10 @@ describe("StewardView", () => {
 
     expect(fetchMock).toHaveBeenCalledWith(
       `/api/runs/${activeRun.runId}/cancel`,
-      expect.objectContaining({ method: "POST" })
+      expect.objectContaining({
+        method: "POST",
+        body: expect.stringContaining('"expectedVersion":1')
+      })
     );
     wrapper.unmount();
   });
@@ -441,6 +477,7 @@ function detail(
       status: summary.status,
       orchestrationMode: summary.orchestrationMode,
       activeStepId: undefined,
+      version: 1,
       stepCount: 1,
       maxSteps: 8,
       maxDepth: 3

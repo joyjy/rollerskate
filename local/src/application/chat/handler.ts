@@ -20,7 +20,9 @@ import type { AgentClient } from "../../modules/agent/client-profile.js";
 import {
   loadChatMentionPromptResource,
   loadChatPromptResource,
-  type ChatPromptResource
+  type ChatPromptResource,
+  type ChatPromptContext,
+  type ChatPromptTaskClaim
 } from "./prompt.js";
 import {
   boundedChatPromptHistory,
@@ -29,14 +31,24 @@ import {
 } from "./query.js";
 import { chatToolCapability } from "./tool-policy.js";
 
+import type { AdmitChatAttention } from "../../core/runtime/store/types.js";
+
+export interface ChatAttentionScheduler {
+  accepts(event: ChatMessageEvent | ChatActivationEvent): boolean;
+  ingest(execution: RuntimeExecution, event: ChatMessageEvent | ChatActivationEvent,
+    admissions: readonly AdmitChatAttention[], at: string): readonly string[];
+}
+
 export class ChatHandler implements RuntimeEventHandler {
   public readonly kind = "chat" as const;
+  readonly #scheduler: ChatAttentionScheduler | undefined;
   readonly #listAgents: (topicId: string) => readonly LocalAgent[];
   readonly #freeTurnPrompt: ChatPromptResource;
   readonly #mentionedTurnPrompt: ChatPromptResource;
   readonly #chat: Pick<LocalChatStore, "messagePage">;
   readonly #admissionPolicy: ChatAttentionAdmissionPolicy | undefined;
   readonly #store: RuntimeStore;
+  readonly #listTaskClaims: ((messageId: string) => readonly Omit<ChatPromptTaskClaim, "sourceMessageEventId">[]) | undefined;
   readonly #resolveProfileContext: (
     agentId: string,
     topicId: string
@@ -47,6 +59,8 @@ export class ChatHandler implements RuntimeEventHandler {
   readonly #reportClientHistoryFailure: (agentId: string, error: unknown) => void;
 
   public constructor(options: {
+    readonly listTaskClaims?: (messageId: string) => readonly Omit<ChatPromptTaskClaim, "sourceMessageEventId">[];
+    readonly scheduler?: ChatAttentionScheduler;
     readonly store: RuntimeStore;
     readonly chat: Pick<LocalChatStore, "messagePage">;
     readonly listAgents: (topicId: string) => readonly LocalAgent[];
@@ -62,7 +76,9 @@ export class ChatHandler implements RuntimeEventHandler {
     ) => import("./prompt.js").ChatPromptContext["clientHistory"];
     readonly reportClientHistoryFailure?: (agentId: string, error: unknown) => void;
   }) {
+    this.#scheduler = options.scheduler;
     this.#store = options.store;
+    this.#listTaskClaims = options.listTaskClaims;
     this.#chat = options.chat;
     this.#listAgents = options.listAgents;
     this.#admissionPolicy = options.admissionPolicy;
@@ -84,13 +100,25 @@ export class ChatHandler implements RuntimeEventHandler {
     if (event?.type !== "chat.message" && event?.type !== "chat.activation") {
       throw new Error(`ChatHandler requires chat attention source: ${execution.eventId}`);
     }
-    const history = boundedChatPromptHistory(chatTimelineFromStore(
-      this.#chat,
-      event.topicId,
-      event.type === "chat.message"
-        ? { beforeEventId: event.eventId, limit: 10_000 }
-        : { limit: 10_000 }
-    ));
+    const prepared = this.prepare(event, at, undefined, !this.#scheduler?.accepts(event));
+    if (this.#scheduler?.accepts(event)) {
+      return this.#scheduler.ingest(execution, event, prepared.admissions, at);
+    }
+    return this.#store.admitChatAttention(execution.executionId, prepared.admissions, at)
+      .map((dispatch) => dispatch.eventId);
+  }
+
+  public prepare(event: ChatMessageEvent | ChatActivationEvent, at: string,
+    onlyAgentId?: string, render = true, historyThrough?: ChatMessageEvent): { admissions: readonly AdmitChatAttention[]; coveredMessageIds: readonly string[] } {
+    const timeline = !render ? {topicId: event.topicId, items: [], hasEarlier: false}
+      : chatTimelineFromStore(this.#chat, event.topicId,
+          event.type === "chat.message"
+            ? {beforeEventId: historyThrough?.eventId ?? event.eventId, limit: 10_000}
+            : {limit: 10_000});
+    const history = boundedChatPromptHistory({...timeline,
+      items: [...timeline.items.filter((item) => item.eventId !== event.eventId),
+        ...(historyThrough !== undefined && historyThrough.eventId !== event.eventId ? [historyThrough] : [])]
+    });
     const agents = this.#listAgents(event.topicId);
     const agentsById = new Map(agents.map((agent) => [agent.principalId, agent]));
     const admission = this.#admissionPolicy?.admitAttention(event, agents);
@@ -126,7 +154,9 @@ export class ChatHandler implements RuntimeEventHandler {
         ? []
         : candidates.filter(({ agentId }) => agentId === sequentialCandidateId);
     const plans = event.type === "chat.message"
-      ? planChatAttention({ message: event, candidates: eligibleCandidates, now: at })
+      ? planChatAttention({ message: onlyAgentId !== undefined && this.#scheduler?.accepts(event)
+          ? {...event, sender: {kind: "system", handleSnapshot: event.sender.handleSnapshot}}
+          : event, candidates: eligibleCandidates, now: at })
       : planChatActivation({ activation: event, candidates: eligibleCandidates, now: at });
     const conversationIntent = root?.type === "chat.activation"
       ? root.conversationIntent
@@ -139,9 +169,10 @@ export class ChatHandler implements RuntimeEventHandler {
               eligibleCandidates[0]?.agentId ?? candidates[0]?.agentId ?? ""
             )?.revision ?? 1
           };
-    return this.#store.admitChatAttention(
-      execution.executionId,
-      plans.map((plan) => plan.outcome === "skip"
+    return {
+      coveredMessageIds: [...history.items.map((item) => item.eventId),
+        ...(event.type === "chat.message" ? [event.eventId] : [])],
+      admissions: plans.filter((plan) => onlyAgentId === undefined || plan.agentId === onlyAgentId).map((plan) => !render || plan.outcome === "skip"
         ? { plan }
         : (() => {
             const prompt = plan.reason === "direct-mention"
@@ -165,7 +196,7 @@ export class ChatHandler implements RuntimeEventHandler {
               : this.#store.latestChatDispatch(event.topicId, plan.agentId);
             const previousDispatchSucceeded = previousDispatch !== undefined &&
               this.#store.executionForEvent(previousDispatch.eventId)?.status === "succeeded";
-            const promptHistory = !previousDispatchSucceeded
+            const promptHistory = this.#scheduler?.accepts(event) || !previousDispatchSucceeded
               ? history
               : incrementalChatPromptHistory(history, {
                   ...(previousDispatch.sourceMessageEventId === undefined
@@ -192,6 +223,7 @@ export class ChatHandler implements RuntimeEventHandler {
                 : {}),
               conversationIntent,
               history: promptHistory,
+              ...this.#taskClaims(event, promptHistory),
               tools: chatToolCapability(client === "kimi-code" ? "request" : "tools"),
               ...(event.type === "chat.message"
                 ? {
@@ -204,8 +236,36 @@ export class ChatHandler implements RuntimeEventHandler {
             })
             };
           })()),
-      at
-    ).map((dispatch) => dispatch.eventId);
+    };
+  }
+
+  #taskClaims(event: ChatMessageEvent | ChatActivationEvent,
+    history: ChatPromptContext["history"]): Pick<ChatPromptContext, "taskClaims" | "taskClaimsTruncated"> {
+    if (this.#listTaskClaims === undefined) return {};
+    const ownerIds = [...new Set([
+      ...(event.type === "chat.message" && event.sender.kind === "owner" ? [event.eventId] : []),
+      ...history.items.filter((item) => item.sender.kind === "owner").reverse().map((item) => item.eventId)
+    ])];
+    const taskClaims: ChatPromptTaskClaim[] = [];
+    let truncated = ownerIds.length > 64;
+    let bytes = 2;
+    for (const sourceMessageEventId of ownerIds.slice(0, 64)) {
+      for (const claim of this.#listTaskClaims(sourceMessageEventId)) {
+        const entry: ChatPromptTaskClaim = {
+          sourceMessageEventId, runId: claim.runId, dispatchEventId: claim.dispatchEventId,
+          agentId: claim.agentId, status: claim.status,
+          ...(claim.taskQuote === undefined ? {} : {taskQuote: claim.taskQuote})
+        };
+        const size = Buffer.byteLength(JSON.stringify(entry), "utf8") + 1;
+        if (taskClaims.length >= 64 || bytes + size > 65_536) {
+          truncated = true;
+          break;
+        }
+        taskClaims.push(entry);
+        bytes += size;
+      }
+    }
+    return {taskClaims, ...(truncated ? {taskClaimsTruncated: true} : {})};
   }
 
   #clientHistory(

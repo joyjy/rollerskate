@@ -104,6 +104,7 @@ export class KimiCodeRuntimeAgent implements RuntimeAgentAdapter {
     let result: RunnerTurnReceipt;
     try {
       result = await this.#client.invoke({
+        ...(input.reportOutput === undefined ? {} : {onOutput: input.reportOutput}),
         prompt: kimiPrompt(
           access === "write"
             ? this.#resources.kimiWritableAgent!

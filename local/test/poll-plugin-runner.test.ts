@@ -206,6 +206,49 @@ test("GitLabee reference plugin keeps pipeline planning and status mapping outsi
   });
 });
 
+test("canonical build pipeline source binds returned pipeline ID and expected SHA", async () => {
+  const plugin = resolve(
+    dirname(fileURLToPath(import.meta.url)),
+    "../../../examples/plugins/build-pipeline.ts"
+  );
+  const runner = new PollPluginRunner();
+  const context = {
+    subscriptionId: "pipeline-42",
+    attempt: 1,
+    startedAt: "2026-07-22T10:00:00.000Z",
+    deadlineAt: "2026-07-22T11:00:00.000Z"
+  };
+  const config = {
+    schemaVersion: "GitLabPipelineInput@1",
+    transport: {
+      kind: "command",
+      executable: realpathSync(process.execPath),
+      project: "group/project",
+      pipelineId: 42,
+      cwd: dirname(plugin)
+    },
+    expectedSha: "a".repeat(40)
+  };
+  assert.deepEqual(await runner.plan(plugin, "build-pipeline", config, context), {
+    kind: "command",
+    executable: realpathSync(process.execPath),
+    args: ["api", "projects/group%2Fproject/pipelines/42"],
+    cwd: dirname(plugin)
+  });
+  const matching = await runner.evaluate(plugin, "build-pipeline", config, context, {
+    kind: "command", exitCode: 0, stdout: JSON.stringify({id:42,status:"success",sha:"a".repeat(40)}), stderr: ""
+  });
+  assert.equal(matching.terminal, "success");
+  const mismatch = await runner.evaluate(plugin, "build-pipeline", config, context, {
+    kind: "command", exitCode: 0, stdout: JSON.stringify({id:42,status:"success",sha:"b".repeat(40)}), stderr: ""
+  });
+  assert.equal(mismatch.terminal, "failure");
+  assert.equal(mismatch.facts.shaMatches, false);
+  await assert.rejects(runner.evaluate(plugin, "build-pipeline", config, context, {
+    kind: "command", exitCode: 0, stdout: JSON.stringify({id:43,status:"success",sha:"a".repeat(40)}), stderr: ""
+  }), /does not match requested pipeline/u);
+});
+
 test("shell command completion plugin observes a fixed workspace receipt without rerunning the command", async () => {
   const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
   const plugin = resolve(repoRoot, "examples/plugins/shell-command-completion.ts");

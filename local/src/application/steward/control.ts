@@ -1,6 +1,13 @@
+import { runMonitorTarget } from "../subscription/run-monitor-target.js";
+import { RunMonitorStore } from "../../capabilities/subscription/run-monitor-store.js";
+import { validateRunResultDestination } from "./result-destination.js";
+import { assertExecutableGraph, parseRunGraph, type RunGraph } from "../../modules/steward/graph-contract.js";
+import { dispatchGraphReady, graphNodePrompt, graphActivePointer } from "./graph.js";
+import { stewardRunIntervention } from "./intervention.js";
 import type { AcceptanceContract } from "../../modules/steward/acceptance.js";
 import { supportsStewardClient, type StewardSelection } from "../../modules/steward/steward-policy.js";
 import { stewardDecisionVersion } from "../../modules/steward/caller-contract.js";
+import { stepMandateSnapshot } from "./control-support.js";
 import { realpathSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -24,12 +31,13 @@ import {
   workflowMandateSnapshot
 } from "../../infrastructure/resources/workflow-resource.js";
 import { runtimePaths } from "../../infrastructure/runtime/config.js";
-import { openRuntimeDatabase } from "../../infrastructure/sqlite/database.js";
+import { openRuntimeDatabase, openRuntimeDatabaseReadOnly } from "../../infrastructure/sqlite/database.js";
 import { AgentRunStore } from "../../infrastructure/sqlite/agent-run-store.js";
 import { LocalFoundationStore } from "../../infrastructure/sqlite/foundation-store.js";
 import { createVikunjaRunResultDestination } from
   "../../integrations/vikunja/task-destination.js";
 import {
+  planCallerRunDecision,
   newAgentRunId,
   newAgentRunCycleId,
   newAgentStepId,
@@ -38,6 +46,7 @@ import {
   type RunMandateSnapshot
 } from "../../modules/steward/state-machine.js";
 import {
+  isStewardOrchestrated,
   parseRunDecision,
   type AgentRunDecisionReceipt,
   type AnyRunDecision,
@@ -54,7 +63,7 @@ import {
   stewardTurnPrompt,
   type StewardDelegateTarget
 } from "./prompt.js";
-import { applyRunDecisionInTransaction } from "./decision.js";
+import { assertWorkspaceEffectSatisfied, applyRunDecisionInTransaction } from "./decision.js";
 import {
   queueStewardOrchestratorRetryInTransaction,
   stewardOrchestratorContinuationPrompt,
@@ -62,6 +71,7 @@ import {
 } from "./orchestrator-retry.js";
 
 export interface StartStewardRunInput {
+  readonly graph?: RunGraph;
   readonly requestId: string;
   readonly series?: {
     readonly key: string;
@@ -108,6 +118,8 @@ export interface StartStewardRunReceipt {
   readonly run: AgentRunProjection;
   readonly rootEventId: string;
   readonly executionId: string;
+  readonly subscriptionId?: string;
+  readonly monitoring?: { readonly status: "active" | "blocked" | "completed"; readonly latestError: string | null };
 }
 
 export interface CancelStewardRunReceipt {
@@ -132,6 +144,7 @@ export interface RetryStewardOrchestratorReceipt extends
 }
 
 export interface SubmitCallerRunDecisionInput {
+  readonly requireManualFallback?: boolean;
   readonly requestId: string;
   readonly decision: AnyRunDecision | Readonly<Record<string, unknown>>;
 }
@@ -225,7 +238,7 @@ function startStewardRunWithDatabase(
           client: agent.client
         }));
     if (requestedMode === "steward" && !supportsStewardClient(steward.client)) {
-      throw new Error("Steward orchestration requires an active Codex, Kimi, or Pi Agent");
+      throw new Error("Steward orchestration requires an active supported Agent");
     }
     if ((input.taskUrl !== undefined || input.resultDestination !== undefined) &&
       requestedMode !== "steward") {
@@ -296,7 +309,17 @@ function startStewardRunWithDatabase(
     foundation.close();
   }
 
-  const baseMandate = mandateSnapshot(input);
+  if (isStewardOrchestrated(orchestratorBinding) && orchestratorBinding.resultDestination) validateRunResultDestination(orchestratorBinding.resultDestination);
+  const graph = input.graph === undefined ? undefined : parseRunGraph(input.graph);
+  if (graph !== undefined) {
+    assertExecutableGraph(graph);
+    if (requestedMode !== "steward" || input.series !== undefined || input.workflowRef !== undefined || input.workspace?.access === "write") throw new Error("DAG execution requires a standalone read-only Steward Run");
+    if (graph.nodes.length > (input.maxSteps ?? 20)) throw new Error("DAG exceeds the admitted step budget");
+    for (const ref of Object.values(graph.participants)) {
+      if (!ref.startsWith("principal:") || !participantAgentIds?.includes(ref.slice(10))) throw new Error("DAG requires resolved admitted principals");
+    }
+  }
+  const baseMandate = {...mandateSnapshot(input), ...(graph === undefined ? {} : {graph})};
   const mandate: RunMandateSnapshot = participantAgentIds === undefined
     ? baseMandate
     : { ...baseMandate, participantAgentIds };
@@ -331,6 +354,7 @@ function startStewardRunWithDatabase(
     Date.parse(iso(input.deadlineAt)) <= Date.parse(timestamp)) {
     throw new Error("deadlineAt must be in the future");
   }
+  const graphDeadline = graph === undefined ? undefined : new Date(Math.min(Date.parse(timestamp) + graph.limits.timeoutSeconds * 1000, input.deadlineAt === undefined ? Infinity : Date.parse(input.deadlineAt))).toISOString();
   const requestId = text(input.requestId, "requestId", 256);
   const seriesKey = input.series === undefined
     ? undefined
@@ -338,7 +362,8 @@ function startStewardRunWithDatabase(
   const sourceRevision = input.series === undefined
     ? undefined
     : text(input.series.sourceRevision, "series.sourceRevision", 512);
-  const rootPrompt = requestedMode === "steward"
+  const firstNode = graph?.nodes.find(node => node.needs.length === 0);
+  const rootPrompt = firstNode !== undefined ? graphNodePrompt(firstNode, []) : requestedMode === "steward"
     ? stewardOrchestratorPrompt({
         objective: mandate.kind === "objective"
           ? mandate.objective
@@ -349,7 +374,7 @@ function startStewardRunWithDatabase(
         currentNetworkAccess: workspaceGrant?.networkAccess ?? false,
         participants: participantTargets,
         contractVersion: stewardDecisionVersion(orchestratorBinding),
-        ...(orchestratorBinding?.schemaVersion !== "OrchestratorBinding@3" ? {} : {acceptanceContract: orchestratorBinding.acceptanceContract}),
+        ...(orchestratorBinding?.schemaVersion !== "OrchestratorBinding@3" ? {} : {acceptanceContract: orchestratorBinding.acceptanceContract, workerAgentId: orchestratorBinding.authority.workerAgentId}),
         ...(orchestratorBinding?.schemaVersion !== "OrchestratorBinding@3" ||
           orchestratorBinding.authority.trigger === undefined
           ? {}
@@ -401,7 +426,7 @@ function startStewardRunWithDatabase(
           kind: "cli",
           externalId: `agent-run:${requestId}`
         },
-        agentId: stewardAgentId,
+        agentId: firstNode === undefined ? stewardAgentId : graph!.participants[firstNode.executor]!.slice(10),
         prompt: rootPrompt,
         ...(cycleSession === undefined ? {} : { sessionId: cycleSession.sessionId }),
         ...(existingSeries === undefined
@@ -415,7 +440,8 @@ function startStewardRunWithDatabase(
             }),
         runContext: {
           schemaVersion: "AgentRunContext@1",
-          resultContractId: requestedMode === "steward"
+          ...(graph === undefined ? {} : {invocationBudget: {schemaVersion: "AgentInvocationBudget@1" as const, totalTimeoutMilliseconds: Math.min(900_000, Date.parse(graphDeadline!) - Date.parse(timestamp))}}),
+          resultContractId: graph !== undefined ? "agent-step-result@1" : requestedMode === "steward"
             ? orchestratorBinding!.decisionContractId
             : requestedMode === "caller"
               ? "agent-step-result@1"
@@ -446,7 +472,7 @@ function startStewardRunWithDatabase(
           orchestratorBinding,
           maxSteps: input.maxSteps ?? 20,
           maxDepth,
-          deadlineAt: input.deadlineAt
+          deadlineAt: graph === undefined ? input.deadlineAt : existing.deadlineAt
         });
         return {
           status: "duplicate",
@@ -466,7 +492,7 @@ function startStewardRunWithDatabase(
           sourceRevision: sourceRevision!,
           mandate,
           ...(workspaceGrant === undefined ? {} : { workspaceGrant }),
-          initialStepCount: requestedMode === "steward" ? 0 : 1,
+          initialStepCount: graph !== undefined ? 1 : requestedMode === "steward" ? 0 : 1,
           createdAt: timestamp
         });
         const run = runs.activateCycleInTransaction({
@@ -506,12 +532,12 @@ function startStewardRunWithDatabase(
         ...(workspaceGrant === undefined ? {} : { workspaceGrant }),
         ...(orchestratorBinding === undefined ? {} : { orchestratorBinding }),
         rootStepId,
-        initialStepCount: requestedMode === "steward" ? 0 : 1,
+        initialStepCount: graph !== undefined ? 1 : requestedMode === "steward" ? 0 : 1,
         maxSteps: input.maxSteps ?? 20,
         maxDepth,
-        ...(input.deadlineAt === undefined
-          ? {}
-          : { deadlineAt: iso(input.deadlineAt) }),
+        ...(graph === undefined ? (input.deadlineAt === undefined ? {} : {deadlineAt: iso(input.deadlineAt)}) : {
+          deadlineAt: graphDeadline!
+        }),
         createdAt: timestamp
       });
       if (cycleId !== undefined) {
@@ -522,22 +548,60 @@ function startStewardRunWithDatabase(
           sourceRevision: sourceRevision!,
           mandate,
           ...(workspaceGrant === undefined ? {} : { workspaceGrant }),
-          initialStepCount: requestedMode === "steward" ? 0 : 1,
+          initialStepCount: graph !== undefined ? 1 : requestedMode === "steward" ? 0 : 1,
           createdAt: timestamp
         });
       }
+      const states = graph === undefined ? undefined : dispatchGraphReady(run, runs, runtime, timestamp);
+      const started = states === undefined ? run : runs.advanceGraphInTransaction(run,
+        states.filter(state => state.request !== undefined).length, timestamp, undefined, graphActivePointer(states, runtime));
       return {
         status: "accepted",
-        run,
+        run: started,
         rootEventId: admission.event.eventId,
         executionId: admission.execution.executionId
       };
     };
-    return ownTransaction ? runtime.withImmediateTransaction(operation) : operation();
+    const admitted = (): StartStewardRunReceipt => {
+      const result = operation();
+      const monitors = new RunMonitorStore(database);
+      let subscription = monitors.createInTransaction(result.run.runId, timestamp);
+      if (!runMonitorTarget(database,result.run)) subscription = monitors.setStatusInTransaction(subscription.subscriptionId,
+        "blocked", "origin_session_unbound: no immutable return target", timestamp);
+      return {...result, subscriptionId: subscription.subscriptionId,
+        monitoring:{status:subscription.status,latestError:subscription.latestError}};
+    };
+    return ownTransaction ? runtime.withImmediateTransaction(admitted) : admitted();
   } finally {
     runs.close();
     runtime.close();
   }
+}
+
+/** Read-only preflight. Submission repeats the authoritative checks in its transaction. */
+export function validateCallerRunDecision(
+  repoRoot: string, runId: string, raw: unknown, runtimeDirectory?: string,
+  at = new Date().toISOString()
+) {
+  const decision = parseRunDecision(raw);
+  if (decision.schemaVersion !== "RunDecision@1") throw new Error("Manual Owner must submit RunDecision@1");
+  const database = openRuntimeDatabaseReadOnly(runtimePaths(repoRoot, runtimeDirectory).database);
+  const runs = new AgentRunStore(database, { migrate: false });
+  const foundation = new LocalFoundationStore(database, { migrate: false });
+  try {
+    const run = runs.requireProjection(runId);
+    if (run.orchestratorBinding?.callerRef.principalId !== foundation.foundation()?.owner.principalId) {
+      throw new Error("RunDecision caller is not the admitted Local Owner");
+    }
+    if ((run.checkpoint?.stepId ?? run.activeStepId) === undefined) throw new Error("Run has no current decision source");
+    const plan = planCallerRunDecision({run, decision, now: at});
+    assertWorkspaceEffectSatisfied(run, plan);
+    if (decision.action === "next_step" && plan.kind === "next_step") {
+      runs.requireActiveAgent(plan.targetAgentId);
+      stepMandateSnapshot(decision.nextStep.mandate);
+    }
+    return {status: "valid" as const, runId, runVersion: run.version, action: decision.action};
+  } finally { runs.close(); foundation.close(); database.close(); }
 }
 
 export function submitCallerRunDecision(
@@ -580,6 +644,10 @@ export function submitCallerRunDecision(
       if (run.orchestratorBinding?.callerRef.principalId !== ownerPrincipalId) {
         throw new Error("RunDecision caller is not the admitted Local Owner");
       }
+      if (input.requireManualFallback && !stewardRunIntervention(run,
+        runtime.eventsForRoot(run.rootEventId).filter((event): event is AgentRequestEvent => event.type === "agent.request"), runtime, timestamp)) {
+        throw new Error("Run no longer has a settled manual recovery; refresh the original card");
+      }
       return applyRunDecisionInTransaction({
         runtime,
         runs,
@@ -601,22 +669,26 @@ export function cancelStewardRun(
   repoRoot: string,
   runId: string,
   runtimeDirectory?: string,
-  at = new Date().toISOString()
+  at = new Date().toISOString(),
+  expectedVersion?: number
 ): CancelStewardRunReceipt {
   const database = openRuntimeDatabase(runtimePaths(repoRoot, runtimeDirectory).database);
   const runtime = new RuntimeStore(database);
   try {
-    return runtime.withImmediateTransaction(() => cancelStewardRunInTransaction(database, runId, at));
+    return runtime.withImmediateTransaction(() => cancelStewardRunInTransaction(database, runId, at, expectedVersion));
   } finally {
     runtime.close();
     database.close();
   }
 }
 
-export function cancelStewardRunInTransaction(database: DatabaseSync, runId: string, at: string): CancelStewardRunReceipt {
+export function cancelStewardRunInTransaction(database: DatabaseSync, runId: string, at: string, expectedVersion?: number): CancelStewardRunReceipt {
   const runtime = new RuntimeStore(database);
   const runs = new AgentRunStore(database);
   try {
+    if (expectedVersion !== undefined && runs.requireProjection(runId).version !== expectedVersion) {
+      throw new Error("Run version changed; read the Run again before cancelling");
+    }
     const cancelled = runs.cancelInTransaction(runId, at);
     if (!cancelled.changed) {
       return {
@@ -641,19 +713,20 @@ export function retryStewardOrchestrator(
   runId: string,
   requestIdInput: string,
   runtimeDirectory?: string,
-  at = new Date().toISOString()
+  at = new Date().toISOString(),
+  expectedVersion?: number
 ): RetryStewardOrchestratorReceipt {
   const database = openRuntimeDatabase(runtimePaths(repoRoot, runtimeDirectory).database);
   const runtime = new RuntimeStore(database);
   try {
-    return runtime.withImmediateTransaction(() => retryStewardOrchestratorInTransaction(database, runId, requestIdInput, at));
+    return runtime.withImmediateTransaction(() => retryStewardOrchestratorInTransaction(database, runId, requestIdInput, at, expectedVersion));
   } finally {
     runtime.close();
     database.close();
   }
 }
 
-export function retryStewardOrchestratorInTransaction(database: DatabaseSync, runId: string, requestIdInput: string, at: string): RetryStewardOrchestratorReceipt {
+export function retryStewardOrchestratorInTransaction(database: DatabaseSync, runId: string, requestIdInput: string, at: string, expectedVersion?: number): RetryStewardOrchestratorReceipt {
   const requestId = text(requestIdInput, "requestId", 256);
   const timestamp = iso(at);
   const runtime = new RuntimeStore(database);
@@ -682,6 +755,7 @@ export function retryStewardOrchestratorInTransaction(database: DatabaseSync, ru
         run
       };
     }
+    if (expectedVersion !== undefined && run.version !== expectedVersion) throw new Error("Run version changed; read the Run again before retrying");
     if (run.status !== "awaiting_orchestrator" || run.activeStepId === undefined ||
       run.stepCount !== 0 ||
       run.checkpoint !== undefined || run.workspaceGrant?.access === "write") {

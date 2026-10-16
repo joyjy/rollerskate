@@ -341,6 +341,7 @@ function agentRunContext(
       : { cycleId: requirePayloadText(value.cycleId, eventId, "cycleId") }),
     stepId: requirePayloadText(value.stepId, eventId, "stepId"),
     depth: payloadInteger(value.depth, eventId, "depth", 0),
+    ...(value.invocationBudget === undefined ? {} : {invocationBudget: invocationBudget(value.invocationBudget, eventId)}),
     ...(value.parentStepId === undefined
       ? {}
       : {
@@ -569,4 +570,12 @@ function requirePayloadText(
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function invocationBudget(value: unknown, eventId: string): import("../../../core/runtime/model.js").AgentInvocationBudget {
+  if (!isRecord(value) || value.schemaVersion !== "AgentInvocationBudget@1" ||
+    !Number.isInteger(value.totalTimeoutMilliseconds) || (value.totalTimeoutMilliseconds as number) < 1 || (value.totalTimeoutMilliseconds as number) > 900_000) {
+    throw new Error(`Agent invocation budget is malformed: ${eventId}`);
+  }
+  return {schemaVersion: "AgentInvocationBudget@1", totalTimeoutMilliseconds: value.totalTimeoutMilliseconds as number};
 }

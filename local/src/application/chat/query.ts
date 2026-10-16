@@ -27,7 +27,7 @@ export interface ChatTimelineOptions {
 export interface ChatMessageView extends ChatMessageSummary {
   readonly readProgress?: ChatReadProgress;
   readonly runProposals?: readonly ChatRunProposalView[];
-  readonly works?: readonly import("../steward/work-query.js").StewardWorkView[];
+  readonly works?: readonly import("./work-query.js").ChatWorkView[];
 }
 
 export interface ChatMessageViewPage {

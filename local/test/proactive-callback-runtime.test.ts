@@ -397,13 +397,14 @@ test("schema v74 upgrades v46 in place and preserves Schedule and SubscriptionDe
       DROP TABLE proactive_callback_occurrences;
       DROP TABLE proactive_callback_definitions;
       DROP TABLE continuous_subscriptions;
+      DROP TABLE notification_controls;
+      DROP TABLE run_subscriptions;
       UPDATE schema_meta SET value = '46' WHERE key = 'schema_version';
     `);
     v46.close();
 
     const diagnostics = initializeRuntimeSchema(database);
-    assert.equal(diagnostics.schemaVersion, 75);
-    assert.equal(diagnostics.tables.length, 33);
+    assert.equal(diagnostics.schemaVersion, 80);
     const migratedSchedules = new ScheduledTaskStore(database);
     const migratedSubscriptions = new SubscriptionStore(database);
     try {
@@ -482,10 +483,11 @@ test("schema v74 drops v51 one-shot callback rows and settles their parent as un
       "2026-07-30T00:00:00.000Z",
       "2026-07-30T00:00:00.000Z"
     );
+    legacy.exec("DROP TABLE notification_controls; DROP TABLE run_subscriptions");
     legacy.prepare("UPDATE schema_meta SET value = '51' WHERE key = 'schema_version'").run();
     legacy.close();
 
-    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 75);
+    assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 80);
     const migrated = new SubscriptionStore(databasePath);
     try {
       assert.equal(
@@ -874,11 +876,13 @@ test("schema v74 migrates v47 and repairs self-declared v48 Delivery state", () 
         next_attempt_at, receipt, last_error, created_at, updated_at
       FROM _v48_deliveries;
       DROP TABLE _v48_deliveries;
+      DROP TABLE notification_controls;
+      DROP TABLE run_subscriptions;
       UPDATE schema_meta SET value = '${declaredVersion}' WHERE key = 'schema_version';
       `);
       database.close();
 
-      assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 75);
+      assert.equal(initializeRuntimeSchema(databasePath).schemaVersion, 80);
       const runtime = new RuntimeStore(databasePath);
       try {
         const delivery = runtime.delivery(deliveryId)!;

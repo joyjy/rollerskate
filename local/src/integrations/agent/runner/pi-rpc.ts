@@ -120,7 +120,7 @@ export class PiRpcRunner implements AgentRunner {
         })();
       };
 
-      const terminate = (reason: RunnerTerminationReason, message: string) => {
+      const terminate = (reason: RunnerTerminationReason, message: string, rejectedBeforeWork = false) => {
         if (settled) return;
         progress.phase(reason === "protocol_exit" ? "terminated" : "cancelling");
         const protocolStop = reason === "protocol_exit" || child.stdin.destroyed
@@ -131,6 +131,7 @@ export class PiRpcRunner implements AgentRunner {
         }
         finish(runnerInvocationFailure({
           message,
+          rejectedBeforeWork: rejectedBeforeWork && toolEventsComplete,
           progress,
           reason,
           totalTimeoutMilliseconds,
@@ -159,9 +160,21 @@ export class PiRpcRunner implements AgentRunner {
         onMessage: (value): boolean => {
           if (settled) return false;
           if (!isRecord(value)) return false;
+          if (value.type === "message_end" && isRecord(value.message) && value.message.role === "assistant" &&
+            value.message.stopReason === "error" && typeof value.message.errorMessage === "string") {
+            terminate("protocol_error", `pi provider request failed: ${value.message.errorMessage}`, true);
+            return true;
+          }
           const progressEvent = piProgress(value);
           if (progressEvent !== undefined) {
             progress.observe(progressEvent.kind, progressEvent.meaningful);
+            if (progressEvent.kind === "thought") request.onOutput?.({kind: "thought"});
+            else if (value.type === "message_update" && isRecord(value.assistantMessageEvent) &&
+              value.assistantMessageEvent.type === "text_delta") {
+              request.onOutput?.({kind: "assistant.delta", data: {text: value.assistantMessageEvent.delta}});
+            } else if (progressEvent.kind === "tool") {
+              request.onOutput?.({kind: value.type === "tool_execution_start" ? "tool.call" : value.type === "tool_execution_end" ? "tool.result" : "tool.update", data: value});
+            }
             if (progressEvent.meaningful) resetMeaningfulTimeout();
           }
           if (value.type === "response") {
@@ -172,7 +185,7 @@ export class PiRpcRunner implements AgentRunner {
                 return true;
               }
               if (value.success !== true) {
-                terminate("protocol_error", `pi RPC get_state failed: ${responseError(value)}`);
+                terminate("protocol_error", `pi RPC get_state failed: ${responseError(value)}`, true);
                 return true;
               }
               if (isRecord(value.data) && typeof value.data.sessionId === "string") {
@@ -194,7 +207,7 @@ export class PiRpcRunner implements AgentRunner {
                 return true;
               }
               if (value.success !== true) {
-                terminate("protocol_error", `pi RPC prompt failed: ${responseError(value)}`);
+                terminate("protocol_error", `pi RPC prompt failed: ${responseError(value)}`, true);
                 return true;
               }
               pendingRequest = undefined;
@@ -207,6 +220,7 @@ export class PiRpcRunner implements AgentRunner {
           }
           const includeAgentEnd = value.type !== "agent_end" || !assistantMessageSeen;
           for (const event of piRunnerEvents(value, includeAgentEnd)) {
+            if (event.type === "assistant.message") request.onOutput?.({kind: "assistant.message", data: event.message});
             if (event.type === "assistant.message") {
               assistantMessageSeen = true;
               assistantBytes += Buffer.byteLength(event.message.text, "utf8");

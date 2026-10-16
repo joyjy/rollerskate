@@ -29,6 +29,23 @@ test("loopback Console API manages local Agents without Server login", async () 
       foundation: { topicId: string };
     }).foundation.topicId;
 
+    for (const action of ["confirm-recovery", "retry-orchestrator"]) {
+      const recovery = await jsonRequest(`${origin}/api/runs/run-missing/${action}`, {
+        method: "POST", body: JSON.stringify({})
+      });
+      assert.equal(recovery.response.status, 403);
+    }
+    const invalidRecovery = await jsonRequest(`${origin}/api/runs/run-missing/confirm-recovery`, {
+      method: "POST", headers: consoleHeaders(), body: JSON.stringify({})
+    });
+    assert.equal(invalidRecovery.response.status, 400);
+    assert.match(String((invalidRecovery.body as {error: string}).error), /revision/);
+    const invalidRetry = await jsonRequest(`${origin}/api/runs/run-missing/retry-orchestrator`, {
+      method: "POST", headers: consoleHeaders(), body: JSON.stringify({requestId: "retry"})
+    });
+    assert.equal(invalidRetry.response.status, 400);
+    assert.match(String((invalidRetry.body as {error: string}).error), /expectedVersion/);
+
     const rejected = await jsonRequest(`${origin}/api/agents`, {
       method: "POST",
       body: JSON.stringify({ handle: "alice" })
@@ -278,19 +295,11 @@ test("loopback Console API manages local Agents without Server login", async () 
       { method: "POST" }
     );
     assert.equal(rejectedHandoff.response.status, 403);
-    const handedOff = await jsonRequest(
+    const removedHandoff = await jsonRequest(
       `${origin}/api/chat/messages/${sourceEventId}/run`,
       { method: "POST", headers: consoleHeaders() }
     );
-    assert.equal(handedOff.response.status, 201);
-    assert.equal((handedOff.body as {
-      run: { orchestratorBinding?: { schemaVersion: string } };
-    }).run.orchestratorBinding?.schemaVersion, "OrchestratorBinding@3");
-    const duplicateHandoff = await jsonRequest(
-      `${origin}/api/chat/messages/${sourceEventId}/run`,
-      { method: "POST", headers: consoleHeaders() }
-    );
-    assert.equal((duplicateHandoff.body as { status: string }).status, "duplicate");
+    assert.equal(removedHandoff.response.status, 405);
 
     const rotated = await jsonRequest(
       `${origin}/api/chat/agents/${alice.principalId}/new-session`,

@@ -277,6 +277,30 @@ test("Kimi Code rejects malformed or out-of-range Run deadlines", async () => {
   );
 });
 
+test("Kimi Code marks a network rejection safe only before tool or permission activity", async () => {
+  for (const networkRejection of ["before-work", "after-tool", "after-permission"] as const) {
+    const fixture = kimiFixture({ networkRejection });
+    const agent = new KimiCodeRuntimeAgent({
+      executable: fixture.executable,
+      projectRoot: fixture.workspace,
+      environment: {},
+      timeoutMilliseconds: 5_000
+    });
+    await assert.rejects(agent.invoke({ event: runEvent() }), (error: unknown) => {
+      assert.ok(error instanceof AgentInvocationError);
+      assert.match(error.message, /HTTP 503 Service unavailable/);
+      assert.equal(error.failure.reason, "protocol_error");
+      assert.equal(error.failure.rejectedBeforeWork, networkRejection === "before-work" ? true : undefined);
+      assert.equal(error.failure.meaningfulUpdateCount, networkRejection === "before-work" ? 0 : 1);
+      if (networkRejection !== "before-work") assert.deepEqual(error.failure.lastProgress, { kind: "tool" });
+      return true;
+    });
+    if (networkRejection === "after-permission") {
+      assert.ok(invocation(fixture.invocation).messages.some(message => message.id === "permission" && message.result));
+    }
+  }
+});
+
 test("Kimi Code distinguishes provider cancellation from protocol exit", async () => {
   const cancelledFixture = kimiFixture({ cancelled: true });
   const cancelledAgent = new KimiCodeRuntimeAgent({
@@ -366,6 +390,7 @@ test("Kimi ACP launch args reject controls other than model selection", () => {
 });
 
 function kimiFixture(options: {
+  readonly networkRejection?: "before-work" | "after-tool" | "after-permission";
   readonly toolKind?: "read" | "edit";
   readonly oversizedTraceBytes?: number;
   readonly multipleMessages?: boolean;
@@ -388,6 +413,9 @@ let promptRequest;
 const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
 const update = (value) => send({ jsonrpc: "2.0", method: "session/update", params: {
   sessionId: "session_fixture", update: value
+}});
+const rejectPrompt = () => send({ jsonrpc: "2.0", id: promptRequest.id, error: {
+  code: -32603, message: "HTTP 503 Service unavailable"
 }});
 const completePrompt = () => {
   ${options.multipleMessages === true ? `update({ sessionUpdate: "agent_message_chunk", messageId: "first", content: { type: "text", text: "checking" } });` : ""}
@@ -422,7 +450,10 @@ process.stdin.on("data", (chunk) => {
     }
     if (message.method === "session/prompt") {
       promptRequest = message;
-      ${options.cancelled === true ? `send({ jsonrpc: "2.0", id: promptRequest.id, result: { stopReason: "cancelled" } });` : options.exitBeforeSettlement === true ? `process.exit(143);` : options.stall === true ? `setInterval(() => update({ sessionUpdate: "session_info_update", title: "noise" }), 5);` : options.meaningfulThenCompleteMilliseconds !== undefined ? `const updates = setInterval(() => update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "thinking fixture" } }), 50);
+      ${options.networkRejection !== undefined ? options.networkRejection === "after-permission" ? `send({ jsonrpc: "2.0", id: "permission", method: "session/request_permission", params: {
+        sessionId: "session_fixture", toolCall: { toolCallId: "tool_1", kind: "read" },
+        options: [{ optionId: "allow-once", name: "Allow", kind: "allow_once" }]
+      }});` : `${options.networkRejection === "after-tool" ? `update({ sessionUpdate: "tool_call", toolCallId: "tool_1", title: "Read fixture", kind: "read", status: "pending" });` : ""} rejectPrompt();` : options.cancelled === true ? `send({ jsonrpc: "2.0", id: promptRequest.id, result: { stopReason: "cancelled" } });` : options.exitBeforeSettlement === true ? `process.exit(143);` : options.stall === true ? `setInterval(() => update({ sessionUpdate: "session_info_update", title: "noise" }), 5);` : options.meaningfulThenCompleteMilliseconds !== undefined ? `const updates = setInterval(() => update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "thinking fixture" } }), 50);
       setTimeout(() => {
         clearInterval(updates);
         completePrompt();
@@ -438,7 +469,7 @@ process.stdin.on("data", (chunk) => {
       }});`}
     }
     if (message.method === "session/cancel") process.exit(0);
-    if (message.id === "permission" && message.result) completePrompt();
+    if (message.id === "permission" && message.result) ${options.networkRejection === "after-permission" ? "rejectPrompt();" : "completePrompt();"}
   }
 });
 `);

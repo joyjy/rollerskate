@@ -27,12 +27,29 @@ export interface RegisteredSubscriptionPlugin {
   readonly triggerKinds: readonly ("until" | "continuous")[];
   readonly allowedHttpOrigins: readonly string[];
   readonly allowedExecutables: readonly string[];
+  readonly gitlabPipeline?: {
+    readonly inputSchema: "GitLabPipelineInput@1";
+    readonly transport: {
+      readonly kind: "command";
+      readonly executable: string;
+      readonly cwd?: string;
+    };
+  };
 }
 
 export function listRegisteredSubscriptionPlugins(
   repoRoot: string,
   runtimeDirectory?: string
 ): readonly RegisteredSubscriptionPlugin[] {
+  const paths = runtimePaths(repoRoot, runtimeDirectory);
+  const plugins = readPluginEntries(repoRoot, runtimeDirectory)
+    .map((value, index) => parsePlugin(value, index, paths.repoRoot, paths.workspace));
+  unique(plugins.map(({ ref }) => ref), "plugin ref");
+  unique(plugins.map(({ id }) => id), "plugin id");
+  return plugins.sort((left, right) => left.ref.localeCompare(right.ref));
+}
+
+function readPluginEntries(repoRoot: string, runtimeDirectory?: string): Record<string, unknown>[] {
   const paths = runtimePaths(repoRoot, runtimeDirectory);
   if (!existsSync(paths.subscriptionPlugins)) return [];
   const stat = statSync(paths.subscriptionPlugins);
@@ -48,15 +65,7 @@ export function listRegisteredSubscriptionPlugins(
   if (registry.plugins.length > 64) {
     throw new Error("Subscription plugin registry exceeds 64 plugins");
   }
-  const plugins = registry.plugins.map((value, index) => parsePlugin(
-    value,
-    index,
-    paths.repoRoot,
-    paths.workspace
-  ));
-  unique(plugins.map(({ ref }) => ref), "plugin ref");
-  unique(plugins.map(({ id }) => id), "plugin id");
-  return plugins.sort((left, right) => left.ref.localeCompare(right.ref));
+  return registry.plugins.map((value, index) => record(value, `plugins[${index}]`));
 }
 
 export function resolveRegisteredSubscriptionPlugin(
@@ -64,8 +73,15 @@ export function resolveRegisteredSubscriptionPlugin(
   ref: string,
   runtimeDirectory?: string
 ): RegisteredSubscriptionPlugin | undefined {
-  return listRegisteredSubscriptionPlugins(repoRoot, runtimeDirectory)
-    .find((plugin) => plugin.ref === ref);
+  const paths = runtimePaths(repoRoot, runtimeDirectory);
+  const entries = readPluginEntries(repoRoot, runtimeDirectory);
+  const index = entries.findIndex((plugin) => plugin.ref === ref);
+  if (index === -1) return undefined;
+  const plugin = parsePlugin(entries[index], index, paths.repoRoot, paths.workspace);
+  if (entries.filter((entry) => entry.ref === plugin.ref || entry.pluginId === plugin.id).length !== 1) {
+    throw new Error("Selected plugin ref and id must be unique");
+  }
+  return plugin;
 }
 
 export function registeredPluginsForTrigger(
@@ -88,8 +104,8 @@ function parsePlugin(
   const plugin = record(value, label);
   exactKeys(plugin, [
     "ref", "pluginPath", "pluginId", "workspaceRef", "triggerKinds",
-    "allowedHttpOrigins", "allowedExecutables"
-  ], label);
+    "allowedHttpOrigins", "allowedExecutables", "gitlabPipeline"
+  ], label, ["gitlabPipeline"]);
   const ref = text(plugin.ref, `${label}.ref`, 256);
   if (!/^plugin:[a-z0-9][a-z0-9._-]*@[1-9][0-9]*$/.test(ref)) {
     throw new Error(`${label}.ref must be a stable versioned plugin ref`);
@@ -123,10 +139,43 @@ function parsePlugin(
       64
     ).map((executable) => canonicalFile(executable, `${label}.allowedExecutables`)).sort()
   };
+  const gitlabPipeline = plugin.gitlabPipeline === undefined ? undefined : parseGitLabPipeline(
+    plugin.gitlabPipeline,
+    label,
+    registered.allowedExecutables
+  );
   return {
     ...registered,
     authorityDigest: `sha256:${createHash("sha256")
-      .update(stableContractJson(registered)).digest("hex")}`
+      .update(stableContractJson({...registered, ...(gitlabPipeline === undefined ? {} : {gitlabPipeline})})).digest("hex")}`,
+    ...(gitlabPipeline === undefined ? {} : { gitlabPipeline })
+  };
+}
+
+function parseGitLabPipeline(
+  value: unknown,
+  label: string,
+  allowedExecutables: readonly string[]
+): NonNullable<RegisteredSubscriptionPlugin["gitlabPipeline"]> {
+  const declaration = record(value, `${label}.gitlabPipeline`);
+  exactKeys(declaration, ["inputSchema", "transport"], `${label}.gitlabPipeline`);
+  if (declaration.inputSchema !== "GitLabPipelineInput@1") {
+    throw new Error(`${label}.gitlabPipeline.inputSchema must be GitLabPipelineInput@1`);
+  }
+  const transport = record(declaration.transport, `${label}.gitlabPipeline.transport`);
+  exactKeys(transport, ["kind", "executable", "cwd"], `${label}.gitlabPipeline.transport`, ["cwd"]);
+  if (transport.kind !== "command") throw new Error(`${label}.gitlabPipeline.transport.kind must be command`);
+  const executable = canonicalFile(text(transport.executable, `${label}.gitlabPipeline.transport.executable`, 4_096), `${label}.gitlabPipeline.transport.executable`);
+  if (!allowedExecutables.includes(executable)) {
+    throw new Error(`${label}.gitlabPipeline.transport.executable must be in allowedExecutables`);
+  }
+  return {
+    inputSchema: "GitLabPipelineInput@1",
+    transport: {
+      kind: "command",
+      executable,
+      ...(transport.cwd === undefined ? {} : { cwd: text(transport.cwd, `${label}.gitlabPipeline.transport.cwd`, 4_096) })
+    }
   };
 }
 
@@ -215,11 +264,12 @@ function record(value: unknown, field: string): Record<string, unknown> {
 function exactKeys(
   value: Readonly<Record<string, unknown>>,
   allowed: readonly string[],
-  field: string
+  field: string,
+  optional: readonly string[] = []
 ): void {
   const unknown = Object.keys(value).find((key) => !allowed.includes(key));
   if (unknown !== undefined) throw new Error(`${field} has unknown field: ${unknown}`);
-  const missing = allowed.find((key) => value[key] === undefined);
+  const missing = allowed.find((key) => value[key] === undefined && !optional.includes(key));
   if (missing !== undefined) throw new Error(`${field} is missing field: ${missing}`);
 }
 

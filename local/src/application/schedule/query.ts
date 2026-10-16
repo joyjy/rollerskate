@@ -296,10 +296,14 @@ export function scheduleSummaryView(inspection: ScheduleInspection): ScheduleSum
   const revision = inspection.schedule.revision;
   const runCounts = emptyRunCounts();
   for (const { run } of inspection.runs) runCounts[run.status] += 1;
+  const waitingOnce = revision.kind === "once" && inspection.runs.some(({ run }) =>
+    run.status === "queued" && run.eventId === undefined && run.cycleId === undefined);
+  const pendingCompletion = definition.status === "completed" && waitingOnce;
   return {
     scheduleId: definition.scheduleId,
     status: definition.status,
-    statusReason: scheduleStatusReason(definition.status),
+    statusReason: pendingCompletion ? "The one-shot time was consumed; its occurrence is still waiting for admission." :
+      scheduleStatusReason(definition.status),
     currentRevision: definition.currentRevision,
     nextRunAt: definition.nextRunAt ?? null,
     nextOccurrenceMissing: definition.nextOccurrenceMissing,
@@ -318,11 +322,11 @@ export function scheduleSummaryView(inspection: ScheduleInspection): ScheduleSum
     target: revision.schemaVersion === "ScheduleRevision@3" ? revision.target : null,
     runCounts,
     availableActions: {
-      pause: definition.status === "active",
+      pause: definition.status === "active" || pendingCompletion,
       resume: definition.status === "paused",
-      cancel: definition.status === "active" || definition.status === "paused",
+      cancel: definition.status === "active" || definition.status === "paused" || pendingCompletion,
       runNow: definition.status === "active" || definition.status === "paused",
-      archive: definition.archivedAt === undefined &&
+      archive: definition.archivedAt === undefined && !waitingOnce &&
         (definition.status === "completed" || definition.status === "cancelled"),
       unarchive: definition.archivedAt !== undefined
     },
@@ -448,6 +452,15 @@ function scheduleStatusReason(status: ScheduleStatus): string {
 }
 
 function runStatusReason(status: ScheduledRunStatus, reason?: string): string {
+  const waiting: Record<string, string> = {
+    "waiting-awake": "Waiting for a normal wake; DarkWake does not admit work.",
+    "waiting-power-probe": "Waiting for a readable interactive power state.",
+    "waiting-network": "Waiting for Codex network transport.",
+    "waiting-desktop": "Waiting for the exact Desktop thread owner.",
+    "waiting-readiness-probe": "Waiting for a successful readiness probe.",
+    "reminder-expired": "The reminder expired before admission; it will not be sent."
+  };
+  if (reason !== undefined && waiting[reason] !== undefined) return waiting[reason]!;
   if (status === "queued") return "The run is waiting for Event admission.";
   if (status === "running") return "The admitted Event is still executing.";
   if (reason !== undefined) return reason;

@@ -13,6 +13,9 @@ import {
 } from "../../application/schedule/query.js";
 import { migrateLegacyScheduleToExternalWorkflow } from
   "../../application/proactive/source-migration.js";
+import { readScheduleRegistration, registerExternalWorkflowSchedule } from
+  "../../application/proactive/schedule-registration.js";
+import { registerCodexDesktopReminderSchedule } from "../../application/proactive/desktop-reminder-registration.js";
 
 interface Output {
   readonly write: (text: string) => void;
@@ -21,6 +24,8 @@ interface Output {
 const HELP = [
   "Usage:",
   "  scripts/rs schedule list",
+  "  scripts/rs schedule register-workflow <registration.json>",
+  "  scripts/rs schedule register-reminder <registration.json>",
   "  scripts/rs schedule inspect|pause|resume|cancel <schedule-id>",
   "  scripts/rs schedule run-now <schedule-id> --request-id <idempotency-key>",
   "  scripts/rs schedule migrate-workflow <schedule-id> --workflow-ref <ref> --expected-revision <n> --request-id <idempotency-key>",
@@ -46,6 +51,16 @@ export function runScheduleCommand(
     throw new Error(
       "legacy_trigger_write_closed: start RunIntent@1; Steward await_source owns Schedule registration"
     );
+  }
+  if (command === "register-workflow") {
+    requireCount(rest, 1, "schedule register-workflow requires one registration JSON path");
+    write(output, registerExternalWorkflowSchedule(repoRoot, readScheduleRegistration(rest[0]!), runtimeDirectory));
+    return 0;
+  }
+  if (command === "register-reminder") {
+    requireCount(rest, 1, "schedule register-reminder requires one registration JSON path");
+    write(output, registerCodexDesktopReminderSchedule(repoRoot, readScheduleRegistration(rest[0]!), runtimeDirectory));
+    return 0;
   }
   if (command === "list") {
     requireCount(rest, 0, "schedule list accepts no arguments");
@@ -119,7 +134,7 @@ export function runScheduleCommand(
   }
   throw new Error(
     "schedule requires list, inspect, pause, resume, cancel, " +
-    "run-now, migrate-workflow, occurrences, runs, trace or resolve"
+    "run-now, register-workflow, migrate-workflow, occurrences, runs, trace or resolve"
   );
 }
 

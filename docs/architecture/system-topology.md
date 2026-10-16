@@ -19,7 +19,7 @@ timestamp: 2026-07-19
 | Server | Phase 1–3 已实现并验收 | Node.js BFF、OIDC/Device/Agent、Room control plane、Matrix AS、MySQL projection 与 head/range/stream。 |
 | Matrix | Server/Local adapter 与隔离真实 Room Gate 已验收 | Server 与 Local Runtime 之间的网络 Event bus；保留 room/thread/message transport facts。 |
 | Local Runtime | `v0.3.1` Local-first product 已实现 | 自动 Local foundation、共享 workspace、Principal/Agent、immutable `Local` Chat、Session、Subscription、单 loop、Console 与停止权。 |
-| Agent provider | Codex、Claude Code、Kimi Code 与 Pi adapter 已实现 | 在 Local 授予的 cwd、sandbox/permission mode、预算和进程边界内执行 Agent invocation；Kimi Code 在受信任本机上只承担 Review Implementer，不承担 Reviewer。 |
+| Agent provider | Codex、Claude Code、Kimi Code 与 pi adapter 已实现 | 在 Local 授予的 cwd、sandbox/permission mode、预算和进程边界内执行 Agent invocation；Kimi Code 在受信任本机上只承担 Review Implementer，不承担 Reviewer。 |
 
 Server 源码位于 `server/`，当前已提供身份、Device/Agent 和 Room API；这些能力不参与 Local 首次启动。Local Runtime 可以通过保留的 Server Room head/range/send adapter 接入 Matrix，但 v0.3.1 Local UI 不展示 Server connection、binding 或 Server Room。完整 Server Event ingress 留到 v0.4。
 

@@ -1,3 +1,6 @@
+import { guardStewardResultContinuation } from "./result-failure.js";
+import { enqueueTerminalRunDelivery } from "./result-destination.js";
+import { dispatchGraphReady, graphState, runGraph, graphActivePointer } from "./graph.js";
 import type { StewardRunDecisionV6 } from "../../modules/steward/run-contract-v6.js";
 import type { StewardRunDecisionV5 } from "../../modules/steward/run-contract-v5.js";
 import type { StewardRunDecisionV4 } from "../../modules/steward/run-contract-v4.js";
@@ -23,15 +26,12 @@ import {
   workflowMandateSnapshot
 } from "../../infrastructure/resources/workflow-resource.js";
 import { AgentRunStore } from "../../infrastructure/sqlite/agent-run-store.js";
-import { vikunjaRunResultDelivery } from
-  "../../integrations/vikunja/task-destination.js";
+import { runResultTaskUrl } from "./result-destination.js";
 import {
   isStewardOrchestrated,
   latestOrchestratorState,
-  parseAgentStepResult,
-  parseRunDecision,
+  parseRunDecisionOutput,
   type AgentRunCheckpoint,
-  type AgentStepResult,
   type StewardRunDecision
 } from "../../modules/steward/caller-contract.js";
 import type { StewardRunDecisionV3 } from
@@ -46,6 +46,7 @@ import { assertSpecCompatibility } from
 import { workspaceEffectFailure } from
   "../../modules/steward/workspace-effect.js";
 import {
+  isTerminal,
   newAgentStepId,
   planAgentRunContinuation,
   planCallerRunDecision,
@@ -61,7 +62,7 @@ import {
   assertWorkspaceEffectSatisfied,
   type StewardSourceBindingRegistrar
 } from "./decision.js";
-import { stepMandateSnapshot } from "./control-support.js";
+import { callerStepResult, stepMandateSnapshot } from "./control-support.js";
 import {
   agentTurnRecoveryContinuations,
   requestAgentTurnAdjudicationInTransaction
@@ -113,7 +114,7 @@ export class StewardModule implements
         ...this.#recoveryContinuations,
         this.#callerContinuation,
         ...this.#orchestratorContinuations
-      ],
+      ].map(continuation => guardStewardResultContinuation(continuation, this.#runs, this.#runtime)),
       executionGuards: [this]
     };
   }
@@ -122,6 +123,10 @@ export class StewardModule implements
     event: AgentInputEvent | ChatDispatchEvent,
     _at: string
   ): RuntimeAgentExecutionGuardDecision {
+    if (event.type === "agent.request" && event.runContext !== undefined) {
+      const run = this.#runs.projection(event.runContext.runId);
+      if (run !== undefined && runGraph(run) !== undefined && run.deadlineAt !== undefined && Date.parse(_at) >= Date.parse(run.deadlineAt)) return {outcome: "skip", reason: "agent_run_deadline_exhausted"};
+    }
     if (event.type !== "agent.request" || event.runContext === undefined ||
       this.#runs.isContinuable(event.runContext.runId)) {
       return { outcome: "allow" };
@@ -436,12 +441,12 @@ class CallerAgentStepContinuation implements RuntimeAgentResultContinuation {
       const observedWorkspaceRevision = run.workspaceGrant === undefined
         ? undefined
         : workspaceRevision(run.workspaceGrant.root).revision;
-      if (run.status === "cancelled") {
+      if (isTerminal(run.status)) {
         this.#runtime.recordExecutionReceiptInTransaction(execution.executionId, {
           schema: "AgentRunCheckpointReceipt@1",
           runId: run.runId,
           stepId: context.stepId,
-          outcome: "ignored_cancelled",
+          outcome: run.status === "cancelled" ? "ignored_cancelled" : "ignored_terminal",
           ...(observedWorkspaceRevision === undefined
             ? {}
             : { observedWorkspaceRevision })
@@ -460,6 +465,7 @@ class CallerAgentStepContinuation implements RuntimeAgentResultContinuation {
           summary: "Agent Run deadline exhausted",
           updatedAt: at
         });
+        enqueueTerminalRunDelivery(this.#runtime, run, "failed", "Agent Run deadline exhausted", at);
         this.#runtime.recordExecutionReceiptInTransaction(execution.executionId, {
           schema: "AgentRunCheckpointReceipt@1",
           runId: run.runId,
@@ -477,7 +483,7 @@ class CallerAgentStepContinuation implements RuntimeAgentResultContinuation {
       if (agentExecution === undefined) {
         throw new Error("Caller-orchestrated Worker Execution is missing");
       }
-      const checkpoint: AgentRunCheckpoint = {
+      let checkpoint: AgentRunCheckpoint = {
         schemaVersion: "AgentRunCheckpoint@1",
         stepId: context.stepId,
         agentId: request.agentId,
@@ -490,7 +496,37 @@ class CallerAgentStepContinuation implements RuntimeAgentResultContinuation {
           : { observedWorkspaceRevision }),
         recordedAt: at
       };
-      const checkpointed = this.#runs.checkpointInTransaction({
+      const graph = runGraph(run);
+      let checkpointed: AgentRunProjection;
+      let graphNodeId: string | undefined;
+      if (graph !== undefined) {
+        const node = graphState(run, this.#runs, this.#runtime).find(state => state.request?.eventId === request.eventId);
+        if (node === undefined) throw new Error("Result does not belong to an admitted DAG node");
+        if (node.result !== undefined) {
+          this.#runtime.completeResultExecutionInTransaction(execution.executionId, at);
+          return;
+        }
+        graphNodeId = node.node.id;
+        this.#runtime.recordExecutionReceiptInTransaction(execution.executionId, {
+          schema: "AgentRunCheckpointReceipt@1", runId: run.runId, stepId: context.stepId,
+          graphNodeId, outcome: "graph_collected", stepOutcome: stepResult.outcome
+        });
+        const states = dispatchGraphReady(run, this.#runs, this.#runtime, at);
+        const count = states.filter(state => state.request !== undefined).length;
+        if (states.some(state => state.status === "active" || state.status === "pending")) {
+          this.#runs.advanceGraphInTransaction(run, count, at, undefined, graphActivePointer(states, this.#runtime));
+          this.#runtime.completeResultExecutionInTransaction(execution.executionId, at);
+          return;
+        }
+        const final = states.find(state => state.node.id === graph.resultNode)!;
+        if (final.value === undefined) checkpoint = {...checkpoint, result: {
+          schemaVersion: "AgentStepResult@1", outcome: states.some(state => state.status === "needs_human") ? "needs_human" : "failed",
+          summary: `DAG result blocked. ${states.map(state => `${state.node.id}: ${state.status}`).join("; ")}`.slice(0, 4096),
+          artifactRefs: states.flatMap(state => state.result === undefined ? [] : [`event:${state.result.eventId}`])
+        }};
+        checkpointed = this.#runs.advanceGraphInTransaction(run, count, at, checkpoint);
+      } else {
+      checkpointed = this.#runs.checkpointInTransaction({
         runId: run.runId,
         expectedVersion: run.version,
         expectedStepId: context.stepId,
@@ -498,6 +534,7 @@ class CallerAgentStepContinuation implements RuntimeAgentResultContinuation {
         checkpoint,
         updatedAt: at
       });
+      }
       let orchestratorEventId: string | undefined;
       let orchestratorExecutionId: string | undefined;
       if (isStewardOrchestrated(checkpointed.orchestratorBinding)) {
@@ -506,14 +543,12 @@ class CallerAgentStepContinuation implements RuntimeAgentResultContinuation {
           throw new Error("Steward orchestration requires a fixed participant roster");
         }
         const binding = checkpointed.orchestratorBinding;
-        const resultDelivery = binding.resultDestination === undefined
-          ? undefined
-          : vikunjaRunResultDelivery(binding.resultDestination);
-        const session = this.#runtime.sessionForRunAgent(
+        const taskUrl = runResultTaskUrl(binding.resultDestination);
+        const session = graph === undefined ? this.#runtime.sessionForRunAgent(
           checkpointed.runId,
           binding.orchestratorRef.agentId,
           checkpointed.activeCycleId
-        );
+        ) : undefined;
         const orchestrationStepId = newAgentStepId();
         const priorState = latestOrchestratorState(
           this.#runs.decisions(checkpointed.runId)
@@ -527,6 +562,7 @@ class CallerAgentStepContinuation implements RuntimeAgentResultContinuation {
           agentId: binding.orchestratorRef.agentId,
           ...(session === undefined ? {} : { sessionId: session.sessionId }),
           prompt: stewardOrchestratorPrompt({
+            acceptanceOnly: graph !== undefined,
             objective: checkpointed.mandate.kind === "objective"
               ? checkpointed.mandate.objective
               : checkpointed.mandate.renderedInstruction,
@@ -538,7 +574,7 @@ class CallerAgentStepContinuation implements RuntimeAgentResultContinuation {
             ...(priorState === undefined ? {} : { priorState }),
             participants: this.#runs.activeParticipantTargets(participantIds),
             contractVersion: stewardDecisionVersion(binding),
-            ...(binding.schemaVersion !== "OrchestratorBinding@3" ? {} : {acceptanceContract: binding.acceptanceContract}),
+            ...(binding.schemaVersion !== "OrchestratorBinding@3" ? {} : {acceptanceContract: binding.acceptanceContract, workerAgentId: binding.authority.workerAgentId}),
             ...(binding.schemaVersion !== "OrchestratorBinding@3" ||
               binding.authority.trigger === undefined
               ? {}
@@ -552,9 +588,7 @@ class CallerAgentStepContinuation implements RuntimeAgentResultContinuation {
             ...(checkpointed.workspaceGrant?.effect === undefined
               ? {}
               : { workspaceEffect: checkpointed.workspaceGrant.effect }),
-            ...(resultDelivery === undefined
-              ? {}
-              : { taskUrl: resultDelivery.taskUrl })
+            ...(taskUrl === undefined ? {} : { taskUrl })
           }),
           runContext: {
             schemaVersion: "AgentRunContext@1",
@@ -564,6 +598,8 @@ class CallerAgentStepContinuation implements RuntimeAgentResultContinuation {
               ? {}
               : { cycleId: checkpointed.activeCycleId }),
             stepId: orchestrationStepId,
+            ...(graph === undefined ? {} : {invocationBudget: {schemaVersion: "AgentInvocationBudget@1" as const,
+              totalTimeoutMilliseconds: Math.min(900_000, Math.max(1, Date.parse(checkpointed.deadlineAt!) - Date.parse(at)))}}),
             parentStepId: checkpoint.stepId,
             depth: 0,
             ...(checkpointed.mandate.kind !== "workflow" ||
@@ -597,6 +633,7 @@ class CallerAgentStepContinuation implements RuntimeAgentResultContinuation {
           : "checkpointed_and_orchestrator_queued",
         runVersion: checkpointed.version,
         stepOutcome: stepResult.outcome,
+        ...(graphNodeId === undefined ? {} : {graphNodeId}),
         ...(orchestratorEventId === undefined
           ? {}
           : { orchestratorEventId, orchestratorExecutionId }),
@@ -692,7 +729,7 @@ class StewardDecisionContinuation implements RuntimeAgentResultContinuation {
       }
       let decision: StewardRunDecision | StewardRunDecisionV3 | StewardRunDecisionV4 | StewardRunDecisionV5 | StewardRunDecisionV6;
       try {
-        const parsed = parseRunDecision(JSON.parse(result.output ?? "") as unknown, {
+        const parsed = parseRunDecisionOutput(result.output ?? "", {
           allowHistorical: this.resultContractId === "run-decision@2"
         });
         assertSpecCompatibility(this.resultContractId, parsed.schemaVersion, {
@@ -887,27 +924,6 @@ class StewardDecisionContinuation implements RuntimeAgentResultContinuation {
       error: error.slice(0, 4_096)
     });
     this.#runtime.completeResultExecutionInTransaction(execution.executionId, at);
-  }
-}
-
-function callerStepResult(result: AgentResultEvent): AgentStepResult {
-  if (result.outcome !== "succeeded") {
-    return {
-      schemaVersion: "AgentStepResult@1",
-      outcome: "failed",
-      summary: result.error ?? "Agent provider failed without an error",
-      artifactRefs: []
-    };
-  }
-  try {
-    return parseAgentStepResult(result.output ?? "");
-  } catch (error) {
-    return {
-      schemaVersion: "AgentStepResult@1",
-      outcome: "failed",
-      summary: `Invalid AgentStepResult@1: ${errorMessage(error)}`.slice(0, 4_096),
-      artifactRefs: []
-    };
   }
 }
 

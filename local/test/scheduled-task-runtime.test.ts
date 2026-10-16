@@ -16,6 +16,10 @@ import { ScheduledTaskRuntime } from "../src/capabilities/scheduled-task/runtime
 import { ScheduledTaskStore } from "../src/capabilities/scheduled-task/store.js";
 import { RuntimeStore } from "../src/core/runtime/store.js";
 import { runLocalApp } from "../src/entrypoints/cli/main.js";
+import { createScheduleAdmissionGate } from "../src/application/schedule/readiness.js";
+import { codexDesktopReminderAction, CODEX_DESKTOP_REMINDER_ACTION } from "../src/application/proactive/desktop-reminder-action.js";
+import { DeterministicApplicationActionRegistry } from "../src/application/proactive/action-registry.js";
+import { openRuntimeDatabase } from "../src/infrastructure/sqlite/database.js";
 
 test("due one-shot admits exactly one canonical Event and projects its terminal result", async () => {
   const fixture = setup();
@@ -50,6 +54,104 @@ test("due one-shot admits exactly one canonical Event and projects its terminal 
   } finally {
     fixture.close();
   }
+});
+
+test("readiness deferral persists without Event admission and cancellation wins an asynchronous probe", async () => {
+  const fixture = setup();
+  try {
+    const schedule = fixture.schedules.create(onceInput(fixture.agentId, "2026-07-24T01:00:00.000Z"),
+      "2026-07-24T00:00:00.000Z");
+    const scheduler = new ScheduledTaskRuntime({
+      store: fixture.schedules, runtime: fixture.runtime, validateTarget: () => undefined,
+      admissionGate: async () => ({ status: "defer", reason: "waiting-network" })
+    });
+    await scheduler.runCycle("2026-07-24T01:00:00.000Z");
+    const pending = fixture.schedules.runs(schedule.definition.scheduleId)[0]!;
+    assert.equal(pending.status, "queued");
+    assert.equal(pending.eventId, undefined);
+    assert.equal(pending.decisionReason, "waiting-network");
+    const cancelling = new ScheduledTaskRuntime({
+      store: fixture.schedules, runtime: fixture.runtime, validateTarget: () => undefined,
+      admissionGate: async () => {
+        fixture.schedules.setStatus(schedule.definition.scheduleId, "cancel", "2026-07-24T01:00:01.000Z");
+        return { status: "ready" };
+      }
+    });
+    await cancelling.runCycle("2026-07-24T01:00:01.000Z");
+    assert.equal(fixture.schedules.requireRun(pending.runId).eventId, undefined);
+    await fixture.scheduler.runCycle("2026-07-24T01:00:02.000Z");
+    assert.equal(fixture.schedules.requireRun(pending.runId).status, "skipped");
+  } finally { fixture.close(); }
+});
+
+test("wake readiness defers network and exact Desktop dependencies, then expires without an Agent", async () => {
+  const fixture = setup();
+  const database = openRuntimeDatabase(fixture.database);
+  const schedules = new ScheduledTaskStore(database);
+  const runtime = new RuntimeStore(database);
+  try {
+    const legacy = schedules.create(onceInput(fixture.agentId, "2026-07-24T01:00:00.000Z"),
+      "2026-07-24T00:00:00.000Z");
+    schedules.setStatus(legacy.definition.scheduleId, "pause", "2026-07-24T00:01:00.000Z");
+    let power: "awake" | "sleeping" | "unknown" = "sleeping";
+    let online = false;
+    let desktop = false;
+    let clock = 0;
+    let networks = 0;
+    const threadId = "00000000-0000-4000-8000-000000000001";
+    const gate = createScheduleAdmissionGate({
+      runs: { projection: () => undefined }, agentClient: () => "codex", clock: () => clock,
+      power: async () => power,
+      network: async () => { networks++; return online; },
+      desktop: async target => { assert.equal(target, threadId); if (!desktop) throw new Error("offline"); }
+    });
+    assert.deepEqual(await gate(legacy.revision, "2026-07-24T01:00:00.000Z"), { status: "defer", reason: "waiting-awake" });
+    assert.equal(networks, 0);
+    power = "awake"; clock += 6_000;
+    assert.deepEqual(await gate(legacy.revision, "2026-07-24T01:00:06.000Z"), { status: "defer", reason: "waiting-network" });
+    online = true; clock += 6_000;
+    assert.deepEqual(await gate(legacy.revision, "2026-07-24T01:00:12.000Z"), { status: "ready" });
+    const actions = new DeterministicApplicationActionRegistry(database, [codexDesktopReminderAction]);
+    const reminder = schedules.withImmediateTransaction(() => schedules.createTargetedInTransaction({
+      scheduleId: "sch_00000000-0000-7000-8000-000000000001", ownerPrincipalId: fixture.agentId,
+      kind: "once", expression: "2026-07-24T01:00:00.000Z", misfirePolicy: "run_once", overlapPolicy: "skip",
+      misfireGraceMilliseconds: 0, target: actions.compileTarget(CODEX_DESKTOP_REMINDER_ACTION, {
+        threadId, body: "fixed text", expiresAt: "2026-07-24T01:01:00.000Z"
+      })
+    }, "2026-07-24T00:00:00.000Z"));
+    const scheduler = new ScheduledTaskRuntime({ store: schedules, runtime: runtime,
+      validateTarget: () => undefined, applicationActions: actions, admissionGate: gate });
+    await scheduler.runCycle("2026-07-24T01:00:12.000Z");
+    const pending = schedules.runs(reminder.definition.scheduleId)[0]!;
+    assert.equal(pending.decisionReason, "waiting-desktop");
+    assert.equal(pending.eventId, undefined);
+    schedules.setStatus(reminder.definition.scheduleId, "pause", "2026-07-24T01:00:13.000Z");
+    await scheduler.runCycle("2026-07-24T01:00:14.000Z");
+    assert.equal(schedules.requireRun(pending.runId).status, "queued");
+    schedules.setStatus(reminder.definition.scheduleId, "resume", "2026-07-24T01:00:15.000Z");
+    assert.equal(schedules.require(reminder.definition.scheduleId).definition.status, "completed");
+    assert.equal(schedules.runs(reminder.definition.scheduleId).length, 1);
+    clock += 60_000; power = "sleeping";
+    await scheduler.runCycle("2026-07-24T01:01:00.000Z");
+    assert.equal(schedules.requireRun(pending.runId).status, "skipped");
+    assert.equal(schedules.requireRun(pending.runId).decisionReason, "reminder-expired");
+    assert.equal(database.prepare("SELECT count(*) AS n FROM deliveries").get()?.n, 0);
+    desktop = true;
+    assert.deepEqual(await gate(reminder.revision, "2026-07-24T01:01:01.000Z"), { status: "skip", reason: "reminder-expired" });
+    power = "awake"; clock += 6_000;
+    const ready = schedules.withImmediateTransaction(() => schedules.createTargetedInTransaction({
+      scheduleId: "sch_00000000-0000-7000-8000-000000000002", ownerPrincipalId: fixture.agentId,
+      kind: "once", expression: "2026-07-24T01:02:00.000Z", misfirePolicy: "run_once", overlapPolicy: "skip",
+      misfireGraceMilliseconds: 0, target: actions.compileTarget(CODEX_DESKTOP_REMINDER_ACTION, {
+        threadId, body: "ready text", expiresAt: "2026-07-24T01:03:00.000Z"
+      })
+    }, "2026-07-24T01:01:00.000Z"));
+    await scheduler.runCycle("2026-07-24T01:02:00.000Z");
+    await scheduler.runCycle("2026-07-24T01:02:01.000Z");
+    assert.equal(schedules.runs(ready.definition.scheduleId)[0]!.status, "succeeded");
+    assert.equal(database.prepare("SELECT count(*) AS n FROM deliveries").get()?.n, 1);
+    assert.equal(database.prepare("SELECT count(*) AS n FROM events").get()?.n, 0);
+  } finally { database.close(); fixture.close(); }
 });
 
 test("sleep recovery coalesces missed cron occurrences without backfill", async () => {

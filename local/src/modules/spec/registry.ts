@@ -257,6 +257,7 @@ const SUBSCRIPTION_CAPABILITY = normalizeSpecRef({ name: "subscription", major: 
 export const ROLLERSKATE_SPEC_REGISTRY = createSpecRegistry([
   contract("spec-ref", 1, "active", "local/src/modules/spec/registry.ts#SpecRefV1", "parseSpecRef", ["SpecRef@1"]),
   contract("steward-policy", 1, "active", "local/src/modules/steward/steward-policy.ts#StewardPolicy", "parseStewardPolicy", ["StewardPolicy@1"]),
+  contract("run-graph", 1, "active", "local/src/modules/steward/graph-contract.ts#RunGraph", "parseRunGraph", ["RunGraph@1"]),
   contract("run-intent", 1, "active", "local/src/modules/steward/admission-contract.ts#RunIntent", "parseRunIntent", ["RunIntent@1"]),
   contract("run-intent", 2, "active", "local/src/modules/run/intent.ts#DeterministicRunIntent", "parseWorkRunIntent", ["RunIntent@2"]),
   contract("steward-run-request", 2, "active", "local/src/modules/steward/admission-contract.ts#StewardRunRequest", "parseStewardRunRequest", ["StewardRunRequest@2"]),

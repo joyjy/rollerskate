@@ -9,6 +9,8 @@ export function stewardWorkView(view: StewardRunDetailView) {
   const terminal = ["succeeded", "failed", "cancelled", "needs_human"].includes(summary.status);
   const outputs = view.outputFolders.flatMap((folder) => folder.outputs);
   return {
+    kind: "agent" as const,
+    detail: { tool: "get_run" as const, runId: summary.runId },
     runId: summary.runId,
     version: summary.version,
     label: redact(summary.mandate.label).slice(0, 512),

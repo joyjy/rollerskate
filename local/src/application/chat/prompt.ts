@@ -12,6 +12,15 @@ import type { ChatToolCapability } from "./tool-policy.js";
 
 const contextPlaceholder = "{{CHAT_CONTEXT_JSON}}";
 
+export interface ChatPromptTaskClaim {
+  readonly sourceMessageEventId: string;
+  readonly runId: string;
+  readonly dispatchEventId: string;
+  readonly agentId: string;
+  readonly status: string;
+  readonly taskQuote?: string;
+}
+
 export interface ChatPromptContext {
   readonly agent: {
     readonly agentId: string;
@@ -24,6 +33,8 @@ export interface ChatPromptContext {
   readonly latestMessage?: ChatMessageEvent;
   readonly conversationIntent: ConversationIntentSnapshot;
   readonly history: ChatPromptHistory;
+  readonly taskClaims?: readonly ChatPromptTaskClaim[];
+  readonly taskClaimsTruncated?: boolean;
   readonly tools: ChatToolCapability;
   readonly chatHistory?:
     | {
@@ -71,7 +82,10 @@ function loadChatResource(
   const template = loadPromptTemplate(
     new URL(`../../../resources/prompts/chat/${filename}`, import.meta.url),
     resourceId
-  );
+  ).replace("{{CHAT_RUN_GUIDANCE}}", loadPromptTemplate(
+    new URL("../../../resources/prompts/chat/run-guidance.md", import.meta.url),
+    "prompt.chat.run-guidance"
+  ));
   if (!template.includes(contextPlaceholder)) {
     throw new Error(`Chat prompt resource is missing ${contextPlaceholder}`);
   }

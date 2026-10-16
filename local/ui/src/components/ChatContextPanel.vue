@@ -9,6 +9,7 @@ import type {
 
 const props = defineProps<{
   agents: readonly LocalAgent[];
+  compact?: boolean;
   presenceAgents: readonly LocalChatPresenceAgent[];
   sessions: readonly LocalChatSession[];
   pending: string | null;
@@ -22,6 +23,7 @@ const emit = defineEmits<{
     presence: { readonly mode: "available" | "snoozed"; readonly until?: string }
   ): void;
   (e: "setHistoryAccess", agent: LocalAgent, action: "grant" | "revoke"): void;
+  (e: "setWebSearchAccess", agent: LocalAgent, action: "grant" | "revoke"): void;
 }>();
 
 const editingPresenceId = ref<string | null>(null);
@@ -127,6 +129,13 @@ function historyDetail(agent: LocalAgent): string {
   return `${clientLabel(agent)} only · ${coverage}${result}`;
 }
 
+function webSearchDetail(agent: LocalAgent): string {
+  const search = presenceMap.value.get(agent.principalId)?.webSearch;
+  if (!search) return "Unavailable on this Runtime";
+  if (!search.supported) return search.reason;
+  return search.status === "active" ? "Native search · allowed next turn" : "Off · applies next turn";
+}
+
 function openPresenceEditor(agent: LocalAgent) {
   if (!presenceState(agent).editable || props.pending !== null) return;
   editingPresenceId.value = editingPresenceId.value === agent.principalId
@@ -173,7 +182,7 @@ function toLocalDateTimeInput(value: string): string {
 </script>
 
 <template>
-  <div class="context-body">
+  <div class="context-body" :class="{ compact }">
     <div v-if="agents.length === 0" class="state">No Local Agents.</div>
     <article
       v-for="{ agent, session } in agentsWithSession"
@@ -183,10 +192,11 @@ function toLocalDateTimeInput(value: string): string {
       :class="{ suspended: agent.status === 'suspended' }"
     >
       <div class="agent-line">
-        <span class="identity">
+        <span v-if="!compact" class="identity">
           <strong>@{{ agent.handle }}</strong>
           <span class="client-label">{{ clientLabel(agent) }}</span>
         </span>
+        <span v-else class="client-label">{{ clientLabel(agent) }}</span>
         <button
           v-if="presenceState(agent).editable"
           type="button"
@@ -233,7 +243,8 @@ function toLocalDateTimeInput(value: string): string {
         <button
           type="button"
           class="secondary-button"
-          :class="{ danger: presenceMap.get(agent.principalId)?.clientHistory?.status === 'active' }"
+          :aria-label="`Client history for @${agent.handle}`"
+          :aria-pressed="presenceMap.get(agent.principalId)?.clientHistory?.status === 'active'"
           :disabled="agent.status !== 'active' || pending !== null"
           @click="emit(
             'setHistoryAccess',
@@ -246,9 +257,22 @@ function toLocalDateTimeInput(value: string): string {
           {{ pending === `history:${agent.principalId}`
             ? "Saving…"
             : presenceMap.get(agent.principalId)?.clientHistory?.status === "active"
-              ? "Revoke"
-              : "Allow" }}
+              ? "On"
+              : "Off" }}
         </button>
+      </div>
+      <div class="history-row">
+        <span>Web search
+          <small>{{ webSearchDetail(agent) }}</small>
+        </span>
+        <button
+          type="button"
+          class="secondary-button"
+          :aria-label="`Web search for @${agent.handle}`"
+          :aria-pressed="presenceMap.get(agent.principalId)?.webSearch?.status === 'active'"
+          :disabled="agent.status !== 'active' || pending !== null || !presenceMap.get(agent.principalId)?.webSearch?.supported"
+          @click="emit('setWebSearchAccess', agent, presenceMap.get(agent.principalId)?.webSearch?.status === 'active' ? 'revoke' : 'grant')"
+        >{{ pending === `web-search:${agent.principalId}` ? 'Saving…' : presenceMap.get(agent.principalId)?.webSearch?.status === 'active' ? 'On' : presenceMap.get(agent.principalId)?.webSearch?.supported ? 'Off' : 'Unsupported' }}</button>
       </div>
       <details class="session-details">
         <summary>Session continuity</summary>
@@ -271,6 +295,7 @@ function toLocalDateTimeInput(value: string): string {
 
 <style scoped>
 .context-body { overflow-y: auto; }
+.compact .session-row { padding: 8px 0 0; border: 0; }
 .session-row {
   padding: 13px 16px;
   display: grid;

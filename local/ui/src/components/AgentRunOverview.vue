@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import { RouterLink } from "vue-router";
 
 import type { AgentRunDetailViewOutput, AgentRunStepOutput } from "@/api/schema";
@@ -10,6 +10,8 @@ import { formatDateTime } from "@/utils/format";
 const props = defineProps<{
   run: AgentRunDetailViewOutput;
   cancelling?: boolean;
+  answering?: boolean;
+  authorizing?: boolean;
   archiving?: boolean;
   cycleId?: string;
   outputId?: string;
@@ -17,6 +19,9 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   cancel: [runId: string];
+  answer: [runId: string, questionId: string, expectedVersion: number, answer: string];
+  authorizeCapability: [runId: string, requestEventId: string, expectedVersion: number];
+  denyCapability: [runId: string, expectedVersion: number];
   archive: [runId: string, archived: boolean];
 }>();
 
@@ -35,6 +40,7 @@ const canArchive = computed(() =>
 const exchangeTotal = computed(() =>
   props.run.exchangeCounts.reduce((total, exchange) => total + exchange.total, 0)
 );
+const answerText = ref("");
 
 function stepDepthPadding(step: AgentRunStepOutput): string {
   return `${step.depth * 16}px`;
@@ -66,7 +72,7 @@ function stepDepthPadding(step: AgentRunStepOutput): string {
             )"
           >{{ run.summary.archivedAt === null ? "Archive" : "Restore" }}</button>
           <button
-            v-if="canCancel"
+            v-if="canCancel && !run.intervention"
             type="button"
             class="cancel-button"
             :disabled="cancelling"
@@ -102,10 +108,36 @@ function stepDepthPadding(step: AgentRunStepOutput): string {
         </div>
       </div>
 
+      <div v-if="run.intervention" class="checkpoint">
+        <strong>需要恢复</strong>
+        <span>{{ run.intervention.reason }}</span>
+        <RouterLink class="trace-link" :to="{name: 'chats', query: {runId: run.summary.runId}}">回到 Chat 处理</RouterLink>
+      </div>
+
       <div v-if="run.humanQuestion?.status === 'pending' || run.humanQuestion?.status === 'expired'" class="checkpoint" role="status">
         <strong>{{ run.humanQuestion.status === 'pending' ? 'Waiting for your answer' : 'Question expired' }}</strong>
         <span>{{ run.humanQuestion.question }}</span>
-        <RouterLink class="trace-link" to="/console/chats">Reply in Chat</RouterLink>
+        <textarea v-if="run.humanQuestion.status === 'pending'" v-model="answerText" rows="2" placeholder="Answer the Owner's question" aria-label="Run answer" />
+        <div class="checkpoint-actions">
+          <button
+            v-if="run.humanQuestion.status === 'pending'"
+            type="button"
+            class="primary-action"
+            :disabled="answering || answerText.trim() === ''"
+            @click="emit('answer', run.summary.runId, run.humanQuestion!.questionId, run.humanQuestion!.runVersion, answerText)"
+          >{{ answering ? "Submitting…" : "Submit answer" }}</button>
+          <RouterLink class="trace-link" to="/console/chats">Open Chat</RouterLink>
+        </div>
+      </div>
+
+      <div v-if="run.capabilityRequest?.status === 'pending' || run.capabilityRequest?.status === 'expired'" class="checkpoint capability-checkpoint" role="status">
+        <strong>{{ run.capabilityRequest.status === 'pending' ? 'Network capability requested' : 'Network capability request expired' }}</strong>
+        <span>{{ run.capabilityRequest.reason }}</span>
+        <span class="mono">{{ run.capabilityRequest.targets.join(', ') }} · run version {{ run.capabilityRequest.runVersion }}</span>
+        <div v-if="run.capabilityRequest.status === 'pending'" class="checkpoint-actions">
+          <button type="button" class="primary-action" :disabled="authorizing" @click="emit('authorizeCapability', run.summary.runId, run.capabilityRequest!.requestEventId, run.capabilityRequest!.runVersion)">{{ authorizing ? 'Authorizing…' : 'Approve network' }}</button>
+          <button type="button" class="cancel-button" :disabled="cancelling" @click="emit('denyCapability', run.summary.runId, run.capabilityRequest!.runVersion)">Deny & cancel Run</button>
+        </div>
       </div>
 
       <div v-else-if="run.checkpoint" class="checkpoint">
@@ -214,6 +246,11 @@ function stepDepthPadding(step: AgentRunStepOutput): string {
 .terminal.failed, .terminal.needs_human { background: var(--warning-soft); color: var(--warning); }
 .terminal.cancelled { background: var(--muted-soft); color: var(--muted); }
 .checkpoint { display: grid; gap: 4px; margin-top: 10px; padding: 10px; border: 1px solid var(--primary); border-radius: 7px; background: var(--primary-soft); color: var(--text); font-size: 12px; }
+.checkpoint textarea { width: 100%; resize: vertical; border: 1px solid var(--border); border-radius: 6px; padding: 7px; font: inherit; }
+.checkpoint-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.primary-action { border: 0; border-radius: 6px; padding: 6px 10px; background: var(--primary); color: white; cursor: pointer; }
+.primary-action:disabled { cursor: wait; opacity: .55; }
+.capability-checkpoint { border-color: var(--warning); background: var(--warning-soft); }
 .source-card { display: grid; gap: 10px; margin-top: 10px; padding: 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-2); font-size: 12px; }
 .source-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .source-head > div { display: grid; gap: 3px; }

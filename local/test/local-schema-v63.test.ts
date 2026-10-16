@@ -41,7 +41,7 @@ test("schema v74 adds reversible archive visibility without changing Run lifecyc
       legacy.close();
     }
 
-    assert.equal(initializeRuntimeSchema(paths.database).schemaVersion, 75);
+    assert.equal(initializeRuntimeSchema(paths.database).schemaVersion, 80);
     const database = new DatabaseSync(paths.database, { readOnly: true });
     try {
       const columns = database.prepare("PRAGMA table_info(agent_runs)").all() as

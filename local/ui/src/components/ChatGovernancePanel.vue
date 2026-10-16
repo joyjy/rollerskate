@@ -4,16 +4,23 @@ import type {
   TopicActivationScheduleViewOutput,
   TopicGovernanceViewOutput
 } from "@/api/schema";
-import type { LocalAgent } from "@/types/local";
+import type { LocalAgent, LocalChatPresenceAgent, LocalChatSession } from "@/types/local";
+import ChatContextPanel from "./ChatContextPanel.vue";
 
 const props = defineProps<{
   agents: readonly LocalAgent[];
+  presenceAgents?: readonly LocalChatPresenceAgent[];
+  sessions?: readonly LocalChatSession[];
   governance: TopicGovernanceViewOutput | null;
   schedules: readonly TopicActivationScheduleViewOutput[];
   pending: string | null;
 }>();
 
 const emit = defineEmits<{
+  (e: "newSession", agent: LocalAgent): void;
+  (e: "setPresence", agent: LocalAgent, presence: { readonly mode: "available" | "snoozed"; readonly until?: string }): void;
+  (e: "setHistoryAccess", agent: LocalAgent, action: "grant" | "revoke"): void;
+  (e: "setWebSearchAccess", agent: LocalAgent, action: "grant" | "revoke"): void;
   (e: "governanceAction", action: "pause" | "resume"): void;
   (e: "participantAction", action: "add" | "remove", agent: LocalAgent): void;
   (e: "scheduleAction", action: "pause" | "resume" | "cancel", scheduleId: string): void;
@@ -182,7 +189,8 @@ function toLocalDateTimeInput(value: string): string {
         <span>{{ governance?.activeParticipantAgentIds.length ?? 0 }}</span>
       </div>
       <div class="participant-list">
-        <div v-for="agent in sortedAgents" :key="agent.principalId" class="participant-row">
+        <article v-for="agent in sortedAgents" :key="agent.principalId" class="participant-entry">
+          <div class="participant-row">
           <span>
             <strong>@{{ agent.handle }}</strong>
             <small>{{ participantLabel(agent) }}</small>
@@ -201,9 +209,24 @@ function toLocalDateTimeInput(value: string): string {
             :disabled="pending !== null"
             @click="emit('participantAction', 'add', agent)"
           >{{ pending === `participant:add:${agent.principalId}` ? "Adding…" : "Add" }}</button>
-        </div>
+          </div>
+          <details v-if="participantMap.get(agent.principalId)?.status === 'active'" class="participant-tools">
+            <summary :aria-label="`Tools and session for @${agent.handle}`">Tools & session</summary>
+            <ChatContextPanel
+              compact
+              :agents="[agent]"
+              :presence-agents="presenceAgents ?? []"
+              :sessions="sessions ?? []"
+              :pending="pending"
+              @new-session="emit('newSession', $event)"
+              @set-presence="(agent, presence) => emit('setPresence', agent, presence)"
+              @set-history-access="(agent, action) => emit('setHistoryAccess', agent, action)"
+              @set-web-search-access="(agent, action) => emit('setWebSearchAccess', agent, action)"
+            />
+          </details>
+        </article>
       </div>
-      <p class="section-note">Removing a participant keeps the Agent, Session, history grant and messages.</p>
+      <p class="section-note">RS history is built in: search all currently joined Topics. Removing a participant revokes access to this Topic. Client history and web search follow each Agent’s settings.</p>
     </section>
 
     <section class="control-section">
@@ -308,6 +331,10 @@ function toLocalDateTimeInput(value: string): string {
 .button-row.compact .secondary-button { padding: 4px 7px; font-size: 10px; }
 .participant-list,
 .schedule-list { display: grid; gap: 6px; }
+.participant-entry { border-bottom: 1px solid var(--border); padding: 7px 0; }
+.participant-entry:last-child { border-bottom: 0; }
+.participant-tools { margin-top: 6px; }
+.participant-tools > summary { cursor: pointer; color: var(--text-dim); font-size: 11px; padding: 3px 0; }
 .participant-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .participant-row > span { display: grid; gap: 1px; min-width: 0; }
 .participant-row small,

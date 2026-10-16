@@ -27,10 +27,40 @@ test("v74 migration preserves pending and terminal Delivery identities, receipts
           status === "failed" ? "old-error" : null);
     }
     writeSchemaVersion(database, 74);
+    database.exec(`
+      DROP TRIGGER chat_message_project_read_progress_dispatch;
+      CREATE TRIGGER chat_message_project_read_progress_dispatch
+      AFTER UPDATE OF status, receipt_json ON executions
+      WHEN EXISTS (
+        SELECT 1 FROM events
+        WHERE event_id = NEW.event_id AND type = 'chat.dispatch'
+      )
+      BEGIN
+        UPDATE chat_messages
+        SET read_progress_json = (
+            SELECT progress_json
+            FROM chat_message_read_progress_v1
+            WHERE event_id = json_extract(
+              (SELECT payload_json FROM events WHERE event_id = NEW.event_id),
+              '$.sourceMessageEventId'
+            )
+          ),
+          projected_at = NEW.updated_at
+        WHERE event_id = json_extract(
+          (SELECT payload_json FROM events WHERE event_id = NEW.event_id),
+          '$.sourceMessageEventId'
+        );
+      END;
+    `);
     const before = database.prepare("SELECT * FROM deliveries ORDER BY delivery_id").all();
     migrateLocalDatabase(database);
     assert.deepEqual(database.prepare("SELECT * FROM deliveries ORDER BY delivery_id").all(), before);
-    assert.equal((database.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value, "75");
+    assert.equal((database.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value, "80");
+    const trigger = database.prepare(`
+      SELECT sql FROM sqlite_master
+      WHERE type = 'trigger' AND name = 'chat_message_project_read_progress_dispatch'
+    `).get() as { sql: string };
+    assert.match(trigger.sql, /json_each\(chat_messages\.attention_json, '\$\.receipts'\)/);
     assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
     migrateLocalDatabase(database);
     assert.deepEqual(database.prepare("SELECT * FROM deliveries ORDER BY delivery_id").all(), before);

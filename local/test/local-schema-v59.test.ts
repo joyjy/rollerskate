@@ -29,7 +29,7 @@ test("schema v74 extends the agent_client check and preserves referencing tables
           session_id, agent_id, adapter_id, provider_session_id, workspace, created_at, updated_at
         ) VALUES (?, ?, 'codex-runtime-jsonl-v1', ?, ?, ?, ?)
       `).run("ses_codex", "prn_codex", "provider_codex", directory, AT, AT);
-      // 把 agents 表降级到 v59 的公开 CHECK，模拟未迁移的 v59 库。
+      // 把 agents 表降级到 v59 的旧 CHECK（不含 pi），模拟未迁移的 v59 库
       legacy.exec("PRAGMA foreign_keys = OFF");
       legacy.exec(`
         CREATE TABLE agents_v59 (
@@ -65,7 +65,7 @@ test("schema v74 extends the agent_client check and preserves referencing tables
     }
 
     const diagnostics = initializeRuntimeSchema(databasePath);
-    assert.equal(diagnostics.schemaVersion, 75);
+    assert.equal(diagnostics.schemaVersion, 80);
 
     const migrated = new DatabaseSync(databasePath);
     try {
@@ -73,7 +73,7 @@ test("schema v74 extends the agent_client check and preserves referencing tables
         "SELECT agent_client FROM agents WHERE principal_id = ?"
       ).get("prn_codex") as { agent_client: string } | undefined;
       assert.equal(codex?.agent_client, "codex");
-      // 当前公开 CHECK 新增允许 Pi。
+      // 新 CHECK 允许 pi
       migrated.prepare(`
         INSERT INTO agents (
           principal_id, handle, handle_key, status, agent_client, execution_config,
@@ -88,7 +88,7 @@ test("schema v74 extends the agent_client check and preserves referencing tables
       `).run("ses_pi", "prn_pi", "provider_pi", directory, AT, AT);
       const violations = migrated.prepare("PRAGMA foreign_key_check").all();
       assert.equal(violations.length, 0);
-      // 非法 client 仍被新 CHECK 拒绝。
+      // 旧 CHECK 移除后，非法 client 仍被新 CHECK 拒绝
       assert.throws(
         () => migrated.prepare(`
           INSERT INTO agents (
